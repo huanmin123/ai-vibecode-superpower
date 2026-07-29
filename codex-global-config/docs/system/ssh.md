@@ -2,9 +2,25 @@
 
 同时读取本地平台文档和远端平台文档。本地 Shell 只构造 SSH 参数；远端命令只使用远端 Shell 语法。用户提供连接凭据只授权该连接，不授权无关的远端写操作。
 
+## 默认认证与最小干预
+
+首次连接先使用用户已经配置且经运行结果验证的默认认证链，例如 SSH 配置、`ssh-agent`、公钥、硬件密钥、跳板机或代理。除端口、可信主机密钥策略和连接超时外，不要预先设置 `PreferredAuthentications`、`PubkeyAuthentication=no`、`PasswordAuthentication=yes` 等选项来关闭或重排认证方式。
+
+```powershell
+$ssh = (Get-Command ssh.exe -ErrorAction Stop | Select-Object -First 1).Source
+$target = 'user@host.example.com'
+& $ssh -o 'StrictHostKeyChecking=accept-new' -o 'ConnectTimeout=10' -- $target
+$exit = $LASTEXITCODE
+if ($exit -ne 0) { throw "SSH 默认认证失败：$exit" }
+```
+
+`ssh -G <host>` 可用于检查客户端最终会采用哪些配置，但不证明网络、代理或认证成功。默认连接已成功时，它就是认证路径正确的证据；不要为了“确认密码”或“统一命令”改成受限认证方式。
+
+只有用户明确要求密码认证，或默认路径的完整错误证据表明确实需要排除/测试密码分支时，才进入下节。强制关闭公钥、代理或其他默认方式后的失败，只能说明该受限认证分支被拒绝，不能单独证明账号、主机或默认认证配置有问题。每次诊断只改变一个认证变量，保留标准错误和实际选项，再决定下一步；不得在没有新证据时反复切换认证组合。
+
 ## 账号密码直接连接
 
-用户提供主机、账号、密码并要求连接，即视为授权使用该密码。开发或测试的首次未知主机可使用 `accept-new` 自动记录并继续认证。生产、敏感凭据或高影响操作前，必须通过可信渠道取得并核对主机密钥指纹，再连接；不得把仅由网络侧返回的密钥当作身份验证证据。
+用户明确要求密码认证，或已完成上节的证据化诊断后，提供主机、账号、密码并要求连接，即视为授权使用该密码。开发或测试的首次未知主机可使用 `accept-new` 自动记录并继续认证。生产、敏感凭据或高影响操作前，必须通过可信渠道取得并核对主机密钥指纹，再连接；不得把仅由网络侧返回的密钥当作身份验证证据。
 
 Windows PowerShell 7：
 
@@ -65,6 +81,8 @@ SSH 正常返回远端命令的退出状态；连接或客户端错误通常返�
 
 SCP 的端口参数是大写 `-P`：
 
+下列 `PasswordAuthentication` 和 `KbdInteractiveAuthentication` 选项仅适用于已经按上节明确选择的密码认证路径；默认认证成功时，传输命令同样保留默认认证链，不附加这些限制。
+
 ```powershell
 $localFile = (Resolve-Path -LiteralPath 'D:\build\package.zip').Path
 $remoteTarget = "${target}:/tmp/package.zip"
@@ -90,7 +108,8 @@ rsync -a -e 'ssh -o StrictHostKeyChecking=accept-new -o BatchMode=no' ./dist/ us
 
 ## 快速诊断
 
-1. 连接失败先看完整标准错误，区分网络、密码、主机密钥和远端命令。
-2. `ssh -G host` 只展开配置，不证明网络或认证可用。
-3. 密码连接不要使用 `BatchMode=yes`。
-4. 只有主机密钥冲突时才处理 `known_hosts`；密码错误和网络错误不要删除主机记录。
+1. 连接失败先保留完整标准错误和实际 SSH 选项，区分网络、代理、主机密钥、默认认证、密码分支和远端命令。
+2. 先运行不限制认证方式的默认连接；`ssh -G host` 只用于解释配置，不证明网络或认证可用。
+3. 需要验证特定认证方式时，一次只改变一个变量，并把结果表述为该方式的结论。例如 `PubkeyAuthentication=no` 后密码被拒绝，结论是“密码分支被拒绝”，不是“账号错误”。
+4. 密码连接不要使用 `BatchMode=yes`。
+5. 只有主机密钥冲突时才处理 `known_hosts`；密码、代理和网络错误不要删除主机记录。
