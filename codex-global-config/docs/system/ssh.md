@@ -113,3 +113,12 @@ rsync -a -e 'ssh -o StrictHostKeyChecking=accept-new -o BatchMode=no' ./dist/ us
 3. 需要验证特定认证方式时，一次只改变一个变量，并把结果表述为该方式的结论。例如 `PubkeyAuthentication=no` 后密码被拒绝，结论是“密码分支被拒绝”，不是“账号错误”。
 4. 密码连接不要使用 `BatchMode=yes`。
 5. 只有主机密钥冲突时才处理 `known_hosts`；密码、代理和网络错误不要删除主机记录。
+
+## 已记录的误判模式
+
+### 强制密码分支被误判为密码或账号错误
+
+- **症状**：默认 SSH 已配置公钥、`ssh-agent`、代理或其他认证链，但诊断命令预先设置 `PubkeyAuthentication=no`、`PreferredAuthentications=password,keyboard-interactive` 或禁用交互；随后得到通用 `Permission denied (publickey,password,keyboard-interactive)` 并被表述为“密码错误”或“账号错误”。
+- **根因**：命令改变了原本可用的认证策略，且可能没有向受限密码分支提交密码。该错误只证明这次受限认证没有完成，不能证明默认认证、账号或密码无效。
+- **防复发顺序**：先用不限制认证方式的默认连接执行无副作用命令，记录实际认证方式；只有明确需要时再单独测试密码分支，并确保客户端确实能够提交密码。每轮只改一个认证变量，比较标准错误和认证方式。
+- **结论边界**：只有服务端在已实际提交目标密码后明确拒绝，才可报告“密码认证被拒绝”；仍不能据此否定已成功的默认认证。无密码提示、`BatchMode=yes`、错误的 `askpass` 或受限客户端环境导致的失败，报告为“客户端未完成密码认证”。
