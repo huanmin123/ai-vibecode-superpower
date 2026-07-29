@@ -1,0 +1,4 @@
+interface:
+  display_name: "GPT Image 2 CLI"
+  short_description: "Use Codex auth/config to run gpt-image-2 image generation"
+  default_prompt: "Use $gpt-image-2-cli to generate an image with gpt-image-2 from my Codex auth/config."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "多模型开发工作流"
+  short_description: "按阶段调度 Sol、Terra 与 Luna 的开发和复审流程"
+  default_prompt: "Use $orchestrate-model-workflow to route this coding task through design, implementation, review, repair, and final verification."
