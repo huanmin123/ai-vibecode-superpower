@@ -1,6 +1,6 @@
 # ripgrep 安装
 
-仅当 `rg --version` 或 `Get-Command rg` 失败时读取本文件。安装完成后必须重新运行 `rg --version` 并确认实际解析到的路径。
+本文件按 Windows、macOS 和 Linux 分节。仅当当前平台的 `rg` 可用性检查失败时读取对应章节：Windows 使用 `Get-Command rg`，macOS/Linux 使用 `command -v rg`；安装完成后必须重新运行 `rg --version` 并确认实际解析到的路径。
 
 优先使用当前系统已有的包管理器。直接下载 Release 时，核对目标架构；上游提供可信摘要或签名时必须验证，未提供时记录 HTTPS 下载的残余完整性风险。不要从第三方镜像或未经核对的转发链接安装。
 
@@ -139,4 +139,4 @@ export PATH="$HOME/.local/bin:$PATH"
 rg --version
 ```
 
-用户级安装后若新会话找不到 `rg`，将 `export PATH="$HOME/.local/bin:$PATH"` 加入实际登录 Shell 的配置文件一次。
+macOS/Linux 的用户级安装后若新会话找不到 `rg`，将 `export PATH="$HOME/.local/bin:$PATH"` 加入实际登录 Shell 的配置文件一次。
