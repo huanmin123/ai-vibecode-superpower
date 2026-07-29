@@ -1,198 +1,196 @@
 ---
 name: orchestrate-model-workflow
-description: "Route software work through a cost-aware multi-model workflow: GPT-5.6 Sol/high for exploration, architecture, bug or vulnerability analysis, and independent review; GPT-5.6 Terra/high for implementation; Terra/xhigh for review-driven repairs; Sol/high for final verification; and GPT-5.6 Luna/high for deterministic, low-risk, fully specified repetitive tasks followed by Terra/high review. Use for complex coding, feature development, refactoring, debugging, security investigation, implementation from a coordinator-accepted plan, code review, or requests to reduce cost by assigning different development phases to different Codex models."
+description: "以成本感知的多模型工作流路由软件任务：GPT-5.6 Sol/high 负责探索、架构、Bug 或漏洞分析与独立复审；GPT-5.6 Terra/high 负责实现；Terra/xhigh 负责依据复审结果修复；Sol/high 负责最终验证；GPT-5.6 Luna/high 只处理步骤完整、低风险、确定性的重复任务，并由 Terra/high 复审。适用于复杂编码、功能开发、重构、调试、安全调查、按协调者验收方案实施、代码复审，或希望按阶段分配 Codex 模型以控制成本的请求。"
 ---
 
-# Orchestrate Model Workflow
+# 多模型工作流编排
 
-Use a coordinator-and-workers workflow. Keep phase ownership explicit and never claim that a model switch occurred unless the runtime or tool call confirms it.
+采用协调者与执行者分工的工作流。明确每个阶段的所有权；除非运行时或工具调用已确认，绝不声称实际切换过模型。
 
-## Keep Sol Analysis-Only
+## Sol 仅做分析
 
-Treat Sol as the core reasoning brain, not an executor. Sol workers may inspect evidence and return structured diagnoses, designs, findings, and verification verdicts, but must not edit workspace files, apply patches, change configuration, invoke destructive commands, or make external state changes.
+Sol 是核心推理者，不是执行者。Sol worker 可以检查证据并返回结构化诊断、设计、问题清单和验证结论；不得编辑工作区、应用补丁、修改配置、调用破坏性命令或改变任何外部状态。
 
-The coordinator records Sol's conclusions in the task artifacts. When the coordinator is itself Sol, delegate that mechanical write to Terra without changing the conclusion. Non-Sol execution workers own every workspace and external-state modification: Terra for normal and escalated implementation, and Luna only for coordinator-accepted low-risk deterministic work.
+协调者把 Sol 的结论记录到任务产物中。协调者本身是 Sol 时，将这项机械写入委派给 Terra，但不得改变结论。所有工作区和外部状态修改由非 Sol 执行者负责：常规或升级实现使用 Terra；Luna 只做协调者已验收的低风险确定性工作。
 
-## Load The Contract
+## 读取契约
 
-Read [references/workflow-design.md](references/workflow-design.md) completely before routing work. For complex tasks, also read [references/execution-plan.md](references/execution-plan.md) and use its artifact and phase checklist.
+开始路由前完整阅读 [references/workflow-design.md](references/workflow-design.md)。复杂任务还要阅读 [references/execution-plan.md](references/execution-plan.md)，并使用其中的产物与阶段清单。
 
-## Request Exact Routes
+## 请求准确路由
 
-When the active tool accepts literal model IDs, request these routes:
+活动工具支持字面模型 ID 时，请使用以下路由：
 
-| Phase | Model ID | Reasoning effort |
+| 阶段 | 模型 ID | 推理强度 |
 | --- | --- | --- |
-| Explore, design, investigate, review, verify | `gpt-5.6-sol` | `high` |
-| Implement a coordinator-accepted plan | `gpt-5.6-terra` | `high` |
-| Repair confirmed review findings | `gpt-5.6-terra` | `xhigh` |
-| Fully specified, low-risk repetitive execution | `gpt-5.6-luna` | `high` |
-| Mandatory review of every Luna result | `gpt-5.6-terra` | `high` |
-| Sol unavailable for high-risk design, review, or verification | `gpt-5.6-terra` | `xhigh` |
-| Escalated unresolved diagnosis or redesign | `gpt-5.6-sol` | `xhigh` |
+| 探索、设计、调查、复审、验证 | `gpt-5.6-sol` | `high` |
+| 实施协调者已验收的计划 | `gpt-5.6-terra` | `high` |
+| 修复已确认的复审问题 | `gpt-5.6-terra` | `xhigh` |
+| 步骤完整、低风险的确定性重复执行 | `gpt-5.6-luna` | `high` |
+| 强制复审每个 Luna 结果 | `gpt-5.6-terra` | `high` |
+| Sol 不可用于高风险设计、复审或验证 | `gpt-5.6-terra` | `xhigh` |
+| 未解决诊断或重新设计的升级 | `gpt-5.6-sol` | `xhigh` |
 
-Use the parameter names required by the actual tool schema, such as `model` with `reasoning_effort` or `thinking`.
+使用实际工具 schema 要求的参数名，例如 `model` 配合 `reasoning_effort` 或 `thinking`。
 
-## Preserve User Intent
+## 保持用户意图
 
-- Treat answer, explanation, review, status, and diagnosis requests as read-only unless the user also asks for implementation.
-- Continue through implementation only for build, change, fix, or equivalent requests.
-- Internal orchestration is part of execution: create workers, task artifacts, and review phases automatically. Do not ask the user to approve delegation, planning, local in-scope edits, or non-destructive validation.
-- Keep destructive operations, external writes, production changes, commits, and user-visible new App tasks within the authority granted by the user and the host product. Internal subagents are not user-visible App tasks.
-- Apply more specific repository instructions in addition to this workflow.
+- 读写授权和确认边界以全局或仓库 `AGENTS.md` 为唯一权威来源，并叠加遵守更具体的仓库指令。
+- 内部编排属于已授权工作的执行部分：自动创建 worker、任务状态和复审阶段；不要求用户再次批准委派、规划、范围内本地修改或非破坏性验证。
+- 内部 subagent 不属于用户可见的 App 任务。创建用户可见任务、提交或其他外部状态变更仍遵守权威授权边界。
 
-## Classify The Work
+## 分类任务
 
-Choose the narrowest applicable route:
+选择适用范围最窄的路径：
 
-| Class | Criteria | Preferred route |
+| 类型 | 条件 | 首选路由 |
 | --- | --- | --- |
-| Simple execution | Steps and expected result are complete, risk is low, and no material design choice remains | Luna/high, then mandatory Terra/high review |
-| Exploration | Requirements, architecture, root cause, vulnerability, or solution is uncertain | Sol/high |
-| Planned implementation | A coordinator-accepted design and measurable acceptance criteria exist | Terra/high |
-| Review | Inspect completed code for correctness, regressions, evidence, and omissions | Sol/high |
-| Repair | Fix confirmed review findings without redesigning unrelated code | Terra/xhigh |
-| Final verification | Re-evaluate the resulting diff and evidence after repair | Sol/high |
-| Escalated investigation | Two repair-review cycles failed, the root cause remains unproven, or user feedback identifies a concrete acceptance gap | Sol/xhigh, then Terra/xhigh |
+| 简单执行 | 步骤和预期结果完整、风险低，没有实质设计选择 | Luna/high，然后强制 Terra/high 复审 |
+| 探索 | 需求、架构、根因、漏洞或方案尚不确定 | Sol/high |
+| 按计划实施 | 已有协调者验收的设计和可衡量验收标准 | Terra/high |
+| 复审 | 检查已完成代码的正确性、回归、证据和遗漏 | Sol/high |
+| 修复 | 修复已确认的问题，不重新设计无关代码 | Terra/xhigh |
+| 最终验证 | 修复后重新评估最终 diff 和证据 | Sol/high |
+| 升级调查 | 两轮修复-复审失败、根因未证明，或用户反馈指出具体验收缺口 | Sol/xhigh，然后 Terra/xhigh |
 
-Do not classify a task as simple merely because it is short. Security-sensitive, destructive, schema-changing, concurrent, or production-impacting work is never simple.
+任务短不等于简单。安全敏感、破坏性、改 schema、并发或影响生产的工作永远不是简单任务。
 
-## Verify Routing Capability
+## 验证路由能力
 
-Before the first delegation:
+首次委派前：
 
-1. Inspect the actual callable delegation tool schema for supported model and reasoning overrides.
-2. Treat that schema as authoritative for subagents. A model appearing in a CLI catalog does not prove that the subagent tool can use it.
-3. Reuse the current agent for a phase only when its model and reasoning effort are confirmed to match the preferred route. Otherwise delegate the phase.
-4. When a model override cannot use full-history inheritance, pass a bounded turn fork or no fork and provide artifact paths plus a self-contained task contract.
-5. If a required Sol/high route is unavailable, confirm that a distinct Terra/xhigh worker can be created before using the documented degraded route.
-6. Use Sol/xhigh only through the escalation criteria in this skill. Do not increase effort merely because a task looks difficult.
-7. Record every fallback in the task plan and final result.
+1. 检查实际可调用的委派工具 schema 是否支持模型和推理强度覆盖。
+2. 以该 schema 作为 subagent 能力的权威来源；模型出现在 CLI 目录中不代表 subagent 工具可以使用它。
+3. 只有当前 agent 的模型和推理强度已确认匹配首选路由时，才复用它；否则委派该阶段。
+4. 模型覆盖不能继承完整历史时，传递有限轮次或不传历史，并提供任务状态、存在时的持久产物路径和自包含任务契约。
+5. 所需的 Sol/high 不可用时，先确认能创建独立 Terra/xhigh worker，再使用文档规定的降级路由。
+6. Sol/xhigh 只可通过本 skill 的升级条件使用；不能只因任务看似困难就提高推理强度。
+7. 在任务计划和最终结果中记录每项回退。
 
-## Run The Workflow
+## 执行工作流
 
-### 1. Establish State
+### 1. 建立状态
 
-For a complex task:
+复杂任务应：
 
-- Create a tracked goal when a goal tool is available.
-- Use the repository's existing planning convention. If none exists, create `.codex/workflows/<task-slug>/design.md`, `plan.md`, and `review.md`.
-- Define scope, non-goals, evidence, risks, rollback, acceptance criteria, and required tests before implementation.
-- Simulate or dry-run high-risk operations and document the recovery path before acting.
+- 工具可用时创建可追踪目标。
+- 采用仓库既有且允许提交的计划惯例；没有时使用任务清单和目标工具持续记录状态。只有用户或仓库明确提供可提交的位置时，才创建持久的设计、计划和复审文档；不得重新创建被忽略的临时目录。
+- 在实施前定义范围、非目标、证据、风险、回滚、验收标准和必要测试。
+- 高风险操作先模拟或 dry-run，并在行动前记录恢复路径。
 
-Skip persistent artifacts for genuinely simple execution unless the repository requires them.
+真正简单的执行可跳过持久产物，除非仓库另有规定。
 
-### 2. Explore And Design With Sol/High
+### 2. 使用 Sol/High 探索和设计
 
-Use the confirmed Sol/high agent to inspect source evidence and return a structured design conclusion. Require it to separate facts, inferences, and unresolved questions. Do not accept unsupported assumptions as design inputs. The coordinator records that conclusion in the design and plan; Sol does not write the artifacts itself.
+使用已确认的 Sol/high agent 检查源代码证据并返回结构化设计结论。要求它区分事实、推断和未解决问题；未经支持的假设不能作为设计输入。协调者把结论记录到任务状态；存在允许的持久产物时再同步到设计和计划。Sol 不自行写入产物。
 
-If Sol/high is unavailable, use a distinct Terra/xhigh worker and mark the design route as `Sol unavailable -> Terra/xhigh`. Do not present this as an equivalent Sol result.
+Sol/high 不可用时，使用独立 Terra/xhigh worker，并标记设计路由为 `Sol unavailable -> Terra/xhigh`；不得将其表述为等价的 Sol 结果。
 
-For diagnosis-only work, deliver the conclusion and stop here unless the user requested a fix.
+仅诊断任务在此交付结论并停止，除非用户要求修复。
 
-### 3. Implement With Terra/High
+### 3. 使用 Terra/High 实施
 
-Delegate only after the design contract is complete. Give the Terra/high worker:
+仅在设计契约完整后委派。向 Terra/high worker 提供：
 
-- exact scope and non-goals;
-- design and plan artifact paths;
-- acceptance criteria and verification commands;
-- ownership boundaries and files it may touch;
-- relevant repository instructions;
-- a requirement to report changed files, tests, assumptions, and remaining risks.
+- 准确的范围和非目标；
+- 任务状态，以及存在时的设计与计划产物路径；
+- 验收标准和验证命令；
+- 所有权边界和允许修改的文件；
+- 相关仓库指令；
+- 报告已改文件、测试、假设和残余风险的要求。
 
-Allow parallel Terra workers only for independent, non-overlapping ownership areas. The coordinator remains responsible for integration.
+只有所有权区域独立且不重叠时才能并行 Terra worker。协调者负责集成。
 
-### 4. Review With Sol/High
+### 4. 使用 Sol/High 复审
 
-Review the actual diff, current files, tests, and requirements rather than the implementer's summary. Return actionable findings ordered by severity and include file/line evidence; do not modify the reviewed workspace. Check at least:
+复审实际 diff、当前文件、测试和需求，而非实现者摘要。返回按严重度排序、含文件/行证据的可操作问题；不得修改被复审工作区。至少检查：
 
-- requirement completeness and behavioral regressions;
-- correctness, boundary behavior, concurrency, and security;
-- performance and resource use;
-- code organization, abstraction fit, over-design, and over-defence;
-- architecture robustness and reasonable extensibility;
-- documentation and test alignment;
-- unsupported assumptions and missing empirical evidence.
+- 需求完整性和行为回归；
+- 正确性、边界行为、并发和安全；
+- 性能和资源使用；
+- 代码组织、抽象适配、过度设计和过度防御；
+- 架构健壮性和合理的可扩展性；
+- 文档和测试的一致性；
+- 未经支持的假设和缺少实证依据的地方。
 
-If no issues are found, state that explicitly and identify residual test gaps.
+没有问题时要明确说明，并列出残余测试缺口。
 
-If Sol/high is unavailable, use a fresh Terra/xhigh reviewer. It must be a different agent from the Terra worker that implemented or repaired the reviewed diff. Record the degraded review route and its residual risk.
+Sol/high 不可用时，使用新的 Terra/xhigh 复审者。它必须不同于实现或修复被审 diff 的 Terra worker。记录降级复审路由和其残余风险。
 
-### 5. Repair With Terra/XHigh
+### 5. 使用 Terra/XHigh 修复
 
-When review finds actionable issues, give Terra/xhigh only the confirmed findings, current diff, constraints, and required verification. Require root-cause fixes and prohibit unrelated cleanup. Re-run affected tests after repair.
+复审发现可操作问题时，只向 Terra/xhigh 提供已确认的问题、当前 diff、约束和所需验证。要求根因修复，禁止无关清理。修复后重跑受影响测试。
 
-### 6. Verify Again With Sol/High
+### 6. 再次使用 Sol/High 验证
 
-Perform a fresh read-only review of the final diff and test evidence. Do not merely check whether the repair worker says each finding is resolved. Re-open affected code and look for regressions introduced by the repair.
+对最终 diff 和测试证据进行新的只读复审。不能只检查修复 worker 是否声称每个问题已解决；重新打开受影响代码，寻找修复引入的回归。
 
-Use at most two repair-review cycles before considering the single escalation path below. Do not continue the same repair loop indefinitely.
+在考虑下方唯一升级路径前，最多进行两轮修复-复审；不得无限重复同一循环。
 
-If Sol/high is unavailable, use a fresh Terra/xhigh verifier under the same independence and disclosure requirements as the first review.
+Sol/high 不可用时，使用新的 Terra/xhigh 验证者，并遵循首次复审相同的独立性和披露要求。
 
-### 7. Escalate With Sol/XHigh
+### 7. 使用 Sol/XHigh 升级
 
-Use this phase only when one of these evidence gates is met:
+仅在满足以下任一证据门槛时使用此阶段：
 
-- two repair-review cycles did not resolve material findings;
-- the root cause remains unknown or available evidence conflicts;
-- the user identifies a concrete mismatch between the delivered result and the documented requirement, acceptance criterion, example, or intended behavior.
+- 两轮修复-复审仍未解决重要问题；
+- 根因未知，或可用证据互相矛盾；
+- 用户指出交付结果与已记录需求、验收标准、示例或预期行为之间存在具体不符。
 
-Do not escalate on an unexplained statement that the result is unsatisfactory. First translate feedback into observable acceptance criteria or ask for the missing expectation.
+不能因为一句未解释的“不满意”就升级。先将反馈转化为可观察的验收标准，或询问缺失的预期。
 
-Create a new Sol/xhigh worker with the current artifacts, failed findings, test evidence, and user feedback. It must re-investigate the root cause, challenge the current design, and return a scoped remediation. The coordinator records the revised design and plan; Sol/xhigh does not edit them or any other workspace file. Do not ask the currently running Sol/high agent to claim it changed its own reasoning effort.
+创建新的 Sol/xhigh worker，传入当前任务状态、失败问题、测试证据和用户反馈。它必须重新调查根因、质疑当前设计并返回有范围的补救方案。协调者记录修订任务状态；存在持久产物时再同步设计和计划。Sol/xhigh 不得编辑这些文件或任何其他工作区文件。不要要求正在运行的 Sol/high agent 声称自己改变了推理强度。
 
-After the coordinator accepts the revised plan against the documented evidence, send it to Terra/xhigh for implementation, then run the normal independent final verification. This is an internal quality gate, not a request for user confirmation. Ask the user only if the revised plan crosses the confirmation boundary in the governing instructions. If Sol/xhigh is unavailable, use the documented independent Terra/xhigh fallback and record `Sol/xhigh unavailable -> Terra/xhigh`. Allow only one escalation per task by default; if its verification still fails, stop and report the unresolved evidence.
+协调者依据记录的证据验收修订计划后，交给 Terra/xhigh 实现，然后执行常规独立最终验证。这是内部质量门，不是向用户索取确认。仅当修订计划跨越主管指令的确认边界时才询问用户。Sol/xhigh 不可用时，使用规定的独立 Terra/xhigh 回退，并记录 `Sol/xhigh unavailable -> Terra/xhigh`。默认每个任务只允许一次升级；其验证仍失败时，停止并报告未解决证据。
 
-### 8. Close The Work
+### 8. 关闭工作
 
-- Run the strongest safe verification available within scope.
-- Update the plan, design decisions, and review record.
-- Mark the goal complete only when acceptance criteria are met and no required work remains.
-- Report the models actually used, any routing fallbacks, changes, verification, and residual risk.
+- 执行范围内最强的安全验证。
+- 更新任务状态；存在持久产物时同步计划、设计决定和复审记录。
+- 只有验收标准已满足且没有必需工作剩余时，才把目标标为完成。
+- 报告实际使用的模型、路由回退、改动、验证和残余风险。
 
-## Route Simple Repetitive Work
+## 路由简单重复工作
 
-Use Luna/high only when the request supplies deterministic steps and the work is low risk. Every Luna result requires a fresh Terra/high review before it can be reported as complete. Luna must not self-review or declare final completion.
+只有用户提供确定性步骤且工作低风险时，才使用 Luna/high。每个 Luna 结果在报告完成前都必须经过新的 Terra/high 复审。Luna 不得自审或声明最终完成。
 
-Give the Terra/high reviewer the original request, Luna's result, changed files or command output, acceptance criteria, and available deterministic checks. Require it to inspect actual output for missed steps, scope drift, incorrect assumptions, and regressions.
+向 Terra/high 复审者提供原始请求、Luna 的结果、已改文件或命令输出、验收标准和可用的确定性检查。要求它检查实际输出中的漏项、范围漂移、错误假设和回归。
 
-- If the Terra/high review is clean, report its verification evidence and complete the task.
-- If it finds bounded issues, use Terra/xhigh to repair them and require a fresh Terra/high re-review.
-- If it finds ambiguity, non-trivial risk, or design work, stop the Luna path and escalate to the normal Sol/Terra workflow.
-- Apply the normal two repair-review cycle limit to this path as well.
+- Terra/high 复审干净时，报告验证证据并完成任务。
+- 发现有界问题时，用 Terra/xhigh 修复，并要求新的 Terra/high 再复审。
+- 发现歧义、非平凡风险或设计工作时，停止 Luna 路径并升级到常规 Sol/Terra 工作流。
+- 此路径同样遵循两轮修复-复审上限。
 
-If the active subagent tool does not support Luna:
+活动 subagent 工具不支持 Luna 时：
 
-1. Do not start a nested `codex exec` process or create a separate App task unless the user explicitly authorized that action.
-2. Use Terra/low as the continuity fallback only for low-risk deterministic work, and disclose the fallback.
-3. For work that fails the low-risk gate, use the normal Sol/Terra workflow.
+1. 除非用户明确授权，不得启动嵌套 `codex exec` 进程或创建单独 App 任务。
+2. 仅对低风险确定性工作使用 Terra/low 作为连续性回退，并披露该回退。
+3. 未通过低风险门槛的工作采用常规 Sol/Terra 工作流。
 
-## Dispatch Contract
+## 委派契约
 
-Every delegated prompt must contain:
+每个委派提示词必须包含：
 
 ```text
-Role and requested model/effort
-Objective and authorized action
-Scope, non-goals, and ownership
-Artifact paths and relevant evidence
-Acceptance criteria and verification commands
-Expected return format
-Stop conditions and escalation rules
+角色和要求的模型/推理强度
+目标和已授权操作
+范围、非目标和所有权
+任务状态或持久产物路径，以及相关证据
+验收标准与验证命令
+期望的返回格式
+停止条件和升级规则
 ```
 
-For every Sol worker, also include: `Read-only analysis only. Do not edit files or change external state; return the structured conclusion to the coordinator.`
+每个 Sol worker 还必须包含：`仅做只读分析。不得编辑文件或改变外部状态；将结构化结论返回协调者。`
 
-Wait for dependency-producing workers before starting dependent phases. Never let an implementation and its independent review run concurrently.
+在启动依赖阶段前等待产生依赖的 worker 完成。绝不让实现和对其的独立复审并行运行。
 
-## Fallback Rules
+## 回退规则
 
-- Never silently substitute a model or reasoning effort.
-- Prefer the closest lower-cost capable route for low-risk work; prefer stopping over weakening review for high-risk work.
-- If Sol/high is unavailable for high-risk design, review, or verification, use a distinct Terra/xhigh worker and record `Sol unavailable -> Terra/xhigh` in the plan and final result.
-- Do not let the Terra implementation or repair worker review its own diff under the Sol fallback. If a distinct Terra/xhigh worker cannot be created, report the capability gap and stop the high-risk phase.
-- Use Sol/xhigh only for the evidence-gated escalation path. If it is unavailable, use the independent Terra/xhigh fallback, record `Sol/xhigh unavailable -> Terra/xhigh`, and preserve the one-escalation limit.
-- If Terra is unavailable, the current capable agent may implement only after recording that the cost-routing objective could not be met.
-- If a worker fails or returns incomplete evidence, retry once with a tighter contract, then continue locally only when safe and disclose the change.
+- 绝不静默替换模型或推理强度。
+- 低风险工作优先选择成本更低但有能力的最近路由；高风险工作宁可停止，也不削弱复审。
+- 高风险设计、复审或验证需要 Sol/high 但其不可用时，使用独立 Terra/xhigh，并在计划和最终结果记录 `Sol unavailable -> Terra/xhigh`。
+- Sol 回退时，不允许 Terra 实现或修复 worker 复审自己的 diff。无法创建独立 Terra/xhigh 复审者时，报告能力缺口并停止高风险阶段。
+- Sol/xhigh 只用于有证据门槛的升级路径。不可用时，使用独立 Terra/xhigh 回退，记录 `Sol/xhigh unavailable -> Terra/xhigh`，并保留一次升级上限。
+- Terra 不可用时，当前有能力的 agent 只有在记录无法达到成本路由目标后才能实施。
+- worker 失败或返回不完整证据时，以更严格契约重试一次；只有安全时才继续本地执行，并披露变化。

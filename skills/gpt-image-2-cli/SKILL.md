@@ -1,28 +1,28 @@
 ---
 name: gpt-image-2-cli
-description: Generate images through the local imagegen CLI with model gpt-image-2 by bridging Codex Desktop credentials from ~/.codex/auth.json and ~/.codex/config.toml into OPENAI_API_KEY and OPENAI_BASE_URL. Use when the user explicitly asks for gpt-image-2 image generation, says the official/API sample is using a non-image model or wrong endpoint, asks to reproduce the prior Codex auth/config image-generation process, or needs image output through the current Codex provider instead of the built-in image_gen tool.
+description: 通过本地 imagegen CLI 和模型 gpt-image-2 生成图像；将 Codex Desktop 的 `~/.codex/auth.json` 与 `~/.codex/config.toml` 中的凭据和提供方配置桥接为 `OPENAI_API_KEY`、`OPENAI_BASE_URL`。用户明确要求 gpt-image-2 图像生成、指出官方/API 示例误用非图像模型或错误端点、要求复现既有 Codex 鉴权/配置图像生成流程，或需要使用当前 Codex 提供方而非内置 `image_gen` 工具输出图像时使用。
 ---
 
 # GPT Image 2 CLI
 
-## Purpose
+## 用途
 
-Use this skill to run the bundled image generation CLI with `--model gpt-image-2` while reusing the current Codex Desktop auth/config files. This avoids hand-copying an API key and avoids accidentally calling a text or Responses model when the user specifically wants GPT Image generation.
+使用此 skill 以 `--model gpt-image-2` 运行随附的图像生成 CLI，同时复用当前 Codex Desktop 的鉴权和配置文件。这样无需手工复制 API key，也能避免在用户明确需要 GPT Image 生成时误调用文本模型或 Responses 模型。
 
-The portable helper scripts are:
+可移植的辅助脚本：
 
 ```text
-scripts/invoke_gpt_image2.py      # direct cross-platform entrypoint
-scripts/invoke-gpt-image2.ps1     # PowerShell wrapper for Windows/macOS/Linux
+scripts/invoke_gpt_image2.py      # 直接的跨平台入口
+scripts/invoke-gpt-image2.ps1     # 适用于 Windows/macOS/Linux 的 PowerShell 包装器
 ```
 
-## Workflow
+## 工作流
 
-1. Shape the image prompt using the system `imagegen` skill conventions when available: include use case, asset type, subject, style, composition, exact text, constraints, and avoid list.
-2. Choose an output path under the current workspace, usually `output/imagegen/<descriptive-name>.png`.
-3. Run the helper script. Do not hardcode a user-specific skill path; resolve it from `CODEX_HOME` or `$HOME/.codex`.
+1. 可用时按系统 `imagegen` skill 的约定组织提示词：包含使用场景、资产类型、主体、风格、构图、精确文字、约束和避免项。
+2. 在当前工作区内选择输出路径，通常为 `output/imagegen/<descriptive-name>.png`。
+3. 运行辅助脚本。不得硬编码特定用户的 skill 路径；从 `CODEX_HOME` 或 `$HOME/.codex` 解析。
 
-PowerShell 7 on Windows/macOS/Linux:
+Windows/macOS/Linux 上的 PowerShell 7：
 
 ```powershell
 $skill = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME ".codex" }
@@ -35,7 +35,7 @@ $skill = Join-Path (Join-Path $skill "skills") "gpt-image-2-cli"
   -Quality high
 ```
 
-macOS/Linux shell:
+macOS/Linux Shell：
 
 ```bash
 skill="${CODEX_HOME:-$HOME/.codex}/skills/gpt-image-2-cli"
@@ -46,55 +46,55 @@ python3 "$skill/scripts/invoke_gpt_image2.py" \
   --quality high
 ```
 
-4. Inspect the generated file before finishing. For diagrams, verify label legibility, geometry, and that the visual explanation matches the user's intent.
-5. Report the saved path and note that the CLI path used `gpt-image-2`.
+4. 完成前检查生成文件。图表尤其要验证标签可读性、几何关系，以及视觉解释是否符合用户意图。
+5. 报告保存路径，并说明 CLI 使用了 `gpt-image-2`。
 
-## What The Helper Does
+## 辅助脚本的行为
 
-- Uses `OPENAI_API_KEY` from the current process if already set.
-- Otherwise reads `OPENAI_API_KEY` from `CODEX_HOME/auth.json` or `~/.codex/auth.json`.
-- Reads `model_provider` and that provider's `base_url` from `CODEX_HOME/config.toml` or `~/.codex/config.toml`, then exports it as `OPENAI_BASE_URL` for the child CLI process.
-- Resolves paths with platform-native path joining; no Windows-only separators or machine-specific home directories are required.
-- Calls the bundled system script:
+- 若当前进程已经设置 `OPENAI_API_KEY`，直接使用它。
+- 否则从 `CODEX_HOME/auth.json` 或 `~/.codex/auth.json` 读取 `OPENAI_API_KEY`。
+- 从 `CODEX_HOME/config.toml` 或 `~/.codex/config.toml` 读取 `model_provider` 和对应提供方的 `base_url`，将其导出为子 CLI 进程使用的 `OPENAI_BASE_URL`。
+- 使用平台原生的路径拼接；无需 Windows 专用分隔符或机器特定的主目录。
+- 调用随附的系统脚本：
 
 ```text
 <codex-home>/skills/.system/imagegen/scripts/image_gen.py generate --model gpt-image-2
 ```
 
-- Does not print or log the API key.
-- The PowerShell wrapper only finds a Python interpreter and forwards arguments to the portable Python entrypoint.
+- 不打印或记录 API key。
+- PowerShell 包装器只负责找到 Python 解释器，并把参数转发给可移植的 Python 入口。
 
-## Parameters
+## 参数
 
-PowerShell wrapper:
+PowerShell 包装器：
 
 ```powershell
--Prompt <string>   # required final prompt
--Out <path>        # optional; defaults to output/imagegen/gpt-image-2-<timestamp>.png
--Size <string>     # default 1536x1024; also supports auto, 1024x1024, 2048x1152, etc.
--Quality <value>   # low, medium, high, auto; default high
--Model <value>     # default gpt-image-2
--CodexHome <path>  # optional override for CODEX_HOME / ~/.codex
--ImageGenCli <path># optional override for image_gen.py
--BaseUrl <url>     # optional override for OPENAI_BASE_URL
--Python <path>     # optional Python interpreter override
--Force             # pass through when intentionally overwriting an existing output
--DryRun            # print the API payload without calling the API
+-Prompt <string>   # 必填的最终提示词
+-Out <path>        # 可选；默认 output/imagegen/gpt-image-2-<timestamp>.png
+-Size <string>     # 默认 1536x1024；也支持 auto、1024x1024、2048x1152 等
+-Quality <value>   # low、medium、high、auto；默认 high
+-Model <value>     # 默认 gpt-image-2
+-CodexHome <path>  # 可选，覆盖 CODEX_HOME / ~/.codex
+-ImageGenCli <path># 可选，覆盖 image_gen.py
+-BaseUrl <url>     # 可选，覆盖 OPENAI_BASE_URL
+-Python <path>     # 可选，覆盖 Python 解释器
+-Force             # 仅在有意覆盖已有输出时传入
+-DryRun            # 打印 API payload，但不调用 API
 ```
 
-Python entrypoint uses the equivalent long options: `--prompt`, `--out`, `--size`, `--quality`, `--model`, `--codex-home`, `--imagegen-cli`, `--base-url`, `--force`, and `--dry-run`.
+Python 入口使用等价长选项：`--prompt`、`--out`、`--size`、`--quality`、`--model`、`--codex-home`、`--imagegen-cli`、`--base-url`、`--force` 和 `--dry-run`。
 
-Use `1024x1024` or `quality low` for quick drafts. Use `1536x1024`, `2048x1152`, or higher with `quality high` for final diagrams or text-heavy images.
+快速草稿使用 `1024x1024` 或 `quality low`。最终图表或文字较多的图像使用 `1536x1024`、`2048x1152` 或更高尺寸，并使用 `quality high`。
 
-## Troubleshooting
+## 排障
 
-- If the helper cannot find `OPENAI_API_KEY`, check `~/.codex/auth.json` or set the environment variable locally. Never ask the user to paste the full key into chat.
-- If generation reaches the API but fails, the configured `base_url` may not support GPT Image models. Keep the error visible, then ask whether to switch provider/config.
-- If the PowerShell wrapper cannot find Python, install Python 3, set `PYTHON`, or pass `-Python <path>`.
-- If Python cannot import `openai`, install the dependency in the active environment before retrying.
-- If the output path exists, rerun with `-Force` only when replacement is intended; otherwise choose a versioned filename.
+- 辅助脚本找不到 `OPENAI_API_KEY` 时，检查 `~/.codex/auth.json` 或在本地设置环境变量。绝不要求用户把完整 key 粘贴到对话中。
+- 已到达 API 但生成失败时，配置的 `base_url` 可能不支持 GPT Image 模型。保留可见错误，然后询问是否切换提供方或配置。
+- PowerShell 包装器找不到 Python 时，安装 Python 3、设置 `PYTHON`，或传入 `-Python <path>`。
+- Python 无法导入 `openai` 时，在当前环境安装该依赖后重试。
+- 输出路径已存在时，只有确定需要替换才以 `-Force` 重跑；否则选择带版本的文件名。
 
-## Example
+## 示例
 
 ```powershell
 $prompt = @"

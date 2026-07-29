@@ -1,160 +1,78 @@
-# Workflow Design Contract
+# 工作流设计契约
 
-## Objective
+## 目标
 
-Minimize expensive-model implementation tokens without weakening design quality or independent verification. Assign each phase to the cheapest model that satisfies its reasoning and reliability requirements.
+以最低满足可靠性要求的模型完成每个阶段，在不削弱设计质量和独立验证的前提下减少高成本实现 token。
 
-## Architecture
+## 架构
 
-Use a coordinator with phase-specific workers. The coordinator owns user intent, artifacts, dependencies, integration, and completion. Workers own bounded phase outputs.
-
-```text
-Sol/high design
-      |
-      v
-Terra/high implementation
-      |
-      v
-Sol/high independent review
-      |
-      +-- findings --> Terra/xhigh repair --+
-      |                                      |
-      +--------------------------------------+
-      |
-      v
-Sol/high final verification
-```
-
-Sol is read-only in every path. It returns conclusions, designs, findings, and verification verdicts; it does not modify the workspace or external systems. The coordinator records the conclusion, and a non-Sol execution worker performs every resulting write: Terra for normal and escalated work, or Luna only for coordinator-accepted low-risk deterministic work.
-
-Fully specified low-risk work may use Luna/high with mandatory Terra/high review.
+协调者负责用户意图、产物、依赖、集成和完成判断；执行者只拥有受限阶段输出。
 
 ```text
-Luna/high execution
-      |
-      v
-Terra/high mandatory review
-      |
-      +-- bounded findings --> Terra/xhigh repair --> fresh Terra/high review
-      |
-      +-- ambiguity or material risk --> normal Sol/Terra workflow
+只读设计
+  -> 实施
+  -> 独立复审
+  -> 修复（有问题时）
+  -> 最终验证
 ```
 
-When Sol/high is unavailable, the normal route degrades as follows:
+Sol 在所有路径只读：返回结论、设计、问题和验证结论，不修改工作区或外部系统。协调者记录结论；Terra 执行正常及升级写入，Luna 仅可执行协调者验收的低风险确定性工作。
 
 ```text
-Terra/xhigh design or review fallback
-      |
-      +-- must be a fresh worker, separate from Terra implementation or repair
-      |
-      +-- record "Sol unavailable -> Terra/xhigh" and residual risk
+低风险确定性执行 -> 强制独立复审
+  -> 有界问题：修复 -> 再复审
+  -> 歧义或重要风险：转入常规路径
 ```
 
-After normal repair-review work fails, use one evidence-gated escalation:
+各阶段的精确模型、推理强度、回退、两轮修复-复审上限和一次升级条件，唯一以 [主 skill](../SKILL.md) 为准；本参考只解释工作流的职责分离和交接方式。
 
-```text
-Two failed repair-review cycles, unknown root cause,
-or concrete user acceptance gap
-      |
-      v
-Sol/xhigh re-investigation and revised design conclusion
-      |
-      v
-Terra/xhigh scoped implementation
-      |
-      v
-Independent final verification
-      |
-      +-- unresolved --> stop and report evidence
-```
+## 设计决定
 
-## Design Decisions
+### 在任务边界切换模型
 
-### Keep model switching at task boundaries
+不要假设运行中的 agent 能改变模型。复用已确认匹配的当前 agent，或创建明确指定模型和推理强度的 worker。
 
-Do not rely on a running agent changing its own model. Reuse a matching current agent or create a worker with an explicit model and effort override. This keeps runtime identity observable.
+### 通过产物交接
 
-### Hand off through artifacts
+跨模型 worker 可能没有完整对话历史。任务状态是事实来源；仓库提供允许的持久位置时，`design.md`、`plan.md` 和 `review.md` 是其可审计副本。提示词指向可用记录并重申受限契约。Sol 只返回结构化内容，由协调者或非 Sol worker 记录。
 
-Cross-model workers may not receive complete conversation history. Treat `design.md`, `plan.md`, and `review.md` as the source of truth. Prompts point to these artifacts and restate the worker's bounded contract. Sol returns structured content for the coordinator to persist; Sol does not write the artifacts itself.
+### 分离实现与复审
 
-### Separate implementation from review
+实现者不能是唯一复审者。复审者检查实际 diff 和证据；修复后必须重新独立复审。低风险确定性执行同样需要独立复审。模型回退时保持同样独立性，无法创建独立复审者则停止高风险阶段。
 
-The implementation worker must not be the only reviewer of its own changes. Sol/high reads the actual diff and evidence. Repair is followed by a fresh Sol/high review.
+### 运行时验证能力
 
-Every Luna result receives the same separation: a distinct Terra/high worker reviews the actual output before completion. Luna is an executor, never the final verifier.
+模型目录、App 任务和子 agent 能力可能不同。先检查实际工具 schema；不能因模型可作为顶层任务使用，就推断可作为子 agent 使用。不得用嵌套 `codex exec` 作为 Luna 自动回退。
 
-When Terra substitutes for Sol, use Terra/xhigh and preserve the same separation. A Terra implementer or repair worker may not review its own diff; if a fresh Terra/xhigh worker is unavailable, stop the high-risk phase and report the capability gap.
+### 仅凭证据升级
 
-### Separate reasoning from execution
+升级是恢复路径，不是默认路径。精确的证据门槛、模型路由和次数上限以 [主 skill](../SKILL.md) 为准。
 
-Sol never edits code, configuration, documentation, test fixtures, or task artifacts, and never performs external state changes. Its output is a structured conclusion. Terra applies conclusions, including the mechanical work of persisting planning artifacts when the coordinator is Sol.
+## 状态机
 
-### Verify capability at runtime
-
-Model catalogs, App task creation, and subagent delegation can expose different model sets. Inspect the active tool schema before routing. Never infer that Luna can be spawned merely because it can start a top-level task.
-
-### Avoid recursive Codex launches
-
-Do not use nested `codex exec` as an automatic Luna workaround. Nested sessions complicate authority, instruction inheritance, output tracking, and concurrent workspace writes.
-
-### Escalate effort only on evidence
-
-Sol/xhigh is a recovery route, not a default. Enter it only after two failed repair-review cycles, an unproven or conflicting root-cause investigation, or user feedback tied to an observable acceptance gap. Create a new Sol/xhigh worker instead of assuming a Sol/high worker changed effort in place. Limit the task to one escalation by default.
-
-## State Machine
-
-| State | Required input | Exit condition | Next state |
+| 状态 | 必要输入 | 退出条件 | 下一状态 |
 | --- | --- | --- | --- |
-| Classify | User request and repo instructions | Route and authorization established | Design or Simple Execute |
-| Design | Evidence and requirements | Coordinator-accepted implementation contract | Implement or Complete |
-| Implement | Design and acceptance criteria | Scoped diff plus test evidence | Review |
-| Review | Actual diff and requirements | Findings or clean review | Repair or Verify |
-| Repair | Confirmed findings | Corrected diff plus tests | Verify |
-| Verify | Final diff and all evidence | Acceptance criteria met | Complete or Repair |
-| Escalate | Evidence-gated unresolved result | Revised design and plan | Implement |
-| Simple Execute | Fully specified low-risk steps | Luna output plus deterministic checks | Luna Review |
-| Luna Review | Luna output and original acceptance criteria | Terra/high verdict | Complete, Repair, or Design |
-| Complete | Verified result | Goal and artifacts closed | Stop |
+| 分类 | 用户请求与仓库规则 | 已确定路由与授权 | 设计或简单执行 |
+| 设计 | 证据与需求 | 协调者验收的实现契约 | 实现或完成 |
+| 实现 | 设计与验收标准 | 受限 diff 与测试证据 | 复审 |
+| 复审 | 实际 diff 与需求 | 问题或干净结论 | 修复或验证 |
+| 修复 | 已确认问题 | 修正 diff 与测试 | 验证 |
+| 验证 | 最终 diff 与全部证据 | 达到验收标准 | 完成或修复 |
+| 升级 | 证据门槛失败 | 修订设计与计划 | 实现 |
+| 简单执行 | 完整低风险步骤 | 执行输出与确定性检查 | 独立复审 |
+| 简单执行复审 | 执行输出与原始验收 | 独立复审结论 | 完成、修复或设计 |
 
-Diagnosis-only requests transition from Design directly to Complete. High-risk unresolved findings transition to Stop rather than forced implementation.
+仅诊断请求从设计直接完成；高风险未解决问题停止，不强行实施。
 
-## Artifact Contract
+## 产物、风险与成本
 
-For complex tasks, prefer existing repository conventions. Otherwise use:
+复杂任务优先采用仓库既有且允许提交的记录惯例；没有时使用任务清单和目标工具持续跟踪。用户或仓库明确提供持久位置时，`design.md`、`plan.md`、`review.md` 分别记录需求与风险、阶段与路由，以及复审与修复证据；不得为此重新创建被忽略的临时目录。
 
-```text
-.codex/workflows/<task-slug>/
-├── design.md
-├── plan.md
-└── review.md
-```
+- 破坏性、生产、迁移、权限和外部操作先模拟、确认精确目标并准备恢复。
+- 修改同一文件或共享状态的 worker 串行执行；假设必须有具体证据。
+- 广泛生成和机械改动交给 Terra，Sol 聚焦证据、决策和复审；Luna 仅用于确定性低风险工作。
+- 优先确定性工具与测试，不要用更高推理强度弥补缺失的需求或验收标准。
 
-`design.md` contains requirements, evidence, proposed behavior, alternatives, risks, rollback, and acceptance criteria.
+## 已知能力边界
 
-`plan.md` contains ordered phases, owners, model routes, dependencies, status, verification commands, and recorded fallbacks.
-
-`review.md` contains review passes, findings, repairs, evidence, and the final verdict.
-
-## Risk Controls
-
-- Dry-run or simulate destructive, production, migration, permission, and external-system changes.
-- Resolve exact targets before destructive actions.
-- Keep implementation workers within declared file ownership.
-- Serialize workers that can modify the same files or shared state.
-- Require concrete evidence before adopting assumptions.
-- Stop after two failed repair-review cycles unless the user explicitly extends the effort.
-- Permit one Sol/xhigh escalation after those cycles; stop after its verification fails unless the user explicitly extends the effort.
-
-## Cost Controls
-
-- Keep broad code generation and mechanical changes on Terra.
-- Keep Sol focused on evidence gathering, decisions, and review.
-- Use Sol/xhigh only for the evidence-gated recovery route.
-- Use Luna only for deterministic low-risk work and always budget a Terra/high review.
-- Prefer deterministic tools and tests over additional reasoning tokens.
-- Do not increase reasoning effort to compensate for an incomplete prompt or missing acceptance criteria.
-
-## Known Capability Boundary
-
-At the time this workflow was created, the local App supported Luna as a top-level model while the active subagent override exposed Sol and Terra only. The workflow therefore checks capabilities dynamically and uses an explicit fallback rather than hard-coding that temporary limitation.
+本地 App 曾支持 Luna 作为顶层模型，而活跃子 agent 覆盖只暴露 Sol 与 Terra。因此每次任务动态检查能力并记录回退，不能硬编码该临时限制。

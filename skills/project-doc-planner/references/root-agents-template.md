@@ -1,36 +1,36 @@
-# Root AGENTS.md Template
+# 根目录 `AGENTS.md` 模板
 
-## Purpose
+## 用途
 
-Use this template to create a reusable project-level `AGENTS.md`. It should define project-wide operating rules, document-reading order, and change habits without copying any reference project's business content.
+用此模板创建可复用的项目级 `AGENTS.md`。它应定义全项目的操作规则、文档阅读顺序和改动习惯，不复制任何参考项目的业务内容。
 
-## Recommended Sections
+## 建议章节
 
-### Project Overview
+### 项目概览
 
-- Project name
-- One-sentence positioning
-- Primary users
-- First usable loop
-- Current phase or maturity
+- 项目名称
+- 一句话定位
+- 主要用户
+- 第一个可用闭环
+- 当前阶段或成熟度
 
-### Work Principles
+### 工作原则
 
-- Prefer a lightweight closed loop first.
-- Update docs before changing architecture boundaries.
-- Default to current-best implementation: current schema, current API contract, current UI flow, and current project conventions.
-- Do not preserve backward compatibility unless the user explicitly requests it or an existing project instruction makes it mandatory.
-- Keep terminology clear and consistent.
-- Avoid introducing heavy abstractions too early.
+- 优先完成轻量的闭环。
+- 改变架构边界前先更新文档。
+- 默认采用当前最佳实现：当前 schema、当前 API 契约、当前 UI 流程和当前项目惯例。
+- 除非用户明确要求或现有项目指令强制，不保留向后兼容性。
+- 术语清晰且一致。
+- 不要过早引入重量级抽象。
 
-### Compatibility Policy
+### 兼容性策略
 
-- Runtime code should not keep old fields, old request shapes, old routes, old table structures, or old UI flows for compatibility by default.
-- Do not add dual-read, dual-write, startup migration, temporary sync, compatibility fallback, migration markers, or one-off data repair to normal runtime paths.
-- Existing data handling belongs in explicit offline SQL/script/rebuild instructions. Create those only when requested, and keep them out of long-lived runtime code.
-- If compatibility is required, document the user request or project constraint, exact scope, retirement condition, and validation evidence.
+- 运行时代码默认不为兼容而保留旧字段、旧请求形状、旧路由、旧表结构或旧 UI 流程。
+- 正常运行路径不增加双读、双写、启动迁移、临时同步、兼容回退、迁移标记或一次性数据修复。
+- 现有数据处理属于明确的离线 SQL、脚本或重建说明。仅在被要求时创建，且不能进入长期运行时代码。
+- 必须兼容时，记录用户请求或项目约束、精确范围、退出条件和验证证据。
 
-### Reference Entry Points
+### 参考入口
 
 - `docs/README.md`
 - `docs/architecture/README.md`
@@ -42,56 +42,56 @@ Use this template to create a reusable project-level `AGENTS.md`. It should defi
 - `docs/refactors/README.md`
 - `.local/project-resources/README.md`（私有环境上下文；仅在当前任务需要时读取）
 
-### Directory Conventions
+### 目录约定
 
-- `frontend/`: UI pages, components, styles, and interactions.
-- `backend/`: APIs, services, storage, middleware, and jobs.
-- `docs/`: documentation, plans, references, and maintenance notes.
-- `.local/project-resources/`: Git-ignored private resources for dev/test/prod env, accounts, databases, deploy facts, logs, runbooks, releases, and rollback material.
+- `frontend/`：UI 页面、组件、样式和交互。
+- `backend/`：API、服务、存储、中间件和任务。
+- `docs/`：文档、计划、参考资料和维护记录。
+- `.local/project-resources/`：被 Git 忽略的私有资源，保存 dev/test/prod 环境、账号、数据库、部署事实、日志、runbook、发布和回滚资料。
 
-### Environment Context
+### 环境上下文
 
-- Agent defaults to the `dev` context.
-- If `test` reuses `dev`, state that explicitly and list the actual env/database/cache/queue boundaries.
-- Production operations require explicit user confirmation and a switch to `prod` resources.
-- Real credentials, DSNs, tokens, cookies, private keys, database backups, and release private artifacts stay in `.local/project-resources/` or a secret manager, not in public docs or final responses.
-- Env loading scripts should reject dev/test configs that point to production databases, production cache/queue DBs, production namespaces, or production root secrets.
+- Agent 默认使用 `dev` 上下文。
+- `test` 复用 `dev` 时，必须明确说明，并列出真实的环境、数据库、缓存和队列边界。
+- 生产操作必须经用户明确确认，并切换到 `prod` 资源。
+- 真实凭据、DSN、token、cookie、私钥、数据库备份和发布私有产物应放在 `.local/project-resources/` 或密钥管理器中，不放在公开文档或最终答复中。
+- 环境加载脚本必须拒绝指向生产数据库、生产缓存/队列库、生产命名空间或生产根密钥的 dev/test 配置。
 
-### AI Delivery Pipeline
+### AI 交付流水线
 
-- "Develop/fix X": read docs, create or update a plan, implement, verify locally, update relevant docs.
-- "Deploy to test": load test or dev-isolated env, run migration/deploy/smoke, record validation.
-- "Release to production": run production preflight, prepare backup and rollback, show summary, wait for explicit confirmation, deploy, smoke, and archive release.
-- "Rollback": read current release and rollback notes, assess data impact, wait for confirmation, execute, smoke, and record result.
-- "Investigate production": use prod runbooks and logs in read-only mode by default; ask before writes, restarts, migrations, cache clearing, config changes, or rollback.
-- If unattended production release is allowed, document the pre-authorization boundary, allowed branches, change types, time window, automatic rollback threshold, notification channel, and audit log.
+- “开发/修复 X”：阅读文档，创建或更新计划，实施，本地验证，更新相关文档。
+- “部署到测试”：加载测试环境或 dev 隔离环境，运行迁移/部署/smoke，并记录验证。
+- “发布到生产”：运行生产预检，准备备份和回滚，展示摘要，等待明确确认，部署、smoke 并归档发布记录。
+- “回滚”：阅读当前发布和回滚记录，评估数据影响，等待确认，执行、smoke 并记录结果。
+- “调查生产”：默认通过 prod runbook 和日志只读调查；写入、重启、迁移、清缓存、改配置或回滚前询问。
+- 允许无人值守生产发布时，记录预授权边界、允许的分支和改动类型、时间窗口、自动回滚阈值、通知渠道和审计日志。
 
-### Module Boundaries
+### 模块边界
 
-- List core modules using placeholders or actual project terms.
-- Describe each module's responsibility and what it should not contain.
-- Keep the boundary description generic enough to reuse across projects.
+- 使用占位符或实际项目术语列出核心模块。
+- 描述每个模块的职责以及不应包含的内容。
+- 边界描述应保持足够通用，便于跨项目复用。
 
-### Change Habits
+### 改动习惯
 
-- When adding fields, define defaults, current schema behavior, and offline handling for existing data if requested.
-- When adding APIs, update contracts and validation docs.
-- When changing storage, update storage docs and migration notes.
-- When adding scripts or deploy steps, update develop/deploy docs.
-- When changing real env, accounts, database, cache, queue, domain, reverse proxy, daemon, deployment path, release, or rollback material, update `.local/project-resources/<env>/...` first; update public docs only when reusable rules or templates changed.
-- When fixing bugs, record reproduction, cause, fix, and verification.
-- When refactoring large code, record split plan, risk, and validation.
+- 新增字段时，定义默认值、当前 schema 行为，以及被要求时对现有数据的离线处理。
+- 新增 API 时，更新契约和验证文档。
+- 修改存储时，更新存储文档和迁移说明。
+- 新增脚本或部署步骤时，更新 develop/deploy 文档。
+- 修改真实环境、账号、数据库、缓存、队列、域名、反向代理、daemon、部署路径、发布或回滚资料时，先更新 `.local/project-resources/<env>/...`；仅在可复用规则或模板变化时更新公开文档。
+- 修复 Bug 时，记录复现、原因、修复和验证。
+- 重构大段代码时，记录拆分计划、风险和验证。
 
-### Verification Expectations
+### 验证预期
 
-- List the usual typecheck, test, build, and manual verification commands.
-- Describe the minimal evidence required before marking work complete.
-- Note any project-specific constraints or environments.
-- For deployment or env changes, include evidence that secrets were not committed, env loading used the intended environment, smoke output was redacted, and rollback material exists.
-- For delivery pipeline changes, include evidence that intent mapping, scripts, gates, release logging, and rollback path were updated together.
+- 列出常用的类型检查、测试、构建和手动验证命令。
+- 描述标记工作完成前所需的最少证据。
+- 说明项目特定约束或环境。
+- 部署或环境改动应包括：未提交密钥、加载的是目标环境、smoke 输出已脱敏、且存在回滚资料的证据。
+- 交付流水线改动应包括：意图映射、脚本、门禁、发布日志和回滚路径同步更新的证据。
 
-## Writing Rules
+## 写作规则
 
-- Keep sections short and reusable.
-- Use placeholders instead of project-specific examples when possible.
-- If a project has special constraints, add them below the generic template.
+- 章节保持简短且可复用。
+- 尽可能使用占位符，不使用项目专有示例。
+- 项目有特殊约束时，在通用模板后补充。

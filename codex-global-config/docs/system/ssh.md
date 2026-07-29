@@ -1,10 +1,10 @@
 # SSH 与跨主机执行
 
-同时读取本地平台文档和远端平台文档。本地 Shell 只构造 SSH 参数；远端命令只使用远端 Shell 语法。
+同时读取本地平台文档和远端平台文档。本地 Shell 只构造 SSH 参数；远端命令只使用远端 Shell 语法。用户提供连接凭据只授权该连接，不授权无关的远端写操作。
 
 ## 账号密码直接连接
 
-用户提供主机、账号、密码并要求连接，即视为授权使用该密码。首次未知主机使用 `accept-new` 自动记录并继续认证；不要求预先提供指纹、已有 `known_hosts` 或二次连接。
+用户提供主机、账号、密码并要求连接，即视为授权使用该密码。开发或测试的首次未知主机可使用 `accept-new` 自动记录并继续认证。生产、敏感凭据或高影响操作前，必须通过可信渠道取得并核对主机密钥指纹，再连接；不得把仅由网络侧返回的密钥当作身份验证证据。
 
 Windows PowerShell 7：
 
@@ -35,9 +35,9 @@ macOS/Linux：
 ssh -o StrictHostKeyChecking=accept-new -o BatchMode=no -o PreferredAuthentications=password,keyboard-interactive -o PasswordAuthentication=yes -o KbdInteractiveAuthentication=yes -o PubkeyAuthentication=no user@host
 ```
 
-用户提供密码或凭据文件并要求连接后，按当前环境选择最方便的认证方式：终端提示、SSH 客户端库进程内认证、进程级环境变量式 `askpass`、辅助脚本或系统临时目录中的凭据文件都可使用。本地 `dev/test` 允许明文凭据和任务需要的终端输出，不要求把可用的 `askpass` 流程改造成进程内认证；辅助文件按任务便利性保留或清理。不得自动把凭据提交到 Git 或主动发送给无关外部服务；生产凭据和生产操作仍须明确授权。缺少主机记录时自动 TOFU/保存，并在同一会话认证和执行远端命令。
+用户提供密码或凭据文件并要求连接后，优先使用终端提示；任务确实需要自动化时，可使用 SSH 客户端库、仅对子进程生效的 `askpass`、辅助脚本或系统临时凭据文件。不要把密码放入命令行、普通日志、最终回复或 Git；临时凭据文件限定为当前任务并在不再需要时删除。生产凭据和生产操作仍须明确授权。缺少主机记录时自动 TOFU/保存，并在同一会话认证和执行远端命令。
 
-已有记录但主机密钥变化时 SSH 会拒绝连接。确认主机确实重装、迁移或换密钥后，只清理精确端点：
+已有记录但主机密钥变化时 SSH 会拒绝连接。先从可信渠道取得新指纹并与实际返回值核对；确认主机确实重装、迁移或换密钥后，才清理精确端点：
 
 ```powershell
 $lookup = if ($port -eq 22) { $hostName } else { "[$hostName]:$port" }
@@ -86,7 +86,7 @@ SFTP 同样使用大写 `-P`；批处理使用 `-b <file>`。两端都有 `rsync
 rsync -a -e 'ssh -o StrictHostKeyChecking=accept-new -o BatchMode=no' ./dist/ user@host:/srv/app/dist/
 ```
 
-覆盖重要文件时，传输后比较大小、哈希或应用级结果。
+传输前确认精确远端路径和现有状态。覆盖重要文件时，先取得明确的覆盖授权并保留备份或可执行的回滚路径；`rsync` 先使用 `--dry-run` 检查变更范围，再执行实际传输。传输后比较大小、哈希或应用级结果。
 
 ## 快速诊断
 

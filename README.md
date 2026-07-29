@@ -72,7 +72,7 @@ sh ./install-codex.sh
 
 日常任务由已安装的 `AGENTS.md` 作为行为入口；只有在需要执行系统命令时，再按任务读取对应的 `docs/system/` 文档。使用某项能力时，先读该 skill 的 `SKILL.md`，再仅在任务命中时加载其 `references/`。这样避免把完整参考树和重复规则塞入每个任务上下文。
 
-维护本仓库时，`codex-global-config/AGENTS.md` 只保留跨项目的稳定行为边界，`codex-global-config/docs/` 只保留系统操作规范，`skills/*/SKILL.md` 只保留触发、路由和执行约束；临时设计、计划和复审记录放在 `.codex/workflows/`，不随安装复制。
+维护本仓库时，`codex-global-config/AGENTS.md` 只保留跨项目的稳定行为边界，`codex-global-config/docs/` 只保留系统操作规范，`skills/*/SKILL.md` 只保留触发、路由和执行约束；临时任务状态由任务清单和目标工具维护。只有仓库已提供可提交的计划位置时，才保存设计、计划或复审记录；不要重新创建被忽略的 `.codex/` 目录。
 
 ## 覆盖与恢复
 

@@ -1,54 +1,55 @@
 ---
 name: project-doc-planner
-description: Use when Codex needs to design or update reusable project documentation, development standards, multi-environment resource boundaries, or an AI delivery workflow. Triggers include a docs architecture, root AGENTS.md, dev/test/prod context, private .local/project-resources, planning/bug/refactor records, deployment, rollback, and verification rules.
+description: 当 Codex 需要设计或更新可复用的项目文档、开发规范、多环境资源边界或 AI 交付流程时使用。触发场景包括文档架构、根目录 AGENTS.md、dev/test/prod 上下文、私有 .local/project-resources、计划/问题/重构记录、部署、回滚和验证规则。
 ---
 
-# Project Documentation Planner
+# 项目文档规划器
 
-Create only the documentation structure the project needs. This skill is the routing and quality contract; detailed trees and templates live in the referenced files and are loaded only when their topic is in scope.
+只创建项目真正需要的文档结构。本 skill 只定义路由与质量约束；详细目录树和模板放在参考文件中，仅在任务命中时加载。
 
-## Establish Scope First
+## 先确定范围
 
-1. Read the repository `AGENTS.md`, `README*`, package manifest, top-level directories, and existing `docs/` before proposing a structure.
-2. Identify the project type, source boundaries, users, environments, deployment needs, and existing documentation conventions. Mark unknown facts as `待确认`; do not invent product details, hosts, credentials, database names, or commands.
-3. Separate stable public rules, temporary plans or review records, and private runtime facts. Do not create a full documentation skeleton for a small configuration package or another narrow repository.
-4. Preserve current project obligations. Otherwise, default to the current schema, API contract, and UI flow; do not introduce long-lived runtime compatibility paths for old structures.
+1. 提出结构前，阅读仓库的 `AGENTS.md`、`README*`、包清单、顶层目录和现有 `docs/`。
+2. 识别项目类型、源码边界、用户、环境、部署需求和既有文档惯例。未知事实标记为 `待确认`，不得编造产品细节、主机、凭据、数据库名或命令。
+3. 区分稳定公开规则、临时计划或复审记录，以及私有运行事实。小型配置包或范围狭窄的仓库不应生成完整文档骨架。
+4. 保留已有项目义务；否则以当前 schema、API 契约和 UI 流程为准，不为旧结构引入长期运行时兼容路径。
 
-## Core Boundaries
+## 核心边界
 
-- `docs/` holds committed, stable rules, templates, and acceptance criteria. Private environment facts, credentials, release artifacts, and operational records belong in a Git-ignored private directory such as `.local/project-resources/`.
-- Every retained `docs/` directory has a `README.md` and one concrete example. Add templates or topic documents only when they will be reused.
-- Use clear, task-specific terminology. A design must state its goal, non-goals, observable behavior, key tradeoffs, material risks, acceptance evidence, and open questions. Include implementation detail only when it affects a decision, risk, rollback, or explicit user request.
-- Convert recurring user intents into an explicit flow with inputs, preflight, execution, success evidence, failure handling, and record location. Development and local validation proceed automatically within scope; production writes, rollback, credential changes, and other high-impact actions retain their documented authorization gates.
-- Never copy a reference repository's product-specific modules, APIs, vendors, hosts, accounts, secrets, or historical records.
+- `docs/` 保存可提交的稳定规则、模板和验收标准；私有环境事实、凭据、发布产物和运行记录放在 Git 忽略目录，例如 `.local/project-resources/`。
+- 每个保留的 `docs/` 目录都有 `README.md` 和一个具体示例；仅在可复用时增加模板或专题文档。
+- 默认用简体中文编写项目文档。代码、命令、路径、配置键、协议字段和有契约意义的原文保持不变；项目明确采用其他语言时遵从项目约定。
+- 设计必须写明目标、非目标、可观察行为、关键取舍、重要风险、验收证据和待解决问题。只有影响决策、风险、回滚或用户明确要求时才展开实现细节。
+- 将高频用户意图映射为含输入、预检、执行、成功证据、失败处理和记录位置的流程。范围内的开发和本地验证自动执行；生产写入、回滚、凭据变更和其他高影响动作保留其授权门槛。
+- 不得复制参考仓库的产品专属模块、API、供应商、主机、账号、密钥或历史记录。
 
-## Load References On Demand
+## 按需加载参考
 
-| Need | Read this reference |
+| 需要 | 读取参考 |
 | --- | --- |
-| Full public documentation tree, role definitions, or initial outline | [new-project-doc-architecture.md](references/new-project-doc-architecture.md) |
-| Development standards, architecture, frontend/backend boundaries, security, or verification | [development-standards.md](references/development-standards.md) |
-| Dev/test/prod context, private resources, deployment, release, rollback, or environment isolation | [local-project-resources.md](references/local-project-resources.md) |
-| A reusable root project instruction file | [root-agents-template.md](references/root-agents-template.md) |
+| 完整公开文档树、目录职责或初始大纲 | [new-project-doc-architecture.md](references/new-project-doc-architecture.md) |
+| 开发规范、架构、前后端边界、安全或验证 | [development-standards.md](references/development-standards.md) |
+| dev/test/prod 上下文、私有资源、部署、发布、回滚或环境隔离 | [local-project-resources.md](references/local-project-resources.md) |
+| 可复用的项目根目录指令文件 | [root-agents-template.md](references/root-agents-template.md) |
 
-Load every reference selected by the task completely. Do not load a reference merely because it exists, and do not reproduce its long templates in this file or in an unrelated response.
+任务选择了哪个参考，就完整阅读哪个；不要因文件存在而加载，也不要把长模板重复写回本 skill 或无关回答。
 
-## Plan And Produce
+## 规划与产出
 
-1. Propose the smallest useful structure and explain why each retained directory exists.
-2. For projects with multiple environments or operational work, add or plan the ignored private resource layer and verify `.gitignore` protects it.
-3. Link the root `AGENTS.md` to the project reading order, delivery flow, environment boundaries, and verification expectations. Keep durable policy in one authority rather than repeating it in every document.
-4. Create or update files using relative Markdown links. Keep examples generic and placeholders explicit.
-5. Verify directory entry points, example-document coverage, link targets, ignore rules, and consistency between delivery flow, scripts, environment rules, and verification guidance.
+1. 提出最小可用结构，并说明每个保留目录的必要性。
+2. 有多环境或运维需求时，创建或规划被 `.gitignore` 保护的私有资源层。
+3. 让根 `AGENTS.md` 链接项目读取顺序、交付流程、环境边界和验证预期；持久政策只保留一个权威位置。
+4. 使用相对 Markdown 链接创建或更新文件，示例保持通用，占位符清晰可见。
+5. 验证目录入口、示例覆盖、链接目标、忽略规则，以及交付流程、脚本、环境规则和验证说明的一致性。
 
-## Required Result
+## 必须交付
 
-For a documentation-architecture request, provide or create:
+文档架构任务应返回或创建：
 
-- the proposed tree and concise responsibility of each retained directory;
-- the public/private boundary and Git-ignore evidence when applicable;
-- the delivery-flow mapping and authorization boundary for relevant operations;
-- the first files to create or update, their acceptance evidence, and unresolved assumptions;
-- a readable `AGENTS.md` outline when one is requested.
+- 建议目录树及每个保留目录的简要职责；
+- 公开/私有边界及适用时的 Git 忽略证据；
+- 交付流程映射和相关操作的授权边界；
+- 首批需创建或更新的文件、验收证据和未解决假设；
+- 用户要求时提供清晰可读的 `AGENTS.md` 大纲。
 
-Report concrete files changed, verification performed, material limitations, and the next actionable decision. Do not claim a structure is complete solely because a directory tree was generated.
+报告具体改动文件、已执行验证、重要限制和下一项可执行决策。不得仅因生成了目录树就宣称文档结构完成。

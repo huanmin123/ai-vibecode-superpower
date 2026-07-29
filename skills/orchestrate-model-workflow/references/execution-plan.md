@@ -1,101 +1,92 @@
-# Execution Plan Template
+# 执行计划模板
 
-Use this template for complex tasks. Adapt it to repository conventions without dropping required fields.
+复杂任务可使用此模板；仓库提供允许的持久计划位置时，将其存入该位置。否则把同样字段记录到任务清单和目标状态，不得为了套用模板创建被忽略的临时目录。
 
-Sol-owned rows are analysis-only: Sol returns the conclusion, while the coordinator records it and a non-Sol execution worker performs every workspace or external-state write: Terra for normal and escalated work, or Luna only for coordinator-accepted low-risk deterministic work.
+Sol 负责只读分析：返回结论，由协调者记录；所有工作区或外部状态写入由非 Sol 执行者完成。正常和升级实现用 Terra，低风险确定性工作仅在协调者验收后使用 Luna。
 
-## Plan Header
+## 计划头
 
 ```markdown
-# <Task> Plan
+# <任务名称> 计划
 
-- Goal: <measurable outcome>
-- Authorization: diagnose-only | implement | destructive action authorization granted
-- Scope: <included systems/files>
-- Non-goals: <explicit exclusions>
-- Risk: low | medium | high
-- Rollback: <recovery method or not applicable>
-- Acceptance: <observable completion criteria>
+- 目标：<可衡量结果>
+- 授权：仅诊断 | 实施 | 已取得破坏性操作授权
+- 范围：<包含的系统/文件>
+- 非目标：<明确排除项>
+- 背景与依据：<相关上下文、已确认事实和关键证据>
+- 硬约束：<安全、兼容、性能、授权、时间或环境边界>
+- 风险：低 | 中 | 高
+- 回滚：<恢复方式或不适用>
+- 验收：<可观察完成标准>
+- 验证：<必需命令、检查或人工路径>
+- 输出：<用户需要的交付物和应报告的证据>
+- 停止条件：<何时停止、升级或要求补充信息>
 ```
 
-## Phase Checklist
+## 阶段清单
 
 ```markdown
-| Phase | Owner | Model/effort | Dependencies | Status | Evidence |
+| 阶段 | 负责人 | 模型/推理强度 | 依赖 | 状态 | 证据 |
 | --- | --- | --- | --- | --- | --- |
-| Classify | Coordinator | current | none | in_progress | |
-| Explore/design | Architect | Sol/high | classification | pending | design.md |
-| Implement | Implementer | Terra/high | coordinator-accepted design | pending | diff/tests |
-| Review 1 | Reviewer | Sol/high | implementation | pending | review.md |
-| Repair | Fixer | Terra/xhigh | confirmed findings | pending | diff/tests |
-| Review 2 | Verifier | Sol/high | repair | pending | final verdict |
-| Escalated analysis/design | Architect | Sol/xhigh | evidence-gated failure | conditional | revised design.md |
-| Escalated implementation | Implementer | Terra/xhigh | coordinator-accepted revised design | conditional | diff/tests |
-| Escalated verification | Verifier | Sol/high | escalated implementation | conditional | final verdict |
+| 分类 | 协调者 | 按主 skill 路由 | 无 | in_progress | |
+| 探索/设计 | 架构者 | 按主 skill 路由 | 分类 | pending | 任务状态/设计结论 |
+| 实现 | 实施者 | 按主 skill 路由 | 协调者验收的设计 | pending | diff/tests |
+| 复审 1 | 复审者 | 按主 skill 路由 | 实现 | pending | 任务状态/复审结论 |
+| 修复 | 修复者 | 按主 skill 路由 | 已确认问题 | pending | diff/tests |
+| 复审 2 | 验证者 | 按主 skill 路由 | 修复 | pending | 最终结论 |
+| 升级分析/设计 | 架构者 | 按主 skill 路由 | 证据门槛失败 | conditional | 更新后的任务状态/设计结论 |
+| 升级实现 | 实施者 | 按主 skill 路由 | 协调者验收的修订设计 | conditional | diff/tests |
+| 升级验证 | 验证者 | 按主 skill 路由 | 升级实现 | conditional | 最终结论 |
 ```
 
-Remove the repair row only after a clean first review. Record actual model routes rather than planned routes when they differ.
+首次复审干净后才删除修复行。实际模型路由与计划不同时，记录实际路由。
 
-When Sol/high is unavailable, replace each affected Sol phase with a distinct Terra/xhigh worker and add `Sol unavailable -> Terra/xhigh` to the Fallbacks field. Do not assign the Terra implementer or repair worker to review its own diff.
+实际模型路由、回退、独立性和升级资格以主 skill 为准，并在计划记录实际路由；实现者或修复者不得复审自己的 diff。
 
-Use the escalated rows only after two failed repair-review cycles, an unproven or conflicting root cause, or user feedback tied to a concrete acceptance gap. Create a new read-only Sol/xhigh worker for that phase; do not claim an existing Sol/high worker changed effort in place. The coordinator records its conclusion and Terra/xhigh implements it. Limit the plan to one escalation by default.
+## Luna 路径
 
-## Luna Path
-
-Use this path only for fully specified low-risk work. Do not omit the Terra/high review.
+仅用于步骤完整、低风险的确定性工作，且不得省略 Terra/high 复审。
 
 ```markdown
-| Phase | Owner | Model/effort | Dependencies | Status | Evidence |
+| 阶段 | 负责人 | 模型/推理强度 | 依赖 | 状态 | 证据 |
 | --- | --- | --- | --- | --- | --- |
-| Execute | Executor | Luna/high | classification | pending | output/checks |
-| Review Luna output | Reviewer | Terra/high | Luna execution | pending | review.md |
-| Repair findings | Fixer | Terra/xhigh | confirmed findings | conditional | diff/checks |
-| Re-review repair | Reviewer | Terra/high | repair | conditional | final verdict |
+| 执行 | 执行者 | 按主 skill 路由 | 分类 | pending | output/checks |
+| 独立复审输出 | 复审者 | 按主 skill 路由 | 执行 | pending | 任务状态/复审结论 |
+| 修复问题 | 修复者 | 按主 skill 路由 | 已确认问题 | conditional | diff/checks |
+| 再复审 | 复审者 | 按主 skill 路由 | 修复 | conditional | 最终结论 |
 ```
 
-Escalate to the full Sol/Terra path if the reviewer discovers ambiguity, material risk, or required design work.
+复审发现歧义、重要风险或设计需求时，转入完整 Sol/Terra 路径。
 
-## Design Checklist
+## 检查清单
 
-- [ ] User intent and write authorization are clear.
-- [ ] Repository instructions and existing patterns were inspected.
-- [ ] Facts, inferences, and unknowns are separated.
-- [ ] Scope and non-goals prevent unrelated changes.
-- [ ] Alternatives and material tradeoffs are recorded.
-- [ ] High-risk operations have a simulation and rollback plan.
-- [ ] Acceptance criteria and verification commands are measurable.
-- [ ] Ownership boundaries allow safe worker delegation.
+### 设计
 
-## Implementation Checklist
+- [ ] 用户意图和写入授权清楚。
+- [ ] 已检查仓库规则与既有模式。
+- [ ] 事实、推断和未知项分离。
+- [ ] 范围与非目标阻止无关修改。
+- [ ] 已记录替代方案、重要取舍、高风险模拟和回滚。
+- [ ] 验收标准与验证命令可衡量。
+- [ ] 所有权边界支持安全委派。
 
-- [ ] The worker received artifact paths and a self-contained contract.
-- [ ] Changes remain within scope and established architecture.
-- [ ] Boundary, error, concurrency, and security behavior are handled proportionally.
-- [ ] Tests cover changed behavior and important regressions.
-- [ ] Documentation is updated when contracts or operation changed.
-- [ ] The worker reported assumptions and remaining risks.
-- [ ] Every Luna execution has a separate Terra/high review before completion.
+### 实现与复审
 
-## Review Checklist
+- [ ] 执行者收到自包含契约、任务状态或持久产物引用，以及验证要求。
+- [ ] 改动保持在范围和既有架构内，并按比例处理边界、错误、并发和安全。
+- [ ] 测试覆盖改动及重要回归，必要文档已同步。
+- [ ] 复审者检查实际 diff 和当前文件；问题含严重度、证据和精确位置。
+- [ ] 修复后进行了新的独立复审；每次低风险确定性执行都有主 skill 要求的独立复审。
 
-- [ ] Reviewer inspected the actual diff and current files.
-- [ ] Requirements and acceptance criteria were checked individually.
-- [ ] Findings include severity, evidence, and precise location.
-- [ ] User dissatisfaction, if any, was translated into a concrete acceptance gap before escalation.
-- [ ] Performance, security, concurrency, and compatibility were considered.
-- [ ] Abstraction fit, over-design, and over-defence were considered.
-- [ ] Test quality and empirical evidence were assessed.
-- [ ] Repair was followed by a fresh independent review.
-
-## Completion Record
+## 完成记录
 
 ```markdown
-## Completion
+## 完成
 
-- Actual routes: <phase -> model/effort>
-- Fallbacks: <none or reason and substitute>
-- Verification: <commands and results>
-- Review verdict: clean | residual findings
-- Residual risk: <specific gaps>
-- Goal status: complete | blocked
+- 实际路由：<阶段 -> 模型/推理强度>
+- 回退：<无，或原因与替代>
+- 验证：<命令和结果>
+- 复审结论：干净 | 存在残余问题
+- 残余风险：<具体缺口>
+- 目标状态：complete | blocked
 ```
