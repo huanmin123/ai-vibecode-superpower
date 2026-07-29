@@ -1,124 +1,28 @@
 # SSH 与跨主机执行
 
-同时读取本地平台文档和远端平台文档。本地 Shell 只构造 SSH 参数；远端命令只使用远端 Shell 语法。用户提供连接凭据只授权该连接，不授权无关的远端写操作。
+这是跨平台的 SSH 规则，不包含 Windows、macOS 或 Linux 的 Shell 写法。连接前还要读取本地平台文档和目标平台文档；Windows 连接 macOS/Linux 的 PowerShell 示例见 [跨系统操作示例](跨系统操作示例.md)。
 
-## 默认认证与最小干预
+用户提供连接凭据只授权该连接，不授权无关的远端写操作。
 
-首次连接先使用用户已经配置且经运行结果验证的默认认证链，例如 SSH 配置、`ssh-agent`、公钥、硬件密钥、跳板机或代理。除端口、可信主机密钥策略和连接超时外，不要预先设置 `PreferredAuthentications`、`PubkeyAuthentication=no`、`PasswordAuthentication=yes` 等选项来关闭或重排认证方式。
+## 认证顺序
 
-```powershell
-$ssh = (Get-Command ssh.exe -ErrorAction Stop | Select-Object -First 1).Source
-$target = 'user@host.example.com'
-& $ssh -o 'StrictHostKeyChecking=accept-new' -o 'ConnectTimeout=10' -- $target
-$exit = $LASTEXITCODE
-if ($exit -ne 0) { throw "SSH 默认认证失败：$exit" }
-```
+1. **先用默认认证**：直接使用 `ssh user@host`（按需加端口和主机密钥选项）。保留现有 SSH 配置、公钥、`ssh-agent`、硬件密钥、跳板机或代理。默认认证成功后直接继续，不为统一命令或确认密码而切换认证方式。
+2. **默认认证确实不可用时才用密码**：用户明确要求密码认证，或默认连接的完整错误证据表明需要测试密码分支时，才限制为密码或键盘交互认证。密码通过终端提示或当前任务的安全凭据通道提供，绝不放进命令行、日志、Git 或最终回复。
 
-`ssh -G <host>` 可用于检查客户端最终会采用哪些配置，但不证明网络、代理或认证成功。默认连接已成功时，它就是认证路径正确的证据；不要为了“确认密码”或“统一命令”改成受限认证方式。
+强制关闭公钥、代理或交互后的失败，只说明这个受限认证分支未完成；它不证明账号、密码或原默认认证错误。每次诊断只改变一个认证变量，并保留标准错误和实际认证方式。
 
-只有用户明确要求密码认证，或默认路径的完整错误证据表明确实需要排除/测试密码分支时，才进入下节。强制关闭公钥、代理或其他默认方式后的失败，只能说明该受限认证分支被拒绝，不能单独证明账号、主机或默认认证配置有问题。每次诊断只改变一个认证变量，保留标准错误和实际选项，再决定下一步；不得在没有新证据时反复切换认证组合。
+## 主机身份
 
-## 账号密码直接连接
+- 开发或测试首次连接可以使用 `StrictHostKeyChecking=accept-new`。
+- 生产、敏感凭据或高影响操作前，必须从可信渠道核对主机密钥指纹。
+- 只有确认主机重装、迁移或换密钥后，才删除对应 `known_hosts` 记录；密码、代理和网络错误不能删除主机记录。
 
-用户明确要求密码认证，或已完成上节的证据化诊断后，提供主机、账号、密码并要求连接，即视为授权使用该密码。开发或测试的首次未知主机可使用 `accept-new` 自动记录并继续认证。生产、敏感凭据或高影响操作前，必须通过可信渠道取得并核对主机密钥指纹，再连接；不得把仅由网络侧返回的密钥当作身份验证证据。
+## 远端命令与传输
 
-Windows PowerShell 7：
+- 本地 Shell 只构造 SSH 参数；远端命令使用目标主机的 Shell 语法。复杂逻辑传脚本后，用明确解释器执行。
+- `ssh` 正常返回远端命令退出码；连接错误通常为 `255`，仍需结合标准错误判断。
+- SCP 端口使用大写 `-P`；重要文件传输前确认远端路径、覆盖授权和回滚，`rsync` 先 `--dry-run`，传输后验证大小、哈希或应用结果。
 
-```powershell
-$ErrorActionPreference = 'Stop'
-$ssh = (Get-Command ssh.exe -ErrorAction Stop | Select-Object -First 1).Source
-$hostName = 'host.example.com'
-$userName = 'deploy'
-$port = 22
-$target = "$userName@$hostName"
-$options = @(
-  '-p', "$port",
-  '-o', 'StrictHostKeyChecking=accept-new',
-  '-o', 'BatchMode=no',
-  '-o', 'PreferredAuthentications=password,keyboard-interactive',
-  '-o', 'PasswordAuthentication=yes',
-  '-o', 'KbdInteractiveAuthentication=yes',
-  '-o', 'PubkeyAuthentication=no',
-  '-o', 'ConnectTimeout=10'
-)
-& $ssh @options -- $target
-if ($LASTEXITCODE -ne 0) { throw "SSH 密码连接失败：$LASTEXITCODE" }
-```
+## 已记录的误判
 
-macOS/Linux：
-
-```sh
-ssh -o StrictHostKeyChecking=accept-new -o BatchMode=no -o PreferredAuthentications=password,keyboard-interactive -o PasswordAuthentication=yes -o KbdInteractiveAuthentication=yes -o PubkeyAuthentication=no user@host
-```
-
-用户提供密码或凭据文件并要求连接后，优先使用终端提示；任务确实需要自动化时，可使用 SSH 客户端库、仅对子进程生效的 `askpass`、辅助脚本或系统临时凭据文件。不要把密码放入命令行、普通日志、最终回复或 Git；临时凭据文件限定为当前任务并在不再需要时删除。生产凭据和生产操作仍须明确授权。缺少主机记录时自动 TOFU/保存，并在同一会话认证和执行远端命令。
-
-已有记录但主机密钥变化时 SSH 会拒绝连接。先从可信渠道取得新指纹并与实际返回值核对；确认主机确实重装、迁移或换密钥后，才清理精确端点：
-
-```powershell
-$lookup = if ($port -eq 22) { $hostName } else { "[$hostName]:$port" }
-& ssh-keygen.exe -F $lookup
-& ssh-keygen.exe -R $lookup
-```
-
-## 执行远端命令
-
-Windows PowerShell 连接 POSIX 主机时，远端命令使用单引号保存为一个参数：
-
-```powershell
-$remote = 'uname -srm; printf "login_shell=%s\nargv0=%s\n" "$SHELL" "$0"; command -v rg; rg --version'
-$sshArgs = @($options + @('--', $target, $remote))
-& $ssh @sshArgs
-$exit = $LASTEXITCODE
-if ($exit -ne 0) { throw "远端命令失败：$exit" }
-```
-
-目标为 Windows OpenSSH 时，先确认服务端默认 Shell，再传 PowerShell 命令或项目脚本。复杂、多行或含动态数据的逻辑先传脚本，再用明确的 `bash`、`zsh` 或 `pwsh.exe -File` 执行。
-
-SSH 正常返回远端命令的退出状态；连接或客户端错误通常返回 `255`，但远端程序也可能返回 `255`，需要结合标准错误判断。
-
-## 文件传输
-
-SCP 的端口参数是大写 `-P`：
-
-下列 `PasswordAuthentication` 和 `KbdInteractiveAuthentication` 选项仅适用于已经按上节明确选择的密码认证路径；默认认证成功时，传输命令同样保留默认认证链，不附加这些限制。
-
-```powershell
-$localFile = (Resolve-Path -LiteralPath 'D:\build\package.zip').Path
-$remoteTarget = "${target}:/tmp/package.zip"
-$scpArgs = @(
-  '-P', "$port",
-  '-o', 'StrictHostKeyChecking=accept-new',
-  '-o', 'BatchMode=no',
-  '-o', 'PasswordAuthentication=yes',
-  '-o', 'KbdInteractiveAuthentication=yes',
-  '--', $localFile, $remoteTarget
-)
-& scp.exe @scpArgs
-if ($LASTEXITCODE -ne 0) { throw "SCP 上传失败：$LASTEXITCODE" }
-```
-
-SFTP 同样使用大写 `-P`；批处理使用 `-b <file>`。两端都有 `rsync` 时可用：
-
-```sh
-rsync -a -e 'ssh -o StrictHostKeyChecking=accept-new -o BatchMode=no' ./dist/ user@host:/srv/app/dist/
-```
-
-传输前确认精确远端路径和现有状态。覆盖重要文件时，先取得明确的覆盖授权并保留备份或可执行的回滚路径；`rsync` 先使用 `--dry-run` 检查变更范围，再执行实际传输。传输后比较大小、哈希或应用级结果。
-
-## 快速诊断
-
-1. 连接失败先保留完整标准错误和实际 SSH 选项，区分网络、代理、主机密钥、默认认证、密码分支和远端命令。
-2. 先运行不限制认证方式的默认连接；`ssh -G host` 只用于解释配置，不证明网络或认证可用。
-3. 需要验证特定认证方式时，一次只改变一个变量，并把结果表述为该方式的结论。例如 `PubkeyAuthentication=no` 后密码被拒绝，结论是“密码分支被拒绝”，不是“账号错误”。
-4. 密码连接不要使用 `BatchMode=yes`。
-5. 只有主机密钥冲突时才处理 `known_hosts`；密码、代理和网络错误不要删除主机记录。
-
-## 已记录的误判模式
-
-### 强制密码分支被误判为密码或账号错误
-
-- **症状**：默认 SSH 已配置公钥、`ssh-agent`、代理或其他认证链，但诊断命令预先设置 `PubkeyAuthentication=no`、`PreferredAuthentications=password,keyboard-interactive` 或禁用交互；随后得到通用 `Permission denied (publickey,password,keyboard-interactive)` 并被表述为“密码错误”或“账号错误”。
-- **根因**：命令改变了原本可用的认证策略，且可能没有向受限密码分支提交密码。该错误只证明这次受限认证没有完成，不能证明默认认证、账号或密码无效。
-- **防复发顺序**：先用不限制认证方式的默认连接执行无副作用命令，记录实际认证方式；只有明确需要时再单独测试密码分支，并确保客户端确实能够提交密码。每轮只改一个认证变量，比较标准错误和认证方式。
-- **结论边界**：只有服务端在已实际提交目标密码后明确拒绝，才可报告“密码认证被拒绝”；仍不能据此否定已成功的默认认证。无密码提示、`BatchMode=yes`、错误的 `askpass` 或受限客户端环境导致的失败，报告为“客户端未完成密码认证”。
+通用 `Permission denied (publickey,password,keyboard-interactive)` 不等于“密码错误”。先验证默认认证；需要测试密码时，确认客户端实际提交了密码。只有服务端在已收到目标密码后明确拒绝，才能报告“密码认证被拒绝”。
