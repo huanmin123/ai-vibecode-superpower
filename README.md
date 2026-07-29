@@ -31,7 +31,7 @@ sh ./install-codex.sh
 .
 ├── install-codex.ps1
 ├── install-codex.sh
-├── sys-agents.md/
+├── codex-global-config/
 │   ├── AGENTS.md
 │   └── docs/
 │       ├── README.md
@@ -55,14 +55,24 @@ sh ./install-codex.sh
 | --- | --- | --- |
 | `install-codex.ps1` | Windows PowerShell 安装入口 | 不安装，直接运行 |
 | `install-codex.sh` | macOS/Linux POSIX shell 安装入口 | 不安装，直接运行 |
-| `sys-agents.md/AGENTS.md` | 全局 Codex 工作规范和命令路由规则 | `<CODEX_HOME>/AGENTS.md` |
-| `sys-agents.md/docs/` | 系统、Shell、SSH、ripgrep 等通用操作规范 | `<CODEX_HOME>/docs/` |
+| `codex-global-config/AGENTS.md` | 全局 Codex 工作规范和命令路由规则 | `<CODEX_HOME>/AGENTS.md` |
+| `codex-global-config/docs/` | 系统、Shell、SSH、ripgrep 等通用操作规范 | `<CODEX_HOME>/docs/` |
 | `skills/` | 可复用 Codex skills 的根目录 | `<CODEX_HOME>/skills/` |
 | `skills/gpt-image-2-cli/` | 使用当前 Codex 配置调用 `gpt-image-2` 的图片生成辅助工具 | `<CODEX_HOME>/skills/gpt-image-2-cli/` |
 | `skills/orchestrate-model-workflow/` | 按风险把设计、实现、审查和修复路由到合适模型的工作流 | `<CODEX_HOME>/skills/orchestrate-model-workflow/` |
 | `skills/project-doc-planner/` | 规划项目文档架构、开发规范和环境资源边界 | `<CODEX_HOME>/skills/project-doc-planner/` |
 
-`sys-agents.md` 是来源目录名，尽管名字以 `.md` 结尾；安装时它不会原样复制，只有其中的 `AGENTS.md` 和 `docs/` 会分别写入 Codex 全局目录。
+### 模型协调建议
+
+复杂任务的默认主协调模型建议使用 `Terra/high`。协调者需要完成任务分类、派发契约、风险与升级决策、结果集成和完成判断；不应为了节省成本将低能力模型用作复杂任务的协调者。仅当工作流已判定步骤完整、低风险且确定性时，才可由更简单的模型执行，且仍须按工作流接受 `Terra/high` 复核。
+
+`codex-global-config/` 是来源目录；安装时它不会原样复制，只有其中的 `AGENTS.md` 和 `docs/` 会分别写入 Codex 全局目录。
+
+## AI 读取与维护顺序
+
+日常任务由已安装的 `AGENTS.md` 作为行为入口；只有在需要执行系统命令时，再按任务读取对应的 `docs/system/` 文档。使用某项能力时，先读该 skill 的 `SKILL.md`，再仅在任务命中时加载其 `references/`。这样避免把完整参考树和重复规则塞入每个任务上下文。
+
+维护本仓库时，`codex-global-config/AGENTS.md` 只保留跨项目的稳定行为边界，`codex-global-config/docs/` 只保留系统操作规范，`skills/*/SKILL.md` 只保留触发、路由和执行约束；临时设计、计划和复审记录放在 `.codex/workflows/`，不随安装复制。
 
 ## 覆盖与恢复
 

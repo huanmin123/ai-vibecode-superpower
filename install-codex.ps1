@@ -84,8 +84,8 @@ function New-UniqueDirectory {
 }
 
 $scriptRoot = Split-Path -Parent $PSCommandPath
-$sourceAgents = Join-Path $scriptRoot 'sys-agents.md\AGENTS.md'
-$sourceDocs = Join-Path $scriptRoot 'sys-agents.md\docs'
+$sourceAgents = Join-Path $scriptRoot 'codex-global-config\AGENTS.md'
+$sourceDocs = Join-Path $scriptRoot 'codex-global-config\docs'
 $sourceSkills = Join-Path $scriptRoot 'skills'
 
 if (-not (Test-Path -LiteralPath $sourceAgents -PathType Leaf)) { throw "Missing source file: $sourceAgents" }

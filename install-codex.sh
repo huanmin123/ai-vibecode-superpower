@@ -3,8 +3,8 @@
 set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P) || exit 1
-source_agents=$script_dir/sys-agents.md/AGENTS.md
-source_docs=$script_dir/sys-agents.md/docs
+source_agents=$script_dir/codex-global-config/AGENTS.md
+source_docs=$script_dir/codex-global-config/docs
 source_skills=$script_dir/skills
 
 if [ ! -f "$source_agents" ]; then

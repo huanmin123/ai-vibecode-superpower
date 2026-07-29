@@ -1,6 +1,6 @@
 ---
 name: orchestrate-model-workflow
-description: "Route software work through a cost-aware multi-model workflow: GPT-5.6 Sol/high for exploration, architecture, bug or vulnerability analysis, and independent review; GPT-5.6 Terra/high for implementation; Terra/xhigh for review-driven repairs; Sol/high for final verification; and GPT-5.6 Luna/high for deterministic, low-risk, fully specified repetitive tasks followed by Terra/high review. Use for complex coding, feature development, refactoring, debugging, security investigation, implementation from an approved plan, code review, or requests to reduce cost by assigning different development phases to different Codex models."
+description: "Route software work through a cost-aware multi-model workflow: GPT-5.6 Sol/high for exploration, architecture, bug or vulnerability analysis, and independent review; GPT-5.6 Terra/high for implementation; Terra/xhigh for review-driven repairs; Sol/high for final verification; and GPT-5.6 Luna/high for deterministic, low-risk, fully specified repetitive tasks followed by Terra/high review. Use for complex coding, feature development, refactoring, debugging, security investigation, implementation from a coordinator-accepted plan, code review, or requests to reduce cost by assigning different development phases to different Codex models."
 ---
 
 # Orchestrate Model Workflow
@@ -11,7 +11,7 @@ Use a coordinator-and-workers workflow. Keep phase ownership explicit and never 
 
 Treat Sol as the core reasoning brain, not an executor. Sol workers may inspect evidence and return structured diagnoses, designs, findings, and verification verdicts, but must not edit workspace files, apply patches, change configuration, invoke destructive commands, or make external state changes.
 
-The coordinator records Sol's conclusions in the task artifacts. When the coordinator is itself Sol, delegate that mechanical write to Terra without changing the conclusion. Non-Sol execution workers own every workspace and external-state modification: Terra for normal and escalated implementation, and Luna only for approved low-risk deterministic work.
+The coordinator records Sol's conclusions in the task artifacts. When the coordinator is itself Sol, delegate that mechanical write to Terra without changing the conclusion. Non-Sol execution workers own every workspace and external-state modification: Terra for normal and escalated implementation, and Luna only for coordinator-accepted low-risk deterministic work.
 
 ## Load The Contract
 
@@ -24,7 +24,7 @@ When the active tool accepts literal model IDs, request these routes:
 | Phase | Model ID | Reasoning effort |
 | --- | --- | --- |
 | Explore, design, investigate, review, verify | `gpt-5.6-sol` | `high` |
-| Implement an approved plan | `gpt-5.6-terra` | `high` |
+| Implement a coordinator-accepted plan | `gpt-5.6-terra` | `high` |
 | Repair confirmed review findings | `gpt-5.6-terra` | `xhigh` |
 | Fully specified, low-risk repetitive execution | `gpt-5.6-luna` | `high` |
 | Mandatory review of every Luna result | `gpt-5.6-terra` | `high` |
@@ -37,7 +37,8 @@ Use the parameter names required by the actual tool schema, such as `model` with
 
 - Treat answer, explanation, review, status, and diagnosis requests as read-only unless the user also asks for implementation.
 - Continue through implementation only for build, change, fix, or equivalent requests.
-- Keep destructive operations, external writes, production changes, commits, and new App tasks within the authority granted by the user and the host product.
+- Internal orchestration is part of execution: create workers, task artifacts, and review phases automatically. Do not ask the user to approve delegation, planning, local in-scope edits, or non-destructive validation.
+- Keep destructive operations, external writes, production changes, commits, and user-visible new App tasks within the authority granted by the user and the host product. Internal subagents are not user-visible App tasks.
 - Apply more specific repository instructions in addition to this workflow.
 
 ## Classify The Work
@@ -48,7 +49,7 @@ Choose the narrowest applicable route:
 | --- | --- | --- |
 | Simple execution | Steps and expected result are complete, risk is low, and no material design choice remains | Luna/high, then mandatory Terra/high review |
 | Exploration | Requirements, architecture, root cause, vulnerability, or solution is uncertain | Sol/high |
-| Planned implementation | An approved design and measurable acceptance criteria exist | Terra/high |
+| Planned implementation | A coordinator-accepted design and measurable acceptance criteria exist | Terra/high |
 | Review | Inspect completed code for correctness, regressions, evidence, and omissions | Sol/high |
 | Repair | Fix confirmed review findings without redesigning unrelated code | Terra/xhigh |
 | Final verification | Re-evaluate the resulting diff and evidence after repair | Sol/high |
@@ -142,7 +143,7 @@ Do not escalate on an unexplained statement that the result is unsatisfactory. F
 
 Create a new Sol/xhigh worker with the current artifacts, failed findings, test evidence, and user feedback. It must re-investigate the root cause, challenge the current design, and return a scoped remediation. The coordinator records the revised design and plan; Sol/xhigh does not edit them or any other workspace file. Do not ask the currently running Sol/high agent to claim it changed its own reasoning effort.
 
-After approval, send the revised plan to Terra/xhigh for implementation, then run the normal independent final verification. If Sol/xhigh is unavailable, use the documented independent Terra/xhigh fallback and record `Sol/xhigh unavailable -> Terra/xhigh`. Allow only one escalation per task by default; if its verification still fails, stop and report the unresolved evidence.
+After the coordinator accepts the revised plan against the documented evidence, send it to Terra/xhigh for implementation, then run the normal independent final verification. This is an internal quality gate, not a request for user confirmation. Ask the user only if the revised plan crosses the confirmation boundary in the governing instructions. If Sol/xhigh is unavailable, use the documented independent Terra/xhigh fallback and record `Sol/xhigh unavailable -> Terra/xhigh`. Allow only one escalation per task by default; if its verification still fails, stop and report the unresolved evidence.
 
 ### 8. Close The Work
 

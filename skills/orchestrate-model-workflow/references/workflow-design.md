@@ -25,7 +25,7 @@ Sol/high independent review
 Sol/high final verification
 ```
 
-Sol is read-only in every path. It returns conclusions, designs, findings, and verification verdicts; it does not modify the workspace or external systems. The coordinator records the conclusion, and a non-Sol execution worker performs every resulting write: Terra for normal and escalated work, or Luna only for approved low-risk deterministic work.
+Sol is read-only in every path. It returns conclusions, designs, findings, and verification verdicts; it does not modify the workspace or external systems. The coordinator records the conclusion, and a non-Sol execution worker performs every resulting write: Terra for normal and escalated work, or Luna only for coordinator-accepted low-risk deterministic work.
 
 Fully specified low-risk work may use Luna/high with mandatory Terra/high review.
 
@@ -107,7 +107,7 @@ Sol/xhigh is a recovery route, not a default. Enter it only after two failed rep
 | State | Required input | Exit condition | Next state |
 | --- | --- | --- | --- |
 | Classify | User request and repo instructions | Route and authorization established | Design or Simple Execute |
-| Design | Evidence and requirements | Approved implementation contract | Implement or Complete |
+| Design | Evidence and requirements | Coordinator-accepted implementation contract | Implement or Complete |
 | Implement | Design and acceptance criteria | Scoped diff plus test evidence | Review |
 | Review | Actual diff and requirements | Findings or clean review | Repair or Verify |
 | Repair | Confirmed findings | Corrected diff plus tests | Verify |

@@ -2,7 +2,7 @@
 
 Use this template for complex tasks. Adapt it to repository conventions without dropping required fields.
 
-Sol-owned rows are analysis-only: Sol returns the conclusion, while the coordinator records it and a non-Sol execution worker performs every workspace or external-state write: Terra for normal and escalated work, or Luna only for approved low-risk deterministic work.
+Sol-owned rows are analysis-only: Sol returns the conclusion, while the coordinator records it and a non-Sol execution worker performs every workspace or external-state write: Terra for normal and escalated work, or Luna only for coordinator-accepted low-risk deterministic work.
 
 ## Plan Header
 
@@ -10,7 +10,7 @@ Sol-owned rows are analysis-only: Sol returns the conclusion, while the coordina
 # <Task> Plan
 
 - Goal: <measurable outcome>
-- Authorization: diagnose-only | implement | destructive action approved
+- Authorization: diagnose-only | implement | destructive action authorization granted
 - Scope: <included systems/files>
 - Non-goals: <explicit exclusions>
 - Risk: low | medium | high
@@ -25,12 +25,12 @@ Sol-owned rows are analysis-only: Sol returns the conclusion, while the coordina
 | --- | --- | --- | --- | --- | --- |
 | Classify | Coordinator | current | none | in_progress | |
 | Explore/design | Architect | Sol/high | classification | pending | design.md |
-| Implement | Implementer | Terra/high | approved design | pending | diff/tests |
+| Implement | Implementer | Terra/high | coordinator-accepted design | pending | diff/tests |
 | Review 1 | Reviewer | Sol/high | implementation | pending | review.md |
 | Repair | Fixer | Terra/xhigh | confirmed findings | pending | diff/tests |
 | Review 2 | Verifier | Sol/high | repair | pending | final verdict |
 | Escalated analysis/design | Architect | Sol/xhigh | evidence-gated failure | conditional | revised design.md |
-| Escalated implementation | Implementer | Terra/xhigh | approved revised design | conditional | diff/tests |
+| Escalated implementation | Implementer | Terra/xhigh | coordinator-accepted revised design | conditional | diff/tests |
 | Escalated verification | Verifier | Sol/high | escalated implementation | conditional | final verdict |
 ```
 
