@@ -1,0 +1,11 @@
+model_provider = "hu"
+model = "gpt-5.6-terra"
+model_reasoning_effort = "high"
+
+[agents]
+max_threads = 1000
+max_depth = 5
+
+[features]
+js_repl = false
+goals = true
