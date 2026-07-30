@@ -20,8 +20,8 @@ sh ./install-codex.sh
 
 1. 校验本仓库中的来源文件。
 2. 将新配置完整复制到安装暂存目录。
-3. 将已有的 `AGENTS.md`、`docs/` 和 `skills/` 备份到 `<CODEX_HOME>/backups/` 下的唯一目录。
-4. 覆盖这三个目标。
+3. 将已有的 `AGENTS.md`、`docs/` 和本仓库管理的 skill 目录备份到 `<CODEX_HOME>/backups/` 下的唯一目录。
+4. 覆盖 `AGENTS.md`、`docs/` 和这些受管理 skill；`<CODEX_HOME>/skills/` 中的其他 skill 保持不变。
 
 脚本不会安装或升级 Codex，也不会读取、输出或复制认证信息。Windows 脚本拒绝穿过符号链接或目录联接的 `CODEX_HOME` 路径；两种脚本都会阻止同一目标目录的并发安装。
 
@@ -76,4 +76,4 @@ sh ./install-codex.sh
 
 ## 覆盖与恢复
 
-每次安装都会整体替换目标中的 `AGENTS.md`、`docs/`、`skills/`。安装前版本保存在 `<CODEX_HOME>/backups/<时间戳-唯一标识>/`，需要恢复时可关闭 Codex 后将备份中的对应项目移回全局目录。不要删除备份，直到确认新配置符合预期。
+每次安装都会整体替换目标中的 `AGENTS.md` 和 `docs/`，并只替换本仓库管理的 skill 目录。安装前版本保存在 `<CODEX_HOME>/backups/<时间戳-唯一标识>/`，需要恢复时可关闭 Codex 后将备份中的对应项目移回全局目录。不要删除备份，直到确认新配置符合预期。

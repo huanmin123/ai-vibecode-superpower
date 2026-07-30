@@ -91,6 +91,8 @@ $sourceSkills = Join-Path $scriptRoot 'skills'
 if (-not (Test-Path -LiteralPath $sourceAgents -PathType Leaf)) { throw "Missing source file: $sourceAgents" }
 if (-not (Test-Path -LiteralPath $sourceDocs -PathType Container)) { throw "Missing source directory: $sourceDocs" }
 if (-not (Test-Path -LiteralPath $sourceSkills -PathType Container)) { throw "Missing source directory: $sourceSkills" }
+$managedSkillNames = @(Get-ChildItem -LiteralPath $sourceSkills -Directory -Force | Sort-Object -Property Name | Select-Object -ExpandProperty Name)
+if ($managedSkillNames.Count -eq 0) { throw "No managed skill directories found in: $sourceSkills" }
 
 if ([string]::IsNullOrWhiteSpace($env:CODEX_HOME)) {
     $codexHome = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)) '.codex'
@@ -107,12 +109,25 @@ Assert-NoReparsePoints -Path $codexHome
 $targets = @{
     'AGENTS.md' = $sourceAgents
     'docs' = $sourceDocs
-    'skills' = $sourceSkills
 }
 foreach ($name in $targets.Keys) {
     if (Test-SamePath -Left (Join-Path $codexHome $name) -Right $targets[$name]) {
         throw "Destination target overlaps its source: $(Join-Path $codexHome $name)"
     }
+}
+foreach ($skillName in $managedSkillNames) {
+    $targetSkill = Join-Path (Join-Path $codexHome 'skills') $skillName
+    $sourceSkill = Join-Path $sourceSkills $skillName
+    if (Test-SamePath -Left $targetSkill -Right $sourceSkill) {
+        throw "Destination target overlaps its source: $targetSkill"
+    }
+}
+
+$installTargets = [System.Collections.Generic.List[string]]::new()
+$installTargets.Add('AGENTS.md')
+$installTargets.Add('docs')
+foreach ($skillName in $managedSkillNames) {
+    $installTargets.Add((Join-Path 'skills' $skillName))
 }
 
 New-Item -ItemType Directory -Path $codexHome -Force | Out-Null
@@ -128,9 +143,13 @@ try {
     $stageRoot = New-UniqueDirectory -Parent $codexHome -Prefix '.install-stage-'
     Copy-Item -LiteralPath $sourceAgents -Destination (Join-Path $stageRoot 'AGENTS.md') -Force
     Copy-Item -LiteralPath $sourceDocs -Destination (Join-Path $stageRoot 'docs') -Recurse -Force
-    Copy-Item -LiteralPath $sourceSkills -Destination (Join-Path $stageRoot 'skills') -Recurse -Force
+    $stagedSkills = Join-Path $stageRoot 'skills'
+    New-Item -ItemType Directory -Path $stagedSkills | Out-Null
+    foreach ($skillName in $managedSkillNames) {
+        Copy-Item -LiteralPath (Join-Path $sourceSkills $skillName) -Destination (Join-Path $stagedSkills $skillName) -Recurse -Force
+    }
 
-    foreach ($name in $targets.Keys) {
+    foreach ($name in $installTargets) {
         $stagedTarget = Join-Path $stageRoot $name
         if (-not (Test-ExistingPath -Path $stagedTarget)) { throw "Staging failed for: $name" }
     }
@@ -138,16 +157,21 @@ try {
     New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
     $backupDirectory = New-UniqueDirectory -Parent $backupRoot -Prefix 'backup-'
 
-    foreach ($name in @('AGENTS.md', 'docs', 'skills')) {
+    foreach ($name in $installTargets) {
         $targetPath = Join-Path $codexHome $name
+        Assert-NoReparsePoints -Path $targetPath
         if (Test-ExistingPath -Path $targetPath) {
-            Move-Item -LiteralPath $targetPath -Destination (Join-Path $backupDirectory $name)
+            $backupPath = Join-Path $backupDirectory $name
+            New-Item -ItemType Directory -Path (Split-Path -Parent $backupPath) -Force | Out-Null
+            Move-Item -LiteralPath $targetPath -Destination $backupPath
             $movedOldTargets.Add($name)
         }
     }
 
-    foreach ($name in @('AGENTS.md', 'docs', 'skills')) {
-        Move-Item -LiteralPath (Join-Path $stageRoot $name) -Destination (Join-Path $codexHome $name)
+    foreach ($name in $installTargets) {
+        $targetPath = Join-Path $codexHome $name
+        New-Item -ItemType Directory -Path (Split-Path -Parent $targetPath) -Force | Out-Null
+        Move-Item -LiteralPath (Join-Path $stageRoot $name) -Destination $targetPath
         $installedTargets.Add($name)
     }
 
@@ -164,8 +188,10 @@ catch {
     if ($null -ne $backupDirectory) {
         foreach ($name in $movedOldTargets) {
             $backupPath = Join-Path $backupDirectory $name
-            if ((Test-ExistingPath -Path $backupPath) -and -not (Test-ExistingPath -Path (Join-Path $codexHome $name))) {
-                Move-Item -LiteralPath $backupPath -Destination (Join-Path $codexHome $name)
+            $restorePath = Join-Path $codexHome $name
+            if ((Test-ExistingPath -Path $backupPath) -and -not (Test-ExistingPath -Path $restorePath)) {
+                New-Item -ItemType Directory -Path (Split-Path -Parent $restorePath) -Force | Out-Null
+                Move-Item -LiteralPath $backupPath -Destination $restorePath
             }
         }
     }
