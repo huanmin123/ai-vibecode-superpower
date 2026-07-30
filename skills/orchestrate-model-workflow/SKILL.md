@@ -35,7 +35,7 @@ Sol 是核心推理者，不是执行者。Sol worker 可以检查证据并返�
 
 ## 最低推理强度
 
-所有委派 worker 的最低推理强度为 `high`。禁止使用 `medium` 或 `low`，包括 `Luna/medium`、`Luna/low` 及任何模型的等价低强度配置。`Luna` 仅可使用 `Luna/high`，并且仍只适用于步骤完整、低风险、确定性的重复工作；不能为了节省成本降低推理强度。
+只使用 `high` 或 `xhigh`：`Luna` 只能是 `Luna/high`，`Terra` 只能是 `Terra/high` 或 `Terra/xhigh`。禁止所有 `medium`/`low` 配置。`Luna` 仍只用于步骤完整、低风险、确定性的重复工作。
 
 ## 保持用户意图
 
@@ -164,12 +164,6 @@ Sol/high 不可用时，使用新的 Terra/xhigh 验证者，并遵循首次复�
 - 发现有界问题时，用 Terra/xhigh 修复，并要求新的 Terra/high 再复审。
 - 发现歧义、非平凡风险或设计工作时，停止 Luna 路径并升级到常规 Sol/Terra 工作流。
 - 此路径同样遵循两轮修复-复审上限。
-
-活动 subagent 工具不支持 Luna 时：
-
-1. 除非用户明确授权，不得启动嵌套 `codex exec` 进程或创建单独 App 任务。
-2. 仅对低风险确定性工作使用 Terra/high 作为连续性回退，并披露该回退。
-3. 未通过低风险门槛的工作采用常规 Sol/Terra 工作流。
 
 ## 委派契约
 
