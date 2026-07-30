@@ -33,6 +33,10 @@ Sol 是核心推理者，不是执行者。Sol worker 可以检查证据并返�
 
 使用实际工具 schema 要求的参数名，例如 `model` 配合 `reasoning_effort` 或 `thinking`。
 
+## 最低推理强度
+
+所有委派 worker 的最低推理强度为 `high`。禁止使用 `medium` 或 `low`，包括 `Luna/medium`、`Luna/low` 及任何模型的等价低强度配置。`Luna` 仅可使用 `Luna/high`，并且仍只适用于步骤完整、低风险、确定性的重复工作；不能为了节省成本降低推理强度。
+
 ## 保持用户意图
 
 - 读写授权和确认边界以全局或仓库 `AGENTS.md` 为唯一权威来源，并叠加遵守更具体的仓库指令。
@@ -164,7 +168,7 @@ Sol/high 不可用时，使用新的 Terra/xhigh 验证者，并遵循首次复�
 活动 subagent 工具不支持 Luna 时：
 
 1. 除非用户明确授权，不得启动嵌套 `codex exec` 进程或创建单独 App 任务。
-2. 仅对低风险确定性工作使用 Terra/low 作为连续性回退，并披露该回退。
+2. 仅对低风险确定性工作使用 Terra/high 作为连续性回退，并披露该回退。
 3. 未通过低风险门槛的工作采用常规 Sol/Terra 工作流。
 
 ## 委派契约
