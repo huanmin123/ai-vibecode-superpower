@@ -5,6 +5,9 @@
 - 本机命令使用 64 位 PowerShell 7 (`pwsh.exe`)；`powershell.exe` 仅表示 Windows PowerShell 5.1。
 - Codex 配置中的 `desktop.integratedTerminalShell = "powershell"` 是产品枚举值，不改成 `pwsh`。
 - 每条命令设置工作目录，不依赖 Profile、alias、虚拟环境激活或上一条命令的状态。
+- 终端调用的 `workdir` 必须是已存在的绝对目录，先用 `Test-Path -LiteralPath <目录> -PathType Container` 或 `Resolve-Path -LiteralPath <目录>` 核实；文件路径、文档路径和命令文本都不能作为 `workdir`。
+- `workdir` 是终端工具的调用参数，不属于 PowerShell 命令。读取全局文档时保持已验证的工作目录不变，以 `Get-Content -LiteralPath <文档绝对路径> -Raw` 读取文件；不要把多个前置文档读取与后续操作合并到同一终端调用。
+- 出现 `Io`、退出码 `-1` 或 Windows 错误 `267`（目录名称无效）而命令未开始执行时，先重新核对工具调用的 `workdir`；除非有后续证据，不得断言是文档路径、工具解析或远端系统的原因。
 - 同名命令可能来自 PowerShell Alias、脚本、Windows 工具或多套第三方工具；`sort`、`where`、`tee`、`cat`、`rm` 等名称尤其容易遮蔽。行为或版本受来源影响时使用 `Get-Command <name> -All`，再调用确认后的完整路径、`.exe` 或 `.cmd`，不只按命令名猜测。
 
 任务确实受版本或工具来源影响时检查一次：
@@ -18,6 +21,7 @@ Get-Command pwsh.exe, rg, git.exe -All -ErrorAction SilentlyContinue
 ## PowerShell 写法
 
 - 静态文本用单引号，需要变量展开才用双引号。
+- `$` 只用于变量；cmdlet 直接写名称，例如 `Get-Content`，不能写成 `$Get-Content`。
 - 动态命令使用参数数组：`& $exe @args`；不用 `Invoke-Expression`。
 - 文件 cmdlet 使用 `-LiteralPath`，路径组合用 `Join-Path`，关键路径用 `Resolve-Path -LiteralPath`。
 - 不把 Bash 的 heredoc、`export`、`source`、`VAR=value command`、`$(pwd)`、`/dev/null` 或反斜杠续行写进 PowerShell。
