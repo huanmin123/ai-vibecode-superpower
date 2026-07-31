@@ -1,6 +1,25 @@
 # Codex 全局配置安装包
 
-本仓库用于把一套通用的 Codex 行为规范、系统命令文档和技能安装到用户级 Codex 配置目录。它不安装 Codex CLI 或桌面应用本身。
+这个仓库为已经使用 Codex 的开发者提供一套可安装到用户级配置目录的工作环境：统一的行为规范、系统命令文档、可分工的 agent role，以及常用 skills。它帮助团队把重复的执行约定和复杂任务的工作方式沉淀下来，而不是每个项目、每次对话都从头约定。
+
+它不安装或升级 Codex CLI，也不安装 Codex 桌面应用。
+
+## 你会得到什么
+
+| 内容 | 解决什么问题 | 为什么需要它 |
+| --- | --- | --- |
+| 全局行为规范与系统文档 | 约束文件操作、跨平台命令、SSH 与 `rg` 的使用方式 | 让涉及 Windows、macOS、Linux 或远程主机的任务有可核对的操作边界，降低误执行风险。 |
+| 九个命名 agent role | 将探索、设计、实施、独立复审和已确认问题的修复分开 | 复杂任务由不同角色承担不同责任，避免实现结论直接充当复审结论。 |
+| `orchestrate-model-workflow` | 按任务风险和阶段路由合适的 agent role | 让复杂开发有清楚的探索、实施、复审和验证顺序，而不是只依赖一次生成。 |
+| `project-doc-planner` | 规划项目文档、开发规范、环境与资源边界 | 需要建立或整理项目文档体系时，先明确哪些内容应公开、应落盘或只保留在本地。 |
+| `gpt-image-2-cli` | 使用当前 Codex 的认证和 provider 配置调用 `gpt-image-2` | 需要生成图像时，无须为同一套配置再手动复制 API key。 |
+| `agent-toolchain` | 为另一个目标项目接入 CodeGraph 与 RTK | 当任务需要理解跨模块关系或反复读取大量只读命令输出时，减少无关信息进入 AI 上下文。详见后文。 |
+
+## 何时值得安装
+
+适合希望把 Codex 用于日常开发、维护多个项目，或需要稳定执行规范的个人和团队。安装后，新的 Codex task 会获得统一的工作约定、skills 和命名角色。
+
+如果只想临时运行一个小脚本，或尚未安装和使用 Codex，本仓库不会替代 Codex 本体，也未必值得额外配置。`agent-toolchain` 更适合复杂重构、跨模块理解、架构分析、大范围排障或频繁查看大输出的项目；单文件、小型或一次性任务通常不需要先接入它。
 
 ## 安装
 
@@ -16,21 +35,54 @@ macOS 或 Linux：
 sh ./install-codex.sh
 ```
 
-安装目录优先使用非空的 `CODEX_HOME`；未设置时使用当前用户的 `~/.codex`。两个脚本都会：
+安装目录优先使用非空的 `CODEX_HOME`；未设置时使用当前用户的 `~/.codex`。安装完成后请重启 Codex 相关程序，使新进程加载更新后的配置。
 
-1. 校验本仓库中的来源文件。
-2. 将 `AGENTS.md`、合并后的 `config.toml`、完整 `docs/` 目录、九个受管理 agent role 和每个受管理 skill 全部生成到安装暂存目录。
-3. 在写入任一受管理目标前，校验全部目标与备份目录的类型和符号链接安全性、用户 role 是否占用保留的 `avsp_` 名称，以及现有 `config.toml` 是否处于可安全合并的 TOML 子集。
-4. 将每个已有受管理目标整体移动到 `<CODEX_HOME>/backups/` 下的同一个唯一目录，再安装全部候选；只替换 `<CODEX_HOME>/agents/ai-vibecode-superpower/`，不会替换或删除 `<CODEX_HOME>/agents/` 中的用户 role；`<CODEX_HOME>/skills/` 中的未管理 skill 也不移动、不删除也不备份。
-5. 任一步失败时，删除已安装的新目标并继续尝试恢复所有已备份的旧目标；恢复失败时保留备份目录并报告失败目标。
+### 安装过程与安全边界
 
-脚本不会安装或升级 Codex，也不会读取、输出或复制认证信息。macOS/Linux 安装需要已在 `PATH` 中的 `rg`，用于安全扫描已有 user role；缺失时会在写入前停止。Windows 脚本拒绝穿过符号链接或目录联接的 `CODEX_HOME` 路径；两种脚本都会阻止同一目标目录的并发安装。macOS/Linux 使用内核 advisory lock；`.install.lock` 是可长期保留的普通锁文件，文件存在不表示有正在运行的安装。
+安装器会先校验来源内容，再在暂存目录准备候选配置；只有全部检查通过后才写入目标目录。已有受管理内容会统一备份到 `<CODEX_HOME>/backups/` 下的唯一目录；若安装中任一步失败，安装器会尝试恢复备份。
 
-安装器只会自动合并没有多行字符串、跨行 value、歧义 table header 或受管理键 quoted/dotted 写法的 `config.toml`；普通 table、带引号的项目表头和不触及受管命名空间的 array table 会原样保留。遇到无法证明无损改写边界的高级 TOML 形式时会在任何备份或目标替换前停止，并报告 `unsupported TOML syntax for safe merge`；它不会猜测受管语义或损坏现有配置。
+它会安装或更新本仓库受管理的 `AGENTS.md`、合并后的 `config.toml`、`docs/`、九个 agent role 和四个 skills。它不会替换用户自有 role，也不会移动、删除或备份未受管理的 skill；不会读取、输出或复制认证信息。
 
-如果需要更加节省token那么需要在目标项目中使用 工具安装skill: `agent-toolchain`  直接在对话中说： 使用 `$agent-toolchain` 给我安装工具  安装完毕后啥也不需要管会全自动使用。
+为了避免不确定地改写配置，安装器只合并可安全解析的 `config.toml`。遇到多行字符串、跨行 value、歧义 table header 或受管理键的 quoted/dotted 写法等无法证明无损改写边界的输入时，会在备份和写入前停止，并报告 `unsupported TOML syntax for safe merge`。Windows 安装器拒绝穿过符号链接或目录联接的 `CODEX_HOME` 路径；macOS/Linux 安装需要 `rg` 用于安全扫描，且两种安装器都会阻止同一目标目录的并发安装。
 
-## 目录树
+安装会将默认主控设置为 `gpt-5.6-terra` / `xhigh`，并保留现有 `config.toml` 中未由本仓库管理的设置。安装成功只证明配置已安全写入，不能保证当前 provider 支持全部固定 role；实际任务会以可启动的 role 为准。
+
+## 可选：为目标项目接入 CodeGraph 与 RTK
+
+`agent-toolchain` 是给**另一个需要增强的目标项目**使用的 skill，不是本仓库已经初始化的示例。它受控地安装、初始化、诊断和维护两项工具：CodeGraph 与 RTK。
+
+| 工具 | 它能做什么 | 它不负责什么 |
+| --- | --- | --- |
+| CodeGraph | 通过 MCP 提供跨模块依赖、调用链和影响范围的索引查询，帮助 AI 在大型代码库中定位相关代码。 | 它的索引不是源码事实；刚修改或未跟踪的文件仍要以当前源码和 `rg` 交叉核实。 |
+| RTK | 压缩已验证的只读高输出命令结果，例如 `git`、`rg`、`log`、`diff`、`test`、`npm` 或 `pnpm`。 | 它不是安全边界，不执行写操作、部署、迁移、权限或密钥操作，也不替代需要原始输出的精确排障。 |
+
+### 为什么它可能节省 token
+
+大型仓库的依赖关系和只读命令输出常常很长。CodeGraph 让 AI 针对关系和影响范围查询，而 RTK 会压缩适用的只读高输出结果；因此进入模型上下文的重复路径、日志和列表可能更少。
+
+这是一种减少输入内容的机制，不是固定的 token 节省承诺。实际收益取决于命令、输出量和任务；仓库没有提供节省比例或性能基准。复杂推理、写操作和需要完整原始输出的诊断不会因为 RTK 而自动变少或被替代。
+
+### 如何接入
+
+在需要接入的目标项目中，直接对 Codex 说：
+
+> 使用 `$agent-toolchain` 给我安装工具。
+
+skill 会按受控流程完成配置预检、安装前 dry-run、受管工具安装、索引初始化和健康检查。接入过程会：
+
+1. 写入目标项目 `.codex/config.toml` 中的 CodeGraph MCP、根 `.gitignore` 的 `/.codegraph/`，以及根 `AGENTS.md` 的两条 AI 路由。
+2. 安装并验证受管的 CodeGraph 与 RTK，然后建立或增量同步 CodeGraph 索引；`.codegraph/` 是本地缓存，不提交到版本库。
+3. 运行 `doctor`、`codegraph status` 和一次可核对查询，确认工具入口和索引状态。
+
+如果已有配置与受控内容冲突，skill 会停止，不覆盖用户内容。它需要可执行的 `node` 与 `npm`，并需要网络访问相应的软件源；会保留已有 npm registry 或代理配置。支持 macOS/Linux 的 arm64 和 x64，以及 Windows x64；Windows arm64 不支持整套工具链。
+
+### 接入后会怎样
+
+日常使用中，你不需要手动定期同步索引。面对复杂重构、跨模块理解、架构分析或大范围排障时，AI 会按需检查工具状态；CodeGraph MCP 会监听文件变更，并在重新连接时补齐离线修改。工具不会自动升级。
+
+这不意味着每个任务都会调用工具，也不代表任何状态都能自动恢复。`doctor`、CodeGraph MCP 或 `codegraph status` 明确报告异常时，AI 才会执行一次相应的恢复操作。MCP 配置变更通常需要新建 Codex task 或重启客户端后才能加载。
+
+## 目录结构
 
 ```text
 .
@@ -60,35 +112,10 @@ sh ./install-codex.sh
     └── agent-toolchain/
 ```
 
-## 文件与模块说明
+## 维护者说明
 
-| 路径 | 作用 | 安装位置 |
-| --- | --- | --- |
-| `install-codex.ps1` | Windows PowerShell 安装入口 | 不安装，直接运行 |
-| `install-codex.sh` | macOS/Linux POSIX shell 安装入口 | 不安装，直接运行 |
-| `codex-global-config/AGENTS.md` | 全局 Codex 工作规范和命令路由规则 | `<CODEX_HOME>/AGENTS.md` |
-| `codex-global-config/agents/ai-vibecode-superpower/` | 九个固定模型与推理强度的命名 agent role | `<CODEX_HOME>/agents/ai-vibecode-superpower/` |
-| `codex-global-config/agents/ai-vibecode-superpower.sha256` | 受管理 role 的内容完整性清单，安装时校验 | 不安装 |
-| `codex-global-config/config.toml` | 主模型、推理强度和 agent 功能配置模板 | 合并到 `<CODEX_HOME>/config.toml` |
-| `codex-global-config/docs/` | 系统、Shell、SSH、ripgrep 等通用操作规范 | `<CODEX_HOME>/docs/` |
-| `skills/` | 可复用 Codex skills 的根目录 | `<CODEX_HOME>/skills/` |
-| `skills/gpt-image-2-cli/` | 使用当前 Codex 配置调用 `gpt-image-2` 的图片生成辅助工具 | `<CODEX_HOME>/skills/gpt-image-2-cli/` |
-| `skills/orchestrate-model-workflow/` | 按风险把设计、实现、审查和修复路由到合适模型的工作流 | `<CODEX_HOME>/skills/orchestrate-model-workflow/` |
-| `skills/project-doc-planner/` | 规划项目文档架构、开发规范和环境资源边界 | `<CODEX_HOME>/skills/project-doc-planner/` |
-| `skills/agent-toolchain/` | 受控安装、初始化、诊断和维护 CodeGraph/RTK 工具链 | `<CODEX_HOME>/skills/agent-toolchain/` |
+`codex-global-config/` 是安装来源目录，不会原样复制：其中的 `AGENTS.md`、`config.toml`、`docs/` 与 agent role 会分别写入 Codex 全局目录。`config.toml` 只更新本仓库管理的 `model`、`model_reasoning_effort`、`agents.max_threads`、`agents.max_depth`、`features.js_repl` 和 `features.goals`，其余设置会保留。
 
-### 主控模型
+维护本仓库时，稳定的行为边界保留在 `codex-global-config/AGENTS.md`，平台与命令规范保留在 `codex-global-config/docs/`，各 skill 的触发条件和执行约束保留在 `skills/*/SKILL.md`。不要在这个安装包仓库中重新创建被忽略的 `.codex/` 目录；需要接入 CodeGraph/RTK 的应是另一个目标项目。
 
-运行安装脚本会将用户级 Codex 默认主控设置为 `gpt-5.6-terra` / `xhigh`。该设置用于后续任务的默认主控模型；安装完成后请重启 Codex 相关程序让新进程加载最新配置。
-
-`codex-global-config/` 是来源目录；安装时它不会原样复制，其中的 `AGENTS.md`、`config.toml`、`docs/` 和 `agents/ai-vibecode-superpower/` 会分别写入 Codex 全局目录。`config.toml` 仅更新本仓库管理的六个键：`model`、`model_reasoning_effort`、`agents.max_threads`、`agents.max_depth`、`features.js_repl` 和 `features.goals` 并保留其他设置。安装成功证明文件已安全落盘，不证明当前 provider 支持所有固定模型；协调者以实际 `spawn_agent(agent_type=...)` 调用和已安装 profile 记录 role、声明的模型/推理强度与读写边界，不要求子 agent 自报它可能无法观察到的运行时模型元数据。高风险、不可逆、生产、权限或外部写入前，任一后续必需 role 无法启动即停止；唯一例外是已通过本地检查的 Sol 调用收到对应 `gpt-5.6-sol` 的结构化 `unsupported_model` 或 `model_not_found`，此时可由只读 `avsp_terra_xhigh_readonly` 完成同一阶段，并记录模型独立性降低。本地可回滚任务在实际需要时启动独立复审，不以子 agent 的身份自报作为预写入门槛。
-
-## AI 读取与维护顺序
-
-日常任务由已安装的 `AGENTS.md` 作为行为入口；只有在需要执行系统命令时，再按任务读取对应的 `docs/system/` 文档。使用某项能力时，先读该 skill 的 `SKILL.md`，再仅在任务命中时加载其 `references/`。这样避免把完整参考树和重复规则塞入每个任务上下文。
-
-维护本仓库时，`codex-global-config/AGENTS.md` 只保留跨项目的稳定行为边界，`codex-global-config/docs/` 只保留系统操作规范，`skills/*/SKILL.md` 只保留触发、路由和执行约束；临时任务状态由任务清单和目标工具维护。只有仓库已提供可提交的计划位置时，才保存设计、计划或复审记录；不要重新创建被忽略的 `.codex/` 目录。
-
-## 覆盖与恢复
-
-每次安装会替换目标中的 `AGENTS.md`、合并后的 `config.toml`、完整 `docs/` 目录、`agents/ai-vibecode-superpower/` 和本仓库管理的 skill。只要其中任一目标已存在，安装器就会创建 `<CODEX_HOME>/backups/<时间戳-唯一标识>/`，并在其中按原始相对路径保存全部旧目标，例如 `config.toml`、`docs/`、`agents/ai-vibecode-superpower/` 和 `skills/<skill-name>/`。安装成功后该备份保留，便于人工恢复；安装失败时，安装器会删除本次已安装的候选并恢复旧目标。安装器只会在它本次创建且仍为空时删除父 `agents/` 目录，因此 `agents/user-role.toml` 等未受管 role 不受影响。若某个恢复操作失败，脚本仍会继续恢复其余目标、返回失败，并保留备份目录。未管理 skill 不受影响。
+安装器备份的内容包括已有的 `AGENTS.md`、`config.toml`、`docs/`、受管理 role 和受管理 skill。安装成功后备份会保留，便于人工恢复；若恢复中有单个目标失败，安装器仍会继续恢复其余目标并报告失败项。未管理 skill 始终不受影响。
