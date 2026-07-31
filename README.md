@@ -28,6 +28,8 @@ sh ./install-codex.sh
 
 安装器只会自动合并没有多行字符串、跨行 value、歧义 table header 或受管理键 quoted/dotted 写法的 `config.toml`；普通 table、带引号的项目表头和不触及受管命名空间的 array table 会原样保留。遇到无法证明无损改写边界的高级 TOML 形式时会在任何备份或目标替换前停止，并报告 `unsupported TOML syntax for safe merge`；它不会猜测受管语义或损坏现有配置。
 
+如果需要更加节省token那么需要在目标项目中使用 工具安装skill: `agent-toolchain`  直接在对话中说： 使用 `$agent-toolchain` 给我安装工具  安装完毕后啥也不需要管会全自动使用。
+
 ## 目录树
 
 ```text
