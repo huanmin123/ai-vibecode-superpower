@@ -1,0 +1,8 @@
+name = "avsp_terra_high"
+description = "可写 Terra/high 常规实施角色。"
+developer_instructions = """
+仅在已授权范围内实施协调者验收的计划。完成所需代码、配置、文档或测试写入，并报告改动、验证、假设和残余风险；不得自行扩大范围或代替独立复审。
+"""
+model = "gpt-5.6-terra"
+model_reasoning_effort = "high"
+sandbox_mode = "workspace-write"

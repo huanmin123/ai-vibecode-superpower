@@ -6,17 +6,27 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P) || exit 1
 source_agents=$script_dir/codex-global-config/AGENTS.md
 source_config=$script_dir/codex-global-config/config.toml
 source_docs=$script_dir/codex-global-config/docs
+source_agent_roles=$script_dir/codex-global-config/agents/ai-vibecode-superpower
+source_agent_role_manifest=$script_dir/codex-global-config/agents/ai-vibecode-superpower.sha256
 source_skills=$script_dir/skills
+managed_agent_role_files='ai-vibecode-superpower-avsp_luna_high.toml ai-vibecode-superpower-avsp_luna_xhigh.toml ai-vibecode-superpower-avsp_sol_high.toml ai-vibecode-superpower-avsp_sol_xhigh.toml ai-vibecode-superpower-avsp_terra_high.toml ai-vibecode-superpower-avsp_terra_xhigh.toml ai-vibecode-superpower-avsp_terra_xhigh_readonly.toml ai-vibecode-superpower-avsp_terra_low_readonly.toml ai-vibecode-superpower-avsp_terra_medium_readonly.toml'
 
-for source_path in "$source_agents" "$source_config"; do
+for source_path in "$source_agents" "$source_config" "$source_agent_role_manifest"; do
     if [ ! -f "$source_path" ]; then
         printf '%s\n' "Missing source file: $source_path" >&2
         exit 1
     fi
 done
-for source_path in "$source_docs" "$source_skills"; do
+for source_path in "$source_docs" "$source_agent_roles" "$source_skills"; do
     if [ ! -d "$source_path" ]; then
         printf '%s\n' "Missing source directory: $source_path" >&2
+        exit 1
+    fi
+done
+for agent_role_file in $managed_agent_role_files; do
+    source_role=$source_agent_roles/$agent_role_file
+    if [ ! -f "$source_role" ]; then
+        printf '%s\n' "Missing managed agent role: $source_role" >&2
         exit 1
     fi
 done
@@ -39,6 +49,11 @@ case $(uname -s) in
         ;;
 esac
 
+command -v rg >/dev/null 2>&1 || {
+    printf '%s\n' 'ripgrep (rg) is required to safely scan user agent roles.' >&2
+    exit 1
+}
+
 if [ -n "${CODEX_HOME:-}" ]; then
     codex_home=$CODEX_HOME
 else
@@ -55,7 +70,8 @@ fi
 
 if [ "$codex_home/AGENTS.md" -ef "$source_agents" ] || \
    [ "$codex_home/config.toml" -ef "$source_config" ] || \
-   [ "$codex_home/docs" -ef "$source_docs" ]; then
+   [ "$codex_home/docs" -ef "$source_docs" ] || \
+   [ "$codex_home/agents/ai-vibecode-superpower" -ef "$source_agent_roles" ]; then
     printf '%s\n' 'Destination target overlaps its source.' >&2
     exit 1
 fi
@@ -72,9 +88,9 @@ stage_dir=
 backup_dir=
 manifest=
 completed=0
-lock_dir=$codex_home/.install.lock
-lock_acquired=0
+lock_file=$codex_home/.install.lock
 skills_parent_created=0
+agents_parent_created=0
 tab=$(printf '\t')
 
 path_exists() {
@@ -95,6 +111,259 @@ assert_no_symlink_tree() {
         path_exists "$child_path" || continue
         assert_no_symlink_tree "$child_path"
     done
+}
+
+is_managed_agent_role_file() {
+    case $1 in
+        ai-vibecode-superpower-avsp_luna_high.toml|\
+        ai-vibecode-superpower-avsp_luna_xhigh.toml|\
+        ai-vibecode-superpower-avsp_sol_high.toml|\
+        ai-vibecode-superpower-avsp_sol_xhigh.toml|\
+        ai-vibecode-superpower-avsp_terra_high.toml|\
+        ai-vibecode-superpower-avsp_terra_xhigh.toml|\
+        ai-vibecode-superpower-avsp_terra_xhigh_readonly.toml|\
+        ai-vibecode-superpower-avsp_terra_low_readonly.toml|\
+        ai-vibecode-superpower-avsp_terra_medium_readonly.toml)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+sha256_file() {
+    case $(uname -s) in
+        Darwin)
+            shasum -a 256 "$1" | awk '{ print $1 }'
+            ;;
+        Linux)
+            sha256sum "$1" | awk '{ print $1 }'
+            ;;
+    esac
+}
+
+assert_managed_agent_role_manifest() {
+    manifest_path=$1
+    manifest_count=0
+
+    while IFS='  ' read -r expected_hash role_file; do
+        [ -n "$expected_hash" ] || continue
+        case $expected_hash in
+            *[!0-9a-f]*)
+                printf '%s\n' "Invalid managed agent role hash: $manifest_path" >&2
+                exit 1
+                ;;
+        esac
+        if [ "${#expected_hash}" -ne 64 ]; then
+            printf '%s\n' "Invalid managed agent role hash length: $manifest_path" >&2
+            exit 1
+        fi
+        if ! is_managed_agent_role_file "$role_file"; then
+            printf '%s\n' "Unexpected managed agent role manifest entry: $role_file" >&2
+            exit 1
+        fi
+        manifest_count=$((manifest_count + 1))
+    done < "$manifest_path"
+
+    expected_role_count=0
+    for role_file in $managed_agent_role_files; do
+        expected_role_count=$((expected_role_count + 1))
+        if [ "$(awk -v role_file="$role_file" '$2 == role_file { count++ } END { print count + 0 }' "$manifest_path")" -ne 1 ]; then
+            printf '%s\n' "Missing or repeated managed agent role hash: $role_file" >&2
+            exit 1
+        fi
+    done
+    if [ "$manifest_count" -ne "$expected_role_count" ]; then
+        printf '%s\n' "Unexpected managed agent role manifest entry count: $manifest_path" >&2
+        exit 1
+    fi
+}
+
+assert_managed_agent_role_contract() {
+    role_path=$1
+    role_file=$(basename "$role_path")
+
+    case $role_file in
+        ai-vibecode-superpower-avsp_luna_high.toml)
+            expected_name=avsp_luna_high
+            expected_model=gpt-5.6-luna
+            expected_effort=high
+            expected_sandbox=read-only
+            ;;
+        ai-vibecode-superpower-avsp_luna_xhigh.toml)
+            expected_name=avsp_luna_xhigh
+            expected_model=gpt-5.6-luna
+            expected_effort=xhigh
+            expected_sandbox=read-only
+            ;;
+        ai-vibecode-superpower-avsp_sol_high.toml)
+            expected_name=avsp_sol_high
+            expected_model=gpt-5.6-sol
+            expected_effort=high
+            expected_sandbox=read-only
+            ;;
+        ai-vibecode-superpower-avsp_sol_xhigh.toml)
+            expected_name=avsp_sol_xhigh
+            expected_model=gpt-5.6-sol
+            expected_effort=xhigh
+            expected_sandbox=read-only
+            ;;
+        ai-vibecode-superpower-avsp_terra_high.toml)
+            expected_name=avsp_terra_high
+            expected_model=gpt-5.6-terra
+            expected_effort=high
+            expected_sandbox=workspace-write
+            ;;
+        ai-vibecode-superpower-avsp_terra_xhigh.toml)
+            expected_name=avsp_terra_xhigh
+            expected_model=gpt-5.6-terra
+            expected_effort=xhigh
+            expected_sandbox=workspace-write
+            ;;
+        ai-vibecode-superpower-avsp_terra_xhigh_readonly.toml)
+            expected_name=avsp_terra_xhigh_readonly
+            expected_model=gpt-5.6-terra
+            expected_effort=xhigh
+            expected_sandbox=read-only
+            ;;
+        ai-vibecode-superpower-avsp_terra_low_readonly.toml)
+            expected_name=avsp_terra_low_readonly
+            expected_model=gpt-5.6-terra
+            expected_effort=low
+            expected_sandbox=read-only
+            ;;
+        ai-vibecode-superpower-avsp_terra_medium_readonly.toml)
+            expected_name=avsp_terra_medium_readonly
+            expected_model=gpt-5.6-terra
+            expected_effort=medium
+            expected_sandbox=read-only
+            ;;
+        *)
+            printf '%s\n' "Unexpected managed agent role: $role_path" >&2
+            exit 1
+            ;;
+    esac
+
+    expected_hash=$(awk -v role_file="$role_file" '$2 == role_file { print $1 }' "$source_agent_role_manifest")
+    actual_hash=$(sha256_file "$role_path")
+    if [ "$actual_hash" != "$expected_hash" ]; then
+        printf '%s\n' "Managed agent role content does not match its contract: $role_path" >&2
+        exit 1
+    fi
+
+    if ! awk \
+        -v expected_name="$expected_name" \
+        -v expected_model="$expected_model" \
+        -v expected_effort="$expected_effort" \
+        -v expected_sandbox="$expected_sandbox" '
+        function trim(value) {
+            sub(/^[[:space:]]*/, "", value)
+            sub(/[[:space:]]*$/, "", value)
+            return value
+        }
+        function validate_scalar(key, expected) {
+            seen[key]++
+            if (seen[key] != 1 || line != key " = \"" expected "\"") {
+                invalid = 1
+            }
+        }
+        BEGIN {
+            in_developer_instructions = 0
+            developer_instructions_count = 0
+            description_count = 0
+        }
+        {
+            line = trim($0)
+
+            if (in_developer_instructions) {
+                if (line == "\"\"\"") {
+                    in_developer_instructions = 0
+                }
+                next
+            }
+            if (line == "" || line ~ /^#/) {
+                next
+            }
+            if (line ~ /^developer_instructions[[:space:]]*=[[:space:]]*"""[[:space:]]*$/) {
+                developer_instructions_count++
+                if (developer_instructions_count != 1) {
+                    invalid = 1
+                }
+                in_developer_instructions = 1
+                next
+            }
+            if (line ~ /^description[[:space:]]*=/) {
+                description_count++
+                if (description_count != 1 || line !~ /^description[[:space:]]*=[[:space:]]*"[^"]*"[[:space:]]*$/) {
+                    invalid = 1
+                }
+                next
+            }
+            if (line ~ /^name[[:space:]]*=/) {
+                validate_scalar("name", expected_name)
+                next
+            }
+            if (line ~ /^model[[:space:]]*=/) {
+                validate_scalar("model", expected_model)
+                next
+            }
+            if (line ~ /^model_reasoning_effort[[:space:]]*=/) {
+                validate_scalar("model_reasoning_effort", expected_effort)
+                next
+            }
+            if (line ~ /^sandbox_mode[[:space:]]*=/) {
+                validate_scalar("sandbox_mode", expected_sandbox)
+                next
+            }
+            invalid = 1
+        }
+        END {
+            if (in_developer_instructions || developer_instructions_count != 1 || description_count != 1 ||
+                seen["name"] != 1 || seen["model"] != 1 ||
+                seen["model_reasoning_effort"] != 1 || seen["sandbox_mode"] != 1) {
+                invalid = 1
+            }
+            exit invalid ? 1 : 0
+        }
+    ' "$role_path"; then
+        printf '%s\n' "Invalid managed agent role contract: $role_path" >&2
+        exit 1
+    fi
+}
+
+assert_managed_agent_role_directory() {
+    role_directory=$1
+    expected_role_count=0
+    actual_role_count=0
+
+    assert_no_symlink_tree "$role_directory"
+    for role_path in "$role_directory"/* "$role_directory"/.[!.]* "$role_directory"/..?*; do
+        path_exists "$role_path" || continue
+        if [ ! -f "$role_path" ]; then
+            printf '%s\n' "Expected a regular managed agent role file: $role_path" >&2
+            exit 1
+        fi
+        role_file=$(basename "$role_path")
+        if ! is_managed_agent_role_file "$role_file"; then
+            printf '%s\n' "Unexpected managed agent role file: $role_path" >&2
+            exit 1
+        fi
+        actual_role_count=$((actual_role_count + 1))
+    done
+    for role_file in $managed_agent_role_files; do
+        expected_role_count=$((expected_role_count + 1))
+        role_path=$role_directory/$role_file
+        if [ ! -f "$role_path" ]; then
+            printf '%s\n' "Missing managed agent role: $role_path" >&2
+            exit 1
+        fi
+        assert_managed_agent_role_contract "$role_path"
+    done
+    if [ "$actual_role_count" -ne "$expected_role_count" ]; then
+        printf '%s\n' "Unexpected managed agent role file count in: $role_directory" >&2
+        exit 1
+    fi
 }
 
 assert_target() {
@@ -137,6 +406,34 @@ assert_directory_container() {
     fi
 }
 
+assert_no_reserved_agent_role_name_conflict() {
+    agents_directory=$1
+
+    [ -d "$agents_directory" ] || return
+    assert_no_symlink_tree "$agents_directory"
+    conflict_found=0
+    for scan_root in "$agents_directory"/* "$agents_directory"/.[!.]* "$agents_directory"/..?*; do
+        path_exists "$scan_root" || continue
+        [ "$(basename "$scan_root")" = ai-vibecode-superpower ] && continue
+        if conflicting_roles=$(rg -il --hidden --no-ignore --glob '*.toml' '^[[:space:]]*(?:name|["\x27]name["\x27])[[:space:]]*=[[:space:]]*["\x27]{1,3}(?:avsp_|\\u0061vsp_|\\U00000061vsp_)' "$scan_root"); then
+            if [ "$conflict_found" -eq 0 ]; then
+                printf '%s\n' "User agent role uses the reserved avsp_ namespace:" >&2
+            fi
+            printf '%s\n' "$conflicting_roles" >&2
+            conflict_found=1
+        else
+            search_status=$?
+            if [ "$search_status" -ne 1 ]; then
+                printf '%s\n' "Could not safely scan user agent roles in: $scan_root" >&2
+                exit "$search_status"
+            fi
+        fi
+    done
+    if [ "$conflict_found" -ne 0 ]; then
+        exit 1
+    fi
+}
+
 mark_state() {
     state_name=$1
     target_name=$2
@@ -149,6 +446,163 @@ has_state() {
     state_name=$1
     target_name=$2
     [ -f "$stage_dir/state/$state_name/$target_name" ]
+}
+
+assert_managed_agent_role_manifest "$source_agent_role_manifest"
+assert_managed_agent_role_directory "$source_agent_roles"
+
+assert_safe_toml_merge_input() {
+    config_path=$1
+
+    if ! awk '
+        function trim(value) {
+            sub(/^[[:space:]]*/, "", value)
+            sub(/[[:space:]]*$/, "", value)
+            return value
+        }
+        function fail(message) {
+            printf "%s:%d: unsupported TOML syntax for safe merge: %s\\n", FILENAME, FNR, message > "/dev/stderr"
+            invalid = 1
+        }
+        function assert_single_line_value(value,    position, character, next_character, in_basic_string, in_literal_string, array_depth, table_depth) {
+            in_basic_string = 0
+            in_literal_string = 0
+            array_depth = 0
+            table_depth = 0
+            for (position = 1; position <= length(value); position++) {
+                character = substr(value, position, 1)
+                if (in_basic_string) {
+                    if (character == "\\") {
+                        position++
+                    } else if (character == "\"") {
+                        in_basic_string = 0
+                    }
+                    continue
+                }
+                if (in_literal_string) {
+                    if (character == "\047") {
+                        in_literal_string = 0
+                    }
+                    continue
+                }
+                if (character == "#") {
+                    break
+                }
+                if (character == "\"") {
+                    in_basic_string = 1
+                } else if (character == "\047") {
+                    in_literal_string = 1
+                } else if (character == "[") {
+                    array_depth++
+                } else if (character == "]") {
+                    array_depth--
+                } else if (character == "{") {
+                    table_depth++
+                } else if (character == "}") {
+                    table_depth--
+                }
+                if (array_depth < 0 || table_depth < 0) {
+                    return 0
+                }
+            }
+            return !in_basic_string && !in_literal_string && array_depth == 0 && table_depth == 0
+        }
+        BEGIN {
+            section = "root"
+        }
+        {
+            line = trim($0)
+            if (line ~ /"""/ || line ~ /\047\047\047/) {
+                fail("multiline strings are not supported")
+                next
+            }
+            if (line == "" || line ~ /^#/) {
+                next
+            }
+            if (line ~ /^\[/) {
+                array_table = line ~ /^\[\[/
+                if (array_table) {
+                    if (line !~ /^\[\[[^]]+\]\][[:space:]]*(#.*)?$/) {
+                        fail("ambiguous array table header")
+                        next
+                    }
+                    header = line
+                    sub(/^\[\[/, "", header)
+                    sub(/\][[:space:]]*\][[:space:]]*(#.*)?$/, "", header)
+                } else if (line !~ /^\[[^]]+\][[:space:]]*(#.*)?$/) {
+                    fail("ambiguous table header")
+                    next
+                } else {
+                    header = line
+                    sub(/^[[:space:]]*\[/, "", header)
+                    sub(/\][[:space:]]*(#.*)?$/, "", header)
+                }
+                if (array_table && (header == "agents" || header == "features")) {
+                    fail("managed table cannot be an array table")
+                    next
+                }
+                if (header ~ /^("agents"|agents|"features"|features|"model"|model|"model_reasoning_effort"|model_reasoning_effort)(\.|$)/ && header != "agents" && header != "features") {
+                    fail("managed namespace table is ambiguous")
+                    next
+                }
+                section = header
+                if (!array_table) {
+                    table_seen[section]++
+                }
+                if (!array_table && (section == "agents" || section == "features") && table_seen[section] != 1) {
+                    fail("managed table is repeated")
+                }
+                next
+            }
+            if (index(line, "=") == 0) {
+                fail("unrecognized non-comment line")
+                next
+            }
+            key = substr(line, 1, index(line, "=") - 1)
+            key = trim(key)
+            value = substr(line, index(line, "=") + 1)
+            if (!assert_single_line_value(value)) {
+                fail("cross-line or unclosed value")
+                next
+            }
+            if (key !~ /^[A-Za-z][A-Za-z0-9_-]*$/) {
+                if (section == "root" && key ~ /^("|\047)?(model|model_reasoning_effort|agents|features)/) {
+                    fail("quoted or dotted managed key")
+                } else if ((section == "agents" || section == "features") && key ~ /^("|\047)?(max_threads|max_depth|js_repl|goals)/) {
+                    fail("quoted or dotted managed key")
+                }
+                next
+            }
+            if (section == "root" && (key == "agents" || key == "features")) {
+                fail("managed table cannot be a root key")
+                next
+            }
+            if (section == "root" && (key == "model" || key == "model_reasoning_effort")) {
+                managed_seen[section SUBSEP key]++
+                if (managed_seen[section SUBSEP key] != 1) {
+                    fail("managed key is repeated")
+                }
+            }
+            if (section == "agents" && (key == "max_threads" || key == "max_depth")) {
+                managed_seen[section SUBSEP key]++
+                if (managed_seen[section SUBSEP key] != 1) {
+                    fail("managed key is repeated")
+                }
+            }
+            if (section == "features" && (key == "js_repl" || key == "goals")) {
+                managed_seen[section SUBSEP key]++
+                if (managed_seen[section SUBSEP key] != 1) {
+                    fail("managed key is repeated")
+                }
+            }
+        }
+        END {
+            exit invalid ? 1 : 0
+        }
+    ' "$config_path"; then
+        printf '%s\n' "Refusing to merge $config_path; no files were changed." >&2
+        exit 1
+    fi
 }
 
 merge_managed_config() {
@@ -187,6 +641,7 @@ merge_managed_config() {
                 header = $0
                 sub(/^[[:space:]]*\[/, "", header)
                 sub(/\][[:space:]]*(#.*)?$/, "", header)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", header)
                 section = (header == "agents" || header == "features") ? header : "other"
                 next
             }
@@ -206,6 +661,7 @@ merge_managed_config() {
                 header = $0
                 sub(/^[[:space:]]*\[/, "", header)
                 sub(/\][[:space:]]*(#.*)?$/, "", header)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", header)
                 current = (header == "agents" || header == "features") ? header : "other"
                 present[current] = 1
                 print
@@ -273,6 +729,9 @@ rollback() {
     if [ "$skills_parent_created" -eq 1 ] && [ -d "$codex_home/skills" ]; then
         rmdir "$codex_home/skills" 2>/dev/null || true
     fi
+    if [ "$agents_parent_created" -eq 1 ] && [ -d "$codex_home/agents" ]; then
+        rmdir "$codex_home/agents" 2>/dev/null || true
+    fi
     if [ "$rollback_failed" -ne 0 ]; then
         printf '%s\n' "Rollback was incomplete; retained backup directory: $backup_dir" >&2
     fi
@@ -287,49 +746,48 @@ cleanup() {
     if [ -n "$stage_dir" ] && [ -d "$stage_dir" ]; then
         rm -rf "$stage_dir"
     fi
-    if [ "$lock_acquired" -eq 1 ]; then
-        rm -f "$lock_dir/pid"
-        rmdir "$lock_dir" 2>/dev/null || true
-    fi
     exit "$status"
 }
 
 trap cleanup 0
 trap 'exit 1' 1 2 3 15
 
-if ! mkdir "$lock_dir" 2>/dev/null; then
-    lock_pid=
-    lock_waits=0
-    while [ ! -f "$lock_dir/pid" ] && [ "$lock_waits" -lt 10 ]; do
-        lock_waits=$((lock_waits + 1))
-        sleep 1
-    done
-    if [ -f "$lock_dir/pid" ]; then
-        lock_pid=$(cat "$lock_dir/pid" 2>/dev/null || true)
-    fi
-    case $lock_pid in
-        ''|*[!0-9]*) ;;
-        *)
-            if kill -0 "$lock_pid" 2>/dev/null; then
-                printf '%s\n' "Another Codex installer is already running for: $codex_home" >&2
-                exit 1
-            fi
-            ;;
-    esac
-    rm -f "$lock_dir/pid" 2>/dev/null || true
-    rmdir "$lock_dir" 2>/dev/null || {
-        printf '%s\n' "Cannot acquire installer lock: $lock_dir" >&2
-        exit 1
-    }
-    mkdir "$lock_dir" || exit 1
+# Keep the kernel advisory lock on this process's descriptor for the whole
+# transaction. The ordinary lock file is intentionally retained between runs.
+if [ -L "$lock_file" ] || { path_exists "$lock_file" && [ ! -f "$lock_file" ]; }; then
+    printf '%s\n' "Expected a regular lock file target: $lock_file" >&2
+    exit 1
 fi
-printf '%s\n' "$$" > "$lock_dir/pid"
-lock_acquired=1
+exec 9>> "$lock_file" || exit 1
+case $(uname -s) in
+    Darwin)
+        command -v lockf >/dev/null 2>&1 || {
+            printf '%s\n' 'lockf is required to serialize the macOS installer.' >&2
+            exit 1
+        }
+        lockf -k -t 0 9 || {
+            printf '%s\n' "Another Codex installer is already running for: $codex_home" >&2
+            exit 1
+        }
+        ;;
+    Linux)
+        command -v flock >/dev/null 2>&1 || {
+            printf '%s\n' 'flock is required to serialize the Linux installer.' >&2
+            exit 1
+        }
+        flock -n 9 || {
+            printf '%s\n' "Another Codex installer is already running for: $codex_home" >&2
+            exit 1
+        }
+        ;;
+esac
 
 stage_dir=$(mktemp -d "$codex_home/.install-stage.XXXXXX")
 mkdir -p "$stage_dir/state/backed-up" "$stage_dir/state/install-started"
 cp "$source_agents" "$stage_dir/AGENTS.md"
 cp -R "$source_docs" "$stage_dir/docs"
+mkdir -p "$stage_dir/agents"
+cp -R "$source_agent_roles" "$stage_dir/agents/"
 mkdir "$stage_dir/skills"
 for source_skill in "$source_skills"/*; do
     [ -d "$source_skill" ] || continue
@@ -342,14 +800,24 @@ if ! path_exists "$config_input"; then
     config_input=$stage_dir/empty-config.toml
     : > "$config_input"
 fi
+assert_safe_toml_merge_input "$source_config"
+assert_safe_toml_merge_input "$config_input"
 merge_managed_config "$config_input" "$stage_dir/merged-config.toml"
+assert_safe_toml_merge_input "$stage_dir/merged-config.toml"
 
-for name in AGENTS.md merged-config.toml docs; do
+for name in AGENTS.md merged-config.toml docs agents/ai-vibecode-superpower; do
     if ! path_exists "$stage_dir/$name"; then
         printf '%s\n' "Staging failed for: $name" >&2
         exit 1
     fi
 done
+for agent_role_file in $managed_agent_role_files; do
+    if [ ! -f "$stage_dir/agents/ai-vibecode-superpower/$agent_role_file" ]; then
+        printf '%s\n' "Staging failed for managed agent role: $agent_role_file" >&2
+        exit 1
+    fi
+done
+assert_managed_agent_role_directory "$stage_dir/agents/ai-vibecode-superpower"
 for staged_skill in "$stage_dir/skills"/*; do
     if [ ! -d "$staged_skill" ]; then
         printf '%s\n' "Staging failed for skill: $(basename "$staged_skill")" >&2
@@ -361,6 +829,7 @@ manifest=$stage_dir/targets.tsv
 printf '%s\t%s\t%s\t%s\n' AGENTS.md "$codex_home/AGENTS.md" "$stage_dir/AGENTS.md" file > "$manifest"
 printf '%s\t%s\t%s\t%s\n' config.toml "$codex_home/config.toml" "$stage_dir/merged-config.toml" file >> "$manifest"
 printf '%s\t%s\t%s\t%s\n' docs "$codex_home/docs" "$stage_dir/docs" directory >> "$manifest"
+printf '%s\t%s\t%s\t%s\n' agents/ai-vibecode-superpower "$codex_home/agents/ai-vibecode-superpower" "$stage_dir/agents/ai-vibecode-superpower" directory >> "$manifest"
 for staged_skill in "$stage_dir/skills"/*; do
     skill_name=$(basename "$staged_skill")
     printf '%s\t%s\t%s\t%s\n' "skills/$skill_name" "$codex_home/skills/$skill_name" "$staged_skill" directory >> "$manifest"
@@ -370,6 +839,8 @@ done
 assert_target "$codex_home/AGENTS.md" file
 assert_target "$codex_home/config.toml" file
 assert_target "$codex_home/docs" directory
+assert_directory_container "$codex_home/agents"
+assert_no_reserved_agent_role_name_conflict "$codex_home/agents"
 assert_directory_container "$codex_home/skills"
 if path_exists "$codex_home/backups"; then
     assert_directory_container "$codex_home/backups"
@@ -388,6 +859,10 @@ done < "$manifest"
 if [ ! -d "$codex_home/skills" ]; then
     mkdir "$codex_home/skills"
     skills_parent_created=1
+fi
+if [ ! -d "$codex_home/agents" ]; then
+    mkdir "$codex_home/agents"
+    agents_parent_created=1
 fi
 if [ "$has_existing_target" -eq 1 ]; then
     mkdir -p "$codex_home/backups"

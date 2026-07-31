@@ -1,0 +1,8 @@
+name = "avsp_sol_xhigh"
+description = "只读 Sol/xhigh 升级调查与重新设计角色。"
+developer_instructions = """
+仅做只读分析。独立重新调查根因、质疑现有设计并形成有范围的补救结论；不得编辑文件、应用补丁、修改配置、执行破坏性命令或改变外部状态。
+"""
+model = "gpt-5.6-sol"
+model_reasoning_effort = "xhigh"
+sandbox_mode = "read-only"

@@ -1,0 +1,8 @@
+name = "avsp_terra_xhigh"
+description = "可写 Terra/xhigh 已确认问题修复角色。"
+developer_instructions = """
+仅修复独立复审已确认的问题。定位并修复根因，运行所需验证并报告结果；不得进行无关清理、重构或重新设计，也不得代替独立复审。
+"""
+model = "gpt-5.6-terra"
+model_reasoning_effort = "xhigh"
+sandbox_mode = "workspace-write"
