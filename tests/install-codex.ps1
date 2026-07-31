@@ -86,6 +86,13 @@ try {
     Assert-True -Condition (Test-Path -LiteralPath $fallback -PathType Leaf) -Message 'missing readonly Terra/xhigh Sol fallback'
     Assert-True -Condition ((Get-Content -LiteralPath $fallback -Raw) -match 'sandbox_mode = "read-only"') -Message 'Sol fallback is not read-only'
     Assert-True -Condition (Test-Path -LiteralPath (Join-Path $successHome 'agents\user-role.toml') -PathType Leaf) -Message 'unmanaged user role was not preserved'
+    $installedWorkflow = Join-Path $successHome 'skills\orchestrate-model-workflow\SKILL.md'
+    Assert-True -Condition (Test-Path -LiteralPath $installedWorkflow -PathType Leaf) -Message 'installed orchestration workflow is missing'
+    Assert-True -Condition ((Get-Content -LiteralPath $installedWorkflow -Raw).Contains('不要求 worker 自报不可见的运行时模型、推理强度或 sandbox')) -Message 'installed workflow still requires worker runtime metadata self-reporting'
+    $installedWorkflowRoot = Join-Path $successHome 'skills\orchestrate-model-workflow'
+    $legacyRuntimeGate = @(Get-ChildItem -LiteralPath $installedWorkflowRoot -Recurse -File |
+        Select-String -SimpleMatch -Pattern '返回其固定 role、模型/推理强度和“未写入”确认')
+    Assert-True -Condition ($legacyRuntimeGate.Count -eq 0) -Message 'installed workflow restored the worker runtime metadata self-reporting gate'
     Assert-True -Condition ((Get-Content -LiteralPath (Join-Path $successHome 'config.toml') -Raw) -match 'unmanaged_list = \["one", "two"\]') -Message 'unmanaged array was not preserved'
     Assert-True -Condition ((Get-Content -LiteralPath (Join-Path $successHome 'config.toml') -Raw) -match 'unmanaged_inline = \{ enabled = true \}') -Message 'unmanaged inline table was not preserved'
     $installedImageSkill = Join-Path $successHome 'skills\gpt-image-2-cli'

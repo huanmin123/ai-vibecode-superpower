@@ -79,7 +79,7 @@ sh ./install-codex.sh
 
 运行安装脚本会将用户级 Codex 默认主控设置为 `gpt-5.6-terra` / `xhigh`。该设置用于后续任务的默认主控模型；安装完成后请重启 Codex 相关程序让新进程加载最新配置。
 
-`codex-global-config/` 是来源目录；安装时它不会原样复制，其中的 `AGENTS.md`、`config.toml`、`docs/` 和 `agents/ai-vibecode-superpower/` 会分别写入 Codex 全局目录。`config.toml` 仅更新本仓库管理的六个键：`model`、`model_reasoning_effort`、`agents.max_threads`、`agents.max_depth`、`features.js_repl` 和 `features.goals` 并保留其他设置。安装成功证明文件已安全落盘，不证明当前 provider 支持所有固定模型；重启后首个任务会在任何 Terra 写入前，对该任务所需 role 执行无写入 runtime preflight。任一必需 role 无法启动即停止；唯一例外是已通过本地检查的 Sol 调用收到对应 `gpt-5.6-sol` 的结构化 `unsupported_model` 或 `model_not_found`，此时可由只读 `avsp_terra_xhigh_readonly` 完成同一阶段，并记录模型独立性降低。不会先写入再等待 Sol 复审。
+`codex-global-config/` 是来源目录；安装时它不会原样复制，其中的 `AGENTS.md`、`config.toml`、`docs/` 和 `agents/ai-vibecode-superpower/` 会分别写入 Codex 全局目录。`config.toml` 仅更新本仓库管理的六个键：`model`、`model_reasoning_effort`、`agents.max_threads`、`agents.max_depth`、`features.js_repl` 和 `features.goals` 并保留其他设置。安装成功证明文件已安全落盘，不证明当前 provider 支持所有固定模型；协调者以实际 `spawn_agent(agent_type=...)` 调用和已安装 profile 记录 role、声明的模型/推理强度与读写边界，不要求子 agent 自报它可能无法观察到的运行时模型元数据。高风险、不可逆、生产、权限或外部写入前，任一后续必需 role 无法启动即停止；唯一例外是已通过本地检查的 Sol 调用收到对应 `gpt-5.6-sol` 的结构化 `unsupported_model` 或 `model_not_found`，此时可由只读 `avsp_terra_xhigh_readonly` 完成同一阶段，并记录模型独立性降低。本地可回滚任务在实际需要时启动独立复审，不以子 agent 的身份自报作为预写入门槛。
 
 ## AI 读取与维护顺序
 

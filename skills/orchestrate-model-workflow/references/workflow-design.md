@@ -33,7 +33,7 @@ Luna 并行探路（`avsp_luna_high` 不可用仅映射至 `avsp_terra_low_reado
 
 ### 通过 role 切换模型
 
-不要假设运行中的 agent 能改变模型或推理强度。委派前验证目标 `agent_type` 可用；任何 Terra 写入前，对本任务后续必需的 Luna、Sol 和 Terra role 逐个执行无写入 runtime preflight，要求返回固定 role、模型/推理强度和未写入确认。任一必需 role 未成功启动或未返回完整确认，就在写入前停止。若运行时提供 effective sandbox 信息则记录它；profile 的 `sandbox_mode` 只是期望权限，宿主覆盖时不得把提示词约束称为技术强制隔离。调用 `spawn_agent` 只传该 `agent_type`，不传 `model` 或 `reasoning_effort`。使用 `fork_turns="none"`，或有限正数轮次，将任务状态、持久产物路径和自包含契约传给 worker；禁止传递完整历史。只有能力检查确认目标是 `avsp_luna_high` 或 `avsp_luna_xhigh` 且其不可用时，才可分别调用对应的只读 fallback。只有原 Sol role 已通过本地 schema/profile 检查、上游为该 `gpt-5.6-sol` 请求返回结构化 `unsupported_model` 或 `model_not_found` 时，才可调用 `avsp_terra_xhigh_readonly` 处理同一只读 Sol 阶段。认证、限流、网络、超时、参数/schema、本地 profile 缺失和未知错误均停止，绝不从错误文本猜测或改用可写 Terra role。
+不要假设运行中的 agent 能改变模型或推理强度。协调者委派前验证目标 `agent_type` 可用，并以实际 `spawn_agent(agent_type=...)` 调用确认创建的 role；对应 profile 中的模型、推理强度和 `sandbox_mode` 是声明配置。worker 不需要也不应被要求自报运行时模型、推理强度或 sandbox，因为这些信息可能未暴露给它。运行时若提供 effective sandbox 等元数据，协调者记录它；未提供时标为不可观察，且不得把 profile 的 `sandbox_mode` 或提示词约束称为技术强制隔离。高风险、不可逆、生产、权限或外部写入前，必须确认本任务后续必需的 role 可启动；本地可回滚的实施不得因缺少 worker 自报元数据而停止。调用 `spawn_agent` 只传该 `agent_type`，不传 `model` 或 `reasoning_effort`。使用 `fork_turns="none"`，或有限正数轮次，将任务状态、持久产物路径和自包含契约传给 worker；禁止传递完整历史。只有能力检查确认目标是 `avsp_luna_high` 或 `avsp_luna_xhigh` 且其不可用时，才可分别调用对应的只读 fallback。只有原 Sol role 已通过本地 schema/profile 检查、上游为该 `gpt-5.6-sol` 请求返回结构化 `unsupported_model` 或 `model_not_found` 时，才可调用 `avsp_terra_xhigh_readonly` 处理同一只读 Sol 阶段。认证、限流、网络、超时、参数/schema、本地 profile 缺失和未知错误均停止，绝不从错误文本猜测或改用可写 Terra role。
 
 ### 通过产物交接
 

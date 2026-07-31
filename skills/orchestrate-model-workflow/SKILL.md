@@ -5,7 +5,7 @@ description: "以命名 agent role 路由软件任务：只读 Luna 负责先锋
 
 # 多模型工作流编排
 
-通过已安装的 `avsp_*` agent role 分离只读分析、实现与独立复审。协调者负责用户意图、阶段依赖、任务产物和完成判断；worker 只拥有其受限阶段的输出。不得声称已切换到未被运行时确认的 role。
+通过已安装的 `avsp_*` agent role 分离只读分析、实现与独立复审。协调者负责用户意图、阶段依赖、任务产物和完成判断；worker 只拥有其受限阶段的输出。协调者以自身实际的 `spawn_agent(agent_type=...)` 调用确认所创建的 role，不要求 worker 自报不可见的运行时模型、推理强度或 sandbox。
 
 开始路由前完整阅读 [references/workflow-design.md](references/workflow-design.md)。复杂任务还要阅读 [references/execution-plan.md](references/execution-plan.md)，并使用其中的产物与阶段清单。
 
@@ -29,9 +29,9 @@ Luna 以及所有只读 Terra fallback 都不得修改工作区。Luna 及其 fa
 
 ## 委派能力与不可用规则
 
-首次委派前检查实际 `spawn_agent` schema 是否支持 `agent_type`，并验证目标 role 可用。任何 Terra 写入前，必须对本任务后续必需的 Luna、Sol 和 Terra role 依次执行一次无写入 runtime preflight：只要求 worker 返回其固定 role、模型/推理强度和“未写入”确认。只有已成功启动并返回完整确认的 role 才可进入写入阶段；任一必需 role 未通过则停止，不得先写入再等待该 role。若运行时提供 effective sandbox 信息，也必须记录它；profile 中的 `sandbox_mode` 是期望权限，宿主覆盖时不得声称已获得技术强制隔离。调用 `spawn_agent` 时只传 `agent_type`，不得再传 `model` 或 `reasoning_effort`。必须显式传 `fork_turns="none"`，或传有限正数轮次；禁止继承完整历史。向 worker 提供自包含任务契约、任务状态和必要产物路径。
+首次委派前检查实际 `spawn_agent` schema 是否支持 `agent_type`，并验证目标 role 可启动。协调者以成功创建的 `agent_type` 和对应已安装 profile 记录声明的模型、推理强度与读写边界；这些是配置事实，不是 worker 对运行时状态的自证。worker 无须也不应被要求返回模型、推理强度或 sandbox。运行时若提供 effective sandbox 等元数据，协调者记录它；未提供时明确标为不可观察，profile 中的 `sandbox_mode` 仍只是期望权限。调用 `spawn_agent` 时只传 `agent_type`，不得再传 `model` 或 `reasoning_effort`。必须显式传 `fork_turns="none"`，或传有限正数轮次；禁止继承完整历史。向 worker 提供自包含任务契约、任务状态和必要产物路径。高风险、不可逆、生产、权限或外部写入任务在执行前必须确认本任务后续必需的 role 可启动；本地可回滚的实现不因缺少 worker 自报元数据而停止。
 
-仅当能力检查确认 `avsp_luna_high` profile 不可用时，才可使用 `avsp_terra_low_readonly`；仅当确认 `avsp_luna_xhigh` profile 不可用时，才可使用 `avsp_terra_medium_readonly`。只有原 Sol profile 已通过本地 schema/profile 检查、委派后上游返回对应 `gpt-5.6-sol` 的结构化 `unsupported_model` 或 `model_not_found` 时，才可使用 `avsp_terra_xhigh_readonly` 替代同一 `avsp_sol_high` 或 `avsp_sol_xhigh` 只读阶段一次。不得从错误文本猜测模型不支持；认证/权限、限流/配额、网络/DNS/TLS/超时、参数或 schema、本地 profile 缺失、取消和未知/内部错误都不得 fallback。所有 fallback 必须通过能力检查，且绝不可写入；fallback 失败立即返回 `MODEL_UNAVAILABLE`。其他任何 profile 不可用时立即返回 `MODEL_UNAVAILABLE` 并停止当前阶段和其依赖阶段。错误必须包含：阶段、原定及实际 `agent_type`、固定模型/推理强度、结构化错误与能力检查证据、是否已经写入，以及恢复所需的外部条件。worker 失败或返回不完整证据时，只能以同一 `agent_type` 重试一次；再次失败后停止并报告原始错误。
+仅当能力检查确认 `avsp_luna_high` profile 不可用时，才可使用 `avsp_terra_low_readonly`；仅当确认 `avsp_luna_xhigh` profile 不可用时，才可使用 `avsp_terra_medium_readonly`。只有原 Sol profile 已通过本地 schema/profile 检查、委派后上游返回对应 `gpt-5.6-sol` 的结构化 `unsupported_model` 或 `model_not_found` 时，才可使用 `avsp_terra_xhigh_readonly` 替代同一 `avsp_sol_high` 或 `avsp_sol_xhigh` 只读阶段一次。不得从错误文本猜测模型不支持；认证/权限、限流/配额、网络/DNS/TLS/超时、参数或 schema、本地 profile 缺失、取消和未知/内部错误都不得 fallback。所有 fallback 必须通过能力检查，且绝不可写入；fallback 失败立即返回 `MODEL_UNAVAILABLE`。其他任何 profile 不可用时立即返回 `MODEL_UNAVAILABLE` 并停止当前阶段和其依赖阶段。错误必须包含：阶段、原定及实际 `agent_type`、profile 声明的模型/推理强度、结构化错误与能力检查证据、是否已经写入，以及恢复所需的外部条件。worker 启动失败或未完成该阶段任务契约时，只能以同一 `agent_type` 重试一次；缺少运行时模型、推理强度或 sandbox 自报不构成失败。再次失败后停止并报告原始错误。
 
 ## 分类与执行
 

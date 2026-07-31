@@ -2,7 +2,7 @@
 
 复杂任务可使用此模板；仓库提供允许的持久计划位置时，将其存入该位置。否则把同样字段记录到任务清单和目标状态，不得为了套用模板创建被忽略的临时目录。
 
-所有委派使用命名 `agent_type`。模型与推理强度由 role 固定，调用 `spawn_agent` 时只传 `agent_type`，且使用 `fork_turns="none"` 或有限正数轮次；不得传 `model` 或 `reasoning_effort`，也不得传递完整历史。任何 Terra 写入前，对本任务后续必需 role 执行无写入 runtime preflight，并记录固定 role、模型/推理强度、未写入确认和可用时的 effective sandbox；任何必需 role 不可用都在写入前停止。Luna role 只读探路与预审，Sol role 独立判断与完整复审，Terra/high 写入实施，可写 Terra/xhigh 仅修复已确认问题。仅当 `avsp_luna_high` 或 `avsp_luna_xhigh` 经能力检查确认不可用时，才分别使用只读的 `avsp_terra_low_readonly` 或 `avsp_terra_medium_readonly`。只有 Sol 调用返回对应 `gpt-5.6-sol` 的结构化 `unsupported_model` 或 `model_not_found` 时，才使用只读 `avsp_terra_xhigh_readonly` 替代同一 Sol 阶段；认证、限流、网络、超时、参数/schema 和未知错误均停止。所有 fallback 不得写入；其他任何 role 不可用都记录 `MODEL_UNAVAILABLE` 并停止。
+所有委派使用命名 `agent_type`。模型与推理强度由 profile 固定，调用 `spawn_agent` 时只传 `agent_type`，且使用 `fork_turns="none"` 或有限正数轮次；不得传 `model` 或 `reasoning_effort`，也不得传递完整历史。协调者记录实际委派的 `agent_type`、profile 声明的模型/推理强度、成功启动证据，以及运行时可见时的 effective sandbox；不得要求 worker 自报这些运行时元数据。高风险、不可逆、生产、权限或外部写入任务在实施前，任何必需 role 不可启动都必须停止；本地可回滚的实施不因缺少 worker 自报元数据而停止。Luna role 只读探路与预审，Sol role 独立判断与完整复审，Terra/high 写入实施，可写 Terra/xhigh 仅修复已确认问题。仅当 `avsp_luna_high` 或 `avsp_luna_xhigh` 经能力检查确认不可用时，才分别使用只读的 `avsp_terra_low_readonly` 或 `avsp_terra_medium_readonly`。只有 Sol 调用返回对应 `gpt-5.6-sol` 的结构化 `unsupported_model` 或 `model_not_found` 时，才使用只读 `avsp_terra_xhigh_readonly` 替代同一 Sol 阶段；认证、限流、网络、超时、参数/schema 和未知错误均停止。所有 fallback 不得写入；其他任何 role 不可用都记录 `MODEL_UNAVAILABLE` 并停止。
 
 ## 计划头
 
@@ -64,7 +64,7 @@
 ### 实现与复审
 
 - [ ] 委派调用只传目标 `agent_type`，并传受限 `fork_turns`。
-- [ ] Terra 写入前已完成本任务必需 role 的无写入 runtime preflight；失败 role 已在写入前停止，并记录固定模型、未写入确认和可用时的 effective sandbox。
+- [ ] 协调者记录了每次实际 `spawn_agent` 的 `agent_type`、profile 声明的模型/推理强度和启动结果；worker 未被要求自报运行时模型、推理强度或 sandbox。高风险、不可逆、生产、权限或外部写入前，所需 role 无法启动已停止；可观察时已记录 effective sandbox。
 - [ ] Luna 不可用时只使用一对一只读 fallback；Sol 仅在结构化模型不支持错误时使用只读 Terra/xhigh fallback；所有 fallback 不写入，其他 role 不可用则记录 `MODEL_UNAVAILABLE`。
 - [ ] 执行者收到自包含契约、任务状态或持久产物引用，以及验证要求。
 - [ ] 改动保持在范围和既有架构内，并按比例处理边界、错误、并发和安全。

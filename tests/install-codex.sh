@@ -134,6 +134,11 @@ expect_line "$success_home/config.toml" 'model = "gpt-5.6-terra"'
 expect_line "$success_home/config.toml" 'model_reasoning_effort = "xhigh"'
 expect_file "$success_home/AGENTS.md"
 expect_directory "$success_home/docs"
+expect_file "$success_home/skills/orchestrate-model-workflow/SKILL.md"
+rg -F '不要求 worker 自报不可见的运行时模型、推理强度或 sandbox' "$success_home/skills/orchestrate-model-workflow/SKILL.md" >/dev/null || fail 'installed workflow still requires worker runtime metadata self-reporting'
+if rg -F '返回其固定 role、模型/推理强度和“未写入”确认' "$success_home/skills/orchestrate-model-workflow" >/dev/null; then
+    fail 'installed workflow restored the worker runtime metadata self-reporting gate'
+fi
 expect_exact_managed_role_files "$success_home/agents/ai-vibecode-superpower"
 expect_role_contract "$success_home/agents/ai-vibecode-superpower/ai-vibecode-superpower-avsp_luna_high.toml" avsp_luna_high gpt-5.6-luna high read-only
 expect_role_contract "$success_home/agents/ai-vibecode-superpower/ai-vibecode-superpower-avsp_luna_xhigh.toml" avsp_luna_xhigh gpt-5.6-luna xhigh read-only
