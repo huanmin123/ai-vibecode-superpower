@@ -19,9 +19,10 @@ sh ./install-codex.sh
 安装目录优先使用非空的 `CODEX_HOME`；未设置时使用当前用户的 `~/.codex`。两个脚本都会：
 
 1. 校验本仓库中的来源文件。
-2. 将新配置完整复制到安装暂存目录。
-3. 仅在覆盖已有的 `AGENTS.md` 前，将它备份到 `<CODEX_HOME>/backups/` 下的唯一目录。
-4. 将 `config.toml` 中由本仓库管理的模型与 agent 键更新为指定值，直接拷贝覆盖 `docs/` 和本仓库管理的 skill；`<CODEX_HOME>/skills/` 中的其他 skill 不移动、不删除也不备份。
+2. 将 `AGENTS.md`、合并后的 `config.toml`、完整 `docs/` 目录和每个受管理 skill 全部生成到安装暂存目录。
+3. 在写入任一受管理目标前，校验全部目标与备份目录的类型和符号链接安全性。
+4. 将每个已有受管理目标整体移动到 `<CODEX_HOME>/backups/` 下的同一个唯一目录，再安装全部候选；`<CODEX_HOME>/skills/` 中的未管理 skill 不移动、不删除也不备份。
+5. 任一步失败时，删除已安装的新目标并继续尝试恢复所有已备份的旧目标；恢复失败时保留备份目录并报告失败目标。
 
 脚本不会安装或升级 Codex，也不会读取、输出或复制认证信息。Windows 脚本拒绝穿过符号链接或目录联接的 `CODEX_HOME` 路径；两种脚本都会阻止同一目标目录的并发安装。
 
@@ -47,7 +48,8 @@ sh ./install-codex.sh
 └── skills/
     ├── gpt-image-2-cli/
     ├── orchestrate-model-workflow/
-    └── project-doc-planner/
+    ├── project-doc-planner/
+    └── agent-toolchain/
 ```
 
 ## 文件与模块说明
@@ -57,18 +59,19 @@ sh ./install-codex.sh
 | `install-codex.ps1` | Windows PowerShell 安装入口 | 不安装，直接运行 |
 | `install-codex.sh` | macOS/Linux POSIX shell 安装入口 | 不安装，直接运行 |
 | `codex-global-config/AGENTS.md` | 全局 Codex 工作规范和命令路由规则 | `<CODEX_HOME>/AGENTS.md` |
-| `codex-global-config/config.toml` | 默认提供方、主模型、推理强度和 agent 功能配置模板 | 合并到 `<CODEX_HOME>/config.toml` |
+| `codex-global-config/config.toml` | 主模型、推理强度和 agent 功能配置模板 | 合并到 `<CODEX_HOME>/config.toml` |
 | `codex-global-config/docs/` | 系统、Shell、SSH、ripgrep 等通用操作规范 | `<CODEX_HOME>/docs/` |
 | `skills/` | 可复用 Codex skills 的根目录 | `<CODEX_HOME>/skills/` |
 | `skills/gpt-image-2-cli/` | 使用当前 Codex 配置调用 `gpt-image-2` 的图片生成辅助工具 | `<CODEX_HOME>/skills/gpt-image-2-cli/` |
 | `skills/orchestrate-model-workflow/` | 按风险把设计、实现、审查和修复路由到合适模型的工作流 | `<CODEX_HOME>/skills/orchestrate-model-workflow/` |
 | `skills/project-doc-planner/` | 规划项目文档架构、开发规范和环境资源边界 | `<CODEX_HOME>/skills/project-doc-planner/` |
+| `skills/agent-toolchain/` | 受控安装、初始化、诊断和维护 CodeGraph/RTK 工具链 | `<CODEX_HOME>/skills/agent-toolchain/` |
 
 ### 模型协调建议
 
 复杂任务的默认主协调模型建议使用 `Terra/high`。协调者需要完成任务分类、派发契约、风险与升级决策、结果集成和完成判断；不应为了节省成本将低能力模型用作复杂任务的协调者。仅当工作流已判定步骤完整、低风险且确定性时，才可由更简单的模型执行，且仍须按工作流接受 `Terra/high` 复核。
 
-`codex-global-config/` 是来源目录；安装时它不会原样复制，其中的 `AGENTS.md`、`config.toml` 和 `docs/` 会分别写入 Codex 全局目录。`config.toml` 仅更新本仓库管理的七个键，保留其他设置，例如 `model_providers.hu`。
+`codex-global-config/` 是来源目录；安装时它不会原样复制，其中的 `AGENTS.md`、`config.toml` 和 `docs/` 会分别写入 Codex 全局目录。`config.toml` 仅更新本仓库管理的六个键：`model`、`model_reasoning_effort`、`agents.max_threads`、`agents.max_depth`、`features.js_repl` 和 `features.goals`。它不会写入或覆盖 `model_provider`，并保留其他设置及 provider 定义。
 
 ## AI 读取与维护顺序
 
@@ -78,4 +81,4 @@ sh ./install-codex.sh
 
 ## 覆盖与恢复
 
-每次安装会覆盖目标中的 `AGENTS.md`、`docs/` 和本仓库管理的 skill，并更新 `config.toml` 中由本仓库管理的七个键。只有安装前已存在的 `AGENTS.md` 会保存到 `<CODEX_HOME>/backups/<时间戳-唯一标识>/AGENTS.md`；备份目录不会包含配置、文档或 skill。安装失败时，脚本也只自动恢复已替换的 `AGENTS.md`。`config.toml` 的其他设置、`docs/` 与受管理 skill 均不备份也不回滚；未管理 skill 不受影响。
+每次安装会替换目标中的 `AGENTS.md`、合并后的 `config.toml`、完整 `docs/` 目录和本仓库管理的 skill。只要其中任一目标已存在，安装器就会创建 `<CODEX_HOME>/backups/<时间戳-唯一标识>/`，并在其中按原始相对路径保存全部旧目标，例如 `config.toml`、`docs/` 和 `skills/<skill-name>/`。安装成功后该备份保留，便于人工恢复；安装失败时，安装器会删除本次已安装的候选并恢复旧目标。若某个恢复操作失败，脚本仍会继续恢复其余目标、返回失败，并保留备份目录。未管理 skill 不受影响。

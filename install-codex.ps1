@@ -103,7 +103,6 @@ function Get-ManagedTomlSettings {
 
     $settings = [ordered]@{
         '' = [ordered]@{
-            'model_provider' = $null
             'model' = $null
             'model_reasoning_effort' = $null
         }
@@ -199,6 +198,82 @@ function Merge-ManagedTomlSettings {
     Set-Content -LiteralPath $OutputPath -Value $output
 }
 
+function Assert-InstallTarget {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][ValidateSet('File', 'Directory')][string]$Kind
+    )
+
+    Assert-NoReparsePoints -Path $Path
+    if (-not (Test-ExistingPath -Path $Path)) { return }
+
+    $item = Get-Item -LiteralPath $Path -Force
+    if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Refusing to replace a symbolic link or junction: $Path"
+    }
+    if ($Kind -eq 'File' -and $item.PSIsContainer) {
+        throw "Expected a regular file target: $Path"
+    }
+    if ($Kind -eq 'Directory') {
+        if (-not $item.PSIsContainer) { throw "Expected a directory target: $Path" }
+        Assert-NoReparsePointsInTree -Path $Path
+    }
+}
+
+function Assert-InstallContainer {
+    param([Parameter(Mandatory)][string]$Path)
+
+    Assert-NoReparsePoints -Path $Path
+    if (-not (Test-ExistingPath -Path $Path)) { return }
+    $item = Get-Item -LiteralPath $Path -Force
+    if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or -not $item.PSIsContainer) {
+        throw "Expected a non-symbolic-link directory: $Path"
+    }
+}
+
+function Invoke-InstallRollback {
+    param(
+        [Parameter(Mandatory)][System.Collections.IEnumerable]$Targets,
+        [AllowNull()][string]$BackupDirectory,
+        [Parameter(Mandatory)][string]$SkillsTarget,
+        [Parameter(Mandatory)][bool]$SkillsParentCreated
+    )
+
+    $errors = [System.Collections.Generic.List[string]]::new()
+    foreach ($target in $Targets) {
+        if ($target.InstallStarted -and (Test-ExistingPath -Path $target.Target)) {
+            try {
+                Remove-Item -LiteralPath $target.Target -Recurse -Force
+            } catch {
+                $errors.Add("Could not remove installed target $($target.Target): $($_.Exception.Message)")
+            }
+        }
+    }
+    if ($null -ne $BackupDirectory) {
+        foreach ($target in $Targets) {
+            $backupTarget = Join-Path $BackupDirectory $target.Name
+            if ($target.BackedUp -and (Test-ExistingPath -Path $backupTarget)) {
+                try {
+                    if (-not (Test-ExistingPath -Path $target.Target)) {
+                        New-Item -ItemType Directory -Path (Split-Path -Parent $target.Target) -Force | Out-Null
+                        Move-Item -LiteralPath $backupTarget -Destination $target.Target
+                    }
+                } catch {
+                    $errors.Add("Could not restore target $($target.Target): $($_.Exception.Message)")
+                }
+            }
+        }
+    }
+    if ($SkillsParentCreated -and (Test-Path -LiteralPath $SkillsTarget -PathType Container)) {
+        try {
+            Remove-Item -LiteralPath $SkillsTarget -Force
+        } catch {
+            $errors.Add("Could not remove newly created skills directory $SkillsTarget: $($_.Exception.Message)")
+        }
+    }
+    return $errors
+}
+
 $scriptRoot = Split-Path -Parent $PSCommandPath
 $sourceAgents = Join-Path $scriptRoot 'codex-global-config\AGENTS.md'
 $sourceConfig = Join-Path $scriptRoot 'codex-global-config\config.toml'
@@ -242,19 +317,19 @@ foreach ($skillName in $managedSkillNames) {
     }
 }
 
-New-Item -ItemType Directory -Path $codexHome -Force | Out-Null
 $installMutex = $null
-$installMutex = Get-InstallMutex -CodexHome $codexHome
 $stageRoot = $null
 $backupDirectory = $null
-$agentsTarget = Join-Path $codexHome 'AGENTS.md'
-$agentsBackedUp = $false
-$agentsInstalled = $false
+$skillsTarget = Join-Path $codexHome 'skills'
+$skillsParentCreated = $false
+$transactionTargets = [System.Collections.Generic.List[object]]::new()
 
 try {
+    New-Item -ItemType Directory -Path $codexHome -Force | Out-Null
+    $installMutex = Get-InstallMutex -CodexHome $codexHome
     $stageRoot = New-UniqueDirectory -Parent $codexHome -Prefix '.install-stage-'
     Copy-Item -LiteralPath $sourceAgents -Destination (Join-Path $stageRoot 'AGENTS.md') -Force
-    Copy-Item -LiteralPath $sourceConfig -Destination (Join-Path $stageRoot 'config.toml') -Force
+    Copy-Item -LiteralPath $sourceConfig -Destination (Join-Path $stageRoot 'template-config.toml') -Force
     Copy-Item -LiteralPath $sourceDocs -Destination (Join-Path $stageRoot 'docs') -Recurse -Force
     $stagedSkills = Join-Path $stageRoot 'skills'
     New-Item -ItemType Directory -Path $stagedSkills | Out-Null
@@ -262,7 +337,7 @@ try {
         Copy-Item -LiteralPath (Join-Path $sourceSkills $skillName) -Destination (Join-Path $stagedSkills $skillName) -Recurse -Force
     }
 
-    foreach ($name in @('AGENTS.md', 'config.toml', 'docs')) {
+    foreach ($name in @('AGENTS.md', 'template-config.toml', 'docs')) {
         if (-not (Test-ExistingPath -Path (Join-Path $stageRoot $name))) { throw "Staging failed for: $name" }
     }
     foreach ($skillName in $managedSkillNames) {
@@ -271,61 +346,58 @@ try {
         }
     }
 
-    $docsTarget = Join-Path $codexHome 'docs'
-    Assert-NoReparsePoints -Path $docsTarget
-    Assert-NoReparsePointsInTree -Path $docsTarget
-    New-Item -ItemType Directory -Path $docsTarget -Force | Out-Null
-    Get-ChildItem -LiteralPath (Join-Path $stageRoot 'docs') -Force | ForEach-Object {
-        Copy-Item -LiteralPath $_.FullName -Destination $docsTarget -Recurse -Force
-    }
-
     $configTarget = Join-Path $codexHome 'config.toml'
-    Assert-NoReparsePoints -Path $configTarget
     $mergedConfig = Join-Path $stageRoot 'merged-config.toml'
-    $managedSettings = Get-ManagedTomlSettings -Path (Join-Path $stageRoot 'config.toml')
+    Assert-InstallTarget -Path $configTarget -Kind File
+    $managedSettings = Get-ManagedTomlSettings -Path (Join-Path $stageRoot 'template-config.toml')
     Merge-ManagedTomlSettings -Settings $managedSettings -ExistingPath $configTarget -OutputPath $mergedConfig
-    Copy-Item -LiteralPath $mergedConfig -Destination $configTarget -Force
 
-    $skillsTarget = Join-Path $codexHome 'skills'
-    Assert-NoReparsePoints -Path $skillsTarget
-    New-Item -ItemType Directory -Path $skillsTarget -Force | Out-Null
+    $transactionTargets.Add([pscustomobject]@{ Name = 'AGENTS.md'; Target = (Join-Path $codexHome 'AGENTS.md'); Candidate = (Join-Path $stageRoot 'AGENTS.md'); Kind = 'File'; WasPresent = $false; BackedUp = $false; InstallStarted = $false })
+    $transactionTargets.Add([pscustomobject]@{ Name = 'config.toml'; Target = $configTarget; Candidate = $mergedConfig; Kind = 'File'; WasPresent = $false; BackedUp = $false; InstallStarted = $false })
+    $transactionTargets.Add([pscustomobject]@{ Name = 'docs'; Target = (Join-Path $codexHome 'docs'); Candidate = (Join-Path $stageRoot 'docs'); Kind = 'Directory'; WasPresent = $false; BackedUp = $false; InstallStarted = $false })
     foreach ($skillName in $managedSkillNames) {
-        $targetSkill = Join-Path $skillsTarget $skillName
-        Assert-NoReparsePoints -Path $targetSkill
-        Assert-NoReparsePointsInTree -Path $targetSkill
-        New-Item -ItemType Directory -Path $targetSkill -Force | Out-Null
-        Get-ChildItem -LiteralPath (Join-Path $stagedSkills $skillName) -Force | ForEach-Object {
-            Copy-Item -LiteralPath $_.FullName -Destination $targetSkill -Recurse -Force
-        }
+        $transactionTargets.Add([pscustomobject]@{ Name = (Join-Path 'skills' $skillName); Target = (Join-Path $skillsTarget $skillName); Candidate = (Join-Path $stagedSkills $skillName); Kind = 'Directory'; WasPresent = $false; BackedUp = $false; InstallStarted = $false })
     }
 
-    Assert-NoReparsePoints -Path $agentsTarget
-    if (Test-ExistingPath -Path $agentsTarget) {
-        $backupRoot = Join-Path $codexHome 'backups'
+    # Validate every destination and the backup root before any managed target is replaced.
+    Assert-InstallContainer -Path $skillsTarget
+    $backupRoot = Join-Path $codexHome 'backups'
+    Assert-InstallContainer -Path $backupRoot
+    foreach ($target in $transactionTargets) {
+        Assert-InstallTarget -Path $target.Target -Kind $target.Kind
+        $target.WasPresent = Test-ExistingPath -Path $target.Target
+    }
+
+    if (-not (Test-Path -LiteralPath $skillsTarget -PathType Container)) {
+        New-Item -ItemType Directory -Path $skillsTarget | Out-Null
+        $skillsParentCreated = $true
+    }
+    if ($transactionTargets.Where({ $_.WasPresent }).Count -gt 0) {
         New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
         $backupDirectory = New-UniqueDirectory -Parent $backupRoot -Prefix 'backup-'
-        Move-Item -LiteralPath $agentsTarget -Destination (Join-Path $backupDirectory 'AGENTS.md')
-        $agentsBackedUp = $true
     }
-    Move-Item -LiteralPath (Join-Path $stageRoot 'AGENTS.md') -Destination $agentsTarget
-    $agentsInstalled = $true
+    foreach ($target in $transactionTargets) {
+        if ($target.WasPresent) {
+            $backupTarget = Join-Path $backupDirectory $target.Name
+            New-Item -ItemType Directory -Path (Split-Path -Parent $backupTarget) -Force | Out-Null
+            Move-Item -LiteralPath $target.Target -Destination $backupTarget
+            $target.BackedUp = $true
+        }
+        $target.InstallStarted = $true
+        Move-Item -LiteralPath $target.Candidate -Destination $target.Target
+    }
 
     Write-Host "Codex configuration installed in: $codexHome"
     if ($null -ne $backupDirectory) {
         Write-Host "Backup directory: $backupDirectory"
     } else {
-        Write-Host 'Backup directory: none (AGENTS.md did not exist)'
+        Write-Host 'Backup directory: none (no managed targets existed)'
     }
 }
 catch {
-    if ($agentsInstalled -and (Test-ExistingPath -Path $agentsTarget)) {
-        Remove-Item -LiteralPath $agentsTarget -Force
-    }
-    if ($agentsBackedUp -and $null -ne $backupDirectory) {
-        $backupAgents = Join-Path $backupDirectory 'AGENTS.md'
-        if ((Test-ExistingPath -Path $backupAgents) -and -not (Test-ExistingPath -Path $agentsTarget)) {
-            Move-Item -LiteralPath $backupAgents -Destination $agentsTarget
-        }
+    $rollbackErrors = Invoke-InstallRollback -Targets $transactionTargets -BackupDirectory $backupDirectory -SkillsTarget $skillsTarget -SkillsParentCreated $skillsParentCreated
+    foreach ($rollbackError in $rollbackErrors) {
+        Write-Warning "$rollbackError Backup directory retained: $backupDirectory"
     }
     throw
 }

@@ -8,22 +8,18 @@ source_config=$script_dir/codex-global-config/config.toml
 source_docs=$script_dir/codex-global-config/docs
 source_skills=$script_dir/skills
 
-if [ ! -f "$source_agents" ]; then
-    printf '%s\n' "Missing source file: $source_agents" >&2
-    exit 1
-fi
-if [ ! -f "$source_config" ]; then
-    printf '%s\n' "Missing source file: $source_config" >&2
-    exit 1
-fi
-if [ ! -d "$source_docs" ]; then
-    printf '%s\n' "Missing source directory: $source_docs" >&2
-    exit 1
-fi
-if [ ! -d "$source_skills" ]; then
-    printf '%s\n' "Missing source directory: $source_skills" >&2
-    exit 1
-fi
+for source_path in "$source_agents" "$source_config"; do
+    if [ ! -f "$source_path" ]; then
+        printf '%s\n' "Missing source file: $source_path" >&2
+        exit 1
+    fi
+done
+for source_path in "$source_docs" "$source_skills"; do
+    if [ ! -d "$source_path" ]; then
+        printf '%s\n' "Missing source directory: $source_path" >&2
+        exit 1
+    fi
+done
 
 managed_skill_count=0
 for source_skill in "$source_skills"/*; do
@@ -74,11 +70,16 @@ done
 
 stage_dir=
 backup_dir=
-agents_backed_up=0
-agents_installed=0
+manifest=
 completed=0
 lock_dir=$codex_home/.install.lock
 lock_acquired=0
+skills_parent_created=0
+tab=$(printf '\t')
+
+path_exists() {
+    [ -e "$1" ] || [ -L "$1" ]
+}
 
 assert_no_symlink_tree() {
     target_path=$1
@@ -91,9 +92,63 @@ assert_no_symlink_tree() {
         return
     fi
     for child_path in "$target_path"/* "$target_path"/.[!.]* "$target_path"/..?*; do
-        [ -e "$child_path" ] || [ -L "$child_path" ] || continue
+        path_exists "$child_path" || continue
         assert_no_symlink_tree "$child_path"
     done
+}
+
+assert_target() {
+    target_path=$1
+    target_kind=$2
+
+    path_exists "$target_path" || return 0
+    if [ -L "$target_path" ]; then
+        printf '%s\n' "Refusing to replace a symbolic link: $target_path" >&2
+        exit 1
+    fi
+    case $target_kind in
+        file)
+            if [ ! -f "$target_path" ]; then
+                printf '%s\n' "Expected a regular file target: $target_path" >&2
+                exit 1
+            fi
+            ;;
+        directory)
+            if [ ! -d "$target_path" ]; then
+                printf '%s\n' "Expected a directory target: $target_path" >&2
+                exit 1
+            fi
+            assert_no_symlink_tree "$target_path"
+            ;;
+        *)
+            printf '%s\n' "Unknown target type: $target_kind" >&2
+            exit 1
+            ;;
+    esac
+}
+
+assert_directory_container() {
+    target_path=$1
+
+    path_exists "$target_path" || return 0
+    if [ -L "$target_path" ] || [ ! -d "$target_path" ]; then
+        printf '%s\n' "Expected a non-symbolic-link directory: $target_path" >&2
+        exit 1
+    fi
+}
+
+mark_state() {
+    state_name=$1
+    target_name=$2
+    marker=$stage_dir/state/$state_name/$target_name
+    mkdir -p "$(dirname "$marker")"
+    : > "$marker"
+}
+
+has_state() {
+    state_name=$1
+    target_name=$2
+    [ -f "$stage_dir/state/$state_name/$target_name" ]
 }
 
 merge_managed_config() {
@@ -106,22 +161,21 @@ merge_managed_config() {
             current = "root"
         }
         function managed_key(section, key) {
-            return (section == "root" && (key == "model_provider" || key == "model" || key == "model_reasoning_effort")) ||
+            return (section == "root" && (key == "model" || key == "model_reasoning_effort")) ||
                    (section == "agents" && (key == "max_threads" || key == "max_depth")) ||
                    (section == "features" && (key == "js_repl" || key == "goals"))
         }
-        function flush_missing(section,    key, order, index) {
+        function flush_missing(section,    key, position, count) {
+            count = 0
             if (section == "root") {
-                order[1] = "model_provider"; order[2] = "model"; order[3] = "model_reasoning_effort"; count = 3
+                order[1] = "model"; order[2] = "model_reasoning_effort"; count = 2
             } else if (section == "agents") {
                 order[1] = "max_threads"; order[2] = "max_depth"; count = 2
             } else if (section == "features") {
                 order[1] = "js_repl"; order[2] = "goals"; count = 2
-            } else {
-                count = 0
             }
-            for (index = 1; index <= count; index++) {
-                key = order[index]
+            for (position = 1; position <= count; position++) {
+                key = order[position]
                 if (!seen[section SUBSEP key]) {
                     print key " = " value[section SUBSEP key]
                     seen[section SUBSEP key] = 1
@@ -139,9 +193,9 @@ merge_managed_config() {
             if (index($0, "=") > 0) {
                 key = substr($0, 1, index($0, "=") - 1)
                 gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
-                if (managed_key(section == "other" ? "other" : (section == "" ? "root" : section), key)) {
-                    value[(section == "" ? "root" : section) SUBSEP key] = substr($0, index($0, "=") + 1)
-                    gsub(/^[[:space:]]+|[[:space:]]+$/, "", value[(section == "" ? "root" : section) SUBSEP key])
+                if (managed_key(section, key)) {
+                    value[section SUBSEP key] = substr($0, index($0, "=") + 1)
+                    gsub(/^[[:space:]]+|[[:space:]]+$/, "", value[section SUBSEP key])
                 }
             }
             next
@@ -169,7 +223,6 @@ merge_managed_config() {
             print
         }
         END {
-            required["root" SUBSEP "model_provider"] = 1
             required["root" SUBSEP "model"] = 1
             required["root" SUBSEP "model_reasoning_effort"] = 1
             required["agents" SUBSEP "max_threads"] = 1
@@ -197,16 +250,39 @@ merge_managed_config() {
     ' "$source_config" "$config_input" > "$config_output"
 }
 
+rollback() {
+    rollback_failed=0
+    [ -n "$manifest" ] && [ -f "$manifest" ] || return 0
+
+    while IFS="$tab" read -r target_name target_path candidate_path target_kind; do
+        if has_state install-started "$target_name" && path_exists "$target_path"; then
+            rm -rf "$target_path" || rollback_failed=1
+        fi
+    done < "$manifest"
+
+    while IFS="$tab" read -r target_name target_path candidate_path target_kind; do
+        backup_path=$backup_dir/$target_name
+        if has_state backed-up "$target_name" && path_exists "$backup_path"; then
+            mkdir -p "$(dirname "$target_path")" || rollback_failed=1
+            if ! path_exists "$target_path"; then
+                mv "$backup_path" "$target_path" || rollback_failed=1
+            fi
+        fi
+    done < "$manifest"
+
+    if [ "$skills_parent_created" -eq 1 ] && [ -d "$codex_home/skills" ]; then
+        rmdir "$codex_home/skills" 2>/dev/null || true
+    fi
+    if [ "$rollback_failed" -ne 0 ]; then
+        printf '%s\n' "Rollback was incomplete; retained backup directory: $backup_dir" >&2
+    fi
+}
+
 cleanup() {
     status=$?
     if [ "$completed" -ne 1 ]; then
-        if [ "$agents_installed" -eq 1 ] && { [ -e "$codex_home/AGENTS.md" ] || [ -L "$codex_home/AGENTS.md" ]; }; then
-            rm -f "$codex_home/AGENTS.md"
-        fi
-        if [ "$agents_backed_up" -eq 1 ] && { [ -e "$backup_dir/AGENTS.md" ] || [ -L "$backup_dir/AGENTS.md" ]; } && \
-           [ ! -e "$codex_home/AGENTS.md" ] && [ ! -L "$codex_home/AGENTS.md" ]; then
-            mv "$backup_dir/AGENTS.md" "$codex_home/AGENTS.md"
-        fi
+        set +e
+        rollback
     fi
     if [ -n "$stage_dir" ] && [ -d "$stage_dir" ]; then
         rm -rf "$stage_dir"
@@ -251,8 +327,8 @@ printf '%s\n' "$$" > "$lock_dir/pid"
 lock_acquired=1
 
 stage_dir=$(mktemp -d "$codex_home/.install-stage.XXXXXX")
+mkdir -p "$stage_dir/state/backed-up" "$stage_dir/state/install-started"
 cp "$source_agents" "$stage_dir/AGENTS.md"
-cp "$source_config" "$stage_dir/config.toml"
 cp -R "$source_docs" "$stage_dir/docs"
 mkdir "$stage_dir/skills"
 for source_skill in "$source_skills"/*; do
@@ -260,8 +336,16 @@ for source_skill in "$source_skills"/*; do
     cp -R "$source_skill" "$stage_dir/skills/"
 done
 
-for name in AGENTS.md config.toml docs; do
-    if [ ! -e "$stage_dir/$name" ]; then
+assert_target "$codex_home/config.toml" file
+config_input=$codex_home/config.toml
+if ! path_exists "$config_input"; then
+    config_input=$stage_dir/empty-config.toml
+    : > "$config_input"
+fi
+merge_managed_config "$config_input" "$stage_dir/merged-config.toml"
+
+for name in AGENTS.md merged-config.toml docs; do
+    if ! path_exists "$stage_dir/$name"; then
         printf '%s\n' "Staging failed for: $name" >&2
         exit 1
     fi
@@ -273,38 +357,58 @@ for staged_skill in "$stage_dir/skills"/*; do
     fi
 done
 
-mkdir -p "$codex_home/docs"
-assert_no_symlink_tree "$codex_home/docs"
-cp -R "$stage_dir/docs"/. "$codex_home/docs/"
-config_input=$codex_home/config.toml
-assert_no_symlink_tree "$config_input"
-if [ ! -f "$config_input" ]; then
-    config_input=$stage_dir/empty-config.toml
-    : > "$config_input"
-fi
-merge_managed_config "$config_input" "$stage_dir/merged-config.toml"
-cp "$stage_dir/merged-config.toml" "$codex_home/config.toml"
-mkdir -p "$codex_home/skills"
+manifest=$stage_dir/targets.tsv
+printf '%s\t%s\t%s\t%s\n' AGENTS.md "$codex_home/AGENTS.md" "$stage_dir/AGENTS.md" file > "$manifest"
+printf '%s\t%s\t%s\t%s\n' config.toml "$codex_home/config.toml" "$stage_dir/merged-config.toml" file >> "$manifest"
+printf '%s\t%s\t%s\t%s\n' docs "$codex_home/docs" "$stage_dir/docs" directory >> "$manifest"
 for staged_skill in "$stage_dir/skills"/*; do
     skill_name=$(basename "$staged_skill")
-    mkdir -p "$codex_home/skills/$skill_name"
-    assert_no_symlink_tree "$codex_home/skills/$skill_name"
-    cp -R "$staged_skill"/. "$codex_home/skills/$skill_name/"
+    printf '%s\t%s\t%s\t%s\n' "skills/$skill_name" "$codex_home/skills/$skill_name" "$staged_skill" directory >> "$manifest"
 done
 
-if [ -e "$codex_home/AGENTS.md" ] || [ -L "$codex_home/AGENTS.md" ]; then
-    mkdir -p "$codex_home/backups"
-    backup_dir=$(mktemp -d "$codex_home/backups/$(date +%Y%m%d-%H%M%S)-$$.XXXXXX")
-    mv "$codex_home/AGENTS.md" "$backup_dir/AGENTS.md"
-    agents_backed_up=1
+# All source candidates exist now. Validate every destination and backup path before replacing any target.
+assert_target "$codex_home/AGENTS.md" file
+assert_target "$codex_home/config.toml" file
+assert_target "$codex_home/docs" directory
+assert_directory_container "$codex_home/skills"
+if path_exists "$codex_home/backups"; then
+    assert_directory_container "$codex_home/backups"
 fi
-mv "$stage_dir/AGENTS.md" "$codex_home/AGENTS.md"
-agents_installed=1
+while IFS="$tab" read -r target_name target_path candidate_path target_kind; do
+    assert_target "$target_path" "$target_kind"
+done < "$manifest"
+
+has_existing_target=0
+while IFS="$tab" read -r target_name target_path candidate_path target_kind; do
+    if path_exists "$target_path"; then
+        has_existing_target=1
+        break
+    fi
+done < "$manifest"
+if [ ! -d "$codex_home/skills" ]; then
+    mkdir "$codex_home/skills"
+    skills_parent_created=1
+fi
+if [ "$has_existing_target" -eq 1 ]; then
+    mkdir -p "$codex_home/backups"
+    backup_dir=$(mktemp -d "$codex_home/backups/backup-$(date +%Y%m%d-%H%M%S)-$$.XXXXXX")
+fi
+
+while IFS="$tab" read -r target_name target_path candidate_path target_kind; do
+    if path_exists "$target_path"; then
+        backup_path=$backup_dir/$target_name
+        mkdir -p "$(dirname "$backup_path")"
+        mv "$target_path" "$backup_path"
+        mark_state backed-up "$target_name"
+    fi
+    mark_state install-started "$target_name"
+    mv "$candidate_path" "$target_path"
+done < "$manifest"
 
 completed=1
 printf '%s\n' "Codex configuration installed in: $codex_home"
 if [ -n "$backup_dir" ]; then
     printf '%s\n' "Backup directory: $backup_dir"
 else
-    printf '%s\n' 'Backup directory: none (AGENTS.md did not exist)'
+    printf '%s\n' 'Backup directory: none (no managed targets existed)'
 fi
