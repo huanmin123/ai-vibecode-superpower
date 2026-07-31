@@ -644,7 +644,7 @@ function Invoke-Doctor {
   $failed = $false
   if ($script:Quick) {
     foreach ($tool in @('codegraph', 'rtk')) {
-      if (Test-QuickReady $tool) { Note "$tool: ready ($(Get-Binary $tool (Get-VersionDirectory $tool (Get-ToolValue $tool 'version'))))" } else { Note "$tool: missing"; $failed = $true }
+      if (Test-QuickReady $tool) { Note "$($tool): ready ($(Get-Binary $tool (Get-VersionDirectory $tool (Get-ToolValue $tool 'version'))))" } else { Note "$($tool): missing"; $failed = $true }
     }
     Note 'codegraph-index: skipped (--quick)'
     if ($failed) { Fail '健康检查未通过' }
@@ -652,7 +652,7 @@ function Invoke-Doctor {
   }
   Assert-CodeGraphIndexSafe
   foreach ($tool in @('codegraph', 'rtk')) {
-    if (Test-Ready $tool) { Note "$tool: ready ($(Get-Binary $tool (Get-VersionDirectory $tool (Get-ToolValue $tool 'version'))))" } else { Note "$tool: missing"; $failed = $true }
+    if (Test-Ready $tool) { Note "$($tool): ready ($(Get-Binary $tool (Get-VersionDirectory $tool (Get-ToolValue $tool 'version'))))" } else { Note "$($tool): missing"; $failed = $true }
   }
   $indexDirectory = Join-Path $script:Project '.codegraph'
   if ((Test-Ready 'codegraph') -and (Test-Path -LiteralPath $indexDirectory -PathType Container) -and (Get-ChildItem -LiteralPath $indexDirectory -Force | Where-Object { $_.Name -ne '.gitignore' } | Select-Object -First 1)) {

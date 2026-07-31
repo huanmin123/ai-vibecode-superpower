@@ -66,6 +66,51 @@ function Assert-NoReparsePointsInTree {
     }
 }
 
+function Get-NormalizedLfSha256 {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $sourceBytes = [System.IO.File]::ReadAllBytes($Path)
+    $normalizedBytes = [System.Collections.Generic.List[byte]]::new()
+    for ($index = 0; $index -lt $sourceBytes.Length; $index++) {
+        if ($sourceBytes[$index] -eq 0x0D -and $index + 1 -lt $sourceBytes.Length -and $sourceBytes[$index + 1] -eq 0x0A) {
+            $normalizedBytes.Add(0x0A)
+            $index++
+            continue
+        }
+        $normalizedBytes.Add($sourceBytes[$index])
+    }
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return (($sha256.ComputeHash($normalizedBytes.ToArray()) | ForEach-Object { $_.ToString('x2') }) -join '')
+    } finally {
+        $sha256.Dispose()
+    }
+}
+
+function Copy-ManagedSkill {
+    param(
+        [Parameter(Mandatory)][string]$SourceDirectory,
+        [Parameter(Mandatory)][string]$DestinationDirectory
+    )
+
+    Assert-NoReparsePointsInTree -Path $SourceDirectory
+    New-Item -ItemType Directory -Path $DestinationDirectory -Force | Out-Null
+    foreach ($sourceItem in Get-ChildItem -LiteralPath $SourceDirectory -Recurse -Force) {
+        $relativePath = [System.IO.Path]::GetRelativePath($SourceDirectory, $sourceItem.FullName)
+        $pathSegments = $relativePath -split '[\\/]'
+        if ($pathSegments -contains '__pycache__') { continue }
+        if (-not $sourceItem.PSIsContainer -and $sourceItem.Extension -ieq '.pyc') { continue }
+
+        $destinationPath = Join-Path $DestinationDirectory $relativePath
+        if ($sourceItem.PSIsContainer) {
+            New-Item -ItemType Directory -Path $destinationPath -Force | Out-Null
+        } else {
+            New-Item -ItemType Directory -Path (Split-Path -Parent $destinationPath) -Force | Out-Null
+            Copy-Item -LiteralPath $sourceItem.FullName -Destination $destinationPath -Force
+        }
+    }
+}
+
 function Assert-ManagedAgentRoleProfiles {
     param(
         [Parameter(Mandatory)][string]$RoleDirectory,
@@ -109,7 +154,7 @@ function Assert-ManagedAgentRoleProfiles {
         if (-not (Test-Path -LiteralPath $rolePath -PathType Leaf)) {
             throw "Missing managed agent role: $rolePath"
         }
-        $actualHash = (Get-FileHash -LiteralPath $rolePath -Algorithm SHA256).Hash.ToLowerInvariant()
+        $actualHash = Get-NormalizedLfSha256 -Path $rolePath
         if ($actualHash -ne $expectedHashes[$contract.FileName]) {
             throw "Managed agent role content does not match its contract: $rolePath"
         }
@@ -590,7 +635,7 @@ try {
     $stagedSkills = Join-Path $stageRoot 'skills'
     New-Item -ItemType Directory -Path $stagedSkills | Out-Null
     foreach ($skillName in $managedSkillNames) {
-        Copy-Item -LiteralPath (Join-Path $sourceSkills $skillName) -Destination (Join-Path $stagedSkills $skillName) -Recurse -Force
+        Copy-ManagedSkill -SourceDirectory (Join-Path $sourceSkills $skillName) -DestinationDirectory (Join-Path $stagedSkills $skillName)
     }
 
     foreach ($name in @('AGENTS.md', 'template-config.toml', 'docs', (Join-Path 'agents' $managedAgentRoleDirectoryName))) {
