@@ -141,6 +141,8 @@ rg -F '唯一运行时规范' "$success_home/skills/orchestrate-model-workflow/S
 rg -F '前者只负责意图' "$success_home/skills/orchestrate-model-workflow/SKILL.md" >/dev/null || fail 'installed workflow does not keep the coordinator read-only by contract'
 rg -F '唯一一级 writer' "$success_home/skills/orchestrate-model-workflow/SKILL.md" >/dev/null || fail 'installed workflow does not assign write ownership to Terra/high'
 rg -F 'HandoffPacket' "$success_home/skills/orchestrate-model-workflow/SKILL.md" >/dev/null || fail 'installed workflow does not require explicit handoffs'
+rg -F '`result_state` 使用 `evidence_needed`、`decision_needed`、`executable`、`verified_complete` 或 `blocked`' "$success_home/skills/orchestrate-model-workflow/SKILL.md" >/dev/null || fail 'installed workflow does not classify result availability'
+rg -F '交接中的主张都是待核验输入，不是结论' "$success_home/skills/orchestrate-model-workflow/SKILL.md" >/dev/null || fail 'installed workflow does not require independent verification of handoffs'
 rg -F '0..N' "$success_home/skills/orchestrate-model-workflow/SKILL.md" >/dev/null || fail 'installed workflow lost dynamic WorkUnit scaling'
 rg -F '语义改动或中高影响路径的最终验收必须使用新的' "$success_home/skills/orchestrate-model-workflow/SKILL.md" >/dev/null || fail 'installed workflow lost independent final acceptance'
 for routing_rule in '纯只读任务' '不得无故插入 Terra 或 Sol' '默认每个任务最多调用一次 Sol' '高影响本身不是 Sol 触发条件' '不再追加“Terra/xhigh 复审 + 新 Terra/xhigh 验收”的重复调用' 'ImplementationContract' '不存在按文件类型或业务对象划定的写入禁止清单' '领域边界/精度/失败语义' 'WorkUnit 受阻时向直接父角色交付' '恢复子任务' '历史 `pending` 或等待中状态不是存活证据' '只创建一个替代执行实例' '进度未知时' '结构化失败' '收敛子任务结果' '幂等消费并移出等待集合' 'result_missing' '所有子任务终态后立即离开等待' '未覆盖行为' '升级原因'; do
@@ -156,10 +158,10 @@ if rg -F '返回其固定 role、模型/推理强度和“未写入”确认' "$
 fi
 rg -F '不是运行时规范' "$success_home/skills/orchestrate-model-workflow/references/workflow-design.md" >/dev/null || fail 'installed workflow design does not defer runtime rules to the skill'
 rg -F 'HandoffPacket' "$success_home/skills/orchestrate-model-workflow/references/workflow-design.md" >/dev/null || fail 'installed workflow design lost the handoff schema'
-for design_guard in 'guard 或验证失败时交由父 `Terra/high` 按当前状态处理' '无法补证或缺少必要输入' '实施前未调用 Sol，或敏感域双阶段 / 根因仍未证实' 'work_id`、目标、范围与非目标' '受阻与继续' 'WorkUnit 受阻时向直接父角色交付' '不能把历史 `pending` 或等待中状态当作存活证据' '替换一次失联实例' '结果收敛' '终态实例的 `HandoffPacket` 只消费一次' 'result_missing'; do
+for design_guard in 'guard 或验证失败时交由父 `Terra/high` 按当前状态处理' '无法补证或缺少必要输入' '实施前未调用 Sol，或敏感域双阶段 / 根因仍未证实' 'work_id`、目标、范围与非目标' '结果可用性' '上游内容视为待核验输入' '受阻与继续' 'WorkUnit 受阻时向直接父角色交付' '不能把历史 `pending` 或等待中状态当作存活证据' '替换一次失联实例' '结果收敛' '终态实例的 `HandoffPacket` 只消费一次' 'result_missing'; do
     rg -F "$design_guard" "$success_home/skills/orchestrate-model-workflow/references/workflow-design.md" >/dev/null || fail "installed workflow design is missing: $design_guard"
 done
-for plan_field in 'work_id' 'dependencies' 'ownership' 'acceptance_and_stop' 'integration_owner' 'guard_results' 'uncovered_behaviors' 'escalation_reason' 'implementation_contract' 'resume_state' 'continuation_context' 'settlement_state' 'terminal_child_evidence'; do
+for plan_field in 'work_id' 'execution_state' 'result_state' 'assessment_basis' 'dependencies' 'ownership' 'acceptance_and_stop' 'integration_owner' 'guard_results' 'uncovered_behaviors' 'escalation_reason' 'implementation_contract' 'resume_state' 'continuation_context' 'settlement_state' 'terminal_child_evidence'; do
     rg -F "$plan_field" "$success_home/skills/orchestrate-model-workflow/references/execution-plan.md" >/dev/null || fail "installed execution plan is missing: $plan_field"
 done
 expect_line "$success_home/skills/orchestrate-model-workflow/references/execution-plan.md" '每个一级 workspace 写入、修复和集成'

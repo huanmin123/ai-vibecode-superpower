@@ -31,9 +31,11 @@
 ```markdown
 work_id: <稳定标识>
 objective_and_scope: <目标、范围与非目标>
-status: <完成 / 失败 / 需要决策 / 需要升级>
+execution_state: <active / completed / failed / cancelled / lost>
+result_state: <evidence_needed / decision_needed / executable / verified_complete / blocked>
 inputs_and_artifacts: <输入状态、文件或产物引用>
 results_and_evidence: <可验证结果、命令与证据位置>
+assessment_basis: <实际核验的原始材料、约束、反证与可观察结果；不适用则明确写不适用>
 guard_results: <ImplementationContract 与实际 diff/目标范围、唯一所有权、不变量、确定性检查、可重建生成物与 Luna 一致性>
 uncovered_behaviors: <尚未被测试或 guard 覆盖的行为；无则明确写无>
 escalation_reason: <升级、未升级或不适用的原因>
@@ -62,6 +64,8 @@ WorkUnit 受阻时向直接父角色交付已完成结果与具体阻塞。恢�
 
 - [ ] 实际路由只使用已安装 profile 的 `agent_type`；没有覆盖模型或 reasoning effort。
 - [ ] 下游收到最小充分任务包与必要产物；没有默认传递完整历史。
+- [ ] WorkUnit 的执行状态与结果状态分别记录；子任务终态只触发结果收敛，不直接表示父任务完成。
+- [ ] 影响判断、行动或关闭的上游主张已独立核验；不成立或证据不足时已明确回到补证，而非形成契约或关闭任务。
 - [ ] 每个一级 workspace 写入、修复和集成由 `avsp_terra_high` 负责；它优先把已完成设计、所有权明确且可验证的 `ImplementationContract` 直接委派给二级 Luna writer，代码类型不是限制，父 Terra 已审核实际 diff 与验证结果。
 - [ ] 独立复审与最终验收按风险完成；仅当纯机械、低风险且所有 guards 通过时，使用新的 Luna 加机器证据闭环，其他语义或中高影响路径使用新的 `avsp_terra_xhigh` work unit。
 - [ ] 记录实际验证、guards 结果、未覆盖行为、待决事项、升级原因与残余风险。

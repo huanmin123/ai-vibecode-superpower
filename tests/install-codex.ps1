@@ -4,6 +4,7 @@ Set-StrictMode -Version Latest
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $installer = Join-Path $repoRoot 'install-codex.ps1'
 $workflowSettlementTest = Join-Path $PSScriptRoot 'workflow-result-settlement.ps1'
+$workflowClosureTest = Join-Path $PSScriptRoot 'workflow-result-closure.ps1'
 $testRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('codex-install-test-' + [System.Guid]::NewGuid().ToString('N'))
 $originalCodexHome = $env:CODEX_HOME
 
@@ -94,6 +95,8 @@ try {
     Assert-True -Condition ($workflowContents.Contains('前者只负责意图')) -Message 'installed workflow does not keep the coordinator read-only by contract'
     Assert-True -Condition ($workflowContents.Contains('唯一一级 writer')) -Message 'installed workflow does not assign write ownership to Terra/high'
     Assert-True -Condition ($workflowContents.Contains('HandoffPacket')) -Message 'installed workflow does not require explicit handoffs'
+    Assert-True -Condition ($workflowContents.Contains('`result_state` 使用 `evidence_needed`、`decision_needed`、`executable`、`verified_complete` 或 `blocked`')) -Message 'installed workflow does not classify result availability'
+    Assert-True -Condition ($workflowContents.Contains('交接中的主张都是待核验输入，不是结论')) -Message 'installed workflow does not require independent verification of handoffs'
     Assert-True -Condition ($workflowContents.Contains('0..N')) -Message 'installed workflow lost dynamic WorkUnit scaling'
     Assert-True -Condition ($workflowContents.Contains('语义改动或中高影响路径的最终验收必须使用新的')) -Message 'installed workflow lost independent final acceptance'
     foreach ($routingRule in @('纯只读任务', '不得无故插入 Terra 或 Sol', '默认每个任务最多调用一次 Sol', '高影响本身不是 Sol 触发条件', '不再追加“Terra/xhigh 复审 + 新 Terra/xhigh 验收”的重复调用', 'ImplementationContract', '不存在按文件类型或业务对象划定的写入禁止清单', '领域边界/精度/失败语义', 'WorkUnit 受阻时向直接父角色交付', '恢复子任务', '历史 `pending` 或等待中状态不是存活证据', '只创建一个替代执行实例', '进度未知时', '结构化失败', '收敛子任务结果', '幂等消费并移出等待集合', 'result_missing', '所有子任务终态后立即离开等待', '未覆盖行为', '升级原因')) {
@@ -108,16 +111,17 @@ try {
     Assert-True -Condition (-not $workflowContents.Contains('返回其固定 role、模型/推理强度和“未写入”确认')) -Message 'installed workflow restored worker runtime metadata self-reporting'
     $installedWorkflowRoot = Join-Path $successHome 'skills\orchestrate-model-workflow'
     & $workflowSettlementTest -SkillRoot $installedWorkflowRoot
+    & $workflowClosureTest -SkillRoot $installedWorkflowRoot
     $installedWorkflowDesign = Join-Path $installedWorkflowRoot 'references\workflow-design.md'
     $workflowDesignContents = Get-Content -LiteralPath $installedWorkflowDesign -Raw
     Assert-True -Condition ($workflowDesignContents.Contains('不是运行时规范')) -Message 'installed workflow design does not defer runtime rules to the skill'
     Assert-True -Condition ($workflowDesignContents.Contains('HandoffPacket')) -Message 'installed workflow design lost the handoff schema'
-    foreach ($designGuard in @('guard 或验证失败时交由父 `Terra/high` 按当前状态处理', '无法补证或缺少必要输入', '实施前未调用 Sol，或敏感域双阶段 / 根因仍未证实', 'work_id`、目标、范围与非目标', '受阻与继续', 'WorkUnit 受阻时向直接父角色交付', '不能把历史 `pending` 或等待中状态当作存活证据', '替换一次失联实例', '结果收敛', '终态实例的 `HandoffPacket` 只消费一次', 'result_missing')) {
+    foreach ($designGuard in @('guard 或验证失败时交由父 `Terra/high` 按当前状态处理', '无法补证或缺少必要输入', '实施前未调用 Sol，或敏感域双阶段 / 根因仍未证实', 'work_id`、目标、范围与非目标', '结果可用性', '上游内容视为待核验输入', '受阻与继续', 'WorkUnit 受阻时向直接父角色交付', '不能把历史 `pending` 或等待中状态当作存活证据', '替换一次失联实例', '结果收敛', '终态实例的 `HandoffPacket` 只消费一次', 'result_missing')) {
         Assert-True -Condition ($workflowDesignContents.Contains($designGuard)) -Message "installed workflow design is missing: $designGuard"
     }
     $installedExecutionPlan = Join-Path $installedWorkflowRoot 'references\execution-plan.md'
     $executionPlanContents = Get-Content -LiteralPath $installedExecutionPlan -Raw
-    foreach ($planField in @('work_id', 'dependencies', 'ownership', 'acceptance_and_stop', 'integration_owner', 'guard_results', 'uncovered_behaviors', 'escalation_reason', 'implementation_contract', 'resume_state', 'continuation_context', 'settlement_state', 'terminal_child_evidence')) {
+    foreach ($planField in @('work_id', 'execution_state', 'result_state', 'assessment_basis', 'dependencies', 'ownership', 'acceptance_and_stop', 'integration_owner', 'guard_results', 'uncovered_behaviors', 'escalation_reason', 'implementation_contract', 'resume_state', 'continuation_context', 'settlement_state', 'terminal_child_evidence')) {
         Assert-True -Condition ($executionPlanContents.Contains($planField)) -Message "installed execution plan is missing: $planField"
     }
     Assert-True -Condition ($executionPlanContents.Contains('每个一级 workspace 写入、修复和集成')) -Message 'installed execution plan does not preserve Terra/high first-level ownership'
