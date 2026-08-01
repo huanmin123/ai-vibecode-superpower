@@ -103,7 +103,7 @@ try {
     }
     $installedAgents = Join-Path $successHome 'AGENTS.md'
     Assert-True -Condition ((Get-Content -LiteralPath $installedAgents -Raw).Contains('## 开发规范')) -Message 'installed AGENTS.md is missing development standards'
-    Assert-True -Condition ((Get-Content -LiteralPath $installedAgents -Raw).Contains('应使用 `$orchestrate-model-workflow`')) -Message 'installed AGENTS.md does not route development work through the skill'
+    Assert-True -Condition ((Get-Content -LiteralPath $installedAgents -Raw).Contains('复杂开发使用 `$orchestrate-model-workflow`')) -Message 'installed AGENTS.md does not route development work through the skill'
     Assert-True -Condition (-not $workflowContents.Contains('返回其固定 role、模型/推理强度和“未写入”确认')) -Message 'installed workflow restored worker runtime metadata self-reporting'
     $installedWorkflowRoot = Join-Path $successHome 'skills\orchestrate-model-workflow'
     $installedWorkflowDesign = Join-Path $installedWorkflowRoot 'references\workflow-design.md'
@@ -155,7 +155,7 @@ try {
     Assert-True -Condition ($successConfig -notmatch '(?m)^js_repl\s*=') -Message 'default js_repl was injected into a new target'
     $installedAgentsContents = Get-Content -LiteralPath $installedAgents -Raw
     Assert-True -Condition ($installedAgentsContents.Contains('## 开发规范')) -Message 'installed AGENTS.md is missing development standards'
-    Assert-True -Condition ($installedAgentsContents.Contains('应使用 `$orchestrate-model-workflow`')) -Message 'installed AGENTS.md does not route development work through the skill'
+    Assert-True -Condition ($installedAgentsContents.Contains('复杂开发使用 `$orchestrate-model-workflow`')) -Message 'installed AGENTS.md does not route development work through the skill'
     $sourceReadmeContents = Get-Content -LiteralPath (Join-Path $repoRoot 'README.md') -Raw
     foreach ($readmeGuard in @('guard 或验证失败由 `Terra/high` 按当前状态处理', '无法补证或缺少必要输入', '实施前未调用 Sol，或敏感域双阶段 / 根因仍未证实', '范围与非目标', '领域边界/精度/失败语义', 'WorkUnit 受阻时向直接父角色交付', 'Luna 是否可以写不是由“是不是生产代码”决定')) {
         Assert-True -Condition ($sourceReadmeContents.Contains($readmeGuard)) -Message "source README is missing workflow guard: $readmeGuard"

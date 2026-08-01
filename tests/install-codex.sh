@@ -150,7 +150,7 @@ for handoff_field in 'work_id' '目标与范围/非目标' '状态' '输入或�
     rg -F "$handoff_field" "$success_home/skills/orchestrate-model-workflow/SKILL.md" >/dev/null || fail "installed workflow handoff is missing: $handoff_field"
 done
 rg -F '## 开发规范' "$success_home/AGENTS.md" >/dev/null || fail 'installed AGENTS.md is missing development standards'
-rg -F '应使用 `$orchestrate-model-workflow`' "$success_home/AGENTS.md" >/dev/null || fail 'installed AGENTS.md does not route development work through the skill'
+rg -F '复杂开发使用 `$orchestrate-model-workflow`' "$success_home/AGENTS.md" >/dev/null || fail 'installed AGENTS.md does not route development work through the skill'
 if rg -F '返回其固定 role、模型/推理强度和“未写入”确认' "$success_home/skills/orchestrate-model-workflow/SKILL.md" >/dev/null; then
     fail 'installed workflow restored worker runtime metadata self-reporting'
 fi
@@ -190,7 +190,7 @@ rg -F '最终验收' "$success_home/agents/ai-vibecode-superpower/ai-vibecode-su
 expect_line "$success_home/agents/ai-vibecode-superpower/ai-vibecode-superpower-avsp_terra_xhigh.toml" '先回到 Luna 取证'
 expect_line "$success_home/agents/ai-vibecode-superpower/ai-vibecode-superpower-avsp_terra_high.toml" 'WorkUnit 受阻时向直接父角色交付'
 expect_line "$success_home/AGENTS.md" '## 开发规范'
-expect_line "$success_home/AGENTS.md" '应使用 `$orchestrate-model-workflow`'
+expect_line "$success_home/AGENTS.md" '复杂开发使用 `$orchestrate-model-workflow`'
 for readme_guard in 'guard 或验证失败由 `Terra/high` 按当前状态处理' '无法补证或缺少必要输入' '实施前未调用 Sol，或敏感域双阶段 / 根因仍未证实' '范围与非目标' '领域边界/精度/失败语义' 'WorkUnit 受阻时向直接父角色交付' 'Luna 是否可以写不是由“是不是生产代码”决定'; do
     expect_line "$repo_root/README.md" "$readme_guard"
 done
