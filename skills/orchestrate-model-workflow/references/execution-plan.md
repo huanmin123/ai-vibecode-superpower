@@ -8,10 +8,10 @@
 # <任务名称> 计划
 
 - 目标：<可观察结果>
-- 授权：仅诊断 | 实施 | 已取得破坏性操作授权
+- 授权：仅诊断 | 范围内实施
 - 范围 / 非目标：<包含与明确排除项>
 - 已知事实与产物：<证据、路径、当前状态>
-- 约束与风险：<安全、兼容、权限、性能、外部影响、回滚>
+- 约束与风险：<兼容、性能、外部影响与任务特有约束>
 - 验收与验证：<完成条件、命令、人工路径>
 - 停止条件：<何时升级、阻塞或要求补充信息>
 ```
@@ -31,17 +31,16 @@
 ```markdown
 work_id: <稳定标识>
 objective_and_scope: <目标、范围与非目标>
-status: <完成 / 阻塞 / 需要升级>
+status: <完成 / 需要决策 / 需要升级>
 inputs_and_artifacts: <输入状态、文件或产物引用>
 results_and_evidence: <可验证结果、命令与证据位置>
-guard_results: <ImplementationContract 与实际 diff/输入状态哈希、唯一所有权、不变量、确定性检查、可重建生成物与 Luna 一致性>
+guard_results: <ImplementationContract 与实际 diff/目标范围、唯一所有权、不变量、确定性检查、可重建生成物与 Luna 一致性>
 uncovered_behaviors: <尚未被测试或 guard 覆盖的行为；无则明确写无>
 escalation_reason: <升级、未升级或不适用的原因>
 risks_and_unknowns: <剩余风险、假设与未知项>
 next_request: <下游应执行的具体动作>
 
 # 仅写入或并发时添加
-input_state_hash: <固定输入与基线状态哈希>
 implementation_contract: <已定行为、允许目标与唯一所有权、不变量/顺序约束、适用的领域边界/精度/失败语义、示例、验证与停止条件>
 dependencies: <依赖 work_id>
 ownership: <允许目标或写入所有权>
@@ -49,10 +48,12 @@ acceptance_and_stop: <验收与停止条件>
 integration_owner: <负责汇总实际结果的 Terra>
 ```
 
+WorkUnit 受阻时向直接父角色交付已完成结果与具体阻塞，父角色按当前状态继续，只有确实缺少需求决策才上行；普通暂态问题不转成用户确认。
+
 ## 关闭检查
 
 - [ ] 实际路由只使用已安装 profile 的 `agent_type`；没有覆盖模型或 reasoning effort。
 - [ ] 下游收到最小充分任务包与必要产物；没有默认传递完整历史。
 - [ ] 每个一级 workspace 写入、修复和集成由 `avsp_terra_high` 负责；它优先把已完成设计、所有权明确且可验证的 `ImplementationContract` 直接委派给二级 Luna writer，代码类型不是限制，父 Terra 已审核实际 diff 与验证结果。
 - [ ] 独立复审与最终验收按风险完成；仅当纯机械、低风险且所有 guards 通过时，使用新的 Luna 加机器证据闭环，其他语义或中高影响路径使用新的 `avsp_terra_xhigh` work unit。
-- [ ] 记录实际验证、guards 结果、未覆盖行为、确认问题、升级原因、修复轮次、fallback（如有）与残余风险。
+- [ ] 记录实际验证、guards 结果、未覆盖行为、待决事项、升级原因与残余风险。
