@@ -283,13 +283,13 @@ function Get-ManagedTomlSettings {
         '' = [ordered]@{
             'model' = $null
             'model_reasoning_effort' = $null
+            'sandbox_mode' = $null
         }
         'agents' = [ordered]@{
             'max_threads' = $null
             'max_depth' = $null
         }
         'features' = [ordered]@{
-            'js_repl' = $null
             'goals' = $null
         }
     }
@@ -400,7 +400,7 @@ function Assert-SafeTomlMergeInput {
             if ($arrayTable -and $section -in @('agents', 'features')) {
                 throw "Unsupported TOML syntax for safe merge at $Path`:$lineNumber (managed table cannot be an array table)"
             }
-            if ($section -match '^("agents"|agents|"features"|features|"model"|model|"model_reasoning_effort"|model_reasoning_effort)(\.|$)' -and $section -notin @('agents', 'features')) {
+            if ($section -match '^("agents"|agents|"features"|features|"model"|model|"model_reasoning_effort"|model_reasoning_effort|"sandbox_mode"|sandbox_mode)(\.|$)' -and $section -notin @('agents', 'features')) {
                 throw "Unsupported TOML syntax for safe merge at $Path`:$lineNumber (managed namespace table)"
             }
             if (-not $arrayTable -and $section -in @('agents', 'features')) {
@@ -440,8 +440,8 @@ function Assert-SafeTomlMergeInput {
             throw "Unsupported TOML syntax for safe merge at $Path`:$lineNumber (cross-line or unclosed value)"
         }
         if ($key -notmatch '^[A-Za-z][A-Za-z0-9_-]*$') {
-            if (($section -eq '' -and $key -match '^("|\x27)?(model|model_reasoning_effort|agents|features)') -or
-                ($section -in @('agents', 'features') -and $key -match '^("|\x27)?(max_threads|max_depth|js_repl|goals)')) {
+            if (($section -eq '' -and $key -match '^("|\x27)?(model|model_reasoning_effort|sandbox_mode|agents|features)') -or
+                ($section -in @('agents', 'features') -and $key -match '^("|\x27)?(max_threads|max_depth|goals)')) {
                 throw "Unsupported TOML syntax for safe merge at $Path`:$lineNumber (quoted or dotted managed key)"
             }
             continue
@@ -449,9 +449,9 @@ function Assert-SafeTomlMergeInput {
         if ($section -eq '' -and $key -in @('agents', 'features')) {
             throw "Unsupported TOML syntax for safe merge at $Path`:$lineNumber (managed table cannot be a root key)"
         }
-        $managed = ($section -eq '' -and $key -in @('model', 'model_reasoning_effort')) -or
+        $managed = ($section -eq '' -and $key -in @('model', 'model_reasoning_effort', 'sandbox_mode')) -or
                    ($section -eq 'agents' -and $key -in @('max_threads', 'max_depth')) -or
-                   ($section -eq 'features' -and $key -in @('js_repl', 'goals'))
+                   ($section -eq 'features' -and $key -eq 'goals')
         if ($managed) {
             $managedKey = "$section/$key"
             $managedSeen[$managedKey] = 1 + ($managedSeen[$managedKey] ?? 0)
@@ -557,10 +557,12 @@ $sourceAgentRoleManifest = Join-Path $scriptRoot 'codex-global-config\agents\ai-
 $managedAgentRoleContracts = @(
     [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_luna_high.toml'; RoleName = 'avsp_luna_high'; Model = 'gpt-5.6-luna'; ReasoningEffort = 'high'; SandboxMode = 'read-only' }
     [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_luna_xhigh.toml'; RoleName = 'avsp_luna_xhigh'; Model = 'gpt-5.6-luna'; ReasoningEffort = 'xhigh'; SandboxMode = 'read-only' }
+    [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_luna_high_writer.toml'; RoleName = 'avsp_luna_high_writer'; Model = 'gpt-5.6-luna'; ReasoningEffort = 'high'; SandboxMode = 'danger-full-access' }
+    [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_luna_xhigh_writer.toml'; RoleName = 'avsp_luna_xhigh_writer'; Model = 'gpt-5.6-luna'; ReasoningEffort = 'xhigh'; SandboxMode = 'danger-full-access' }
     [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_sol_high.toml'; RoleName = 'avsp_sol_high'; Model = 'gpt-5.6-sol'; ReasoningEffort = 'high'; SandboxMode = 'read-only' }
     [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_sol_xhigh.toml'; RoleName = 'avsp_sol_xhigh'; Model = 'gpt-5.6-sol'; ReasoningEffort = 'xhigh'; SandboxMode = 'read-only' }
-    [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_terra_high.toml'; RoleName = 'avsp_terra_high'; Model = 'gpt-5.6-terra'; ReasoningEffort = 'high'; SandboxMode = 'workspace-write' }
-    [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_terra_xhigh.toml'; RoleName = 'avsp_terra_xhigh'; Model = 'gpt-5.6-terra'; ReasoningEffort = 'xhigh'; SandboxMode = 'workspace-write' }
+    [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_terra_high.toml'; RoleName = 'avsp_terra_high'; Model = 'gpt-5.6-terra'; ReasoningEffort = 'high'; SandboxMode = 'danger-full-access' }
+    [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_terra_xhigh.toml'; RoleName = 'avsp_terra_xhigh'; Model = 'gpt-5.6-terra'; ReasoningEffort = 'xhigh'; SandboxMode = 'read-only' }
     [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_terra_xhigh_readonly.toml'; RoleName = 'avsp_terra_xhigh_readonly'; Model = 'gpt-5.6-terra'; ReasoningEffort = 'xhigh'; SandboxMode = 'read-only' }
     [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_terra_low_readonly.toml'; RoleName = 'avsp_terra_low_readonly'; Model = 'gpt-5.6-terra'; ReasoningEffort = 'low'; SandboxMode = 'read-only' }
     [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_terra_medium_readonly.toml'; RoleName = 'avsp_terra_medium_readonly'; Model = 'gpt-5.6-terra'; ReasoningEffort = 'medium'; SandboxMode = 'read-only' }

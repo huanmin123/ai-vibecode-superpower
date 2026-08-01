@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Snake</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #10151b; color: #eef4f1; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 24px; background: radial-gradient(circle at 20% 10%, #20312b, #10151b 55%); }
+    main { width: min(92vw, 520px); }
+    header { display: flex; align-items: end; justify-content: space-between; gap: 16px; margin-bottom: 14px; }
+    h1 { margin: 0; font-size: clamp(2rem, 7vw, 3rem); letter-spacing: .04em; }
+    .score { color: #9be7b2; font-size: 1.1rem; font-weight: 700; }
+    .board-wrap { position: relative; aspect-ratio: 1; border: 2px solid #3e6554; border-radius: 14px; padding: 10px; background: #18231f; box-shadow: 0 18px 50px #0007; }
+    canvas { display: block; width: 100%; height: 100%; border-radius: 8px; background: #0c1210; image-rendering: pixelated; }
+    .status { min-height: 1.5em; margin: 14px 0 4px; color: #d8e8df; text-align: center; font-weight: 600; }
+    .hint { margin: 0; color: #94a69d; text-align: center; font-size: .9rem; }
+    button { display: block; margin: 16px auto 0; border: 0; border-radius: 8px; padding: 10px 18px; background: #9be7b2; color: #112019; font: inherit; font-weight: 800; cursor: pointer; }
+    button:hover { background: #b8f2c7; }
+    button:focus-visible { outline: 3px solid #fff; outline-offset: 3px; }
+  </style>
+</head>
+<body>
+  <main>
+    <header><h1>Snake</h1><div class="score">Score: <span id="score">0</span></div></header>
+    <div class="board-wrap"><canvas id="board" width="400" height="400" aria-label="Snake game board"></canvas></div>
+    <p class="status" id="status" role="status">Playing</p>
+    <p class="hint">Arrow keys or WASD to move. Press R to restart.</p>
+    <button id="restart" type="button">Restart</button>
+  </main>
+  <script>
+    (() => {
+      const canvas = document.getElementById('board');
+      const context = canvas.getContext('2d');
+      const scoreLabel = document.getElementById('score');
+      const statusLabel = document.getElementById('status');
+      const restartButton = document.getElementById('restart');
+      const gridSize = 20;
+      const cellSize = canvas.width / gridSize;
+      const directions = { ArrowUp: { x: 0, y: -1 }, w: { x: 0, y: -1 }, ArrowDown: { x: 0, y: 1 }, s: { x: 0, y: 1 }, ArrowLeft: { x: -1, y: 0 }, a: { x: -1, y: 0 }, ArrowRight: { x: 1, y: 0 }, d: { x: 1, y: 0 } };
+      let snake;
+      let direction;
+      let nextDirection;
+      let food;
+      let score;
+      let gameOver;
+      let timer;
+
+      function randomFood() {
+        const openCells = [];
+        for (let y = 0; y < gridSize; y += 1) for (let x = 0; x < gridSize; x += 1) {
+          if (!snake.some((part) => part.x === x && part.y === y)) openCells.push({ x, y });
+        }
+        return openCells[Math.floor(Math.random() * openCells.length)];
+      }
+
+      function reset() {
+        snake = [{ x: 10, y: 10 }, { x: 9, y: 10 }, { x: 8, y: 10 }];
+        direction = { x: 1, y: 0 };
+        nextDirection = { x: 1, y: 0 };
+        score = 0;
+        gameOver = false;
+        food = randomFood();
+        scoreLabel.textContent = score;
+        statusLabel.textContent = 'Playing';
+        clearInterval(timer);
+        timer = setInterval(tick, 125);
+        draw();
+      }
+
+      function tick() {
+        if (gameOver) return;
+        direction = nextDirection;
+        const head = { x: snake[0].x + direction.x, y: snake[0].y + direction.y };
+        const hitWall = head.x < 0 || head.x >= gridSize || head.y < 0 || head.y >= gridSize;
+        const hitSelf = snake.some((part) => part.x === head.x && part.y === head.y);
+        if (hitWall || hitSelf) {
+          gameOver = true;
+          clearInterval(timer);
+          statusLabel.textContent = 'Game over - press R or Restart';
+          draw();
+          return;
+        }
+        snake.unshift(head);
+        if (head.x === food.x && head.y === food.y) {
+          score += 1;
+          scoreLabel.textContent = score;
+          food = randomFood();
+        } else {
+          snake.pop();
+        }
+        draw();
+      }
+
+      function draw() {
+        context.fillStyle = '#0c1210';
+        context.fillRect(0, 0, canvas.width, canvas.height);
+        context.strokeStyle = '#15231d';
+        context.lineWidth = 1;
+        for (let i = 1; i < gridSize; i += 1) {
+          context.beginPath(); context.moveTo(i * cellSize, 0); context.lineTo(i * cellSize, canvas.height); context.stroke();
+          context.beginPath(); context.moveTo(0, i * cellSize); context.lineTo(canvas.width, i * cellSize); context.stroke();
+        }
+        context.fillStyle = '#f7c95f';
+        context.beginPath();
+        context.arc(food.x * cellSize + cellSize / 2, food.y * cellSize + cellSize / 2, cellSize * .3, 0, Math.PI * 2);
+        context.fill();
+        snake.forEach((part, index) => {
+          context.fillStyle = index === 0 ? '#b8f2c7' : '#63c886';
+          context.fillRect(part.x * cellSize + 2, part.y * cellSize + 2, cellSize - 4, cellSize - 4);
+        });
+        if (gameOver) {
+          context.fillStyle = '#10151bcc';
+          context.fillRect(0, 0, canvas.width, canvas.height);
+          context.fillStyle = '#eef4f1';
+          context.font = '700 26px system-ui, sans-serif';
+          context.textAlign = 'center';
+          context.fillText('GAME OVER', canvas.width / 2, canvas.height / 2);
+        }
+      }
+
+      document.addEventListener('keydown', (event) => {
+        const key = event.key.length === 1 ? event.key.toLowerCase() : event.key;
+        if (key === 'r') { event.preventDefault(); reset(); return; }
+        const candidate = directions[key];
+        if (!candidate) return;
+        event.preventDefault();
+        if (candidate.x !== -direction.x || candidate.y !== -direction.y) nextDirection = candidate;
+      });
+      restartButton.addEventListener('click', reset);
+      reset();
+    })();
+  </script>
+</body>
+</html>

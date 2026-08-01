@@ -81,20 +81,81 @@ try {
     $env:CODEX_HOME = $successHome
     & $successInstaller
     $roles = @(Get-ChildItem -LiteralPath (Join-Path $successHome 'agents\ai-vibecode-superpower') -File -Filter '*.toml')
-    Assert-True -Condition ($roles.Count -eq 9) -Message 'expected nine managed role profiles'
+    Assert-True -Condition ($roles.Count -eq 11) -Message 'expected eleven managed role profiles'
     $fallback = Join-Path $successHome 'agents\ai-vibecode-superpower\ai-vibecode-superpower-avsp_terra_xhigh_readonly.toml'
     Assert-True -Condition (Test-Path -LiteralPath $fallback -PathType Leaf) -Message 'missing readonly Terra/xhigh Sol fallback'
     Assert-True -Condition ((Get-Content -LiteralPath $fallback -Raw) -match 'sandbox_mode = "read-only"') -Message 'Sol fallback is not read-only'
     Assert-True -Condition (Test-Path -LiteralPath (Join-Path $successHome 'agents\user-role.toml') -PathType Leaf) -Message 'unmanaged user role was not preserved'
     $installedWorkflow = Join-Path $successHome 'skills\orchestrate-model-workflow\SKILL.md'
     Assert-True -Condition (Test-Path -LiteralPath $installedWorkflow -PathType Leaf) -Message 'installed orchestration workflow is missing'
-    Assert-True -Condition ((Get-Content -LiteralPath $installedWorkflow -Raw).Contains('不要求 worker 自报不可见的运行时模型、推理强度或 sandbox')) -Message 'installed workflow still requires worker runtime metadata self-reporting'
+    $workflowContents = Get-Content -LiteralPath $installedWorkflow -Raw
+    Assert-True -Condition ($workflowContents.Contains('唯一运行时规范')) -Message 'installed workflow does not declare a single runtime authority'
+    Assert-True -Condition ($workflowContents.Contains('前者只负责意图')) -Message 'installed workflow does not keep the coordinator read-only by contract'
+    Assert-True -Condition ($workflowContents.Contains('唯一一级 writer')) -Message 'installed workflow does not assign write ownership to Terra/high'
+    Assert-True -Condition ($workflowContents.Contains('HandoffPacket')) -Message 'installed workflow does not require explicit handoffs'
+    Assert-True -Condition ($workflowContents.Contains('0..N')) -Message 'installed workflow lost dynamic WorkUnit scaling'
+    Assert-True -Condition ($workflowContents.Contains('语义改动或中高影响路径的最终验收必须使用新的')) -Message 'installed workflow lost independent final acceptance'
+    foreach ($routingRule in @('纯只读任务', '不得无故插入 Terra 或 Sol', '默认每个任务最多调用一次 Sol', '高影响本身不是 Sol 触发条件', '不再追加“Terra/xhigh 复审 + 新 Terra/xhigh 验收”的重复调用', 'ImplementationContract', '不存在按文件类型或业务对象划定的写入禁止清单', '领域边界/精度/失败语义', '输入状态哈希', '未覆盖行为', '升级原因')) {
+        Assert-True -Condition ($workflowContents.Contains($routingRule)) -Message "installed workflow is missing routing guard: $routingRule"
+    }
+    foreach ($handoffField in @('work_id', '目标与范围/非目标', '状态', '输入或产物引用', '可验证结果与证据', '风险/未知项', '下一阶段请求')) {
+        Assert-True -Condition ($workflowContents.Contains($handoffField)) -Message "installed workflow handoff is missing: $handoffField"
+    }
+    $installedAgents = Join-Path $successHome 'AGENTS.md'
+    Assert-True -Condition ((Get-Content -LiteralPath $installedAgents -Raw).Contains('必须调用 `$orchestrate-model-workflow`')) -Message 'installed AGENTS.md does not route complex work through the skill'
+    Assert-True -Condition (-not $workflowContents.Contains('返回其固定 role、模型/推理强度和“未写入”确认')) -Message 'installed workflow restored worker runtime metadata self-reporting'
     $installedWorkflowRoot = Join-Path $successHome 'skills\orchestrate-model-workflow'
-    $legacyRuntimeGate = @(Get-ChildItem -LiteralPath $installedWorkflowRoot -Recurse -File |
-        Select-String -SimpleMatch -Pattern '返回其固定 role、模型/推理强度和“未写入”确认')
-    Assert-True -Condition ($legacyRuntimeGate.Count -eq 0) -Message 'installed workflow restored the worker runtime metadata self-reporting gate'
+    $installedWorkflowDesign = Join-Path $installedWorkflowRoot 'references\workflow-design.md'
+    $workflowDesignContents = Get-Content -LiteralPath $installedWorkflowDesign -Raw
+    Assert-True -Condition ($workflowDesignContents.Contains('不是运行时规范')) -Message 'installed workflow design does not defer runtime rules to the skill'
+    Assert-True -Condition ($workflowDesignContents.Contains('HandoffPacket')) -Message 'installed workflow design lost the handoff schema'
+    foreach ($designGuard in @('guard 失败或范围漂移，且根因已证实', '无法补证或缺少必要输入', '实施前未调用 Sol，或敏感域双阶段 / 根因仍未证实', 'work_id`、目标、范围与非目标')) {
+        Assert-True -Condition ($workflowDesignContents.Contains($designGuard)) -Message "installed workflow design is missing: $designGuard"
+    }
+    $installedExecutionPlan = Join-Path $installedWorkflowRoot 'references\execution-plan.md'
+    $executionPlanContents = Get-Content -LiteralPath $installedExecutionPlan -Raw
+    foreach ($planField in @('work_id', 'dependencies', 'ownership', 'acceptance_and_stop', 'integration_owner', 'guard_results', 'uncovered_behaviors', 'escalation_reason', 'input_state_hash', 'implementation_contract')) {
+        Assert-True -Condition ($executionPlanContents.Contains($planField)) -Message "installed execution plan is missing: $planField"
+    }
+    Assert-True -Condition ($executionPlanContents.Contains('每个一级 workspace 写入、修复和集成')) -Message 'installed execution plan does not preserve Terra/high first-level ownership'
+    Assert-True -Condition ($executionPlanContents.Contains('代码类型不是限制')) -Message 'installed execution plan still restricts Luna by code category'
+    Assert-True -Condition ($executionPlanContents.Contains('领域边界/精度/失败语义')) -Message 'installed execution plan omits implementation-contract boundary semantics'
+    Assert-True -Condition ($executionPlanContents.Contains('仅当纯机械、低风险且所有 guards 通过时')) -Message 'installed execution plan lost the mechanical acceptance exception'
+    $installedSkillMetadata = Join-Path $installedWorkflowRoot 'agents\openai.yaml'
+    Assert-True -Condition ((Get-Content -LiteralPath $installedSkillMetadata -Raw).Contains('不要假定设计、复审、修复或最终验收均必经')) -Message 'installed workflow metadata restores mandatory stages'
+    $installedWriter = Join-Path $successHome 'agents\ai-vibecode-superpower\ai-vibecode-superpower-avsp_terra_high.toml'
+    Assert-True -Condition ((Get-Content -LiteralPath $installedWriter -Raw).Contains('唯一一级 Terra/high')) -Message 'installed Terra/high role does not own implementation leadership'
+    $installedLunaHighWriter = Join-Path $successHome 'agents\ai-vibecode-superpower\ai-vibecode-superpower-avsp_luna_high_writer.toml'
+    $installedLunaXhighWriter = Join-Path $successHome 'agents\ai-vibecode-superpower\ai-vibecode-superpower-avsp_luna_xhigh_writer.toml'
+    foreach ($installedLunaWriter in @($installedLunaHighWriter, $installedLunaXhighWriter)) {
+        $writerContents = Get-Content -LiteralPath $installedLunaWriter -Raw
+        Assert-True -Condition ($writerContents.Contains('只接受 `avsp_terra_high` 的直接委派')) -Message "installed Luna writer is not limited to a Terra/high parent: $installedLunaWriter"
+        Assert-True -Condition ($writerContents.Contains('不得继续派生')) -Message "installed Luna writer permits child delegation: $installedLunaWriter"
+        Assert-True -Condition ($writerContents.Contains('可修改任何指定的代码或产物')) -Message "installed Luna writer cannot implement contract code: $installedLunaWriter"
+        Assert-True -Condition ($writerContents.Contains('ImplementationContract')) -Message "installed Luna writer is missing an implementation contract: $installedLunaWriter"
+        Assert-True -Condition ($writerContents.Contains('领域边界/精度/失败语义')) -Message "installed Luna writer contract omits boundary semantics: $installedLunaWriter"
+        Assert-True -Condition (-not $writerContents.Contains('不得修改生产逻辑')) -Message "installed Luna writer still has a production-code ban: $installedLunaWriter"
+        Assert-True -Condition (-not $writerContents.Contains('HandoffPacket')) -Message "installed Luna writer duplicated central handoff policy: $installedLunaWriter"
+        Assert-True -Condition ($writerContents -match 'sandbox_mode = "danger-full-access"') -Message "installed Luna writer does not have the configured full-access sandbox: $installedLunaWriter"
+    }
+    $installedTerraXhigh = Join-Path $successHome 'agents\ai-vibecode-superpower\ai-vibecode-superpower-avsp_terra_xhigh.toml'
+    $terraXhighContents = Get-Content -LiteralPath $installedTerraXhigh -Raw
+    Assert-True -Condition ($terraXhighContents.Contains('始终只读')) -Message 'installed Terra/xhigh is not declared readonly'
+    Assert-True -Condition ($terraXhighContents.Contains('最终验收')) -Message 'installed Terra/xhigh is missing its final acceptance responsibility'
+    Assert-True -Condition ($terraXhighContents.Contains('先回到 Luna 取证')) -Message 'installed Terra/xhigh skips the required Luna re-evidence step'
     Assert-True -Condition ((Get-Content -LiteralPath (Join-Path $successHome 'config.toml') -Raw) -match 'unmanaged_list = \["one", "two"\]') -Message 'unmanaged array was not preserved'
     Assert-True -Condition ((Get-Content -LiteralPath (Join-Path $successHome 'config.toml') -Raw) -match 'unmanaged_inline = \{ enabled = true \}') -Message 'unmanaged inline table was not preserved'
+    $successConfig = Get-Content -LiteralPath (Join-Path $successHome 'config.toml') -Raw
+    Assert-True -Condition ($successConfig -match '(?m)^model_reasoning_effort = "high"\r?$') -Message 'managed controller reasoning effort was not installed'
+    Assert-True -Condition ($successConfig -match '(?m)^sandbox_mode = "danger-full-access"\r?$') -Message 'managed sandbox mode was not installed'
+    Assert-True -Condition ($successConfig -notmatch '(?m)^js_repl\s*=') -Message 'default js_repl was injected into a new target'
+    $installedAgentsContents = Get-Content -LiteralPath $installedAgents -Raw
+    Assert-True -Condition ($installedAgentsContents.Contains('所有一级工作区写入、修复与集成')) -Message 'installed AGENTS.md does not preserve first-level write ownership'
+    Assert-True -Condition ($installedAgentsContents.Contains('ImplementationContract')) -Message 'installed AGENTS.md does not permit contract-based Luna implementation'
+    $sourceReadmeContents = Get-Content -LiteralPath (Join-Path $repoRoot 'README.md') -Raw
+    foreach ($readmeGuard in @('guard 失败或范围漂移，且根因已证实', '无法补证或缺少必要输入', '实施前未调用 Sol，或敏感域双阶段 / 根因仍未证实', '范围与非目标', '可验证的 fallback', '领域边界/精度/失败语义', 'Luna 是否可以写不是由“是不是生产代码”决定')) {
+        Assert-True -Condition ($sourceReadmeContents.Contains($readmeGuard)) -Message "source README is missing workflow guard: $readmeGuard"
+    }
     $installedImageSkill = Join-Path $successHome 'skills\gpt-image-2-cli'
     Assert-True -Condition (-not (Test-Path -LiteralPath (Join-Path $installedImageSkill 'scripts\__pycache__'))) -Message 'managed skill copied __pycache__ into the destination'
     Assert-True -Condition (@(Get-ChildItem -LiteralPath $installedImageSkill -Recurse -File -Filter '*.pyc' -Force).Count -eq 0) -Message 'managed skill copied a .pyc file into the destination'
@@ -127,6 +188,10 @@ try {
 
     $complexExistingHome = Join-Path $testRoot 'complex-existing-home'
     New-TestHome -Path $complexExistingHome
+    $complexConfigPath = Join-Path $complexExistingHome 'config.toml'
+    $complexConfigBefore = Get-Content -LiteralPath $complexConfigPath -Raw
+    [System.IO.File]::WriteAllText($complexConfigPath, "sandbox_mode = `"read-only`"`n$complexConfigBefore", [System.Text.UTF8Encoding]::new($false))
+    Add-Content -LiteralPath $complexConfigPath -Value 'js_repl = false'
     Add-Content -LiteralPath (Join-Path $complexExistingHome 'config.toml') -Value '[projects."/tmp/example"]'
     Add-Content -LiteralPath (Join-Path $complexExistingHome 'config.toml') -Value 'name = "kept"'
     Add-Content -LiteralPath (Join-Path $complexExistingHome 'config.toml') -Value '[[skills.config]]'
@@ -137,6 +202,8 @@ try {
     Assert-True -Condition ($complexConfig -match '\[projects\."/tmp/example"\]') -Message 'quoted project table was not preserved'
     Assert-True -Condition ($complexConfig -match '\[\[skills\.config\]\]') -Message 'array table was not preserved'
     Assert-True -Condition ($complexConfig -match 'path = "kept"') -Message 'array table value was not preserved'
+    Assert-True -Condition ($complexConfig -match '(?m)^sandbox_mode = "danger-full-access"\r?$') -Message 'managed sandbox mode was not updated'
+    Assert-True -Condition ($complexConfig -match '(?m)^js_repl = false\r?$') -Message 'existing unmanaged js_repl was not preserved'
 
     $unsafeHome = Join-Path $testRoot 'unsafe-toml-home'
     New-TestHome -Path $unsafeHome

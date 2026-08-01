@@ -55,6 +55,8 @@ expect_exact_managed_role_files() {
         case $(basename "$role_path") in
             ai-vibecode-superpower-avsp_luna_high.toml|\
             ai-vibecode-superpower-avsp_luna_xhigh.toml|\
+            ai-vibecode-superpower-avsp_luna_high_writer.toml|\
+            ai-vibecode-superpower-avsp_luna_xhigh_writer.toml|\
             ai-vibecode-superpower-avsp_sol_high.toml|\
             ai-vibecode-superpower-avsp_sol_xhigh.toml|\
             ai-vibecode-superpower-avsp_terra_high.toml|\
@@ -69,7 +71,7 @@ expect_exact_managed_role_files() {
         esac
         role_count=$((role_count + 1))
     done
-    [ "$role_count" -eq 9 ] || fail "expected 9 managed role files, found: $role_count"
+    [ "$role_count" -eq 11 ] || fail "expected 11 managed role files, found: $role_count"
 }
 
 copy_installer_fixture() {
@@ -131,27 +133,86 @@ expect_line "$success_home/config.toml" 'unmanaged_root_setting = true'
 expect_line "$success_home/config.toml" 'unmanaged_list = ["one", "two"]'
 expect_line "$success_home/config.toml" 'unmanaged_inline = { enabled = true }'
 expect_line "$success_home/config.toml" 'model = "gpt-5.6-terra"'
-expect_line "$success_home/config.toml" 'model_reasoning_effort = "xhigh"'
+expect_line "$success_home/config.toml" 'model_reasoning_effort = "high"'
 expect_file "$success_home/AGENTS.md"
 expect_directory "$success_home/docs"
 expect_file "$success_home/skills/orchestrate-model-workflow/SKILL.md"
-rg -F '不要求 worker 自报不可见的运行时模型、推理强度或 sandbox' "$success_home/skills/orchestrate-model-workflow/SKILL.md" >/dev/null || fail 'installed workflow still requires worker runtime metadata self-reporting'
+rg -F '唯一运行时规范' "$success_home/skills/orchestrate-model-workflow/SKILL.md" >/dev/null || fail 'installed workflow does not declare a single runtime authority'
+rg -F '前者只负责意图' "$success_home/skills/orchestrate-model-workflow/SKILL.md" >/dev/null || fail 'installed workflow does not keep the coordinator read-only by contract'
+rg -F '唯一一级 writer' "$success_home/skills/orchestrate-model-workflow/SKILL.md" >/dev/null || fail 'installed workflow does not assign write ownership to Terra/high'
+rg -F 'HandoffPacket' "$success_home/skills/orchestrate-model-workflow/SKILL.md" >/dev/null || fail 'installed workflow does not require explicit handoffs'
+rg -F '0..N' "$success_home/skills/orchestrate-model-workflow/SKILL.md" >/dev/null || fail 'installed workflow lost dynamic WorkUnit scaling'
+rg -F '语义改动或中高影响路径的最终验收必须使用新的' "$success_home/skills/orchestrate-model-workflow/SKILL.md" >/dev/null || fail 'installed workflow lost independent final acceptance'
+for routing_rule in '纯只读任务' '不得无故插入 Terra 或 Sol' '默认每个任务最多调用一次 Sol' '高影响本身不是 Sol 触发条件' '不再追加“Terra/xhigh 复审 + 新 Terra/xhigh 验收”的重复调用' 'ImplementationContract' '不存在按文件类型或业务对象划定的写入禁止清单' '领域边界/精度/失败语义' '输入状态哈希' '未覆盖行为' '升级原因'; do
+    rg -F "$routing_rule" "$success_home/skills/orchestrate-model-workflow/SKILL.md" >/dev/null || fail "installed workflow is missing routing guard: $routing_rule"
+done
+for handoff_field in 'work_id' '目标与范围/非目标' '状态' '输入或产物引用' '可验证结果与证据' '风险/未知项' '下一阶段请求'; do
+    rg -F "$handoff_field" "$success_home/skills/orchestrate-model-workflow/SKILL.md" >/dev/null || fail "installed workflow handoff is missing: $handoff_field"
+done
+rg -F '必须调用 `$orchestrate-model-workflow`' "$success_home/AGENTS.md" >/dev/null || fail 'installed AGENTS.md does not route complex work through the skill'
+if rg -F '返回其固定 role、模型/推理强度和“未写入”确认' "$success_home/skills/orchestrate-model-workflow/SKILL.md" >/dev/null; then
+    fail 'installed workflow restored worker runtime metadata self-reporting'
+fi
+rg -F '不是运行时规范' "$success_home/skills/orchestrate-model-workflow/references/workflow-design.md" >/dev/null || fail 'installed workflow design does not defer runtime rules to the skill'
+rg -F 'HandoffPacket' "$success_home/skills/orchestrate-model-workflow/references/workflow-design.md" >/dev/null || fail 'installed workflow design lost the handoff schema'
+for design_guard in 'guard 失败或范围漂移，且根因已证实' '无法补证或缺少必要输入' '实施前未调用 Sol，或敏感域双阶段 / 根因仍未证实' 'work_id`、目标、范围与非目标'; do
+    rg -F "$design_guard" "$success_home/skills/orchestrate-model-workflow/references/workflow-design.md" >/dev/null || fail "installed workflow design is missing: $design_guard"
+done
+for plan_field in 'work_id' 'dependencies' 'ownership' 'acceptance_and_stop' 'integration_owner' 'guard_results' 'uncovered_behaviors' 'escalation_reason' 'input_state_hash' 'implementation_contract'; do
+    rg -F "$plan_field" "$success_home/skills/orchestrate-model-workflow/references/execution-plan.md" >/dev/null || fail "installed execution plan is missing: $plan_field"
+done
+expect_line "$success_home/skills/orchestrate-model-workflow/references/execution-plan.md" '每个一级 workspace 写入、修复和集成'
+expect_line "$success_home/skills/orchestrate-model-workflow/references/execution-plan.md" '代码类型不是限制'
+expect_line "$success_home/skills/orchestrate-model-workflow/references/execution-plan.md" '领域边界/精度/失败语义'
+expect_line "$success_home/skills/orchestrate-model-workflow/references/execution-plan.md" '仅当纯机械、低风险且所有 guards 通过时'
+expect_line "$success_home/skills/orchestrate-model-workflow/agents/openai.yaml" '不要假定设计、复审、修复或最终验收均必经'
+rg -F '唯一一级 Terra/high' "$success_home/agents/ai-vibecode-superpower/ai-vibecode-superpower-avsp_terra_high.toml" >/dev/null || fail 'installed Terra/high role does not own implementation leadership'
+for luna_writer in \
+    "$success_home/agents/ai-vibecode-superpower/ai-vibecode-superpower-avsp_luna_high_writer.toml" \
+    "$success_home/agents/ai-vibecode-superpower/ai-vibecode-superpower-avsp_luna_xhigh_writer.toml"; do
+    expect_line "$luna_writer" '只接受 `avsp_terra_high` 的直接委派'
+    expect_line "$luna_writer" '不得继续派生'
+    expect_line "$luna_writer" '可修改任何指定的代码或产物'
+    expect_line "$luna_writer" 'ImplementationContract'
+    expect_line "$luna_writer" '领域边界/精度/失败语义'
+    if rg -F '不得修改生产逻辑' "$luna_writer" >/dev/null; then
+        fail "installed Luna writer still has a production-code ban: $luna_writer"
+    fi
+    expect_line "$luna_writer" 'sandbox_mode = "danger-full-access"'
+    if rg -F 'HandoffPacket' "$luna_writer" >/dev/null; then
+        fail "installed Luna writer duplicated central handoff policy: $luna_writer"
+    fi
+done
+rg -F '始终只读' "$success_home/agents/ai-vibecode-superpower/ai-vibecode-superpower-avsp_terra_xhigh.toml" >/dev/null || fail 'installed Terra/xhigh is not declared readonly'
+rg -F '最终验收' "$success_home/agents/ai-vibecode-superpower/ai-vibecode-superpower-avsp_terra_xhigh.toml" >/dev/null || fail 'installed Terra/xhigh is missing its final acceptance responsibility'
+expect_line "$success_home/agents/ai-vibecode-superpower/ai-vibecode-superpower-avsp_terra_xhigh.toml" '先回到 Luna 取证'
+expect_line "$success_home/AGENTS.md" '所有一级工作区写入、修复与集成'
+expect_line "$success_home/AGENTS.md" 'ImplementationContract'
+for readme_guard in 'guard 失败或范围漂移，且根因已证实' '无法补证或缺少必要输入' '实施前未调用 Sol，或敏感域双阶段 / 根因仍未证实' '范围与非目标' '可验证的 fallback' '领域边界/精度/失败语义' 'Luna 是否可以写不是由“是不是生产代码”决定'; do
+    expect_line "$repo_root/README.md" "$readme_guard"
+done
 if rg -F '返回其固定 role、模型/推理强度和“未写入”确认' "$success_home/skills/orchestrate-model-workflow" >/dev/null; then
     fail 'installed workflow restored the worker runtime metadata self-reporting gate'
 fi
 expect_exact_managed_role_files "$success_home/agents/ai-vibecode-superpower"
 expect_role_contract "$success_home/agents/ai-vibecode-superpower/ai-vibecode-superpower-avsp_luna_high.toml" avsp_luna_high gpt-5.6-luna high read-only
 expect_role_contract "$success_home/agents/ai-vibecode-superpower/ai-vibecode-superpower-avsp_luna_xhigh.toml" avsp_luna_xhigh gpt-5.6-luna xhigh read-only
+expect_role_contract "$success_home/agents/ai-vibecode-superpower/ai-vibecode-superpower-avsp_luna_high_writer.toml" avsp_luna_high_writer gpt-5.6-luna high danger-full-access
+expect_role_contract "$success_home/agents/ai-vibecode-superpower/ai-vibecode-superpower-avsp_luna_xhigh_writer.toml" avsp_luna_xhigh_writer gpt-5.6-luna xhigh danger-full-access
 expect_role_contract "$success_home/agents/ai-vibecode-superpower/ai-vibecode-superpower-avsp_sol_high.toml" avsp_sol_high gpt-5.6-sol high read-only
 expect_role_contract "$success_home/agents/ai-vibecode-superpower/ai-vibecode-superpower-avsp_sol_xhigh.toml" avsp_sol_xhigh gpt-5.6-sol xhigh read-only
-expect_role_contract "$success_home/agents/ai-vibecode-superpower/ai-vibecode-superpower-avsp_terra_high.toml" avsp_terra_high gpt-5.6-terra high workspace-write
-expect_role_contract "$success_home/agents/ai-vibecode-superpower/ai-vibecode-superpower-avsp_terra_xhigh.toml" avsp_terra_xhigh gpt-5.6-terra xhigh workspace-write
+expect_role_contract "$success_home/agents/ai-vibecode-superpower/ai-vibecode-superpower-avsp_terra_high.toml" avsp_terra_high gpt-5.6-terra high danger-full-access
+expect_role_contract "$success_home/agents/ai-vibecode-superpower/ai-vibecode-superpower-avsp_terra_xhigh.toml" avsp_terra_xhigh gpt-5.6-terra xhigh read-only
 expect_role_contract "$success_home/agents/ai-vibecode-superpower/ai-vibecode-superpower-avsp_terra_xhigh_readonly.toml" avsp_terra_xhigh_readonly gpt-5.6-terra xhigh read-only
 expect_role_contract "$success_home/agents/ai-vibecode-superpower/ai-vibecode-superpower-avsp_terra_low_readonly.toml" avsp_terra_low_readonly gpt-5.6-terra low read-only
 expect_role_contract "$success_home/agents/ai-vibecode-superpower/ai-vibecode-superpower-avsp_terra_medium_readonly.toml" avsp_terra_medium_readonly gpt-5.6-terra medium read-only
 expect_file "$success_home/agents/user-role.toml"
 expect_directory "$success_home/skills/gpt-image-2-cli"
 expect_file "$success_home/skills/unmanaged-skill/keep.txt"
+expect_line "$success_home/config.toml" 'sandbox_mode = "danger-full-access"'
+if rg -q '^js_repl[[:space:]]*=' "$success_home/config.toml"; then
+    fail 'default js_repl was injected into a new target'
+fi
 [ ! -e "$success_home/docs/legacy.txt" ] || fail 'old docs were merged instead of replaced'
 [ ! -e "$success_home/skills/gpt-image-2-cli/legacy.txt" ] || fail 'old managed skill was merged instead of replaced'
 
@@ -371,6 +432,10 @@ cmp -s "$managed_array_table_home/config.toml" "$managed_array_table_home/config
 
 complex_existing_home=$test_root/complex-existing-home
 make_existing_install "$complex_existing_home"
+config_path=$complex_existing_home/config.toml
+{ printf '%s\n' 'sandbox_mode = "read-only"'; cat "$config_path"; } > "$config_path.tmp"
+mv "$config_path.tmp" "$config_path"
+printf '%s\n' 'js_repl = false' >> "$config_path"
 printf '%s\n' '[projects."/tmp/example"]' >> "$complex_existing_home/config.toml"
 printf '%s\n' 'name = "kept"' >> "$complex_existing_home/config.toml"
 printf '%s\n' '[[skills.config]]' >> "$complex_existing_home/config.toml"
@@ -379,6 +444,8 @@ CODEX_HOME=$complex_existing_home sh "$installer" >/dev/null
 expect_line "$complex_existing_home/config.toml" '[projects."/tmp/example"]'
 expect_line "$complex_existing_home/config.toml" '[[skills.config]]'
 expect_line "$complex_existing_home/config.toml" 'path = "kept"'
+expect_line "$complex_existing_home/config.toml" 'sandbox_mode = "danger-full-access"'
+expect_line "$complex_existing_home/config.toml" 'js_repl = false'
 
 existing_lock_home=$test_root/existing-lock-home
 make_existing_install "$existing_lock_home"

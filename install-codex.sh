@@ -9,7 +9,7 @@ source_docs=$script_dir/codex-global-config/docs
 source_agent_roles=$script_dir/codex-global-config/agents/ai-vibecode-superpower
 source_agent_role_manifest=$script_dir/codex-global-config/agents/ai-vibecode-superpower.sha256
 source_skills=$script_dir/skills
-managed_agent_role_files='ai-vibecode-superpower-avsp_luna_high.toml ai-vibecode-superpower-avsp_luna_xhigh.toml ai-vibecode-superpower-avsp_sol_high.toml ai-vibecode-superpower-avsp_sol_xhigh.toml ai-vibecode-superpower-avsp_terra_high.toml ai-vibecode-superpower-avsp_terra_xhigh.toml ai-vibecode-superpower-avsp_terra_xhigh_readonly.toml ai-vibecode-superpower-avsp_terra_low_readonly.toml ai-vibecode-superpower-avsp_terra_medium_readonly.toml'
+managed_agent_role_files='ai-vibecode-superpower-avsp_luna_high.toml ai-vibecode-superpower-avsp_luna_xhigh.toml ai-vibecode-superpower-avsp_luna_high_writer.toml ai-vibecode-superpower-avsp_luna_xhigh_writer.toml ai-vibecode-superpower-avsp_sol_high.toml ai-vibecode-superpower-avsp_sol_xhigh.toml ai-vibecode-superpower-avsp_terra_high.toml ai-vibecode-superpower-avsp_terra_xhigh.toml ai-vibecode-superpower-avsp_terra_xhigh_readonly.toml ai-vibecode-superpower-avsp_terra_low_readonly.toml ai-vibecode-superpower-avsp_terra_medium_readonly.toml'
 
 for source_path in "$source_agents" "$source_config" "$source_agent_role_manifest"; do
     if [ ! -f "$source_path" ]; then
@@ -117,6 +117,8 @@ is_managed_agent_role_file() {
     case $1 in
         ai-vibecode-superpower-avsp_luna_high.toml|\
         ai-vibecode-superpower-avsp_luna_xhigh.toml|\
+        ai-vibecode-superpower-avsp_luna_high_writer.toml|\
+        ai-vibecode-superpower-avsp_luna_xhigh_writer.toml|\
         ai-vibecode-superpower-avsp_sol_high.toml|\
         ai-vibecode-superpower-avsp_sol_xhigh.toml|\
         ai-vibecode-superpower-avsp_terra_high.toml|\
@@ -197,6 +199,18 @@ assert_managed_agent_role_contract() {
             expected_effort=xhigh
             expected_sandbox=read-only
             ;;
+        ai-vibecode-superpower-avsp_luna_high_writer.toml)
+            expected_name=avsp_luna_high_writer
+            expected_model=gpt-5.6-luna
+            expected_effort=high
+            expected_sandbox=danger-full-access
+            ;;
+        ai-vibecode-superpower-avsp_luna_xhigh_writer.toml)
+            expected_name=avsp_luna_xhigh_writer
+            expected_model=gpt-5.6-luna
+            expected_effort=xhigh
+            expected_sandbox=danger-full-access
+            ;;
         ai-vibecode-superpower-avsp_sol_high.toml)
             expected_name=avsp_sol_high
             expected_model=gpt-5.6-sol
@@ -213,13 +227,13 @@ assert_managed_agent_role_contract() {
             expected_name=avsp_terra_high
             expected_model=gpt-5.6-terra
             expected_effort=high
-            expected_sandbox=workspace-write
+            expected_sandbox=danger-full-access
             ;;
         ai-vibecode-superpower-avsp_terra_xhigh.toml)
             expected_name=avsp_terra_xhigh
             expected_model=gpt-5.6-terra
             expected_effort=xhigh
-            expected_sandbox=workspace-write
+            expected_sandbox=read-only
             ;;
         ai-vibecode-superpower-avsp_terra_xhigh_readonly.toml)
             expected_name=avsp_terra_xhigh_readonly
@@ -541,7 +555,7 @@ assert_safe_toml_merge_input() {
                     fail("managed table cannot be an array table")
                     next
                 }
-                if (header ~ /^("agents"|agents|"features"|features|"model"|model|"model_reasoning_effort"|model_reasoning_effort)(\.|$)/ && header != "agents" && header != "features") {
+                if (header ~ /^("agents"|agents|"features"|features|"model"|model|"model_reasoning_effort"|model_reasoning_effort|"sandbox_mode"|sandbox_mode)(\.|$)/ && header != "agents" && header != "features") {
                     fail("managed namespace table is ambiguous")
                     next
                 }
@@ -566,9 +580,9 @@ assert_safe_toml_merge_input() {
                 next
             }
             if (key !~ /^[A-Za-z][A-Za-z0-9_-]*$/) {
-                if (section == "root" && key ~ /^("|\047)?(model|model_reasoning_effort|agents|features)/) {
+                if (section == "root" && key ~ /^("|\047)?(model|model_reasoning_effort|sandbox_mode|agents|features)/) {
                     fail("quoted or dotted managed key")
-                } else if ((section == "agents" || section == "features") && key ~ /^("|\047)?(max_threads|max_depth|js_repl|goals)/) {
+                } else if ((section == "agents" || section == "features") && key ~ /^("|\047)?(max_threads|max_depth|goals)/) {
                     fail("quoted or dotted managed key")
                 }
                 next
@@ -577,7 +591,7 @@ assert_safe_toml_merge_input() {
                 fail("managed table cannot be a root key")
                 next
             }
-            if (section == "root" && (key == "model" || key == "model_reasoning_effort")) {
+            if (section == "root" && (key == "model" || key == "model_reasoning_effort" || key == "sandbox_mode")) {
                 managed_seen[section SUBSEP key]++
                 if (managed_seen[section SUBSEP key] != 1) {
                     fail("managed key is repeated")
@@ -589,7 +603,7 @@ assert_safe_toml_merge_input() {
                     fail("managed key is repeated")
                 }
             }
-            if (section == "features" && (key == "js_repl" || key == "goals")) {
+            if (section == "features" && key == "goals") {
                 managed_seen[section SUBSEP key]++
                 if (managed_seen[section SUBSEP key] != 1) {
                     fail("managed key is repeated")
@@ -615,18 +629,18 @@ merge_managed_config() {
             current = "root"
         }
         function managed_key(section, key) {
-            return (section == "root" && (key == "model" || key == "model_reasoning_effort")) ||
+            return (section == "root" && (key == "model" || key == "model_reasoning_effort" || key == "sandbox_mode")) ||
                    (section == "agents" && (key == "max_threads" || key == "max_depth")) ||
-                   (section == "features" && (key == "js_repl" || key == "goals"))
+                   (section == "features" && key == "goals")
         }
         function flush_missing(section,    key, position, count) {
             count = 0
             if (section == "root") {
-                order[1] = "model"; order[2] = "model_reasoning_effort"; count = 2
+                order[1] = "model"; order[2] = "model_reasoning_effort"; order[3] = "sandbox_mode"; count = 3
             } else if (section == "agents") {
                 order[1] = "max_threads"; order[2] = "max_depth"; count = 2
             } else if (section == "features") {
-                order[1] = "js_repl"; order[2] = "goals"; count = 2
+                order[1] = "goals"; count = 1
             }
             for (position = 1; position <= count; position++) {
                 key = order[position]
@@ -681,9 +695,9 @@ merge_managed_config() {
         END {
             required["root" SUBSEP "model"] = 1
             required["root" SUBSEP "model_reasoning_effort"] = 1
+            required["root" SUBSEP "sandbox_mode"] = 1
             required["agents" SUBSEP "max_threads"] = 1
             required["agents" SUBSEP "max_depth"] = 1
-            required["features" SUBSEP "js_repl"] = 1
             required["features" SUBSEP "goals"] = 1
             for (setting in required) {
                 if (!(setting in value)) {

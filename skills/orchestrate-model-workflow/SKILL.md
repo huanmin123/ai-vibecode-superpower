@@ -1,79 +1,63 @@
 ---
 name: orchestrate-model-workflow
-description: "以命名 agent role 路由软件任务：只读 Luna 负责先锋探索和预审，Sol 负责汇总、独立复审与验证，Terra/high 负责常规写入，Terra/xhigh 只修复已确认问题。"
+description: "以命名 agent role 路由软件任务：纯只读直达 Luna，Terra/high 负责集成与受控写入，Sol 仅处理真正高风险或高不确定判断。"
 ---
 
 # 多模型工作流编排
 
-通过已安装的 `avsp_*` agent role 分离只读分析、实现与独立复审。协调者负责用户意图、阶段依赖、任务产物和完成判断；worker 只拥有其受限阶段的输出。协调者以自身实际的 `spawn_agent(agent_type=...)` 调用确认所创建的 role，不要求 worker 自报不可见的运行时模型、推理强度或 sandbox。
+本文件是模型路由、交接、并发、fallback 和验收的唯一运行时规范。role profile 只定义角色本地权限和输出边界；`references/` 提供设计说明与模板，README 只面向使用者介绍。规则冲突时以本文件为准。
 
-开始路由前完整阅读 [references/workflow-design.md](references/workflow-design.md)。复杂任务还要阅读 [references/execution-plan.md](references/execution-plan.md)，并使用其中的产物与阶段清单。
+主控 `Terra/high` 指默认主控模型/推理强度，不是可写 role `avsp_terra_high`。前者只负责意图、上下文选择、阶段依赖、调度、显式交接和完成判断，不得写入工作区；后者是被明确委派的一级 writer。主控以实际 `spawn_agent(agent_type=...)` 调用确认 role，不要求 worker 自报不可见的运行时模型、推理强度或 sandbox。
 
-## 固定角色路由
+开始路由前阅读 [references/workflow-design.md](references/workflow-design.md)；复杂任务使用 [references/execution-plan.md](references/execution-plan.md) 的状态与交接模板。
 
-每个阶段只能使用下表的 `agent_type`。模型与推理强度是 profile 的固定属性，不在委派调用中覆盖。
+## 角色
 
-| 阶段                           | `agent_type`                 | 固定模型 / 推理强度                | 职责                                             |
-| ---------------------------- | ---------------------------- | -------------------------- | ---------------------------------------------- |
-| 先锋探索、初版分析、快速并行探路             | `avsp_luna_high`             | `gpt-5.6-luna` / `high`    | 只读事实、证据、风险与待核实问题                               |
-| 复杂先锋探索或复杂预审                  | `avsp_luna_xhigh`            | `gpt-5.6-luna` / `xhigh`   | 只读复杂证据域分析                                      |
-| Luna/high 不可用时的唯一只读兜底        | `avsp_terra_low_readonly`    | `gpt-5.6-terra` / `low`    | 仅替代 `avsp_luna_high` 的只读先锋探索或复审预审；不得写入或替代 Sol  |
-| Luna/xhigh 不可用时的唯一只读兜底       | `avsp_terra_medium_readonly` | `gpt-5.6-terra` / `medium` | 仅替代 `avsp_luna_xhigh` 的只读先锋探索或复审预审；不得写入或替代 Sol |
-| 汇总、设计、调查、正式复审、最终验证           | `avsp_sol_high`              | `gpt-5.6-sol` / `high`     | 只读独立判断与完整复审                                    |
-| 未解决诊断或重新设计升级                 | `avsp_sol_xhigh`             | `gpt-5.6-sol` / `xhigh`    | 只读根因重查与有范围的补救设计                                |
-| Sol 上游明确不支持模型时的唯一只读 fallback | `avsp_terra_xhigh_readonly`  | `gpt-5.6-terra` / `xhigh`  | 仅替代同一 Sol 只读阶段；不得写入，必须披露独立性降级                  |
-| 实施已验收计划和必要的常规写入              | `avsp_terra_high`            | `gpt-5.6-terra` / `high`   | 在授权范围内写入                                       |
-| 修复独立复审已确认的问题                 | `avsp_terra_xhigh`           | `gpt-5.6-terra` / `xhigh`  | 只修复确认问题，不重做设计                                  |
+模型与推理强度由 profile 固定；`spawn_agent` 只传 `agent_type`，不得覆盖 `model` 或 `reasoning_effort`。
 
-Luna 以及所有只读 Terra fallback 都不得修改工作区。Luna 及其 fallback 只能报告事实、证据和待核实问题，不得把线索定性为缺陷或漏洞。Sol 独立核验所有线索，不能因 Luna 或 fallback 报告无发现而缩小复审范围。`avsp_terra_xhigh_readonly` 在 Sol fallback 时应完成同等范围的独立只读判断，但必须记录模型独立性降低。Terra/high 负责常规写入；可写 `avsp_terra_xhigh` 仅修复已确认的问题。
+| 用途 | `agent_type` | 边界 |
+| --- | --- | --- |
+| 常规取证、实施后预审 | `avsp_luna_high` | 只读事实、证据与未知项 |
+| 深入取证、复杂预审 | `avsp_luna_xhigh` | 只读复杂证据域 |
+| 二级契约实施 | `avsp_luna_high_writer` / `avsp_luna_xhigh_writer` | 仅 `avsp_terra_high` 的直接子代理；在实施契约内写入代码与产物 |
+| Luna 不可用的只读替代 | `avsp_terra_low_readonly` / `avsp_terra_medium_readonly` | 仅一对一替代对应 Luna |
+| 高不确定性定案、正式复审 | `avsp_sol_high` | 只读独立判断 |
+| 未解根因或重新设计 | `avsp_sol_xhigh` | 只读升级调查 |
+| Sol 不支持模型时的替代 | `avsp_terra_xhigh_readonly` | 仅同一 Sol 只读阶段，披露独立性降级 |
+| 实施、修复、集成 | `avsp_terra_high` | 唯一一级 writer |
+| 受控技术定案、复审、最终验收 | `avsp_terra_xhigh` | 始终只读 |
 
-## 委派能力与不可用规则
+## 不变量
 
-首次委派前检查实际 `spawn_agent` schema 是否支持 `agent_type`，并验证目标 role 可启动。协调者以成功创建的 `agent_type` 和对应已安装 profile 记录声明的模型、推理强度与读写边界；这些是配置事实，不是 worker 对运行时状态的自证。worker 无须也不应被要求返回模型、推理强度或 sandbox。运行时若提供 effective sandbox 等元数据，协调者记录它；未提供时明确标为不可观察，profile 中的 `sandbox_mode` 仍只是期望权限。调用 `spawn_agent` 时只传 `agent_type`，不得再传 `model` 或 `reasoning_effort`。必须显式传 `fork_turns="none"`，或传有限正数轮次；禁止继承完整历史。向 worker 提供自包含任务契约、任务状态和必要产物路径。高风险、不可逆、生产、权限或外部写入任务在执行前必须确认本任务后续必需的 role 可启动；本地可回滚的实现不因缺少 worker 自报元数据而停止。
+1. 所有实施、修复、测试或文档改动的一级所有权、集成和结果责任都属于 `avsp_terra_high`。主控、只读 Luna、Sol、`avsp_terra_xhigh` 与所有 fallback 均不得写入或充当 writer fallback；Luna writer 只能在其父 Terra 的直接委派下写入。
+2. 二级 Luna writer 仅能作为 `avsp_terra_high` 的直接子代理实施一个或多个互不冲突的 `ImplementationContract`，不得继续派生。不存在按文件类型或业务对象划定的写入禁止清单：只要契约明确，Luna 可以写生产逻辑、公共接口或 schema、迁移脚本、共享状态或并发相关代码。每份契约必须给出目标行为与已定设计、允许目标及唯一所有权、相关不变量或顺序约束、适用的领域边界/精度/失败语义、基线或示例、验证方式与停止条件。Luna 遇到契约缺口、所有权冲突、范围漂移、未预期验证失败或需要新的技术取舍时必须停止并交回父 Terra；父 Terra 审核实际 diff 与验证结果、解决例外并完成集成。写入代码或迁移脚本不等于执行生产、外部或不可逆操作，后者仍按风险和授权边界处理。
+3. `avsp_terra_xhigh` 只能做有界技术定案、相应复审或最终验收；它发现关键未知、范围漂移或风险升级时，必须先交回 Luna 补充证据，只有满足 Sol 升级条件时才转入 Sol。
+4. 实现与独立复审不并行。语义改动或中高影响路径的最终验收必须使用新的 `avsp_terra_xhigh` work unit，不能复用该任务的定案者或复审者实例；纯机械、低风险写入仅在全部机器 guards 通过时，才能适用第 5 条的 Luna 验收例外。
 
-仅当能力检查确认 `avsp_luna_high` profile 不可用时，才可使用 `avsp_terra_low_readonly`；仅当确认 `avsp_luna_xhigh` profile 不可用时，才可使用 `avsp_terra_medium_readonly`。只有原 Sol profile 已通过本地 schema/profile 检查、委派后上游返回对应 `gpt-5.6-sol` 的结构化 `unsupported_model` 或 `model_not_found` 时，才可使用 `avsp_terra_xhigh_readonly` 替代同一 `avsp_sol_high` 或 `avsp_sol_xhigh` 只读阶段一次。不得从错误文本猜测模型不支持；认证/权限、限流/配额、网络/DNS/TLS/超时、参数或 schema、本地 profile 缺失、取消和未知/内部错误都不得 fallback。所有 fallback 必须通过能力检查，且绝不可写入；fallback 失败立即返回 `MODEL_UNAVAILABLE`。其他任何 profile 不可用时立即返回 `MODEL_UNAVAILABLE` 并停止当前阶段和其依赖阶段。错误必须包含：阶段、原定及实际 `agent_type`、profile 声明的模型/推理强度、结构化错误与能力检查证据、是否已经写入，以及恢复所需的外部条件。worker 启动失败或未完成该阶段任务契约时，只能以同一 `agent_type` 重试一次；缺少运行时模型、推理强度或 sandbox 自报不构成失败。再次失败后停止并报告原始错误。
+## 路由与阶段
 
-## 分类与执行
+先按证据是否充分、决策是否有界、影响与耦合、风险可逆性和验收可观察性判断。任务短不等于简单，高影响本身不是 Sol 触发条件。
 
-任务短不等于简单。安全敏感、破坏性、改 schema、并发或影响生产的工作永远不是简单任务。
+1. **纯只读任务**：不需要写入、技术定案或实施计划时，主控直接委派匹配的 Luna WorkUnit，Luna 可直接交付事实、证据、推断、未知项与风险；不得无故插入 Terra 或 Sol。证据显示写入、关键未知或下列 Sol 条件时立即升级。
+2. **已设计、可验证的实施路径**：既有规格或前序定案已足以形成 `ImplementationContract` 时，主控直接委派 `avsp_terra_high`。Terra 持有一级所有权，并默认将契约中互斥的代码、测试、文档或生成物 WorkUnit 批量下放给 Luna writer；`avsp_luna_high_writer` 是默认实施者，只有契约虽完整但单元需要更深局部理解时才使用 `avsp_luna_xhigh_writer`。Terra 优先负责拆解、所有权、集成、冲突、契约缺口、验证失败和不可下放部分，而不是重复编写已经被充分设计的实现。
+3. **有界技术路径**：Luna 取证后，只有确实需要受控技术定案时才由 `avsp_terra_xhigh` 输出 `ImplementationContract`；随后 `avsp_terra_high` 负责把契约拆成 WorkUnit，并优先让 Luna writer 实施其中包括生产代码在内的已定部分。实施后执行 Luna 预审与机器 guards；通过后只使用一个新的 `avsp_terra_xhigh` 最终验收 WorkUnit，不再追加“Terra/xhigh 复审 + 新 Terra/xhigh 验收”的重复调用。
+4. **真正高风险或高不确定路径**：仅当不确定性出现在权限、安全或隐私合规、数据迁移或完整性、并发竞态、生产或不可逆外部副作用、公共契约或跨模块重设计、无可靠 oracle 的非确定性风险，或证据矛盾/修复后仍未证实根因时，Luna 取证后才允许 Sol。默认每个任务最多调用一次 Sol 独立判断：不确定性在实施前出现则用 Sol 定案；在实施后才出现则用 Sol 正式复审。Sol 或 Terra 定案后仍应尽量形成 `ImplementationContract` 并下放已定实现；Terra 直接编码仅保留无法可靠拆解、需要持续设计判断或存在共享所有权冲突的残余部分。只有上述敏感域需要前后两阶段独立判断，或证据仍矛盾、修复后根因仍未证实时，才允许 Sol 双阶段或升级 `avsp_sol_xhigh`。
+5. **验收与升级**：纯机械、低风险写入在所有 guards 通过时可由新的 Luna 加机器证据闭环验收；语义改动或中高影响路径必须由新的 `avsp_terra_xhigh` 最终验收。任一 guard、预审或验收失败，或出现范围漂移时，交 `avsp_terra_high` 在原契约内修复；若根因未证实或证据矛盾，再走 Sol 升级条件。
 
-| 类型       | 条件                        | 路由                                                                                                |
-| -------- | ------------------------- | ------------------------------------------------------------------------------------------------- |
-| 先锋探索     | 需求、架构、根因、漏洞或方案尚不确定        | Luna role 探路；仅 Luna 不可用时使用对应只读 Terra fallback；Sol/high 汇总定案，且仅结构化模型不支持时可用只读 Terra/xhigh 替代        |
-| 简单执行     | 步骤与预期完整、低风险且无实质设计选择       | Terra/high 实施，Luna 预审；仅 Luna 不可用时使用对应只读 Terra fallback；Sol/high 复审，且仅结构化模型不支持时可用只读 Terra/xhigh 替代 |
-| 按计划实施    | 有协调者验收的设计与可衡量验收           | Terra/high                                                                                        |
-| 首次代码复审预审 | 实施完成后按证据域并行报告线索           | Luna role；仅不可用时使用对应只读 Terra fallback                                                              |
-| 正式复审     | 检查完成代码的正确性、回归、证据与遗漏       | Sol/high；仅结构化模型不支持时 `avsp_terra_xhigh_readonly`                                                   |
-| 修复       | 修复已确认问题，不重新设计无关代码         | Terra/xhigh                                                                                       |
-| 最终验证     | 修复后重新评估最终 diff 和证据        | Sol/high；仅结构化模型不支持时 `avsp_terra_xhigh_readonly`                                                   |
-| 升级调查     | 两轮修复-复审失败、根因未证明，或出现具体验收缺口 | Sol/xhigh；仅结构化模型不支持时 `avsp_terra_xhigh_readonly`，然后 Terra/xhigh                                   |
+机器 guards 必须可观察并记录结果：`ImplementationContract`、实际 diff 与输入状态哈希一致，目标所有权未冲突，已声明的不变量、确定性 test/type/lint/build/contract/golden 与可重建生成物均通过，且 Luna 预审与机器证据一致。任一项失败立即升级；没有可靠的相关 guard 时不得走低风险闭环。
 
-### 1. 建立状态
+Luna 取证、预审和二级 writer 均可创建 `0..N` 个 `WorkUnit`，没有静态数量上限。每个 WorkUnit 必须覆盖互补证据域、使用固定输入并说明新增价值；验收覆盖目标完成即停止，重复、矛盾或不可解释的结果立即升级。并发 writer 不得共享文件、共享状态或其他写入目标，共享目标由单一 owner 串行处理。允许为独立反证或关键假设核验而有目的地重叠，但每个分支必须说明新增价值。
 
-复杂任务应建立可追踪状态，并在实施前记录范围、非目标、证据、风险、回滚、验收标准和必要验证。只有仓库已有允许提交的位置时，才创建持久设计、计划或复审文档；否则使用任务清单和目标状态。
+## 交接与上下文
 
-### 2. Luna 探路，Sol/high 汇总设计
+每个阶段返回 `HandoffPacket`，由协调者显式交给下游；role 间不假设隐式对话连通。核心字段是：`work_id`、目标与范围/非目标、状态、输入或产物引用、可验证结果与证据、`guard_results`、未覆盖行为、升级原因、风险/未知项、下一阶段请求。涉及写入或并发时额外提供：输入状态哈希、`ImplementationContract`、依赖、允许目标或所有权、验收、停止条件和集成负责人。
 
-将互不重叠的证据域交给多个 Luna role（无上限但需要合理）。每个 worker 返回事实、证据位置、推断、风险和未解决问题，且不修改文件或外部状态。复杂探路才使用 `avsp_luna_xhigh`。仅在对应 Luna profile 的能力检查确认不可用时，才分别用 `avsp_terra_low_readonly` 或 `avsp_terra_medium_readonly` 承担同一只读任务。等待所有依赖结果后，交给 `avsp_sol_high` 汇总、核对矛盾、反驳不可靠假设，并形成协调者可验收的实现契约；仅在该 Sol 调用收到规定的结构化模型不支持错误时，才能用 `avsp_terra_xhigh_readonly` 完成同一汇总并记录独立性降级。仅诊断任务在此交付结论并停止，除非用户要求修复。
+默认使用自包含任务包、相关产物引用与 `fork_turns="none"`。只有有限近期历史会改变语义、范围、风险或决策时，才传递有限正数轮次；不得默认继承完整历史。下游缺少会影响判断的输入时必须停止并报告，而不是猜测。
 
-### 3. Terra/high 实施
+## 委派、fallback 与关闭
 
-仅在设计契约完整后委派 `avsp_terra_high`。提示词必须包含：准确范围和非目标、任务状态或产物路径、验收标准与验证命令、允许修改的文件、相关仓库指令，以及已改文件、测试、假设和残余风险的返回要求。只有所有权区域独立且不重叠时才能并行实施 worker。
+每个委派至少说明角色、目标与授权操作、范围与非目标、必要 `HandoffPacket`、验收、验证、返回格式和停止条件；writer 额外说明允许文件或所有权。高风险、不可逆、生产、权限或外部写入前，确认后续必需 role 可启动。
 
-### 4. Luna 预审，Sol/high 正式复审
+只有已确认对应 Luna profile 不可用时，才能分别使用 `avsp_terra_low_readonly` 或 `avsp_terra_medium_readonly`。只有 Sol 请求返回对应 `gpt-5.6-sol` 的结构化 `unsupported_model` 或 `model_not_found` 时，才能以 `avsp_terra_xhigh_readonly` 替代同一 Sol 阶段；认证、配额、网络、超时、参数/schema 与未知错误均停止。二级 Luna writer 失败可按同一 `agent_type` 重试一次，仍失败由父 Terra 在原契约内完成或停止；其他必需 role 不可用则报告 `MODEL_UNAVAILABLE`，主控不得自行写入兜底。
 
-Terra 完成写入后，使用多个 Luna role（无上限但需要合理） 按互不重叠的证据域预审：代码规范、基础类型或运行时错误、实际 diff 范围与死代码、常见安全模式，以及测试遗漏与回归风险。仅在对应 Luna profile 的能力检查确认不可用时，才使用其一对一只读 Terra fallback。每个线索必须有证据位置、触发条件、潜在影响和需要 Sol 核对的原因。只有改动面大、涉及认证/权限、外部输入或依赖关系明显复杂时，才使用 `avsp_luna_xhigh`。
-
-所有预审完成后，由 `avsp_sol_high` 复审实际 diff、当前文件、测试和需求，而非实现者摘要。只有规定的结构化模型不支持错误才能改由新的 `avsp_terra_xhigh_readonly` worker 完成同一只读范围，并明确记录原 Sol role、错误和独立性降级。复审者必须逐项独立核验 Luna 线索，并完整检查需求、调用链、行为回归、边界、并发、权限、架构、性能、文档和测试。问题按严重度排序，给出精确文件/行证据；没有问题时明确说明并列出残余测试缺口。
-
-### 5. 修复、验证与升级
-
-Sol 确认可操作问题时，只向 `avsp_terra_xhigh` 提供已确认问题、当前 diff、约束和所需验证。它必须修复根因，禁止无关清理。修复后重跑受影响测试，再由新的 `avsp_sol_high` 对最终 diff 和测试证据进行独立复审。最多进行两轮修复-复审。
-
-仅在两轮仍未解决重要问题、根因未知或证据矛盾、或用户指出具体验收缺口时，使用 `avsp_sol_xhigh` 重新调查根因并形成有范围的补救方案。协调者验收修订计划后，交给 `avsp_terra_xhigh` 实现，再执行常规独立最终验证。默认每个任务只允许一次升级；升级验证仍失败时，停止并报告未解决证据。
-
-## 委派契约与关闭
-
-每个委派提示词必须包含角色、目标和授权操作、范围与非目标、所有权、任务状态或产物路径、相关证据、验收标准、验证命令、返回格式和停止条件。所有 Sol worker 和 `avsp_terra_xhigh_readonly` 都必须明确“仅做只读分析，不得编辑文件或改变外部状态”。实现与其独立复审绝不并行；依赖阶段必须等待上游完成。
-
-关闭前执行范围内最强的安全验证，更新任务状态和存在的持久产物，并报告实际 `agent_type` 路由、能力检查、改动、验证和残余风险。只有验收标准已满足且没有必需工作剩余时，才标记完成。
+关闭前执行范围内最强的验证，记录实际路由、验证证据、guards 结果、未覆盖行为、升级原因（如有）和残余风险。只有验收标准满足且没有必需工作剩余时，才能完成任务。

@@ -1,10 +1,10 @@
 model = "gpt-5.6-terra"
-model_reasoning_effort = "xhigh"
+model_reasoning_effort = "high"
+sandbox_mode = "danger-full-access"
 
 [agents]
 max_threads = 1000
 max_depth = 5
 
 [features]
-js_repl = false
 goals = true

@@ -1,0 +1,7 @@
+角色链路：`主控 -> avsp_terra_high -> avsp_luna_high_writer`；随后新的 `avsp_terra_xhigh` 最终验收未通过。
+
+修改文件：[src/order-total.mjs](F:\ai-vibecode-superpower\smoke-tests\luna-writer-contract\src\order-total.mjs)，仅此文件被新增。
+
+测试结果：`npm test` 退出码 `0`，输出 `order-total contract tests passed`。
+
+停止/升级：最终验收发现溢出语义缺口。两个安全整数的乘积或累计和仍可超出 JavaScript 安全整数范围，现有 `number` 实现无法保证精确的整数分总和。文件保留但未验收通过；需明确溢出时抛错、改用 `BigInt`，或限制总和范围。

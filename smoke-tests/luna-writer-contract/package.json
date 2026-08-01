@@ -1,0 +1,8 @@
+{
+  "name": "luna-writer-contract-smoke",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node test/order-total.test.mjs"
+  }
+}
