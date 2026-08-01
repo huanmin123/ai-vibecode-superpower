@@ -31,7 +31,7 @@
 ```markdown
 work_id: <稳定标识>
 objective_and_scope: <目标、范围与非目标>
-status: <完成 / 需要决策 / 需要升级>
+status: <完成 / 失败 / 需要决策 / 需要升级>
 inputs_and_artifacts: <输入状态、文件或产物引用>
 results_and_evidence: <可验证结果、命令与证据位置>
 guard_results: <ImplementationContract 与实际 diff/目标范围、唯一所有权、不变量、确定性检查、可重建生成物与 Luna 一致性>
@@ -46,9 +46,17 @@ dependencies: <依赖 work_id>
 ownership: <允许目标或写入所有权>
 acceptance_and_stop: <验收与停止条件>
 integration_owner: <负责汇总实际结果的 Terra>
+
+# 仅恢复已有任务时添加
+resume_state: <不适用 / 活动实例已核验 / 失联实例已替换 / 失败；附实例和产物证据>
+continuation_context: <原契约与验收、旧实例回报、当前 diff/文件、验证输出、未完成项、进度分类>
+
+# 仅父任务汇总子任务时添加
+settlement_state: <活动等待 / 结果已消费 / 结果已重建 / result_missing；附实例或产物证据>
+terminal_child_evidence: <子任务 work_id、终态、HandoffPacket 或输出/产物/diff/验证日志引用>
 ```
 
-WorkUnit 受阻时向直接父角色交付已完成结果与具体阻塞，父角色按当前状态继续，只有确实缺少需求决策才上行；普通暂态问题不转成用户确认。
+WorkUnit 受阻时向直接父角色交付已完成结果与具体阻塞。恢复时按 `SKILL.md` 核验实例与已有产物；历史 `pending` 状态本身不能作为继续等待的依据。终态子任务必须收敛结果，不得留在等待集合。
 
 ## 关闭检查
 

@@ -66,6 +66,8 @@ flowchart TD
 
 边界受控只表示证据充分、范围清楚、风险可解释、验收可观察；证据仍可补充时回到 Luna，无法补证或缺少必要输入时停止并报告，任何角色都不得猜测后强行沿低成本路径完成。Luna 是否可以写不是由“是不是生产代码”决定，而是由 `ImplementationContract` 决定：契约必须写明已定行为、允许目标与唯一所有权、不变量或顺序约束、适用的领域边界/精度/失败语义、示例、验证和停止条件。低风险闭环记录契约、实际 diff、确定性检查、可重建生成物以及 Luna 与机器证据的一致性；guard 或验证失败由 `Terra/high` 按当前状态处理。每个阶段通过 `HandoffPacket` 显式交接 `work_id`、目标、范围与非目标、状态、输入/产物引用、可验证结果与证据、`guard_results`、未覆盖行为、升级原因、风险/未知项和下一阶段请求；写入或并发时再附加 `ImplementationContract`、所有权、依赖、验收、停止条件和集成负责人。上下文默认最小充分，只有会改变判断的近期历史才附加。WorkUnit 受阻时向直接父角色交付已完成结果与具体阻塞，父角色按当前状态继续，只有确实缺少需求决策才上行；普通暂态问题不转成用户确认。
 
+前述普通受阻说明不适用于断线恢复。恢复任务不以历史 `pending` 或等待中状态作为子任务仍存活的证据。父 Terra 按 `SKILL.md` 核验活动实例和共享工作区中的已有产物；失联实例的替代者接收原契约、已有 diff、验证输出、未完成项与明确进度分类。进度未知先盘点，不能继续则报告可观察失败，不能无限等待。子任务已终态时，父 Terra 消费其 `HandoffPacket` 并移出等待；缺失结果只从已有输出、产物、diff 与验证证据重建，证据不足明确报告 `result_missing`。所有子任务终态后立即进入集成、验证或失败，不能继续等待。
+
 ### 什么时候优于直接使用 Sol
 
 | 任务属性 | 直接使用 Sol | 使用工作流 |
@@ -109,6 +111,15 @@ sh ./install-codex.sh
 ```
 
 安装目录优先使用非空的 `CODEX_HOME`；未设置时使用当前用户的 `~/.codex`。安装完成后请重启 Codex 相关程序，使新进程加载更新后的配置。
+
+### 回归测试
+
+Windows（PowerShell 7）：
+
+```powershell
+pwsh -NoProfile -File .\tests\workflow-result-settlement.ps1 -SkillRoot .\skills\orchestrate-model-workflow
+pwsh -NoProfile -File .\tests\install-codex.ps1
+```
 
 ### 安装过程与安全边界
 

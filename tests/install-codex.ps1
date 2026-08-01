@@ -3,6 +3,7 @@ Set-StrictMode -Version Latest
 
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $installer = Join-Path $repoRoot 'install-codex.ps1'
+$workflowSettlementTest = Join-Path $PSScriptRoot 'workflow-result-settlement.ps1'
 $testRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('codex-install-test-' + [System.Guid]::NewGuid().ToString('N'))
 $originalCodexHome = $env:CODEX_HOME
 
@@ -95,7 +96,7 @@ try {
     Assert-True -Condition ($workflowContents.Contains('HandoffPacket')) -Message 'installed workflow does not require explicit handoffs'
     Assert-True -Condition ($workflowContents.Contains('0..N')) -Message 'installed workflow lost dynamic WorkUnit scaling'
     Assert-True -Condition ($workflowContents.Contains('语义改动或中高影响路径的最终验收必须使用新的')) -Message 'installed workflow lost independent final acceptance'
-    foreach ($routingRule in @('纯只读任务', '不得无故插入 Terra 或 Sol', '默认每个任务最多调用一次 Sol', '高影响本身不是 Sol 触发条件', '不再追加“Terra/xhigh 复审 + 新 Terra/xhigh 验收”的重复调用', 'ImplementationContract', '不存在按文件类型或业务对象划定的写入禁止清单', '领域边界/精度/失败语义', 'WorkUnit 受阻时向直接父角色交付', '未覆盖行为', '升级原因')) {
+    foreach ($routingRule in @('纯只读任务', '不得无故插入 Terra 或 Sol', '默认每个任务最多调用一次 Sol', '高影响本身不是 Sol 触发条件', '不再追加“Terra/xhigh 复审 + 新 Terra/xhigh 验收”的重复调用', 'ImplementationContract', '不存在按文件类型或业务对象划定的写入禁止清单', '领域边界/精度/失败语义', 'WorkUnit 受阻时向直接父角色交付', '恢复子任务', '历史 `pending` 或等待中状态不是存活证据', '只创建一个替代执行实例', '进度未知时', '结构化失败', '收敛子任务结果', '幂等消费并移出等待集合', 'result_missing', '所有子任务终态后立即离开等待', '未覆盖行为', '升级原因')) {
         Assert-True -Condition ($workflowContents.Contains($routingRule)) -Message "installed workflow is missing routing guard: $routingRule"
     }
     foreach ($handoffField in @('work_id', '目标与范围/非目标', '状态', '输入或产物引用', '可验证结果与证据', '风险/未知项', '下一阶段请求', 'ImplementationContract', '所有权', '验收')) {
@@ -106,16 +107,17 @@ try {
     Assert-True -Condition ((Get-Content -LiteralPath $installedAgents -Raw).Contains('复杂开发使用 `$orchestrate-model-workflow`')) -Message 'installed AGENTS.md does not route development work through the skill'
     Assert-True -Condition (-not $workflowContents.Contains('返回其固定 role、模型/推理强度和“未写入”确认')) -Message 'installed workflow restored worker runtime metadata self-reporting'
     $installedWorkflowRoot = Join-Path $successHome 'skills\orchestrate-model-workflow'
+    & $workflowSettlementTest -SkillRoot $installedWorkflowRoot
     $installedWorkflowDesign = Join-Path $installedWorkflowRoot 'references\workflow-design.md'
     $workflowDesignContents = Get-Content -LiteralPath $installedWorkflowDesign -Raw
     Assert-True -Condition ($workflowDesignContents.Contains('不是运行时规范')) -Message 'installed workflow design does not defer runtime rules to the skill'
     Assert-True -Condition ($workflowDesignContents.Contains('HandoffPacket')) -Message 'installed workflow design lost the handoff schema'
-    foreach ($designGuard in @('guard 或验证失败时交由父 `Terra/high` 按当前状态处理', '无法补证或缺少必要输入', '实施前未调用 Sol，或敏感域双阶段 / 根因仍未证实', 'work_id`、目标、范围与非目标', '受阻与继续', 'WorkUnit 受阻时向直接父角色交付')) {
+    foreach ($designGuard in @('guard 或验证失败时交由父 `Terra/high` 按当前状态处理', '无法补证或缺少必要输入', '实施前未调用 Sol，或敏感域双阶段 / 根因仍未证实', 'work_id`、目标、范围与非目标', '受阻与继续', 'WorkUnit 受阻时向直接父角色交付', '不能把历史 `pending` 或等待中状态当作存活证据', '替换一次失联实例', '结果收敛', '终态实例的 `HandoffPacket` 只消费一次', 'result_missing')) {
         Assert-True -Condition ($workflowDesignContents.Contains($designGuard)) -Message "installed workflow design is missing: $designGuard"
     }
     $installedExecutionPlan = Join-Path $installedWorkflowRoot 'references\execution-plan.md'
     $executionPlanContents = Get-Content -LiteralPath $installedExecutionPlan -Raw
-    foreach ($planField in @('work_id', 'dependencies', 'ownership', 'acceptance_and_stop', 'integration_owner', 'guard_results', 'uncovered_behaviors', 'escalation_reason', 'implementation_contract')) {
+    foreach ($planField in @('work_id', 'dependencies', 'ownership', 'acceptance_and_stop', 'integration_owner', 'guard_results', 'uncovered_behaviors', 'escalation_reason', 'implementation_contract', 'resume_state', 'continuation_context', 'settlement_state', 'terminal_child_evidence')) {
         Assert-True -Condition ($executionPlanContents.Contains($planField)) -Message "installed execution plan is missing: $planField"
     }
     Assert-True -Condition ($executionPlanContents.Contains('每个一级 workspace 写入、修复和集成')) -Message 'installed execution plan does not preserve Terra/high first-level ownership'
@@ -147,6 +149,8 @@ try {
     Assert-True -Condition ($terraXhighContents.Contains('先回到 Luna 取证')) -Message 'installed Terra/xhigh skips the required Luna re-evidence step'
     $terraHighContents = Get-Content -LiteralPath $installedWriter -Raw
     Assert-True -Condition ($terraHighContents.Contains('WorkUnit 受阻时向直接父角色交付')) -Message 'installed Terra/high does not return blocked work to its parent'
+    Assert-True -Condition ($terraHighContents.Contains('收敛子任务结果')) -Message 'installed Terra/high does not settle child results'
+    Assert-True -Condition ($terraHighContents.Contains('result_missing')) -Message 'installed Terra/high hides a missing child result'
     Assert-True -Condition ((Get-Content -LiteralPath (Join-Path $successHome 'config.toml') -Raw) -match 'unmanaged_list = \["one", "two"\]') -Message 'unmanaged array was not preserved'
     Assert-True -Condition ((Get-Content -LiteralPath (Join-Path $successHome 'config.toml') -Raw) -match 'unmanaged_inline = \{ enabled = true \}') -Message 'unmanaged inline table was not preserved'
     $successConfig = Get-Content -LiteralPath (Join-Path $successHome 'config.toml') -Raw
@@ -157,7 +161,7 @@ try {
     Assert-True -Condition ($installedAgentsContents.Contains('## 开发规范')) -Message 'installed AGENTS.md is missing development standards'
     Assert-True -Condition ($installedAgentsContents.Contains('复杂开发使用 `$orchestrate-model-workflow`')) -Message 'installed AGENTS.md does not route development work through the skill'
     $sourceReadmeContents = Get-Content -LiteralPath (Join-Path $repoRoot 'README.md') -Raw
-    foreach ($readmeGuard in @('guard 或验证失败由 `Terra/high` 按当前状态处理', '无法补证或缺少必要输入', '实施前未调用 Sol，或敏感域双阶段 / 根因仍未证实', '范围与非目标', '领域边界/精度/失败语义', 'WorkUnit 受阻时向直接父角色交付', 'Luna 是否可以写不是由“是不是生产代码”决定')) {
+    foreach ($readmeGuard in @('guard 或验证失败由 `Terra/high` 按当前状态处理', '无法补证或缺少必要输入', '实施前未调用 Sol，或敏感域双阶段 / 根因仍未证实', '范围与非目标', '领域边界/精度/失败语义', 'WorkUnit 受阻时向直接父角色交付', '恢复任务不以历史 `pending` 或等待中状态', '子任务已终态时', 'result_missing', 'Luna 是否可以写不是由“是不是生产代码”决定')) {
         Assert-True -Condition ($sourceReadmeContents.Contains($readmeGuard)) -Message "source README is missing workflow guard: $readmeGuard"
     }
     $installedImageSkill = Join-Path $successHome 'skills\gpt-image-2-cli'
