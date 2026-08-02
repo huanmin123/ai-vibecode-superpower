@@ -76,6 +76,8 @@ Luna 取证、预审和二级 writer 均可创建 `0..N` 个 `WorkUnit`，没有
 
 每个委派至少说明角色、目标与授权操作、范围与非目标、必要 `HandoffPacket`、验收、验证、返回格式和停止条件；writer 额外说明允许文件或所有权。不要重复角色能力或通用限制；委派提示按前述“委派提示”执行。
 
+指定 `agent_type` 时必须显式传递 `fork_turns="none"`。不得省略该值或使用 `"all"`：全历史 fork 会继承父 agent type，Codex 会拒绝创建不同 role 的子 agent。需要历史时，使用自包含 `HandoffPacket` 传递必要事实、契约、diff 与验证证据。
+
 只有已确认对应 Luna profile 不可用时，才能分别使用 `avsp_terra_low_readonly` 或 `avsp_terra_medium_readonly`；只有 Sol 请求返回对应 `gpt-5.6-sol` 的结构化不支持结果时，才能以 `avsp_terra_xhigh_readonly` 替代同一 Sol 阶段。其他必需 role 不可用则报告 `MODEL_UNAVAILABLE`，主控不得自行写入兜底。
 
 关闭前执行范围内最强的验证，记录实际路由、验证证据、guards 结果、未覆盖行为、升级原因（如有）和残余风险。只有验收标准满足且没有必需工作剩余时，才能完成任务。
