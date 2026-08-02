@@ -197,7 +197,8 @@ CODEGRAPH_NO_UPDATE_CHECK = "1"
 DO_NOT_TRACK = "1"'
   [ "$agents_needs_write" -eq 0 ] || append_project_text "$agents" '## AI 工具
 
-- CodeGraph/RTK 的安装、初始化、维护和验证使用全局 `$agent-toolchain`；跨模块任务使用 CodeGraph MCP。
+- CodeGraph/RTK 的安装、初始化、维护和验证使用全局 `$agent-toolchain`。
+- CodeGraph MCP 用于查询跨模块依赖、调用链和影响范围；处理跨模块任务时使用它。
 - 对只读高输出命令，优先使用匹配的 `rtk` 子命令：`git`、`rg`、`log`、`diff`、`test`、`mvn`、`npm`、`pnpm`、`read`、`find`、`ls`、`tree`。未列出的只读命令先用 `rtk rewrite "<command>"` 或 `rtk --help` 判断；写操作和精确排障使用原生命令。'
   [ "$ignore_needs_write" -eq 0 ] || append_project_text "$ignore" '/.codegraph/'
   note "项目 CodeGraph/RTK 路由已就绪"

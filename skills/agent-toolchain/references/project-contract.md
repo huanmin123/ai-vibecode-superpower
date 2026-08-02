@@ -6,7 +6,7 @@
 
 - `.codex/config.toml` 中精确的 CodeGraph MCP：`codegraph serve --mcp`，并关闭 CodeGraph telemetry、更新检查和通用追踪。
 - 根 `.gitignore` 中的 `/.codegraph/`；索引是缓存，不提交。
-- 根 `AGENTS.md` 中两条短规则：工具链生命周期使用全局 `$agent-toolchain`，跨模块任务使用 CodeGraph MCP；只读高输出命令使用匹配的 `rtk` 子命令（`git`、`rg`、`log`、`diff`、`test`、`mvn`、`npm`、`pnpm`、`read`、`find`、`ls`、`tree`），未知命令先用 `rtk rewrite` 或 `rtk --help` 判断，写操作和精确排障使用原生命令。
+- 根 `AGENTS.md` 中三条短规则：工具链生命周期使用全局 `$agent-toolchain`；CodeGraph MCP 用于查询跨模块依赖、调用链和影响范围，处理跨模块任务时使用它；只读高输出命令使用匹配的 `rtk` 子命令（`git`、`rg`、`log`、`diff`、`test`、`mvn`、`npm`、`pnpm`、`read`、`find`、`ls`、`tree`），未知命令先用 `rtk rewrite` 或 `rtk --help` 判断，写操作和精确排障使用原生命令。
 
 项目不得新增锁文件、工具链脚本、供应商 installer 或 README 工具说明。已有配置冲突时报告并停止，不覆盖用户内容。项目可以没有 Git；执行器只要求 `--project` 指向真实目录。
 
