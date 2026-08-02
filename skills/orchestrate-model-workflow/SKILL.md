@@ -7,7 +7,7 @@ description: "以命名 agent role 路由软件任务：纯只读直达 Luna，T
 
 本文件是模型路由、交接、并发和验收的唯一运行时规范。role profile 只定义角色本地权限和输出边界；`references/` 提供设计说明与模板，README 只面向使用者介绍。规则冲突时以本文件为准。
 
-主控 `Terra/high` 指默认主控模型/推理强度，不是可写 role `avsp_terra_high`。前者只负责意图、上下文选择、阶段依赖、调度、显式交接和完成判断，不得写入工作区；后者是被明确委派的一级 writer。主控以实际 `spawn_agent(agent_type=...)` 调用确认 role，不要求 worker 自报不可见的运行时模型、推理强度或 sandbox。
+主控 `Terra/high` 指默认主控模型/推理强度，不是可写 role `avsp_terra_high`。前者只负责意图、上下文选择、阶段依赖、调度、显式交接和完成判断，不得写入工作区；后者是被明确委派的一级 writer。主控通过运行时提供的角色委派入口传递实际 role 标识，由 profile 解析模型、推理强度和权限；不要求 worker 自报不可见的运行时属性。
 
 开始路由前阅读 [references/workflow-design.md](references/workflow-design.md)；复杂任务使用 [references/execution-plan.md](references/execution-plan.md) 的状态与交接模板。
 
@@ -17,7 +17,8 @@ description: "以命名 agent role 路由软件任务：纯只读直达 Luna，T
 
 ## 角色
 
-模型与推理强度由 profile 固定；`spawn_agent` 只传 `agent_type`，不得覆盖 `model` 或 `reasoning_effort`。
+模型与推理强度由 profile 固定；委派时只传 role 标识和任务包，不在任务提示中覆盖 profile 的模型、推理强度或权限。
+下表是当前安装包的 role 适配注册表，不是工作流语义本身；新增或替换 provider 时只需更新适配映射，不应改变 ownership、验收和恢复语义。
 
 | 用途 | `agent_type` | 边界 |
 | --- | --- | --- |
@@ -54,30 +55,30 @@ Luna 取证、预审和二级 writer 均可创建 `0..N` 个 `WorkUnit`，没有
 
 ## 交接与上下文
 
-每个阶段返回 `HandoffPacket`，由协调者显式交给下游；role 间不假设隐式对话连通。核心字段是：`work_id`、目标与范围/非目标、`execution_state`、`result_state`、输入或产物引用、可验证结果与证据、核验依据、`guard_results`、未覆盖行为、升级原因、风险/未知项和下一阶段请求。涉及写入或并发时额外提供 `ImplementationContract`、依赖、允许目标或所有权、验收、停止条件和集成负责人。默认使用自包含任务包与相关产物引用；只有会改变判断的近期历史才附加。下游缺少影响判断的输入时交回父角色，不猜测。
+每个阶段用最小 `HandoffPacket` 交代：目标和范围、`execution_state`、`result_state`、产物或证据，以及下一动作或阻塞；写入再附 `ImplementationContract`、目标所有权、验收和停止条件。交接是待核验输入，不传完整历史，也不要求固定 checkpoint 或表格字段。
 
-### 结果定案
+需要跨顶层重启恢复的任务必须另外维护一个可读取的 `RecoveryManifest`。它不是新的运行时队列，而是任务状态的持久化索引；必须明确状态提供者、版本和最近写入时间。没有可核验的持久化提供者时，父任务只做一次最终状态盘点，报告 `PERSISTENCE_UNAVAILABLE`，将 `recovery_state` 设为 `recovery_required`/`runtime_wait`，结束当前执行轮次并保持 goal active；不得继续重复测试或审计。
 
-`execution_state` 只描述 WorkUnit 是否仍在运行；`completed`、`failed` 等终态不表示父任务已完成。`result_state` 使用 `evidence_needed`、`decision_needed`、`executable`、`verified_complete` 或 `blocked`，分别表示需要补充材料、需要判断、已具备可执行契约、已满足当前任务验收或无法继续。
+子任务终态不表示父任务完成。`execution_state` 使用可映射到“活动、成功终态、失败终态、取消、失联”的生命周期语义；`result_state` 使用可映射到“需要证据、需要决策、可执行、已验证完成、真实领域受阻”的结果语义。状态提供者可以使用不同原始枚举，但 Handoff 必须记录规范化语义，父任务只能按语义消费：只有“已验证完成”才可集成或完成；“真实领域受阻”必须说明领域缺失，不能代表执行通道故障。
 
-交接中的主张都是待核验输入，不是结论。任何负责判断、行动或关闭的接收节点，都必须依据原始材料、任务约束和可观察结果独立判断；关键主张不成立或证据不足时，转为 `evidence_needed`，不得因上游已交接而生成契约或关闭任务。只有已定结论才能形成 `ImplementationContract`。
+没有可消费 Handoff 时，先核验实例状态、diff、产物和验证输出。仍在运行则等待；实例失联、终止或无法恢复且工作未完成时，父任务在当前回合创建一次替代实例，并交付原契约和已知产物。替代 Handoff 记录被替代实例，整个 WorkUnit 生命周期不得再次替代。替代不能创建时保留原始错误、尝试和缺失条件，并保持 goal active。运行时未唤醒、投递失败或替代启动失败不得把 goal 标记为 blocked；只有真实领域或授权缺失反复出现且达到阻塞条件时才可调用状态更新接口。
 
-收敛所有终态子任务后，协调者必须先按 `result_state` 继续路由，而不是继续等待或假定整体完成。相对于当前任务验收仍未满足的 `evidence_needed`、`decision_needed` 与 `executable` 都是中间结果；只有 `verified_complete` 且证据满足当前任务验收时才能完成。`blocked` 必须传递结构化失败、已尝试操作与缺失条件，不得报告成功。
+### 顶层重启与分层恢复
 
-### 恢复子任务
+主 agent 恢复或被新的顶层任务接管时，先读取并校验 `RecoveryManifest`，按 `manifest_revision` 只消费一次每个子任务的终态。根主控只恢复或替代自己的直接一级实施 owner；不得越级直接创建二级 writer。替代一级 owner 收到原契约、当前 diff、验证输出和子树状态后，只恢复或替代自己的直接二级子任务。
 
-恢复任务时，父角色必须逐个核验未完成子任务是否仍有可读取的活动执行实例和可验证的新进展；历史 `pending` 或等待中状态不是存活证据。实例仍存活时保留它继续执行；实例不存在、已终止或无法核验时，先检查已有产物、实际 diff、验证输出和目标所有权，再将旧实例标为失联。工作仍需完成时，只创建一个替代执行实例，并交付自包含的 `HandoffPacket`：原 `ImplementationContract` 与验收、旧子任务已回传的内容、当前文件与实际 diff、验证输出、未完成项，以及进度为“已验证完成”“已验证部分完成”或“未知”的明确分类。进度未知时，替代实例必须先盘点当前状态；不得假定从零开始或已经完成。不得等待失联实例返回、反复创建替代实例或从空白状态重做已完成工作。替代实例无法启动、不能验证继续条件或仍未完成时，返回包含原始错误、已尝试操作、现有产物、受影响范围和缺失条件的结构化失败；不得自动降级、隐藏错误或报告成功。
+恢复顺序固定为：读取清单并取得本轮恢复 claim；核验直接子任务实例、心跳、diff 和产物；活动且可核验则继续，已验证完成则幂等消费，失联或未完成且 `replacement_count=0` 才创建一次替代；替代成功后递增清单版本并记录 `replacement_of`，随后由替代者继续其下级恢复。持久化或 claim 冲突、投递、唤醒和启动失败属于 `failure_class=runtime`。若当前主控没有可用的直接 writer 委派通道，顶层控制器（若 host 提供顶层任务创建或 fork 能力）必须创建带原清单的新顶层替代任务；没有控制器时只保留 `recovery_required`，不得转为 `domain_blocked`/`blocked`，也不得在原任务内继续空转。
 
-### 收敛子任务结果
+`RecoveryManifest` 至少包含由状态提供者定义的 schema 标识、`goal_id`、`run_id`、`root_work_id`、revision、`persisted_at`、目标语义、恢复语义和直接子任务条目。恢复语义至少要能区分正常、核验、继续、消费、一次替代、需要恢复、运行时等待和已收敛；具体枚举由状态提供者映射。每个条目包含 `work_id`、`parent_work_id`、由角色层级推导的层级、`agent_type`、`instance_id`、规范化生命周期语义、规范化结果语义、规范化失败类别、尝试次数、替代次数、替代关系、packet revision、最近核验时间、checkpoint、产物、契约和收敛语义。提供者不支持原子版本检查或幂等 claim 时，恢复必须停止并报告原始错误，不能并发创建 writer。
 
-父角色在等待前、收到子任务状态变化后和恢复时收敛结果。只等待可读取且已核验活动的执行实例；终态实例有 `HandoffPacket` 时幂等消费并移出等待集合。终态但无结果时，依据可用最终输出、产物、实际 diff 和验证日志重建；证据不足则标记 `result_missing` 并返回结构化失败。所有子任务终态后立即离开等待，先按 `result_state` 继续路由，再进入集成、验证、补证、定案或显式失败；原工作仍未完成时才按恢复规则创建一次替代实例。不得对终态实例重复等待、无限轮询、静默降级、假定完成或追加无必要的用户确认。
+提示词不能排队、唤醒或重试 agent。若运行时未提供子任务终态唤醒、`RecoveryManifest` 持久化、claim 或 backoff 能力，本规则只约束父任务已在运行时的处理。停止类 hook 也不能代替恢复控制器。需要跨进程、定时或多次重试时，必须使用已明确的外部状态提供者或 host 的顶层任务控制能力；缺失时进入 `runtime_wait` 并结束当前轮次，不伪造“已排队”，也不重复跑只读检查。
 
 ## 委派与关闭
 
 每个委派至少说明角色、目标与授权操作、范围与非目标、必要 `HandoffPacket`、验收、验证、返回格式和停止条件；writer 额外说明允许文件或所有权。不要重复角色能力或通用限制；委派提示按前述“委派提示”执行。
 
-指定 `agent_type` 时必须显式传递 `fork_turns="none"`。不得省略该值或使用 `"all"`：全历史 fork 会继承父 agent type，Codex 会拒绝创建不同 role 的子 agent。需要历史时，使用自包含 `HandoffPacket` 传递必要事实、契约、diff 与验证证据。
+使用角色委派入口时必须显式声明不继承完整父上下文，并通过自包含 `HandoffPacket` 传递必要事实、契约、diff 与验证证据；不得依赖隐式历史复制或让子代理自行改变 role。
 
-只有已确认对应 Luna profile 不可用时，才能分别使用 `avsp_terra_low_readonly` 或 `avsp_terra_medium_readonly`；只有 Sol 请求返回对应 `gpt-5.6-sol` 的结构化不支持结果时，才能以 `avsp_terra_xhigh_readonly` 替代同一 Sol 阶段。其他必需 role 不可用则报告 `MODEL_UNAVAILABLE`，主控不得自行写入兜底。
+只有已确认对应只读 profile 不可用时，才能使用配置中声明的一对一只读替代；只有高风险独立判断明确返回“模型或能力不支持”时，才能使用对应的只读技术替代。其他必需 role 不可用时保留 provider 原始错误和缺失条件，主控不得自行写入兜底。
 
 关闭前执行范围内最强的验证，记录实际路由、验证证据、guards 结果、未覆盖行为、升级原因（如有）和残余风险。只有验收标准满足且没有必需工作剩余时，才能完成任务。
