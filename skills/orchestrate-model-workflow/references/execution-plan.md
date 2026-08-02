@@ -81,11 +81,14 @@ children:
     execution_state: <规范化生命周期语义>
     result_state: <规范化结果语义>
     failure_class: <规范化失败类别>
+    attempt: <本 WorkUnit 执行次数>
     replacement_count: <0 / 1>
     replacement_of: <实例或 null>
     packet_revision: <单调版本>
     last_observed_at: <时间>
     checkpoint_ref: <引用>
+    artifact_refs: <产物引用>
+    contract_ref: <ImplementationContract 引用；只读 WorkUnit 可为空>
     settlement_state: <规范化收敛语义>
 ```
 

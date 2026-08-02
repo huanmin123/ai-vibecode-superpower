@@ -51,7 +51,7 @@ description: "以命名 agent role 路由软件任务：纯只读直达 Luna，T
 
 机器 guards 必须可观察并记录结果：`ImplementationContract`、实际 diff 与目标范围一致，目标所有权未冲突，已声明的不变量、确定性 test/type/lint/build/contract/golden 与可重建生成物均通过，且 Luna 预审与机器证据一致。没有可靠的相关 guard 时不得走低风险闭环。guard 或验证失败时交由父 Terra 按当前状态处理。
 
-Luna 取证、预审和二级 writer 均可创建 `0..N` 个 `WorkUnit`，没有静态数量上限。每个 WorkUnit 必须覆盖互补证据域、使用固定输入并说明新增价值；验收覆盖目标完成即停止，重复、矛盾或不可解释的结果立即升级。并发 writer 不得共享文件、共享状态或其他写入目标，共享目标由单一 owner 串行处理。允许为独立反证或关键假设核验而有目的地重叠，但每个分支必须说明新增价值。
+取证、预审和二级 writer 阶段均可使用 `0..N` 个 `WorkUnit`，没有静态数量上限；`WorkUnit` 是可独立验收的工作，不等于子代理。二级 writer WorkUnit 由其父 `avsp_terra_high` 创建并直接委派，writer 不得创建子代理或继续派生。每个 WorkUnit 必须覆盖互补证据域、使用固定输入并说明新增价值；验收覆盖目标完成即停止，重复、矛盾或不可解释的结果立即升级。并发 writer 不得共享文件、共享状态或其他写入目标，共享目标由单一 owner 串行处理。允许为独立反证或关键假设核验而有目的地重叠，但每个分支必须说明新增价值。
 
 ## 交接与上下文
 

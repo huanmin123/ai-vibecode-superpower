@@ -181,7 +181,7 @@ skill 会按受控流程完成配置预检、安装前 dry-run、受管工具安
 
 ## 维护者说明
 
-`codex-global-config/` 是安装来源目录，不会原样复制：其中的 `AGENTS.md`、`config.toml`、`docs/` 与 agent role 会分别写入 Codex 全局目录。`config.toml` 只更新本仓库管理的 `model`、`model_reasoning_effort`、`agents.max_threads`、`agents.max_depth`、`features.js_repl` 和 `features.goals`，其余设置会保留。
+`codex-global-config/` 是安装来源目录，不会原样复制：其中的 `AGENTS.md`、`config.toml`、`docs/` 与 agent role 会分别写入 Codex 全局目录。`config.toml` 只更新本仓库管理的 `model`、`model_reasoning_effort`、`agents.max_threads`、`agents.max_depth` 和 `features.goals`，其余设置会保留。
 
 维护本仓库时，跨任务行为保留在 `codex-global-config/AGENTS.md`，工作流的唯一运行时规范保留在 `skills/orchestrate-model-workflow/SKILL.md`，平台与命令规范保留在 `codex-global-config/docs/`，references 与 README 只作说明或模板。不要在这个安装包仓库中重新创建被忽略的 `.codex/` 目录；需要接入 CodeGraph/RTK 的应是另一个目标项目。
 
