@@ -20,13 +20,15 @@ scripts/invoke-gpt-image2.ps1     # 适用于 Windows/macOS/Linux 的 PowerShell
 
 1. 可用时按系统 `imagegen` skill 的约定组织提示词：包含使用场景、资产类型、主体、风格、构图、精确文字、约束和避免项。
 2. 在当前工作区内选择输出路径，通常为 `output/imagegen/<descriptive-name>.png`。
-3. 运行辅助脚本。不得硬编码特定用户的 skill 路径；从 `CODEX_HOME` 或 `$HOME/.codex` 解析。
+3. 运行辅助脚本。不得硬编码特定用户的 skill 路径；从 `CODEX_HOME/plugins/cache` 中已安装的 `agnets-workflow` 插件解析。
 
 Windows/macOS/Linux 上的 PowerShell 7：
 
 ```powershell
-$skill = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME ".codex" }
-$skill = Join-Path (Join-Path $skill "skills") "gpt-image-2-cli"
+$codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME ".codex" }
+$skill = @(Get-ChildItem -Path (Join-Path $codexHome 'plugins/cache/*/agnets-workflow/*/skills/gpt-image-2-cli') -Directory -ErrorAction SilentlyContinue | Sort-Object LastWriteTime | Select-Object -Last 1 -ExpandProperty FullName)
+if ($skill.Count -ne 1) { throw '未找到已安装的 agnets-workflow 插件。' }
+$skill = $skill[0]
 
 & (Join-Path (Join-Path $skill "scripts") "invoke-gpt-image2.ps1") `
   -Prompt "<final image prompt>" `
@@ -38,7 +40,9 @@ $skill = Join-Path (Join-Path $skill "skills") "gpt-image-2-cli"
 macOS/Linux Shell：
 
 ```bash
-skill="${CODEX_HOME:-$HOME/.codex}/skills/gpt-image-2-cli"
+codex_home="${CODEX_HOME:-$HOME/.codex}"
+skill=$(find "$codex_home/plugins/cache" -type d -path '*/agnets-workflow/*/skills/gpt-image-2-cli' -print 2>/dev/null | sort | tail -n 1)
+[ -n "$skill" ] || { printf '%s\n' '未找到已安装的 agnets-workflow 插件。' >&2; exit 1; }
 python3 "$skill/scripts/invoke_gpt_image2.py" \
   --prompt "<final image prompt>" \
   --out "output/imagegen/<descriptive-name>.png" \
@@ -105,8 +109,10 @@ Style/medium: crisp vector-like technical illustration with legible Chinese labe
 Constraints: simple, intuitive, no watermark, no photorealism.
 "@
 
-$skill = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME ".codex" }
-$skill = Join-Path (Join-Path $skill "skills") "gpt-image-2-cli"
+$codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME ".codex" }
+$skill = @(Get-ChildItem -Path (Join-Path $codexHome 'plugins/cache/*/agnets-workflow/*/skills/gpt-image-2-cli') -Directory -ErrorAction SilentlyContinue | Sort-Object LastWriteTime | Select-Object -Last 1 -ExpandProperty FullName)
+if ($skill.Count -ne 1) { throw '未找到已安装的 agnets-workflow 插件。' }
+$skill = $skill[0]
 
 & (Join-Path (Join-Path $skill "scripts") "invoke-gpt-image2.ps1") `
   -Prompt $prompt `

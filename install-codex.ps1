@@ -89,30 +89,6 @@ function Get-NormalizedLfSha256 {
     }
 }
 
-function Copy-ManagedSkill {
-    param(
-        [Parameter(Mandatory)][string]$SourceDirectory,
-        [Parameter(Mandatory)][string]$DestinationDirectory
-    )
-
-    Assert-NoReparsePointsInTree -Path $SourceDirectory
-    New-Item -ItemType Directory -Path $DestinationDirectory -Force | Out-Null
-    foreach ($sourceItem in Get-ChildItem -LiteralPath $SourceDirectory -Recurse -Force) {
-        $relativePath = [System.IO.Path]::GetRelativePath($SourceDirectory, $sourceItem.FullName)
-        $pathSegments = $relativePath -split '[\\/]'
-        if ($pathSegments -contains '__pycache__') { continue }
-        if (-not $sourceItem.PSIsContainer -and $sourceItem.Extension -ieq '.pyc') { continue }
-
-        $destinationPath = Join-Path $DestinationDirectory $relativePath
-        if ($sourceItem.PSIsContainer) {
-            New-Item -ItemType Directory -Path $destinationPath -Force | Out-Null
-        } else {
-            New-Item -ItemType Directory -Path (Split-Path -Parent $destinationPath) -Force | Out-Null
-            Copy-Item -LiteralPath $sourceItem.FullName -Destination $destinationPath -Force
-        }
-    }
-}
-
 function Assert-ManagedAgentRoleProfiles {
     param(
         [Parameter(Mandatory)][string]$RoleDirectory,
@@ -499,8 +475,6 @@ function Invoke-InstallRollback {
     param(
         [Parameter(Mandatory)][System.Collections.IEnumerable]$Targets,
         [AllowNull()][string]$BackupDirectory,
-        [Parameter(Mandatory)][string]$SkillsTarget,
-        [Parameter(Mandatory)][bool]$SkillsParentCreated,
         [Parameter(Mandatory)][string]$AgentsTarget,
         [Parameter(Mandatory)][bool]$AgentsParentCreated
     )
@@ -530,13 +504,6 @@ function Invoke-InstallRollback {
             }
         }
     }
-    if ($SkillsParentCreated -and (Test-Path -LiteralPath $SkillsTarget -PathType Container)) {
-        try {
-            Remove-Item -LiteralPath $SkillsTarget -Force
-        } catch {
-            $errors.Add("Could not remove newly created skills directory ${SkillsTarget}: $($_.Exception.Message)")
-        }
-    }
     if ($AgentsParentCreated -and (Test-Path -LiteralPath $AgentsTarget -PathType Container)) {
         try {
             if (@(Get-ChildItem -LiteralPath $AgentsTarget -Force).Count -eq 0) {
@@ -547,6 +514,94 @@ function Invoke-InstallRollback {
         }
     }
     return $errors
+}
+
+function Get-CodexCliPath {
+    foreach ($commandName in @('codex.cmd', 'codex.exe')) {
+        $command = Get-Command $commandName -All -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -ne $command -and -not [string]::IsNullOrWhiteSpace($command.Source)) {
+            return $command.Source
+        }
+    }
+    throw 'Codex CLI is required to install the managed plugin, but codex.cmd/codex.exe was not found.'
+}
+
+function Assert-WorkflowControllerNode {
+    $node = Get-Command node -All -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $node -or [string]::IsNullOrWhiteSpace($node.Source)) {
+        throw 'Node.js is required for the agnets-workflow workflow-controller MCP server, but the node command was not found.'
+    }
+}
+
+function Install-ManagedPlugin {
+    param(
+        [Parameter(Mandatory)][string]$CodexHome,
+        [Parameter(Mandatory)][string]$MarketplaceRoot,
+        [Parameter(Mandatory)][string]$PluginName,
+        [Parameter(Mandatory)][string]$MarketplaceName
+    )
+
+    $codexCli = Get-CodexCliPath
+    Assert-WorkflowControllerNode
+    $hadCodexHome = Test-Path Env:CODEX_HOME
+    $previousCodexHome = $env:CODEX_HOME
+    try {
+        $env:CODEX_HOME = $CodexHome
+        & $codexCli plugin marketplace add $MarketplaceRoot
+        if ($LASTEXITCODE -ne 0) { throw "Could not register plugin marketplace: $MarketplaceRoot" }
+        & $codexCli plugin add "$PluginName@$MarketplaceName"
+        if ($LASTEXITCODE -ne 0) { throw "Could not install managed plugin: $PluginName@$MarketplaceName" }
+    } finally {
+        if ($hadCodexHome) {
+            $env:CODEX_HOME = $previousCodexHome
+        } else {
+            Remove-Item Env:CODEX_HOME -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Test-ConfiguredPlugin {
+    param(
+        [Parameter(Mandatory)][string]$ConfigPath,
+        [Parameter(Mandatory)][string]$PluginId
+    )
+
+    if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) { return $false }
+    $escapedPluginId = [System.Text.RegularExpressions.Regex]::Escape($PluginId)
+    $pattern = '^\s*\[plugins\.(?:"' + $escapedPluginId + '"|''' + $escapedPluginId + ''')\]\s*(?:#.*)?$'
+    foreach ($line in [System.IO.File]::ReadAllLines($ConfigPath)) {
+        if ($line -match $pattern) { return $true }
+    }
+    return $false
+}
+
+function Remove-LegacyManagedPlugin {
+    param(
+        [Parameter(Mandatory)][string]$CodexHome,
+        [Parameter(Mandatory)][string]$PluginId
+    )
+
+    if (-not (Test-ConfiguredPlugin -ConfigPath (Join-Path $CodexHome 'config.toml') -PluginId $PluginId)) { return }
+
+    $codexCli = Get-CodexCliPath
+    $hadCodexHome = Test-Path Env:CODEX_HOME
+    $previousCodexHome = $env:CODEX_HOME
+    try {
+        $env:CODEX_HOME = $CodexHome
+        for ($attempt = 1; $attempt -le 8; $attempt++) {
+            & $codexCli plugin remove $PluginId
+            if ($LASTEXITCODE -eq 0) { return }
+            $exitCode = $LASTEXITCODE
+            if ($attempt -lt 8) { Start-Sleep -Seconds 1 }
+        }
+        throw "Could not remove legacy managed plugin after 8 attempts: $PluginId (exit code $exitCode)"
+    } finally {
+        if ($hadCodexHome) {
+            $env:CODEX_HOME = $previousCodexHome
+        } else {
+            Remove-Item Env:CODEX_HOME -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 $scriptRoot = Split-Path -Parent $PSCommandPath
@@ -569,17 +624,33 @@ $managedAgentRoleContracts = @(
     [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_terra_low_readonly.toml'; RoleName = 'avsp_terra_low_readonly'; Model = 'gpt-5.6-terra'; ReasoningEffort = 'low'; SandboxMode = 'read-only' }
     [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_terra_medium_readonly.toml'; RoleName = 'avsp_terra_medium_readonly'; Model = 'gpt-5.6-terra'; ReasoningEffort = 'medium'; SandboxMode = 'read-only' }
 )
-$sourceSkills = Join-Path $scriptRoot 'skills'
+$managedPluginName = 'agnets-workflow'
+$managedMarketplaceName = 'ai-vibecode-superpower-local'
+$sourcePlugin = Join-Path $scriptRoot "plugins\$managedPluginName"
+$sourceMarketplace = Join-Path $scriptRoot '.agents\plugins\marketplace.json'
+$sourceSkills = Join-Path $sourcePlugin 'skills'
 
 if (-not (Test-Path -LiteralPath $sourceAgents -PathType Leaf)) { throw "Missing source file: $sourceAgents" }
 if (-not (Test-Path -LiteralPath $sourceConfig -PathType Leaf)) { throw "Missing source file: $sourceConfig" }
 if (-not (Test-Path -LiteralPath $sourceDocs -PathType Container)) { throw "Missing source directory: $sourceDocs" }
 if (-not (Test-Path -LiteralPath $sourceAgentRoles -PathType Container)) { throw "Missing source directory: $sourceAgentRoles" }
 if (-not (Test-Path -LiteralPath $sourceAgentRoleManifest -PathType Leaf)) { throw "Missing source file: $sourceAgentRoleManifest" }
+if (-not (Test-Path -LiteralPath $sourceMarketplace -PathType Leaf)) { throw "Missing source file: $sourceMarketplace" }
+if (-not (Test-Path -LiteralPath $sourcePlugin -PathType Container)) { throw "Missing source directory: $sourcePlugin" }
 Assert-ManagedAgentRoleProfiles -RoleDirectory $sourceAgentRoles -Contracts $managedAgentRoleContracts -ManifestPath $sourceAgentRoleManifest
 if (-not (Test-Path -LiteralPath $sourceSkills -PathType Container)) { throw "Missing source directory: $sourceSkills" }
-$managedSkillNames = @(Get-ChildItem -LiteralPath $sourceSkills -Directory -Force | Sort-Object -Property Name | Select-Object -ExpandProperty Name)
-if ($managedSkillNames.Count -eq 0) { throw "No managed skill directories found in: $sourceSkills" }
+$legacyManagedSkillNames = @(
+    'agent-toolchain'
+    'gpt-image-2-cli'
+    'orchestrate-model-workflow'
+    'project-doc-planner'
+    'workflow-controller'
+)
+foreach ($skillName in $legacyManagedSkillNames) {
+    if (-not (Test-Path -LiteralPath (Join-Path $sourceSkills $skillName) -PathType Container)) {
+        throw "Missing managed plugin skill: $skillName"
+    }
+}
 
 if ([string]::IsNullOrWhiteSpace($env:CODEX_HOME)) {
     $codexHome = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)) '.codex'
@@ -609,19 +680,11 @@ foreach ($name in $targets.Keys) {
 if (Test-SamePath -Left $targetAgentRoles -Right $sourceAgentRoles) {
     throw "Destination target overlaps its source: $targetAgentRoles"
 }
-foreach ($skillName in $managedSkillNames) {
-    $targetSkill = Join-Path (Join-Path $codexHome 'skills') $skillName
-    $sourceSkill = Join-Path $sourceSkills $skillName
-    if (Test-SamePath -Left $targetSkill -Right $sourceSkill) {
-        throw "Destination target overlaps its source: $targetSkill"
-    }
-}
 
 $installMutex = $null
 $stageRoot = $null
 $backupDirectory = $null
 $skillsTarget = Join-Path $codexHome 'skills'
-$skillsParentCreated = $false
 $agentsParentCreated = $false
 $transactionTargets = [System.Collections.Generic.List[object]]::new()
 
@@ -636,21 +699,10 @@ try {
     New-Item -ItemType Directory -Path $stagedAgents | Out-Null
     $stagedAgentRoles = Join-Path $stagedAgents $managedAgentRoleDirectoryName
     Copy-Item -LiteralPath $sourceAgentRoles -Destination $stagedAgentRoles -Recurse -Force
-    $stagedSkills = Join-Path $stageRoot 'skills'
-    New-Item -ItemType Directory -Path $stagedSkills | Out-Null
-    foreach ($skillName in $managedSkillNames) {
-        Copy-ManagedSkill -SourceDirectory (Join-Path $sourceSkills $skillName) -DestinationDirectory (Join-Path $stagedSkills $skillName)
-    }
-
     foreach ($name in @('AGENTS.md', 'template-config.toml', 'docs', (Join-Path 'agents' $managedAgentRoleDirectoryName))) {
         if (-not (Test-ExistingPath -Path (Join-Path $stageRoot $name))) { throw "Staging failed for: $name" }
     }
     Assert-ManagedAgentRoleProfiles -RoleDirectory $stagedAgentRoles -Contracts $managedAgentRoleContracts -ManifestPath $sourceAgentRoleManifest
-    foreach ($skillName in $managedSkillNames) {
-        if (-not (Test-Path -LiteralPath (Join-Path $stagedSkills $skillName) -PathType Container)) {
-            throw "Staging failed for skill: $skillName"
-        }
-    }
 
     $configTarget = Join-Path $codexHome 'config.toml'
     $mergedConfig = Join-Path $stageRoot 'merged-config.toml'
@@ -661,15 +713,15 @@ try {
     Merge-ManagedTomlSettings -Settings $managedSettings -ExistingPath $configTarget -OutputPath $mergedConfig
     Assert-SafeTomlMergeInput -Path $mergedConfig
 
-    $transactionTargets.Add([pscustomobject]@{ Name = 'AGENTS.md'; Target = (Join-Path $codexHome 'AGENTS.md'); Candidate = (Join-Path $stageRoot 'AGENTS.md'); Kind = 'File'; WasPresent = $false; BackedUp = $false; InstallStarted = $false })
-    $transactionTargets.Add([pscustomobject]@{ Name = 'config.toml'; Target = $configTarget; Candidate = $mergedConfig; Kind = 'File'; WasPresent = $false; BackedUp = $false; InstallStarted = $false })
-    $transactionTargets.Add([pscustomobject]@{ Name = 'docs'; Target = (Join-Path $codexHome 'docs'); Candidate = (Join-Path $stageRoot 'docs'); Kind = 'Directory'; WasPresent = $false; BackedUp = $false; InstallStarted = $false })
-    $transactionTargets.Add([pscustomobject]@{ Name = (Join-Path 'agents' $managedAgentRoleDirectoryName); Target = $targetAgentRoles; Candidate = $stagedAgentRoles; Kind = 'Directory'; WasPresent = $false; BackedUp = $false; InstallStarted = $false })
-    foreach ($skillName in $managedSkillNames) {
-        $transactionTargets.Add([pscustomobject]@{ Name = (Join-Path 'skills' $skillName); Target = (Join-Path $skillsTarget $skillName); Candidate = (Join-Path $stagedSkills $skillName); Kind = 'Directory'; WasPresent = $false; BackedUp = $false; InstallStarted = $false })
+    $transactionTargets.Add([pscustomobject]@{ Name = 'AGENTS.md'; Target = (Join-Path $codexHome 'AGENTS.md'); Candidate = (Join-Path $stageRoot 'AGENTS.md'); Kind = 'File'; Operation = 'Replace'; WasPresent = $false; BackedUp = $false; InstallStarted = $false })
+    $transactionTargets.Add([pscustomobject]@{ Name = 'config.toml'; Target = $configTarget; Candidate = $mergedConfig; Kind = 'File'; Operation = 'Replace'; WasPresent = $false; BackedUp = $false; InstallStarted = $false })
+    $transactionTargets.Add([pscustomobject]@{ Name = 'docs'; Target = (Join-Path $codexHome 'docs'); Candidate = (Join-Path $stageRoot 'docs'); Kind = 'Directory'; Operation = 'Replace'; WasPresent = $false; BackedUp = $false; InstallStarted = $false })
+    $transactionTargets.Add([pscustomobject]@{ Name = (Join-Path 'agents' $managedAgentRoleDirectoryName); Target = $targetAgentRoles; Candidate = $stagedAgentRoles; Kind = 'Directory'; Operation = 'Replace'; WasPresent = $false; BackedUp = $false; InstallStarted = $false })
+    foreach ($skillName in $legacyManagedSkillNames) {
+        $transactionTargets.Add([pscustomobject]@{ Name = (Join-Path 'skills' $skillName); Target = (Join-Path $skillsTarget $skillName); Candidate = $null; Kind = 'Directory'; Operation = 'Remove'; WasPresent = $false; BackedUp = $false; InstallStarted = $false })
     }
 
-    # Validate every destination and the backup root before any managed target is replaced.
+    # Validate every destination and the backup root before any managed target is replaced or removed.
     Assert-InstallContainer -Path $agentsTarget
     Assert-NoReservedAgentRoleNameConflict -AgentsDirectory $agentsTarget -ManagedRoleDirectory $targetAgentRoles
     Assert-InstallContainer -Path $skillsTarget
@@ -680,10 +732,6 @@ try {
         $target.WasPresent = Test-ExistingPath -Path $target.Target
     }
 
-    if (-not (Test-Path -LiteralPath $skillsTarget -PathType Container)) {
-        New-Item -ItemType Directory -Path $skillsTarget | Out-Null
-        $skillsParentCreated = $true
-    }
     if (-not (Test-Path -LiteralPath $agentsTarget -PathType Container)) {
         New-Item -ItemType Directory -Path $agentsTarget | Out-Null
         $agentsParentCreated = $true
@@ -692,7 +740,7 @@ try {
         New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
         $backupDirectory = New-UniqueDirectory -Parent $backupRoot -Prefix 'backup-'
     }
-    foreach ($target in $transactionTargets) {
+    foreach ($target in $transactionTargets.Where({ $_.Operation -eq 'Replace' })) {
         if ($target.WasPresent) {
             $backupTarget = Join-Path $backupDirectory $target.Name
             New-Item -ItemType Directory -Path (Split-Path -Parent $backupTarget) -Force | Out-Null
@@ -700,10 +748,32 @@ try {
             $target.BackedUp = $true
         }
         $target.InstallStarted = $true
-        Move-Item -LiteralPath $target.Candidate -Destination $target.Target
+        if ($target.Operation -eq 'Replace') {
+            Move-Item -LiteralPath $target.Candidate -Destination $target.Target
+        }
+    }
+
+    # Plugin commands update config.toml. Run them only after its staged version
+    # is installed, while the transaction can still restore the previous config.
+    Install-ManagedPlugin -CodexHome $codexHome -MarketplaceRoot $scriptRoot -PluginName $managedPluginName -MarketplaceName $managedMarketplaceName
+
+    # The CLI may briefly retain config.toml after plugin add. The bounded retry
+    # preserves the final error and occurs before any legacy skill is removed.
+    Remove-LegacyManagedPlugin -CodexHome $codexHome -PluginId 'workflow-controller@ai-vibecode-superpower-local'
+
+    foreach ($target in $transactionTargets.Where({ $_.Operation -eq 'Remove' })) {
+        if ($target.WasPresent) {
+            $backupTarget = Join-Path $backupDirectory $target.Name
+            New-Item -ItemType Directory -Path (Split-Path -Parent $backupTarget) -Force | Out-Null
+            Move-Item -LiteralPath $target.Target -Destination $backupTarget
+            $target.BackedUp = $true
+        }
+        $target.InstallStarted = $true
     }
 
     Write-Host "Codex configuration installed in: $codexHome"
+    Write-Host "Managed plugin installed: $managedPluginName@$managedMarketplaceName"
+    Write-Host 'Legacy managed global skills removed; plugin is the only skill distribution entry point.'
     if ($null -ne $backupDirectory) {
         Write-Host "Backup directory: $backupDirectory"
     } else {
@@ -711,7 +781,7 @@ try {
     }
 }
 catch {
-    $rollbackErrors = Invoke-InstallRollback -Targets $transactionTargets -BackupDirectory $backupDirectory -SkillsTarget $skillsTarget -SkillsParentCreated $skillsParentCreated -AgentsTarget $agentsTarget -AgentsParentCreated $agentsParentCreated
+    $rollbackErrors = Invoke-InstallRollback -Targets $transactionTargets -BackupDirectory $backupDirectory -AgentsTarget $agentsTarget -AgentsParentCreated $agentsParentCreated
     foreach ($rollbackError in $rollbackErrors) {
         Write-Warning "$rollbackError Backup directory retained: $backupDirectory"
     }

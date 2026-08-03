@@ -25,7 +25,9 @@ description: 受控安装、初始化、诊断和维护项目级 CodeGraph 与 R
 macOS/Linux：
 
 ```sh
-driver="${CODEX_HOME:-$HOME/.codex}/skills/agent-toolchain/scripts/agent-toolchain.sh"
+codex_home="${CODEX_HOME:-$HOME/.codex}"
+driver=$(find "$codex_home/plugins/cache" -type f -path '*/agnets-workflow/*/skills/agent-toolchain/scripts/agent-toolchain.sh' -print 2>/dev/null | sort | tail -n 1)
+[ -n "$driver" ] || { printf '%s\n' '未找到已安装的 agnets-workflow 插件。' >&2; exit 1; }
 "$driver" configure --project "$PWD"
 "$driver" bootstrap --project "$PWD" --dry-run
 "$driver" bootstrap --project "$PWD" --apply
@@ -37,7 +39,9 @@ Windows PowerShell 7：
 
 ```powershell
 $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
-$driver = Join-Path $codexHome 'skills/agent-toolchain/scripts/agent-toolchain.ps1'
+$driver = @(Get-ChildItem -Path (Join-Path $codexHome 'plugins/cache/*/agnets-workflow/*/skills/agent-toolchain/scripts/agent-toolchain.ps1') -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime | Select-Object -Last 1 -ExpandProperty FullName)
+if ($driver.Count -ne 1) { throw '未找到已安装的 agnets-workflow 插件。' }
+$driver = $driver[0]
 & $driver configure --project $PWD
 & $driver bootstrap --project $PWD --dry-run
 & $driver bootstrap --project $PWD --apply

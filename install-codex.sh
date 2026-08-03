@@ -8,16 +8,20 @@ source_config=$script_dir/codex-global-config/config.toml
 source_docs=$script_dir/codex-global-config/docs
 source_agent_roles=$script_dir/codex-global-config/agents/ai-vibecode-superpower
 source_agent_role_manifest=$script_dir/codex-global-config/agents/ai-vibecode-superpower.sha256
-source_skills=$script_dir/skills
+managed_plugin_name=agnets-workflow
+managed_marketplace_name=ai-vibecode-superpower-local
+source_plugin=$script_dir/plugins/$managed_plugin_name
+source_marketplace=$script_dir/.agents/plugins/marketplace.json
+source_skills=$source_plugin/skills
 managed_agent_role_files='ai-vibecode-superpower-avsp_luna_high.toml ai-vibecode-superpower-avsp_luna_xhigh.toml ai-vibecode-superpower-avsp_luna_high_writer.toml ai-vibecode-superpower-avsp_luna_xhigh_writer.toml ai-vibecode-superpower-avsp_sol_high.toml ai-vibecode-superpower-avsp_sol_xhigh.toml ai-vibecode-superpower-avsp_terra_high.toml ai-vibecode-superpower-avsp_terra_xhigh.toml ai-vibecode-superpower-avsp_terra_xhigh_readonly.toml ai-vibecode-superpower-avsp_terra_low_readonly.toml ai-vibecode-superpower-avsp_terra_medium_readonly.toml'
 
-for source_path in "$source_agents" "$source_config" "$source_agent_role_manifest"; do
+for source_path in "$source_agents" "$source_config" "$source_agent_role_manifest" "$source_marketplace"; do
     if [ ! -f "$source_path" ]; then
         printf '%s\n' "Missing source file: $source_path" >&2
         exit 1
     fi
 done
-for source_path in "$source_docs" "$source_agent_roles" "$source_skills"; do
+for source_path in "$source_docs" "$source_agent_roles" "$source_plugin" "$source_skills"; do
     if [ ! -d "$source_path" ]; then
         printf '%s\n' "Missing source directory: $source_path" >&2
         exit 1
@@ -31,15 +35,13 @@ for agent_role_file in $managed_agent_role_files; do
     fi
 done
 
-managed_skill_count=0
-for source_skill in "$source_skills"/*; do
-    [ -d "$source_skill" ] || continue
-    managed_skill_count=$((managed_skill_count + 1))
+legacy_managed_skill_names='agent-toolchain gpt-image-2-cli orchestrate-model-workflow project-doc-planner workflow-controller'
+for skill_name in $legacy_managed_skill_names; do
+    if [ ! -d "$source_skills/$skill_name" ]; then
+        printf '%s\n' "Missing managed plugin skill: $skill_name" >&2
+        exit 1
+    fi
 done
-if [ "$managed_skill_count" -eq 0 ]; then
-    printf '%s\n' "No managed skill directories found in: $source_skills" >&2
-    exit 1
-fi
 
 case $(uname -s) in
     Darwin|Linux) ;;
@@ -75,24 +77,57 @@ if [ "$codex_home/AGENTS.md" -ef "$source_agents" ] || \
     printf '%s\n' 'Destination target overlaps its source.' >&2
     exit 1
 fi
-for source_skill in "$source_skills"/*; do
-    [ -d "$source_skill" ] || continue
-    skill_name=$(basename "$source_skill")
-    if [ "$codex_home/skills/$skill_name" -ef "$source_skill" ]; then
-        printf '%s\n' "Destination target overlaps its source: $codex_home/skills/$skill_name" >&2
-        exit 1
-    fi
-done
-
 stage_dir=
 backup_dir=
 manifest=
 completed=0
 lock_file=$codex_home/.install.lock
-skills_parent_created=0
 agents_parent_created=0
 tab=$(printf '\t')
 carriage_return=$(printf '\r')
+
+install_managed_plugin() {
+    command -v codex >/dev/null 2>&1 || {
+        printf '%s\n' 'Codex CLI is required to install the managed plugin, but codex was not found.' >&2
+        return 1
+    }
+    command -v node >/dev/null 2>&1 || {
+        printf '%s\n' 'Node.js is required for the agnets-workflow workflow-controller MCP server, but the node command was not found.' >&2
+        return 1
+    }
+    CODEX_HOME="$codex_home" codex plugin marketplace add "$script_dir"
+    CODEX_HOME="$codex_home" codex plugin add "$managed_plugin_name@$managed_marketplace_name"
+}
+
+remove_legacy_managed_plugin() {
+    legacy_plugin_id=workflow-controller@ai-vibecode-superpower-local
+    config_path=$codex_home/config.toml
+    [ -f "$config_path" ] || return 0
+
+    if ! rg -F -q -- "[plugins.\"$legacy_plugin_id\"]" "$config_path" && \
+       ! rg -F -q -- "[plugins.'$legacy_plugin_id']" "$config_path"; then
+        return 0
+    fi
+
+    command -v codex >/dev/null 2>&1 || {
+        printf '%s\n' 'Codex CLI is required to remove the legacy managed plugin, but codex was not found.' >&2
+        return 1
+    }
+    attempt=1
+    while :; do
+        if CODEX_HOME="$codex_home" codex plugin remove "$legacy_plugin_id"; then
+            return 0
+        else
+            exit_code=$?
+        fi
+        if [ "$attempt" -ge 8 ]; then
+            printf '%s\n' "Could not remove legacy managed plugin after 8 attempts: $legacy_plugin_id (exit code $exit_code)" >&2
+            return "$exit_code"
+        fi
+        attempt=$((attempt + 1))
+        sleep 1
+    done
+}
 
 path_exists() {
     [ -e "$1" ] || [ -L "$1" ]
@@ -765,13 +800,13 @@ rollback() {
     rollback_failed=0
     [ -n "$manifest" ] && [ -f "$manifest" ] || return 0
 
-    while IFS="$tab" read -r target_name target_path candidate_path target_kind; do
+    while IFS="$tab" read -r target_name target_path candidate_path target_kind target_operation; do
         if has_state install-started "$target_name" && path_exists "$target_path"; then
             rm -rf "$target_path" || rollback_failed=1
         fi
     done < "$manifest"
 
-    while IFS="$tab" read -r target_name target_path candidate_path target_kind; do
+    while IFS="$tab" read -r target_name target_path candidate_path target_kind target_operation; do
         backup_path=$backup_dir/$target_name
         if has_state backed-up "$target_name" && path_exists "$backup_path"; then
             mkdir -p "$(dirname "$target_path")" || rollback_failed=1
@@ -781,9 +816,6 @@ rollback() {
         fi
     done < "$manifest"
 
-    if [ "$skills_parent_created" -eq 1 ] && [ -d "$codex_home/skills" ]; then
-        rmdir "$codex_home/skills" 2>/dev/null || true
-    fi
     if [ "$agents_parent_created" -eq 1 ] && [ -d "$codex_home/agents" ]; then
         rmdir "$codex_home/agents" 2>/dev/null || true
     fi
@@ -843,11 +875,6 @@ cp "$source_agents" "$stage_dir/AGENTS.md"
 cp -R "$source_docs" "$stage_dir/docs"
 mkdir -p "$stage_dir/agents"
 cp -R "$source_agent_roles" "$stage_dir/agents/"
-mkdir "$stage_dir/skills"
-for source_skill in "$source_skills"/*; do
-    [ -d "$source_skill" ] || continue
-    cp -R "$source_skill" "$stage_dir/skills/"
-done
 
 assert_target "$codex_home/config.toml" file
 config_input=$codex_home/config.toml
@@ -873,24 +900,17 @@ for agent_role_file in $managed_agent_role_files; do
     fi
 done
 assert_managed_agent_role_directory "$stage_dir/agents/ai-vibecode-superpower"
-for staged_skill in "$stage_dir/skills"/*; do
-    if [ ! -d "$staged_skill" ]; then
-        printf '%s\n' "Staging failed for skill: $(basename "$staged_skill")" >&2
-        exit 1
-    fi
-done
 
 manifest=$stage_dir/targets.tsv
-printf '%s\t%s\t%s\t%s\n' AGENTS.md "$codex_home/AGENTS.md" "$stage_dir/AGENTS.md" file > "$manifest"
-printf '%s\t%s\t%s\t%s\n' config.toml "$codex_home/config.toml" "$stage_dir/merged-config.toml" file >> "$manifest"
-printf '%s\t%s\t%s\t%s\n' docs "$codex_home/docs" "$stage_dir/docs" directory >> "$manifest"
-printf '%s\t%s\t%s\t%s\n' agents/ai-vibecode-superpower "$codex_home/agents/ai-vibecode-superpower" "$stage_dir/agents/ai-vibecode-superpower" directory >> "$manifest"
-for staged_skill in "$stage_dir/skills"/*; do
-    skill_name=$(basename "$staged_skill")
-    printf '%s\t%s\t%s\t%s\n' "skills/$skill_name" "$codex_home/skills/$skill_name" "$staged_skill" directory >> "$manifest"
+printf '%s\t%s\t%s\t%s\t%s\n' AGENTS.md "$codex_home/AGENTS.md" "$stage_dir/AGENTS.md" file replace > "$manifest"
+printf '%s\t%s\t%s\t%s\t%s\n' config.toml "$codex_home/config.toml" "$stage_dir/merged-config.toml" file replace >> "$manifest"
+printf '%s\t%s\t%s\t%s\t%s\n' docs "$codex_home/docs" "$stage_dir/docs" directory replace >> "$manifest"
+printf '%s\t%s\t%s\t%s\t%s\n' agents/ai-vibecode-superpower "$codex_home/agents/ai-vibecode-superpower" "$stage_dir/agents/ai-vibecode-superpower" directory replace >> "$manifest"
+for skill_name in $legacy_managed_skill_names; do
+    printf '%s\t%s\t%s\t%s\t%s\n' "skills/$skill_name" "$codex_home/skills/$skill_name" - directory remove >> "$manifest"
 done
 
-# All source candidates exist now. Validate every destination and backup path before replacing any target.
+# All source candidates exist now. Validate every destination and backup path before replacing or removing any target.
 assert_target "$codex_home/AGENTS.md" file
 assert_target "$codex_home/config.toml" file
 assert_target "$codex_home/docs" directory
@@ -900,21 +920,17 @@ assert_directory_container "$codex_home/skills"
 if path_exists "$codex_home/backups"; then
     assert_directory_container "$codex_home/backups"
 fi
-while IFS="$tab" read -r target_name target_path candidate_path target_kind; do
+while IFS="$tab" read -r target_name target_path candidate_path target_kind target_operation; do
     assert_target "$target_path" "$target_kind"
 done < "$manifest"
 
 has_existing_target=0
-while IFS="$tab" read -r target_name target_path candidate_path target_kind; do
+while IFS="$tab" read -r target_name target_path candidate_path target_kind target_operation; do
     if path_exists "$target_path"; then
         has_existing_target=1
         break
     fi
 done < "$manifest"
-if [ ! -d "$codex_home/skills" ]; then
-    mkdir "$codex_home/skills"
-    skills_parent_created=1
-fi
 if [ ! -d "$codex_home/agents" ]; then
     mkdir "$codex_home/agents"
     agents_parent_created=1
@@ -924,7 +940,8 @@ if [ "$has_existing_target" -eq 1 ]; then
     backup_dir=$(mktemp -d "$codex_home/backups/backup-$(date +%Y%m%d-%H%M%S)-$$.XXXXXX")
 fi
 
-while IFS="$tab" read -r target_name target_path candidate_path target_kind; do
+while IFS="$tab" read -r target_name target_path candidate_path target_kind target_operation; do
+    [ "$target_operation" = replace ] || continue
     if path_exists "$target_path"; then
         backup_path=$backup_dir/$target_name
         mkdir -p "$(dirname "$backup_path")"
@@ -932,11 +949,34 @@ while IFS="$tab" read -r target_name target_path candidate_path target_kind; do
         mark_state backed-up "$target_name"
     fi
     mark_state install-started "$target_name"
-    mv "$candidate_path" "$target_path"
+    if [ "$target_operation" = replace ]; then
+        mv "$candidate_path" "$target_path"
+    fi
+done < "$manifest"
+
+# Plugin commands update config.toml. Run them only after its staged version
+# is installed, while the transaction can still restore the previous config.
+install_managed_plugin
+
+# The CLI may briefly retain config.toml after plugin add. The bounded retry
+# preserves the final error and occurs before any legacy skill is removed.
+remove_legacy_managed_plugin
+
+while IFS="$tab" read -r target_name target_path candidate_path target_kind target_operation; do
+    [ "$target_operation" = remove ] || continue
+    if path_exists "$target_path"; then
+        backup_path=$backup_dir/$target_name
+        mkdir -p "$(dirname "$backup_path")"
+        mv "$target_path" "$backup_path"
+        mark_state backed-up "$target_name"
+    fi
+    mark_state install-started "$target_name"
 done < "$manifest"
 
 completed=1
 printf '%s\n' "Codex configuration installed in: $codex_home"
+printf '%s\n' "Managed plugin installed: $managed_plugin_name@$managed_marketplace_name"
+printf '%s\n' 'Legacy managed global skills removed; plugin is the only skill distribution entry point.'
 if [ -n "$backup_dir" ]; then
     printf '%s\n' "Backup directory: $backup_dir"
 else

@@ -16,7 +16,7 @@
 
 | task_name | 阶段 | agent_type | 输入/依赖 | 验收 | 状态 |
 | --- | --- | --- | --- | --- | --- |
-| <Codex task name> | 取证 / 定案 / 实施 / 预审 / 验收 | <role> | <必要输入> | <条件> | pending |
+| <Codex task name> | 取证 / 定案 / 实施 / 预审 / 总验收 | <role> | <必要输入> | <条件> | pending |
 ```
 
 ## 委派消息
@@ -53,6 +53,21 @@ remaining_work_or_blocker: <未完成工作；保留原始错误和缺失条件>
 ```
 
 子 agent 未返回时，父 agent 先核验 `list_agents`、实例状态/历史、diff、产物和验证输出。投递、触发、等待或中断的工具返回都不等于子任务完成或已经停止写入。
+
+## 任务级总验收
+
+每个有状态变更的任务在关闭前，由 main/root 新建此前未参与该任务的 `avsp_sol_high` 做总验收；仅在证据冲突、根因未证实、无可靠 oracle 或需受约束重设计时使用 `avsp_sol_xhigh`。所选 Sol role 或模型被实际证明不可用时，使用此前未参与该任务的 `avsp_terra_xhigh_readonly` 兜底同一验收并披露独立性降级；超时、证据不足或普通失败不得降级。输入必须包含原始目标、逐项验收条件、范围/非目标、执行契约、实际 diff/产物、验证输出和已知风险。验收返回 `pass`、`fail` 或 `unavailable`，并逐项说明需求覆盖、范围漂移、行为或回归风险、验证缺口与残余风险。缺少审核实例标识、逐项需求覆盖或证据时视为 `unavailable`。`fail` 或 `unavailable` 不得关闭任务；修复或补证后必须新建另一独立 Sol 实例重新验收。
+
+```markdown
+auditor_task: <新建且此前未参与本任务的 task path>
+auditor_role: <avsp_sol_high | avsp_sol_xhigh | avsp_terra_xhigh_readonly>
+verdict: <pass | fail | unavailable>
+requirement_coverage: <逐项验收条件 -> 证据或缺口>
+scope_and_regression: <范围漂移、行为或回归风险>
+verification_gaps: <未验证项及原因>
+residual_risk: <残余风险；无则写无>
+fallback_reason: <仅 Terra fallback；保留 Sol 不可用原始错误>
+```
 
 ## 协调检查
 
