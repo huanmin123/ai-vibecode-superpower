@@ -106,7 +106,7 @@ assert_no_symlink_tree() {
         exit 1
     fi
     if [ ! -d "$target_path" ]; then
-        return
+        return 0
     fi
     for child_path in "$target_path"/* "$target_path"/.[!.]* "$target_path"/..?*; do
         path_exists "$child_path" || continue
@@ -210,7 +210,7 @@ assert_managed_agent_role_manifest() {
     for role_file in $managed_agent_role_files; do
         expected_role_count=$((expected_role_count + 1))
         case " $manifest_role_files " in
-            *" $role_file ") ;;
+            *" $role_file "*) ;;
             *)
                 printf '%s\n' "Missing managed agent role hash: $role_file" >&2
                 exit 1
@@ -464,7 +464,7 @@ assert_directory_container() {
 assert_no_reserved_agent_role_name_conflict() {
     agents_directory=$1
 
-    [ -d "$agents_directory" ] || return
+    [ -d "$agents_directory" ] || return 0
     assert_no_symlink_tree "$agents_directory"
     conflict_found=0
     for scan_root in "$agents_directory"/* "$agents_directory"/.[!.]* "$agents_directory"/..?*; do
