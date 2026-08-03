@@ -2,7 +2,7 @@
 
 这是一套给 Codex 使用者的全局配置与统一插件：统一工作约定、可分工的 agent role，以及 `agnets-workflow` 提供的常用 skills 和工作流工具。安装后，新建的 Codex task 可以直接使用它们。
 
-本项目不安装或升级 Codex CLI，也不安装 Codex 桌面应用。
+本项目不安装或升级 Codex CLI，也不安装 Codex 桌面应用。   还有就是内置的`superpowser`插件请关闭使用否则可能会冲突和加大成本 。 
 
 ## 你会得到
 
