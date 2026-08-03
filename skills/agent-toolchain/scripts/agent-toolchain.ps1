@@ -331,7 +331,7 @@ exit /b %ERRORLEVEL%
 "@
 }
 
-function Get-RtkLauncher {
+function Get-LegacyRtkLauncher {
   @"
 @echo off
 setlocal
@@ -343,10 +343,74 @@ exit /b %ERRORLEVEL%
 "@
 }
 
-function Ensure-PublicLauncher([string]$Tool) {
+function Get-PublicRtkBinary { return Join-Path $ToolchainBin 'rtk.exe' }
+
+function Test-PublicRtkBinary([string]$Version) {
+  try {
+    $publicPath = Get-PublicRtkBinary
+    $target = Get-Binary 'rtk' (Get-VersionDirectory 'rtk' $Version)
+    if (-not (Test-Path -LiteralPath $publicPath -PathType Leaf) -or -not (Test-Path -LiteralPath $target -PathType Leaf)) { return $false }
+    $publicItem = Get-Item -LiteralPath $publicPath -Force
+    if ($publicItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { return $false }
+    return (Get-Sha256 $publicPath) -eq (Get-Sha256 $target)
+  } catch { return $false }
+}
+
+function Assert-LegacyRtkLauncherSafe {
+  $legacyPath = Join-Path $ToolchainBin 'rtk.cmd'
+  if (-not (Test-Path -LiteralPath $legacyPath)) { return }
+  $legacyItem = Get-Item -LiteralPath $legacyPath -Force
+  if (($legacyItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -or $legacyItem.PSIsContainer) { Fail "$legacyPath 必须是普通文件" }
+  if ((Get-Content -LiteralPath $legacyPath -Raw) -cne (Get-LegacyRtkLauncher)) { Fail "$legacyPath 已被非受管理目标占用" }
+}
+
+function Remove-LegacyRtkLauncher {
+  $legacyPath = Join-Path $ToolchainBin 'rtk.cmd'
+  Assert-LegacyRtkLauncherSafe
+  if (-not (Test-Path -LiteralPath $legacyPath -PathType Leaf)) { return }
+  Remove-Item -LiteralPath $legacyPath -Force
+}
+
+function Ensure-PublicRtkBinary([string]$Version) {
+  Assert-SafeVersion $Version
+  Verify-VersionDirectory 'rtk' $Version
+  Assert-LegacyRtkLauncherSafe
+  $publicPath = Get-PublicRtkBinary
+  if (Test-Path -LiteralPath $publicPath) {
+    $publicItem = Get-Item -LiteralPath $publicPath -Force
+    if (($publicItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -or $publicItem.PSIsContainer) { Fail "$publicPath 必须是普通文件" }
+    if (Test-PublicRtkBinary $Version) {
+      Remove-LegacyRtkLauncher
+      return
+    }
+    $currentVersion = Get-CurrentVersion 'rtk'
+    if (-not $currentVersion -or -not (Test-PublicRtkBinary $currentVersion)) { Fail "$publicPath 已被非受管理目标占用" }
+  }
+  $target = Get-Binary 'rtk' (Get-VersionDirectory 'rtk' $Version)
+  $temporary = Join-Path $ToolchainBin ".rtk-$([Guid]::NewGuid().ToString('N')).tmp"
+  try {
+    New-Item -ItemType HardLink -Path $temporary -Target $target | Out-Null
+    if (Test-Path -LiteralPath $publicPath -PathType Leaf) {
+      [System.IO.File]::Replace($temporary, $publicPath, $null)
+    } else {
+      [System.IO.File]::Move($temporary, $publicPath)
+    }
+  } finally {
+    if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
+  }
+  if (-not (Test-PublicRtkBinary $Version)) { Fail 'RTK 原生公共入口验证失败' }
+  Remove-LegacyRtkLauncher
+}
+
+function Ensure-PublicLauncher([string]$Tool, [string]$Version = '') {
   New-Item -ItemType Directory -Path $ToolchainBin -Force | Out-Null
+  if ($Tool -eq 'rtk') {
+    if ([string]::IsNullOrWhiteSpace($Version)) { Fail 'RTK 公共入口缺少版本号' }
+    Ensure-PublicRtkBinary $Version
+    return
+  }
   $path = Join-Path $ToolchainBin "$Tool.cmd"
-  $expected = if ($Tool -eq 'codegraph') { Get-CodeGraphLauncher } else { Get-RtkLauncher }
+  $expected = Get-CodeGraphLauncher
   if (Test-Path -LiteralPath $path) {
     $current = Get-Content -LiteralPath $path -Raw
     if ($current -cne $expected) {
@@ -392,14 +456,20 @@ function Set-CurrentVersion([string]$Tool, [string]$Version) {
   Assert-NoReparsePoints $toolDirectory
   $currentFile = Get-CurrentFile $Tool
   if ((Test-Path -LiteralPath $currentFile) -and -not (Test-Path -LiteralPath $currentFile -PathType Leaf)) { Fail "current 不是普通文件：$currentFile" }
-  Ensure-PublicLauncher $Tool
+  Ensure-PublicLauncher $Tool $Version
   Ensure-UserPath @($ToolchainBin)
   $temporary = Join-Path $toolDirectory ".current-$([Guid]::NewGuid().ToString('N')).tmp"
-  [System.IO.File]::WriteAllText($temporary, "$Version`n", [System.Text.UTF8Encoding]::new($false))
-  if (Test-Path -LiteralPath $currentFile -PathType Leaf) {
-    [System.IO.File]::Replace($temporary, $currentFile, $null)
-  } else {
-    [System.IO.File]::Move($temporary, $currentFile)
+  $backup = Join-Path $toolDirectory ".current-$([Guid]::NewGuid().ToString('N')).bak"
+  try {
+    [System.IO.File]::WriteAllText($temporary, "$Version`n", [System.Text.UTF8Encoding]::new($false))
+    if (Test-Path -LiteralPath $currentFile -PathType Leaf) {
+      [System.IO.File]::Replace($temporary, $currentFile, $backup)
+    } else {
+      [System.IO.File]::Move($temporary, $currentFile)
+    }
+  } finally {
+    if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
+    if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Force }
   }
 }
 
@@ -408,12 +478,9 @@ function Test-Ready([string]$Tool) {
     if ($Tool -eq 'codegraph') { return Test-CodeGraphNpmReady }
     $version = Get-ToolValue $Tool 'version'
     if ((Get-CurrentVersion $Tool) -ne $version) { return $false }
-    $launcher = Join-Path $ToolchainBin "$Tool.cmd"
-    if (-not (Test-Path -LiteralPath $launcher -PathType Leaf)) { return $false }
-    $expected = if ($Tool -eq 'codegraph') { Get-CodeGraphLauncher } else { Get-RtkLauncher }
-    if ((Get-Content -LiteralPath $launcher -Raw) -cne $expected) { return $false }
+    if (Test-Path -LiteralPath (Join-Path $ToolchainBin 'rtk.cmd')) { return $false }
     Verify-VersionDirectory $Tool $version
-    return $true
+    return Test-PublicRtkBinary $version
   } catch { return $false }
 }
 
@@ -422,10 +489,7 @@ function Test-QuickReady([string]$Tool) {
     if ($Tool -eq 'codegraph') { return Test-CodeGraphNpmReady }
     $version = Get-ToolValue $Tool 'version'
     if ((Get-CurrentVersion $Tool) -ne $version) { return $false }
-    $launcher = Join-Path $ToolchainBin "$Tool.cmd"
-    if (-not (Test-Path -LiteralPath $launcher -PathType Leaf)) { return $false }
-    $expected = if ($Tool -eq 'codegraph') { Get-CodeGraphLauncher } else { Get-RtkLauncher }
-    if ((Get-Content -LiteralPath $launcher -Raw) -cne $expected) { return $false }
+    if (Test-Path -LiteralPath (Join-Path $ToolchainBin 'rtk.cmd')) { return $false }
     $directory = Get-VersionDirectory $Tool $version
     if (-not (Test-Path -LiteralPath $directory -PathType Container)) { return $false }
     Assert-NoReparsePoints $directory
@@ -441,7 +505,7 @@ function Test-QuickReady([string]$Tool) {
     if ($Tool -eq 'codegraph') {
       if (-not (Test-Path -LiteralPath (Join-Path $directory 'node.exe') -PathType Leaf) -or -not (Test-Path -LiteralPath (Join-Path $directory 'lib/dist/bin/codegraph.js') -PathType Leaf)) { return $false }
     }
-    return $true
+    return Test-PublicRtkBinary $version
   } catch { return $false }
 }
 
@@ -546,11 +610,22 @@ function Install-Tool([ValidateSet('codegraph', 'rtk')][string]$Tool) {
   $version = Get-ToolValue $Tool 'version'
   if (Test-Ready $Tool) { Note "$Tool $version 已就绪"; return }
   $destination = Get-VersionDirectory $Tool $version
-  if (Test-Path -LiteralPath $destination) { Fail "$destination 已存在但不健康，拒绝覆盖" }
+  if (Test-Path -LiteralPath $destination) {
+    if ((Get-CurrentVersion $Tool) -eq $version) {
+      Verify-VersionDirectory $Tool $version
+      if ($script:DryRun) {
+        Note "dry-run: 修复 $ToolchainBin\\rtk.exe 公共入口"
+        return
+      }
+      Set-CurrentVersion $Tool $version
+      if (Test-Ready $Tool) { Note "$Tool $version 已修复"; return }
+    }
+    Fail "$destination 已存在但不健康，拒绝覆盖"
+  }
   if ($script:DryRun) {
     Note "dry-run: 下载 $(Get-ToolValue $Tool 'url')"
     Note "dry-run: 验证 SHA-256 $(Get-ToolValue $Tool 'sha')"
-    Note "dry-run: 安装到 $destination 并创建 $ToolchainBin\\$Tool.cmd"
+    Note "dry-run: 安装到 $destination 并创建 $ToolchainBin\\rtk.exe"
     return
   }
   $workDirectory = Join-Path ([System.IO.Path]::GetTempPath()) "agent-toolchain-$([Guid]::NewGuid().ToString('N'))"
@@ -672,7 +747,12 @@ function Invoke-Bootstrap {
     throw
   }
   if ($script:Apply -and (Test-Ready 'codegraph')) { Invoke-WithCodeGraphEnvironment { & (Get-Binary 'codegraph' (Get-VersionDirectory 'codegraph' (Get-ToolValue 'codegraph' 'version'))) telemetry off | Out-Null } }
-  if ($script:Apply -and (Test-Ready 'rtk')) { $env:RTK_TELEMETRY_DISABLED = '1'; & (Get-Binary 'rtk' (Get-VersionDirectory 'rtk' (Get-ToolValue 'rtk' 'version'))) telemetry disable | Out-Null }
+  if ($script:Apply -and (Test-Ready 'rtk')) {
+    $env:RTK_TELEMETRY_DISABLED = '1'
+    $telemetryOutput = @(& (Get-Binary 'rtk' (Get-VersionDirectory 'rtk' (Get-ToolValue 'rtk' 'version'))) telemetry disable)
+    $telemetryExitCode = $LASTEXITCODE
+    if ($telemetryExitCode -ne 0) { Fail "RTK telemetry disable 失败：$telemetryExitCode $($telemetryOutput -join ' ')" }
+  }
 }
 
 function Invoke-InitCodeGraph {

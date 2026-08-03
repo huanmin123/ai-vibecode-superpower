@@ -12,6 +12,12 @@
 4. **明确长度与语气**：短答复说明必须保留和可省略的信息，不使用泛泛的“简短”；直接回答，用户报告问题时先回应具体问题，省略泛泛表扬、安慰和签名。
 5. **用评估迭代**：基于代表性任务，每次只增删一组提示词、示例或工具，再比较任务成功、完整性、证据、token、延迟与成本。
 
+## README 定位
+
+1. `README.md` 是使用者手册：只说明用途、适用场景、简明工作流、安装入口和可选能力。
+2. 不在 README 重复 role 路由、模型选择、消息字段、权限边界、并发限制、配置合并或安装器实现细节。
+3. 技术规则只在其权威来源维护：项目文档边界在本文件，工作流在 `skills/orchestrate-model-workflow/SKILL.md`，role 边界在 `codex-global-config/agents/ai-vibecode-superpower/`，安装行为在安装脚本。README 仅在确有必要时链接这些来源。
+
 ## 权威来源
 
 - 全局行为规范：`codex-global-config/AGENTS.md`；安装后对应 `<CODEX_HOME>/AGENTS.md`。

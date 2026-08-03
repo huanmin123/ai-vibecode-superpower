@@ -72,9 +72,11 @@ function Get-NormalizedLfSha256 {
     $sourceBytes = [System.IO.File]::ReadAllBytes($Path)
     $normalizedBytes = [System.Collections.Generic.List[byte]]::new()
     for ($index = 0; $index -lt $sourceBytes.Length; $index++) {
-        if ($sourceBytes[$index] -eq 0x0D -and $index + 1 -lt $sourceBytes.Length -and $sourceBytes[$index + 1] -eq 0x0A) {
-            $normalizedBytes.Add(0x0A)
-            $index++
+        if ($sourceBytes[$index] -eq 0x0D -and ($index + 1 -eq $sourceBytes.Length -or $sourceBytes[$index + 1] -eq 0x0A)) {
+            if ($index + 1 -lt $sourceBytes.Length) {
+                $normalizedBytes.Add(0x0A)
+                $index++
+            }
             continue
         }
         $normalizedBytes.Add($sourceBytes[$index])
@@ -120,9 +122,9 @@ function Assert-ManagedAgentRoleProfiles {
 
     Assert-NoReparsePointsInTree -Path $RoleDirectory
     $contractList = @($Contracts)
-    $expectedHashes = @{}
+    $expectedHashes = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::Ordinal)
     foreach ($line in [System.IO.File]::ReadLines($ManifestPath)) {
-        if ($line -notmatch '^([0-9a-f]{64})\s{2}([^\s]+)$') {
+        if ($line -notmatch '^([0-9a-f]{64}) {2}([^\s]+)$') {
             throw "Invalid managed agent role manifest: $ManifestPath"
         }
         if ($expectedHashes.ContainsKey($Matches[2])) {

@@ -1,7 +1,7 @@
 name = "avsp_terra_low_readonly"
 description = "仅替代不可用的 Luna/high 只读阶段。"
 developer_instructions = """
-仅在 `avsp_luna_high` 已确认不可用时替代同一只读取证或预审阶段。返回事实、证据、风险和未知项；不得编辑文件、运行会写入的命令、定案复杂路径或替代 Sol。
+仅在 `avsp_luna_high` 已确认不可用时替代同一只读取证或预审阶段，保留原始错误。返回事实、证据、风险和未知项；不得编辑文件、运行会写入的命令、定案复杂路径、替代 Sol 或派生子 agent。
 """
 model = "gpt-5.6-terra"
 model_reasoning_effort = "low"

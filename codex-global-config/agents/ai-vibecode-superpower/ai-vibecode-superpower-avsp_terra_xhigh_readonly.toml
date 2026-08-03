@@ -1,7 +1,7 @@
 name = "avsp_terra_xhigh_readonly"
-description = "仅在 Sol 模型明确不支持时替代同一只读阶段。"
+description = "仅在 Sol role 或其模型实际不可用时替代同一只读阶段。"
 developer_instructions = """
-仅在原 Sol role 已通过能力检查且上游对对应 `gpt-5.6-sol` 返回结构化 `unsupported_model` 或 `model_not_found` 时，替代同一只读阶段。返回原 Sol role、错误证据、结论、未知项和独立性降级；不得编辑文件、运行会写入的命令或替代 Terra writer。其他错误不得触发此 fallback。
+仅在 `spawn_agent` 或原 Sol agent 的实际结果表明对应 role 或模型不可用时，替代同一只读阶段。保留原始错误，返回原 Sol role、结论、未知项和独立性降级；超时、证据不足或普通执行失败不得触发此 fallback。不得编辑文件、运行会写入的命令、替代 Terra writer 或派生子 agent。
 """
 model = "gpt-5.6-terra"
 model_reasoning_effort = "xhigh"

@@ -92,6 +92,7 @@ lock_file=$codex_home/.install.lock
 skills_parent_created=0
 agents_parent_created=0
 tab=$(printf '\t')
+carriage_return=$(printf '\r')
 
 path_exists() {
     [ -e "$1" ] || [ -L "$1" ]
@@ -134,47 +135,87 @@ is_managed_agent_role_file() {
     esac
 }
 
-sha256_file() {
+normalized_lf_sha256() {
     case $(uname -s) in
         Darwin)
-            shasum -a 256 "$1" | awk '{ print $1 }'
+            sed "s/${carriage_return}\$//" "$1" | shasum -a 256 | awk '{ print $1 }'
             ;;
         Linux)
-            sha256sum "$1" | awk '{ print $1 }'
+            sed "s/${carriage_return}\$//" "$1" | sha256sum | awk '{ print $1 }'
             ;;
     esac
+}
+
+parse_managed_agent_role_manifest_line() {
+    manifest_line=$1
+    case $manifest_line in
+        *"  "*) ;;
+        *) return 1 ;;
+    esac
+    manifest_hash=${manifest_line%"  "*}
+    manifest_role_file=${manifest_line#"$manifest_hash"  }
+    [ "$manifest_hash  $manifest_role_file" = "$manifest_line" ] || return 1
+    [ -n "$manifest_role_file" ] || return 1
+    case $manifest_hash in
+        *[!0-9a-f]*|'') return 1 ;;
+    esac
+    [ "${#manifest_hash}" -eq 64 ] || return 1
+    case $manifest_role_file in
+        *[[:space:]]*) return 1 ;;
+    esac
+    return 0
+}
+
+managed_agent_role_manifest_hash() {
+    requested_role_file=$1
+    while IFS= read -r manifest_line || [ -n "$manifest_line" ]; do
+        if ! parse_managed_agent_role_manifest_line "$manifest_line"; then
+            printf '%s\n' "Invalid managed agent role manifest: $source_agent_role_manifest" >&2
+            return 1
+        fi
+        if [ "$manifest_role_file" = "$requested_role_file" ]; then
+            printf '%s\n' "$manifest_hash"
+            return 0
+        fi
+    done < "$source_agent_role_manifest"
+    printf '%s\n' "Missing managed agent role hash: $requested_role_file" >&2
+    return 1
 }
 
 assert_managed_agent_role_manifest() {
     manifest_path=$1
     manifest_count=0
+    manifest_role_files=
 
-    while IFS='  ' read -r expected_hash role_file; do
-        [ -n "$expected_hash" ] || continue
-        case $expected_hash in
-            *[!0-9a-f]*)
-                printf '%s\n' "Invalid managed agent role hash: $manifest_path" >&2
+    while IFS= read -r manifest_line || [ -n "$manifest_line" ]; do
+        if ! parse_managed_agent_role_manifest_line "$manifest_line"; then
+            printf '%s\n' "Invalid managed agent role manifest: $manifest_path" >&2
+            exit 1
+        fi
+        if ! is_managed_agent_role_file "$manifest_role_file"; then
+            printf '%s\n' "Unexpected managed agent role manifest entry: $manifest_role_file" >&2
+            exit 1
+        fi
+        case " $manifest_role_files " in
+            *" $manifest_role_file "*)
+                printf '%s\n' "Repeated managed agent role hash: $manifest_role_file" >&2
                 exit 1
                 ;;
         esac
-        if [ "${#expected_hash}" -ne 64 ]; then
-            printf '%s\n' "Invalid managed agent role hash length: $manifest_path" >&2
-            exit 1
-        fi
-        if ! is_managed_agent_role_file "$role_file"; then
-            printf '%s\n' "Unexpected managed agent role manifest entry: $role_file" >&2
-            exit 1
-        fi
+        manifest_role_files="$manifest_role_files $manifest_role_file"
         manifest_count=$((manifest_count + 1))
     done < "$manifest_path"
 
     expected_role_count=0
     for role_file in $managed_agent_role_files; do
         expected_role_count=$((expected_role_count + 1))
-        if [ "$(awk -v role_file="$role_file" '$2 == role_file { count++ } END { print count + 0 }' "$manifest_path")" -ne 1 ]; then
-            printf '%s\n' "Missing or repeated managed agent role hash: $role_file" >&2
-            exit 1
-        fi
+        case " $manifest_role_files " in
+            *" $role_file ") ;;
+            *)
+                printf '%s\n' "Missing managed agent role hash: $role_file" >&2
+                exit 1
+                ;;
+        esac
     done
     if [ "$manifest_count" -ne "$expected_role_count" ]; then
         printf '%s\n' "Unexpected managed agent role manifest entry count: $manifest_path" >&2
@@ -259,8 +300,8 @@ assert_managed_agent_role_contract() {
             ;;
     esac
 
-    expected_hash=$(awk -v role_file="$role_file" '$2 == role_file { print $1 }' "$source_agent_role_manifest")
-    actual_hash=$(sha256_file "$role_path")
+    expected_hash=$(managed_agent_role_manifest_hash "$role_file")
+    actual_hash=$(normalized_lf_sha256 "$role_path")
     if [ "$actual_hash" != "$expected_hash" ]; then
         printf '%s\n' "Managed agent role content does not match its contract: $role_path" >&2
         exit 1

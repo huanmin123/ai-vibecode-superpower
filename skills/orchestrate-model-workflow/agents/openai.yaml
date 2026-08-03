@@ -1,4 +1,4 @@
 interface:
   display_name: "多模型开发工作流"
-  short_description: "按阶段调度 Sol、Terra 与 Luna 的开发和复审流程"
-  default_prompt: "使用 $orchestrate-model-workflow：先明确目标、范围、已授权本地操作、验收和停止条件，再按证据与任务复杂度选择必要的 Luna、Terra 与 Sol 阶段；不要假定设计、复审、修复或最终验收均必经。"
+  short_description: "按证据和执行风险调度 Luna、Terra 与 Sol"
+  default_prompt: "使用 $orchestrate-model-workflow 按证据与风险路由角色，并在状态变更前由 Terra 完成契约和执行风险分流。"
