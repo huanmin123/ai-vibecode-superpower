@@ -25,21 +25,21 @@ role 会先应用，但 child 随后继承父 turn 的 approval policy 和 permi
 | 深入取证、复杂预审 | `avsp_luna_xhigh` | 需要更深局部证据理解 |
 | 已定契约执行 | `avsp_luna_high_writer` / `avsp_luna_xhigh_writer` | 仅直接父 `avsp_terra_high` 的 `delegable` 状态变更任务 |
 | Luna 只读替代 | `avsp_terra_low_readonly` / `avsp_terra_medium_readonly` | 对应 Luna role 真正不可用时一对一替代 |
-| 高风险未决定案、正式复审 | `avsp_sol_high` | 证据基本一致，但高风险决策仍未决 |
+| 高难定案、复杂复审 | `avsp_sol_high` | 证据充分，但多约束权衡、跨域影响或推理复杂度高 |
 | 升级调查、受约束重设计 | `avsp_sol_xhigh` | 证据冲突、根因未证实、无可靠 oracle，或需重新思考 |
 | Sol 只读替代 | `avsp_terra_xhigh_readonly` | 所选 Sol role 或模型真正不可用，必须披露独立性下降 |
 | 契约、保护执行与集成 | `avsp_terra_high` | 唯一可委派 writer 的命名 role |
-| 有界定案、复审、最终验收 | `avsp_terra_xhigh` | 新建的独立只读实例 |
+| 有界定案、常规复审、最终验收 | `avsp_terra_xhigh` | 证据充分、范围有界且推理路径常规的新建独立只读实例 |
 
 ## 委派、路由与执行
 
 命名 `agent_type` 的 `spawn_agent` 必须显式传 `fork_turns="none"`，并使用自包含消息。仅确需有限最近上下文时才传正整数；不得省略。`fork_turns="all"` 仅用于继承父 role 的 full-history fork，且不得同时传自定义 `agent_type`。
 
 1. **只需事实**：按独立且互补的证据域直接委派 `1..N` 个 Luna；不得为同一事实重复创建分支。证据不足但可补充时继续 Luna；无法补证、授权缺失或必要外部输入缺失时停止并报告。
-2. **需要判断**：证据充分且边界受控时委派 `avsp_terra_xhigh`。只有高风险未知仍会改变结果时选择 `avsp_sol_high`；满足表中的升级条件时选择 `avsp_sol_xhigh`。风险域名称或影响大本身不触发 Sol。
+2. **需要判断**：证据充分时，`avsp_terra_xhigh` 与 `avsp_sol_high` 同属定案层，按难度分流而非先后升级：范围有界且推理路径常规时选 Terra；存在多约束权衡、跨域影响或高复杂度推理时选 Sol。高影响或风险域名称本身不触发 Sol。仅在证据冲突、根因未证实、无可靠 oracle 或需受约束重设计时升级 `avsp_sol_xhigh`。
 3. **需要状态变更**：main/root 可直接委派 `1..N` 个 `avsp_terra_high`，但每个分支必须有独立且互斥的写入目标。先在消息的 `execution_contract` 中写明目标行为、已定步骤、允许目标与非目标、授权、唯一 owner、关键不变量、适用领域边界/精度、失败语义、回滚或恢复、验证和停止条件。仍有会改变行为、风险或兼容性的选择时不得委派 executor。
 4. **执行风险**：只有影响面受控、失败可回滚或恢复、外部副作用受限、共享状态与顺序风险已解决且有可靠验证时才是 `delegable`；否则为 `protected`，由 Terra 直接执行。Terra 可把 `1..N` 个互不冲突的 `delegable` 契约并行交给 Luna writer；默认 Luna/high，只有完整契约仍需更深局部理解时用 xhigh writer，并说明理由。`operation_owner` 只用于状态变更任务；并行任务的写入目标必须互斥。
-5. **验收**：实施 Terra 审核 writer 的实际结果。纯机械低风险改动在机器 guards 全通过后可由新的 Luna 预审闭环；语义、中高影响或 `protected` 改动由 main/root 新建独立 `avsp_terra_xhigh` 最终验收。证据冲突、根因未证实或无可靠 oracle 时再升级 Sol。
+5. **验收**：实施 Terra 审核 writer 的实际结果。纯机械低风险改动在机器 guards 全通过后可由新的 Luna 预审闭环；语义、中高影响或 `protected` 改动由 main/root 新建独立的定案层验收：常规、有界复审选 `avsp_terra_xhigh`，多约束或高复杂度复审选 `avsp_sol_high`。证据冲突、根因未证实或无可靠 oracle 时升级 `avsp_sol_xhigh`。
 
 ## 消息、失败与恢复
 
