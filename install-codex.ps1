@@ -628,7 +628,17 @@ $managedPluginName = 'agnets-workflow'
 $managedMarketplaceName = 'ai-vibecode-superpower-local'
 $sourcePlugin = Join-Path $scriptRoot "plugins\$managedPluginName"
 $sourceMarketplace = Join-Path $scriptRoot '.agents\plugins\marketplace.json'
-$sourceSkills = Join-Path $sourcePlugin 'skills'
+$sourcePluginSkills = Join-Path $sourcePlugin 'skills'
+$sourceStandaloneSkills = Join-Path $scriptRoot 'skills'
+$managedPluginSkillNames = @(
+    'agent-toolchain'
+    'orchestrate-model-workflow'
+    'workflow-controller'
+)
+$managedStandaloneSkillNames = @(
+    'gpt-image-2-cli'
+    'project-doc-planner'
+)
 
 if (-not (Test-Path -LiteralPath $sourceAgents -PathType Leaf)) { throw "Missing source file: $sourceAgents" }
 if (-not (Test-Path -LiteralPath $sourceConfig -PathType Leaf)) { throw "Missing source file: $sourceConfig" }
@@ -638,17 +648,16 @@ if (-not (Test-Path -LiteralPath $sourceAgentRoleManifest -PathType Leaf)) { thr
 if (-not (Test-Path -LiteralPath $sourceMarketplace -PathType Leaf)) { throw "Missing source file: $sourceMarketplace" }
 if (-not (Test-Path -LiteralPath $sourcePlugin -PathType Container)) { throw "Missing source directory: $sourcePlugin" }
 Assert-ManagedAgentRoleProfiles -RoleDirectory $sourceAgentRoles -Contracts $managedAgentRoleContracts -ManifestPath $sourceAgentRoleManifest
-if (-not (Test-Path -LiteralPath $sourceSkills -PathType Container)) { throw "Missing source directory: $sourceSkills" }
-$legacyManagedSkillNames = @(
-    'agent-toolchain'
-    'gpt-image-2-cli'
-    'orchestrate-model-workflow'
-    'project-doc-planner'
-    'workflow-controller'
-)
-foreach ($skillName in $legacyManagedSkillNames) {
-    if (-not (Test-Path -LiteralPath (Join-Path $sourceSkills $skillName) -PathType Container)) {
+if (-not (Test-Path -LiteralPath $sourcePluginSkills -PathType Container)) { throw "Missing source directory: $sourcePluginSkills" }
+if (-not (Test-Path -LiteralPath $sourceStandaloneSkills -PathType Container)) { throw "Missing source directory: $sourceStandaloneSkills" }
+foreach ($skillName in $managedPluginSkillNames) {
+    if (-not (Test-Path -LiteralPath (Join-Path $sourcePluginSkills $skillName) -PathType Container)) {
         throw "Missing managed plugin skill: $skillName"
+    }
+}
+foreach ($skillName in $managedStandaloneSkillNames) {
+    if (-not (Test-Path -LiteralPath (Join-Path $sourceStandaloneSkills $skillName) -PathType Container)) {
+        throw "Missing managed standalone skill: $skillName"
     }
 }
 
@@ -699,10 +708,18 @@ try {
     New-Item -ItemType Directory -Path $stagedAgents | Out-Null
     $stagedAgentRoles = Join-Path $stagedAgents $managedAgentRoleDirectoryName
     Copy-Item -LiteralPath $sourceAgentRoles -Destination $stagedAgentRoles -Recurse -Force
+    $stagedStandaloneSkills = Join-Path $stageRoot 'skills'
+    New-Item -ItemType Directory -Path $stagedStandaloneSkills | Out-Null
+    foreach ($skillName in $managedStandaloneSkillNames) {
+        Copy-Item -LiteralPath (Join-Path $sourceStandaloneSkills $skillName) -Destination (Join-Path $stagedStandaloneSkills $skillName) -Recurse -Force
+    }
     foreach ($name in @('AGENTS.md', 'template-config.toml', 'docs', (Join-Path 'agents' $managedAgentRoleDirectoryName))) {
         if (-not (Test-ExistingPath -Path (Join-Path $stageRoot $name))) { throw "Staging failed for: $name" }
     }
     Assert-ManagedAgentRoleProfiles -RoleDirectory $stagedAgentRoles -Contracts $managedAgentRoleContracts -ManifestPath $sourceAgentRoleManifest
+    foreach ($skillName in $managedStandaloneSkillNames) {
+        if (-not (Test-ExistingPath -Path (Join-Path $stagedStandaloneSkills $skillName))) { throw "Staging failed for standalone skill: $skillName" }
+    }
 
     $configTarget = Join-Path $codexHome 'config.toml'
     $mergedConfig = Join-Path $stageRoot 'merged-config.toml'
@@ -717,7 +734,13 @@ try {
     $transactionTargets.Add([pscustomobject]@{ Name = 'config.toml'; Target = $configTarget; Candidate = $mergedConfig; Kind = 'File'; Operation = 'Replace'; WasPresent = $false; BackedUp = $false; InstallStarted = $false })
     $transactionTargets.Add([pscustomobject]@{ Name = 'docs'; Target = (Join-Path $codexHome 'docs'); Candidate = (Join-Path $stageRoot 'docs'); Kind = 'Directory'; Operation = 'Replace'; WasPresent = $false; BackedUp = $false; InstallStarted = $false })
     $transactionTargets.Add([pscustomobject]@{ Name = (Join-Path 'agents' $managedAgentRoleDirectoryName); Target = $targetAgentRoles; Candidate = $stagedAgentRoles; Kind = 'Directory'; Operation = 'Replace'; WasPresent = $false; BackedUp = $false; InstallStarted = $false })
-    foreach ($skillName in $legacyManagedSkillNames) {
+    foreach ($skillName in $managedStandaloneSkillNames) {
+        $sourceSkill = Join-Path $sourceStandaloneSkills $skillName
+        $targetSkill = Join-Path $skillsTarget $skillName
+        if (Test-SamePath -Left $targetSkill -Right $sourceSkill) { throw "Destination target overlaps its source: $targetSkill" }
+        $transactionTargets.Add([pscustomobject]@{ Name = (Join-Path 'skills' $skillName); Target = $targetSkill; Candidate = (Join-Path $stagedStandaloneSkills $skillName); Kind = 'Directory'; Operation = 'Replace'; WasPresent = $false; BackedUp = $false; InstallStarted = $false })
+    }
+    foreach ($skillName in $managedPluginSkillNames) {
         $transactionTargets.Add([pscustomobject]@{ Name = (Join-Path 'skills' $skillName); Target = (Join-Path $skillsTarget $skillName); Candidate = $null; Kind = 'Directory'; Operation = 'Remove'; WasPresent = $false; BackedUp = $false; InstallStarted = $false })
     }
 
@@ -773,7 +796,7 @@ try {
 
     Write-Host "Codex configuration installed in: $codexHome"
     Write-Host "Managed plugin installed: $managedPluginName@$managedMarketplaceName"
-    Write-Host 'Legacy managed global skills removed; plugin is the only skill distribution entry point.'
+    Write-Host 'Managed standalone skills installed; obsolete global copies of plugin skills removed.'
     if ($null -ne $backupDirectory) {
         Write-Host "Backup directory: $backupDirectory"
     } else {

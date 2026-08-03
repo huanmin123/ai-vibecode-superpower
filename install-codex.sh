@@ -12,7 +12,10 @@ managed_plugin_name=agnets-workflow
 managed_marketplace_name=ai-vibecode-superpower-local
 source_plugin=$script_dir/plugins/$managed_plugin_name
 source_marketplace=$script_dir/.agents/plugins/marketplace.json
-source_skills=$source_plugin/skills
+source_plugin_skills=$source_plugin/skills
+source_standalone_skills=$script_dir/skills
+managed_plugin_skill_names='agent-toolchain orchestrate-model-workflow workflow-controller'
+managed_standalone_skill_names='gpt-image-2-cli project-doc-planner'
 managed_agent_role_files='ai-vibecode-superpower-avsp_luna_high.toml ai-vibecode-superpower-avsp_luna_xhigh.toml ai-vibecode-superpower-avsp_luna_high_writer.toml ai-vibecode-superpower-avsp_luna_xhigh_writer.toml ai-vibecode-superpower-avsp_sol_high.toml ai-vibecode-superpower-avsp_sol_xhigh.toml ai-vibecode-superpower-avsp_terra_high.toml ai-vibecode-superpower-avsp_terra_xhigh.toml ai-vibecode-superpower-avsp_terra_xhigh_readonly.toml ai-vibecode-superpower-avsp_terra_low_readonly.toml ai-vibecode-superpower-avsp_terra_medium_readonly.toml'
 
 for source_path in "$source_agents" "$source_config" "$source_agent_role_manifest" "$source_marketplace"; do
@@ -21,7 +24,7 @@ for source_path in "$source_agents" "$source_config" "$source_agent_role_manifes
         exit 1
     fi
 done
-for source_path in "$source_docs" "$source_agent_roles" "$source_plugin" "$source_skills"; do
+for source_path in "$source_docs" "$source_agent_roles" "$source_plugin" "$source_plugin_skills" "$source_standalone_skills"; do
     if [ ! -d "$source_path" ]; then
         printf '%s\n' "Missing source directory: $source_path" >&2
         exit 1
@@ -35,10 +38,15 @@ for agent_role_file in $managed_agent_role_files; do
     fi
 done
 
-legacy_managed_skill_names='agent-toolchain gpt-image-2-cli orchestrate-model-workflow project-doc-planner workflow-controller'
-for skill_name in $legacy_managed_skill_names; do
-    if [ ! -d "$source_skills/$skill_name" ]; then
+for skill_name in $managed_plugin_skill_names; do
+    if [ ! -d "$source_plugin_skills/$skill_name" ]; then
         printf '%s\n' "Missing managed plugin skill: $skill_name" >&2
+        exit 1
+    fi
+done
+for skill_name in $managed_standalone_skill_names; do
+    if [ ! -d "$source_standalone_skills/$skill_name" ]; then
+        printf '%s\n' "Missing managed standalone skill: $skill_name" >&2
         exit 1
     fi
 done
@@ -77,6 +85,12 @@ if [ "$codex_home/AGENTS.md" -ef "$source_agents" ] || \
     printf '%s\n' 'Destination target overlaps its source.' >&2
     exit 1
 fi
+for skill_name in $managed_standalone_skill_names; do
+    if [ "$codex_home/skills/$skill_name" -ef "$source_standalone_skills/$skill_name" ]; then
+        printf '%s\n' "Destination target overlaps its source: $codex_home/skills/$skill_name" >&2
+        exit 1
+    fi
+done
 stage_dir=
 backup_dir=
 manifest=
@@ -875,6 +889,10 @@ cp "$source_agents" "$stage_dir/AGENTS.md"
 cp -R "$source_docs" "$stage_dir/docs"
 mkdir -p "$stage_dir/agents"
 cp -R "$source_agent_roles" "$stage_dir/agents/"
+mkdir -p "$stage_dir/skills"
+for skill_name in $managed_standalone_skill_names; do
+    cp -R "$source_standalone_skills/$skill_name" "$stage_dir/skills/"
+done
 
 assert_target "$codex_home/config.toml" file
 config_input=$codex_home/config.toml
@@ -899,6 +917,12 @@ for agent_role_file in $managed_agent_role_files; do
         exit 1
     fi
 done
+for skill_name in $managed_standalone_skill_names; do
+    if [ ! -d "$stage_dir/skills/$skill_name" ]; then
+        printf '%s\n' "Staging failed for standalone skill: $skill_name" >&2
+        exit 1
+    fi
+done
 assert_managed_agent_role_directory "$stage_dir/agents/ai-vibecode-superpower"
 
 manifest=$stage_dir/targets.tsv
@@ -906,7 +930,10 @@ printf '%s\t%s\t%s\t%s\t%s\n' AGENTS.md "$codex_home/AGENTS.md" "$stage_dir/AGEN
 printf '%s\t%s\t%s\t%s\t%s\n' config.toml "$codex_home/config.toml" "$stage_dir/merged-config.toml" file replace >> "$manifest"
 printf '%s\t%s\t%s\t%s\t%s\n' docs "$codex_home/docs" "$stage_dir/docs" directory replace >> "$manifest"
 printf '%s\t%s\t%s\t%s\t%s\n' agents/ai-vibecode-superpower "$codex_home/agents/ai-vibecode-superpower" "$stage_dir/agents/ai-vibecode-superpower" directory replace >> "$manifest"
-for skill_name in $legacy_managed_skill_names; do
+for skill_name in $managed_standalone_skill_names; do
+    printf '%s\t%s\t%s\t%s\t%s\n' "skills/$skill_name" "$codex_home/skills/$skill_name" "$stage_dir/skills/$skill_name" directory replace >> "$manifest"
+done
+for skill_name in $managed_plugin_skill_names; do
     printf '%s\t%s\t%s\t%s\t%s\n' "skills/$skill_name" "$codex_home/skills/$skill_name" - directory remove >> "$manifest"
 done
 
@@ -976,7 +1003,7 @@ done < "$manifest"
 completed=1
 printf '%s\n' "Codex configuration installed in: $codex_home"
 printf '%s\n' "Managed plugin installed: $managed_plugin_name@$managed_marketplace_name"
-printf '%s\n' 'Legacy managed global skills removed; plugin is the only skill distribution entry point.'
+printf '%s\n' 'Managed standalone skills installed; obsolete global copies of plugin skills removed.'
 if [ -n "$backup_dir" ]; then
     printf '%s\n' "Backup directory: $backup_dir"
 else

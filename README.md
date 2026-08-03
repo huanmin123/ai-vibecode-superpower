@@ -8,7 +8,8 @@
 
 - 统一的全局规则和跨平台命令文档。
 - 11 个分工角色，用于调查、判断、实施和复查。
-- `agnets-workflow` 插件，包含 `orchestrate-model-workflow`、`project-doc-planner`、`gpt-image-2-cli`、`agent-toolchain` 和 `workflow-controller`。
+- `agnets-workflow` 插件，包含 `orchestrate-model-workflow`、`agent-toolchain` 和 `workflow-controller`。
+- 独立全局 skill：`project-doc-planner` 与 `gpt-image-2-cli`。
 
 ## 适合什么时候
 
@@ -47,7 +48,7 @@ macOS 或 Linux：
 sh ./install-codex.sh
 ```
 
-安装目录优先使用非空的 `CODEX_HOME`；未设置时使用当前用户的 `~/.codex`。安装器会备份它管理的已有内容，并注册、安装或更新 `agnets-workflow`；同时移除本项目旧版安装的五个同名全局 skill 和旧的独立 `workflow-controller` 插件，避免重复加载。完成后重启 Codex 相关程序，或新建 task 以加载新配置。
+安装目录优先使用非空的 `CODEX_HOME`；未设置时使用当前用户的 `~/.codex`。安装器会备份它管理的已有内容，并注册、安装或更新 `agnets-workflow`，同时安装或更新两个独立全局 skill，并移除旧版安装的三个插件同名全局 skill 和旧的独立 `workflow-controller` 插件，避免重复加载。完成后重启 Codex 相关程序，或新建 task 以加载新配置。
 
 `workflow-controller` 使用 Codex 所需的 Node.js 运行时；安装器会在写入前检查 `node` 命令。
 
