@@ -253,10 +253,11 @@ test('checkpoints a stale claim and returns a bounded recovery package only afte
     const requeue = parameters => call('requeue-stale', { task_id: 'feature-1', node_id: 'implement', claim_id: claim.node.claim_id, reason: 'Codex agent is confirmed stopped after interruption', ...parameters });
     await assert.rejects(() => requeue({}), /is required/);
     await assert.rejects(() => requeue({ previous_agent_stopped: false }), /must be true/);
-    const [requeued] = await requeue({ previous_agent_stopped: true });
+    await assert.rejects(() => requeue({ previous_agent_stopped: true }), /replacement_agent_task_path/);
+    const [requeued] = await requeue({ previous_agent_stopped: true, replacement_agent_task_path: '/root/replacement' });
     assert.equal(requeued.node.status, 'pending');
     assert.equal(requeued.node.agent_task_path, null);
-    assert.equal(requeued.recovery_package.continuation.kind, 'native_resume_candidate');
+    assert.equal(requeued.recovery_package.continuation.kind, 'new_agent_required');
     assert.equal(requeued.recovery_package.previous_attempt.agent_thread_id, '019f0000-0000-7000-8000-000000000001');
     assert.deepEqual(requeued.recovery_package.previous_attempt.checkpoint, { completed: ['inspect'], next_step: 'edit app.txt', evidence_paths: ['app.txt'] });
     assert.equal(requeued.ready_nodes[0].id, 'implement');
@@ -268,9 +269,37 @@ test('checkpoints a stale claim and returns a bounded recovery package only afte
   } finally { await rm(fixture.root, { recursive: true, force: true }); }
 });
 
-test('prunes only seven-day idle released task states and retains active task states', async () => {
-  const released = await setup(); const active = await setup();
+test('rebinds modern routing owners for replacement workers and independent total reviewers', async () => {
+  const fixture = await setup();
   try {
+    const call = (command, parameters) => dispatch(command, { state_dir: fixture.stateDir, ...parameters });
+    const workRoute = { execution_risk: 'protected', routing_reason: 'controlled recovery', execution_owner: '/root/original-worker', integration_owner: '/root', quality_guard: 'test' };
+    const firstReviewRoute = { execution_risk: 'protected', routing_reason: 'independent review', execution_owner: '/root/first-reviewer', integration_owner: '/root', quality_guard: 'test' };
+    await writeFile(fixture.manifest, JSON.stringify({ task_id: 'feature-1', workspace: fixture.workspace, goal: 'Recover modern routing', routing_schema_version: 1, requirements: [{ id: 'R1', text: 'recover task' }], nodes: [{ id: 'work', kind: 'implementation', ...workRoute }, { id: 'total-review', kind: 'total_review', agent_type: 'avsp_sol_high', depends_on: ['work'], ...firstReviewRoute }] }));
+    await call('init', { manifest: fixture.manifest });
+    const [original] = await call('claim', { task_id: 'feature-1', node_id: 'work', agent_task_path: '/root/original-worker', agent_role: 'avsp_terra_high', lease_duration_sec: 1 });
+    const stateFile = path.join(fixture.stateDir, 'feature-1.json'); const staleState = JSON.parse(await readFile(stateFile, 'utf8'));
+    staleState.nodes.work.heartbeat_at = '1970-01-01T00:00:00.000Z'; staleState.nodes.work.activation_at = '1970-01-01T00:00:00.000Z'; staleState.nodes.work.heartbeat_count = 1; await writeFile(stateFile, JSON.stringify(staleState));
+    const [requeued] = await call('requeue-stale', { task_id: 'feature-1', node_id: 'work', claim_id: original.node.claim_id, reason: 'original worker stopped', replacement_agent_task_path: '/root/replacement-worker', previous_agent_stopped: true });
+    assert.equal(requeued.node.execution_owner, '/root/replacement-worker');
+    assert.equal(requeued.recovery_package.node.execution_owner, '/root/replacement-worker');
+    assert.equal(requeued.recovery_package.previous_attempt.execution_owner, '/root/original-worker');
+    const [replacement] = await call('claim', { task_id: 'feature-1', node_id: 'work', agent_task_path: '/root/replacement-worker', agent_role: 'avsp_terra_high' });
+    const workResult = path.join(fixture.root, 'work.json'); await writeFile(workResult, '{}'); await call('complete', { task_id: 'feature-1', node_id: 'work', claim_id: replacement.node.claim_id, status: 'succeeded', result: workResult });
+    const [firstReviewer] = await call('claim', { task_id: 'feature-1', node_id: 'total-review', agent_task_path: '/root/first-reviewer', agent_role: 'avsp_sol_high' });
+    const unavailable = path.join(fixture.root, 'unavailable.json'); await writeFile(unavailable, '{}'); await call('complete', { task_id: 'feature-1', node_id: 'total-review', claim_id: firstReviewer.node.claim_id, status: 'unavailable', result: unavailable });
+    const [retried] = await call('retry', { task_id: 'feature-1', node_id: 'total-review', reason: 'new independent total review', replacement_agent_task_path: '/root/second-reviewer', previous_agent_stopped: true });
+    assert.equal(retried.node.execution_owner, '/root/second-reviewer');
+    const [secondReviewer] = await call('claim', { task_id: 'feature-1', node_id: 'total-review', agent_task_path: '/root/second-reviewer', agent_role: 'avsp_sol_high' });
+    assert.equal(secondReviewer.node.agent_task_path, '/root/second-reviewer');
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test('prunes only verified seven-day idle released task states and retains active, unknown, or incomplete states', async () => {
+  const released = await setup(); const active = await setup(); const unknown = await setup(); const incomplete = await setup();
+  try {
+    const modernManifest = (fixture, workOwner, reviewOwner) => writeFile(fixture.manifest, JSON.stringify({ task_id: 'feature-1', workspace: fixture.workspace, goal: 'Change app safely', routing_schema_version: 1, requirements: [{ id: 'R1', text: 'app changes' }], nodes: [{ id: 'implement', kind: 'implementation', execution_risk: 'protected', routing_reason: 'controlled test', execution_owner: workOwner, integration_owner: '/root', quality_guard: 'test' }, { id: 'verify', kind: 'verification', depends_on: ['implement'], execution_risk: 'protected', routing_reason: 'controlled test', execution_owner: '/root/verify', integration_owner: '/root', quality_guard: 'test' }, { id: 'total-review', kind: 'total_review', agent_type: 'avsp_sol_high', depends_on: ['implement', 'verify'], execution_risk: 'protected', routing_reason: 'controlled test', execution_owner: reviewOwner, integration_owner: '/root', quality_guard: 'test' }] }));
+    await modernManifest(released, '/root/implement', '/root/reviewer');
     await dispatch('init', { state_dir: released.stateDir, manifest: released.manifest });
     await dispatch('release-workspace', { state_dir: released.stateDir, task_id: 'feature-1', previous_agents_stopped: true });
     const releasedFile = path.join(released.stateDir, 'feature-1.json'); const releasedState = JSON.parse(await readFile(releasedFile, 'utf8'));
@@ -279,6 +308,7 @@ test('prunes only seven-day idle released task states and retains active task st
     assert.deepEqual(pruned.deleted.map(item => item.task_id), ['feature-1']);
     await assert.rejects(() => readFile(releasedFile, 'utf8'), /ENOENT/);
 
+    await modernManifest(active, '/root/active-implement', '/root/active-reviewer');
     await dispatch('init', { state_dir: active.stateDir, manifest: active.manifest });
     const activeFile = path.join(active.stateDir, 'feature-1.json'); const activeState = JSON.parse(await readFile(activeFile, 'utf8'));
     activeState.updated_at = '1970-01-01T00:00:00.000Z'; await writeFile(activeFile, JSON.stringify(activeState));
@@ -286,7 +316,71 @@ test('prunes only seven-day idle released task states and retains active task st
     assert.equal(retained.deleted.length, 0);
     assert.equal(retained.retained.find(item => item.task_id === 'feature-1').reason, 'workspace lease is not released');
     assert.equal(JSON.parse(await readFile(activeFile, 'utf8')).task_id, 'feature-1');
-  } finally { await rm(released.root, { recursive: true, force: true }); await rm(active.root, { recursive: true, force: true }); }
+
+    await modernManifest(unknown, '/root/unknown-implement', '/root/unknown-reviewer');
+    await dispatch('init', { state_dir: unknown.stateDir, manifest: unknown.manifest });
+    await dispatch('release-workspace', { state_dir: unknown.stateDir, task_id: 'feature-1', previous_agents_stopped: true });
+    const unknownFile = path.join(unknown.stateDir, 'feature-1.json'); const unknownState = JSON.parse(await readFile(unknownFile, 'utf8'));
+    unknownState.updated_at = '1970-01-01T00:00:00.000Z'; unknownState.future_state_field = true; await writeFile(unknownFile, JSON.stringify(unknownState));
+    const [unknownRetained] = await dispatch('prune-expired', { state_dir: unknown.stateDir });
+    assert.equal(unknownRetained.deleted_count, 0);
+    assert.equal(unknownRetained.retained.find(item => item.task_id === 'feature-1').reason, 'incomplete or unknown state fields');
+    assert.equal(JSON.parse(await readFile(unknownFile, 'utf8')).task_id, 'feature-1');
+
+    await modernManifest(incomplete, '/root/incomplete-implement', '/root/incomplete-reviewer');
+    await dispatch('init', { state_dir: incomplete.stateDir, manifest: incomplete.manifest });
+    await dispatch('release-workspace', { state_dir: incomplete.stateDir, task_id: 'feature-1', previous_agents_stopped: true });
+    const incompleteFile = path.join(incomplete.stateDir, 'feature-1.json'); const incompleteState = JSON.parse(await readFile(incompleteFile, 'utf8'));
+    incompleteState.updated_at = '1970-01-01T00:00:00.000Z'; delete incompleteState.closed_at; await writeFile(incompleteFile, JSON.stringify(incompleteState));
+    const [incompleteRetained] = await dispatch('prune-expired', { state_dir: incomplete.stateDir });
+    assert.equal(incompleteRetained.deleted_count, 0);
+    assert.equal(incompleteRetained.retained.find(item => item.task_id === 'feature-1').reason, 'incomplete or unknown state fields');
+    assert.equal(JSON.parse(await readFile(incompleteFile, 'utf8')).task_id, 'feature-1');
+
+    incompleteState.closed_at = null; delete incompleteState.nodes.implement.attempt; await writeFile(incompleteFile, JSON.stringify(incompleteState));
+    const [incompleteNodeRetained] = await dispatch('prune-expired', { state_dir: incomplete.stateDir });
+    assert.equal(incompleteNodeRetained.deleted_count, 0);
+    assert.equal(incompleteNodeRetained.retained.find(item => item.task_id === 'feature-1').reason, 'incomplete, unknown, or active node state');
+    assert.equal(JSON.parse(await readFile(incompleteFile, 'utf8')).task_id, 'feature-1');
+
+    incompleteState.nodes.implement.attempt = 0; incompleteState.workspace_lease.future_field = true; await writeFile(incompleteFile, JSON.stringify(incompleteState));
+    const [invalidLeaseRetained] = await dispatch('prune-expired', { state_dir: incomplete.stateDir });
+    assert.equal(invalidLeaseRetained.deleted_count, 0);
+    assert.equal(invalidLeaseRetained.retained.find(item => item.task_id === 'feature-1').reason, 'workspace lease is not a complete released state');
+    delete incompleteState.workspace_lease.future_field; incompleteState.requirements = [{}]; await writeFile(incompleteFile, JSON.stringify(incompleteState));
+    const [invalidRequirementsRetained] = await dispatch('prune-expired', { state_dir: incomplete.stateDir });
+    assert.equal(invalidRequirementsRetained.deleted_count, 0);
+    assert.equal(invalidRequirementsRetained.retained.find(item => item.task_id === 'feature-1').reason, 'malformed state collection item');
+  } finally { await rm(released.root, { recursive: true, force: true }); await rm(active.root, { recursive: true, force: true }); await rm(unknown.root, { recursive: true, force: true }); await rm(incomplete.root, { recursive: true, force: true }); }
+});
+
+test('persists the six-hour automatic cleanup throttle across CLI processes while explicit pruning remains immediate', async () => {
+  const fixture = await setup();
+  try {
+    await writeFile(fixture.manifest, JSON.stringify({ task_id: 'feature-1', workspace: fixture.workspace, goal: 'Throttle cleanup', routing_schema_version: 1, requirements: [{ id: 'R1', text: 'retain recent sweep state' }], nodes: [{ id: 'work', kind: 'implementation', execution_risk: 'protected', routing_reason: 'test', execution_owner: '/root/work', integration_owner: '/root', quality_guard: 'test' }, { id: 'total-review', kind: 'total_review', agent_type: 'avsp_sol_high', depends_on: ['work'], execution_risk: 'protected', routing_reason: 'test', execution_owner: '/root/reviewer', integration_owner: '/root', quality_guard: 'test' }] }));
+    await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+    await dispatch('release-workspace', { state_dir: fixture.stateDir, task_id: 'feature-1', previous_agents_stopped: true });
+    await execFile(process.execPath, [controllerCli, 'status', '--task-id', 'feature-1', '--state-dir', fixture.stateDir], { cwd: fixture.root, windowsHide: true });
+    const sweepPath = path.join(fixture.stateDir, '.workflow-prune-sweep.json');
+    assert.ok(JSON.parse(await readFile(sweepPath, 'utf8')).last_sweep_at);
+    const stateFile = path.join(fixture.stateDir, 'feature-1.json'); const state = JSON.parse(await readFile(stateFile, 'utf8'));
+    state.updated_at = '1970-01-01T00:00:00.000Z'; await writeFile(stateFile, JSON.stringify(state));
+    await execFile(process.execPath, [controllerCli, 'status', '--task-id', 'feature-1', '--state-dir', fixture.stateDir], { cwd: fixture.root, windowsHide: true });
+    assert.equal(JSON.parse(await readFile(stateFile, 'utf8')).task_id, 'feature-1');
+    const [pruned] = await dispatch('prune-expired', { state_dir: fixture.stateDir });
+    assert.equal(pruned.deleted_count, 1);
+    await assert.rejects(() => readFile(stateFile, 'utf8'), /ENOENT/);
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test('bounds the combined prune report to 128 entries', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'agnets-prune-report-'));
+  try {
+    const stateDir = path.join(root, 'state'); await mkdir(stateDir);
+    for (let index = 0; index < 129; index++) await writeFile(path.join(stateDir, `invalid-${index}.json`), '{}');
+    const [pruned] = await dispatch('prune-expired', { state_dir: stateDir });
+    assert.equal(pruned.deleted_count, 0); assert.equal(pruned.retained_count, 129); assert.equal(pruned.deleted.length + pruned.retained.length, 128); assert.equal(pruned.report_truncated, true);
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 test('serializes stale-lock recovery and validates manifest and review fields', async () => {
@@ -457,6 +551,7 @@ test('MCP retry schema retains only the canonical stopped-agent confirmation par
   const checkpoint = TOOLS.find(tool => tool.name === 'workflow_checkpoint');
   assert.deepEqual(checkpoint.inputSchema.required, ['task_id', 'node_id', 'claim_id', 'checkpoint', 'state_dir']);
   const requeue = TOOLS.find(tool => tool.name === 'workflow_requeue_stale');
+  assert.deepEqual(requeue.inputSchema.required, ['task_id', 'node_id', 'claim_id', 'reason', 'replacement_agent_task_path', 'previous_agent_stopped', 'state_dir']);
   assert.equal(requeue.inputSchema.properties.previous_agent_stopped.const, true);
   assert.equal(TOOL_COMMANDS.workflow_requeue_stale, 'requeue-stale');
   assert.equal(TOOL_COMMANDS.workflow_prune_expired, 'prune-expired');

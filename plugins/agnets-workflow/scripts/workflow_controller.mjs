@@ -32,6 +32,9 @@ const MAX_CHECKPOINT_BYTES = 32 * 1024;
 const MAX_RECOVERY_RESULT_BYTES = 8 * 1024;
 const DEFAULT_TASK_RETENTION_DAYS = 7;
 const DAY_MS = 24 * 60 * 60 * 1000;
+const PRUNE_SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const MAX_PRUNE_REPORT_ENTRIES = 128;
+const PRUNE_SWEEP_FILENAME = '.workflow-prune-sweep.json';
 
 export class ControllerError extends Error {}
 
@@ -611,11 +614,11 @@ function staleNodes(state, now = Date.now()) {
     if (!node.activation_at || node.heartbeat_count === 0) {
       const deadline = activationDeadline(node);
       if (deadline === null || deadline >= now) return [];
-      return [{ id: node.id, agent_task_path: node.agent_task_path, claim_id: node.claim_id, reason: 'never_activated', claimed_at: node.claimed_at, activation_deadline_at: new Date(deadline).toISOString(), lease_duration_sec: node.lease_duration_sec }];
+      return [{ id: node.id, agent_task_path: node.agent_task_path, agent_thread_id: node.agent_thread_id, claim_id: node.claim_id, reason: 'never_activated', claimed_at: node.claimed_at, activation_deadline_at: new Date(deadline).toISOString(), lease_duration_sec: node.lease_duration_sec }];
     }
     const heartbeat = Date.parse(node.heartbeat_at);
     if (!Number.isFinite(heartbeat) || heartbeat + node.lease_duration_sec * 1000 >= now) return [];
-    return [{ id: node.id, agent_task_path: node.agent_task_path, claim_id: node.claim_id, reason: 'heartbeat_expired', heartbeat_at: node.heartbeat_at, lease_duration_sec: node.lease_duration_sec }];
+    return [{ id: node.id, agent_task_path: node.agent_task_path, agent_thread_id: node.agent_thread_id, claim_id: node.claim_id, reason: 'heartbeat_expired', heartbeat_at: node.heartbeat_at, lease_duration_sec: node.lease_duration_sec }];
   });
 }
 
@@ -811,7 +814,7 @@ function compactRecoveryResult(result) {
   return { bytes, truncated: true, digest: createHash('sha256').update(serialized).digest('hex') };
 }
 
-function recoveryPacket(state, node, stale, reason) {
+function recoveryPacket(state, node, stale, reason, priorExecutionOwner = node.execution_owner) {
   const previousAttempt = {
     attempt: node.attempt,
     agent_task_path: node.agent_task_path,
@@ -822,6 +825,7 @@ function recoveryPacket(state, node, stale, reason) {
     activation_at: node.activation_at,
     heartbeat_at: node.heartbeat_at,
     heartbeat_count: node.heartbeat_count,
+    execution_owner: priorExecutionOwner,
     stale_reason: stale.reason,
     checkpoint: node.checkpoint,
     checkpoint_at: node.checkpoint_at,
@@ -829,15 +833,27 @@ function recoveryPacket(state, node, stale, reason) {
   };
   return {
     version: 1,
-    continuation: node.agent_thread_id
-      ? { kind: 'native_resume_candidate', agent_thread_id: node.agent_thread_id, requirement: 'Only use when the current Codex runtime exposes resume_agent and the old agent is closed.' }
-      : { kind: 'new_agent_required', reason: 'No native agent thread ID was recorded for this attempt.' },
+    continuation: { kind: 'new_agent_required', prior_agent_thread_id: node.agent_thread_id, reason: 'This operation invalidated the old claim. Native session resumption, when available, must be attempted before workflow_requeue_stale.' },
     task: { task_id: state.task_id, workspace: state.workspace, goal: state.goal, requirements: state.requirements, scope: state.scope, non_goals: state.non_goals },
     node: { id: node.id, kind: node.kind, agent_type: node.agent_type, depends_on: node.depends_on, execution_risk: node.execution_risk, routing_reason: node.routing_reason, execution_owner: node.execution_owner, integration_owner: node.integration_owner, quality_guard: node.quality_guard },
     completed_dependencies: node.depends_on.map(id => ({ id, status: state.nodes[id].status, result: compactRecoveryResult(state.nodes[id].result) })),
     previous_attempt: previousAttempt,
     instructions: 'This is a replacement agent. Do not assume the previous agent session was restored. Inspect the current workspace and diff, validate the saved checkpoint and dependency evidence, then write a fresh checkpoint before material work.',
   };
+}
+
+function replacementExecutionOwner(state, node, parameters) {
+  const replacement = requiredString(parameters.replacement_agent_task_path, 'replacement_agent_task_path');
+  if (replacement === node.agent_task_path) throw new ControllerError('replacement_agent_task_path must differ from the stale or prior agent_task_path');
+  if (node.kind === 'total_review' && participantPaths(state).has(replacement)) throw new ControllerError('A replacement total reviewer must not be a prior participant');
+  if (!node.routing_legacy && Object.values(state.nodes).some(candidate => candidate.id !== node.id && candidate.execution_owner === replacement)) throw new ControllerError(`replacement_agent_task_path is already reserved by another node: ${replacement}`);
+  return replacement;
+}
+
+function rebindExecutionOwner(node, replacement) {
+  const priorExecutionOwner = node.execution_owner;
+  if (!node.routing_legacy) node.execution_owner = replacement;
+  return priorExecutionOwner;
 }
 
 function clearAttemptForRetry(node) {
@@ -851,11 +867,12 @@ async function requeueStaleNode(parameters) {
     const stale = staleNodes(state).find(candidate => candidate.id === nodeId && candidate.claim_id === claimId);
     if (!stale) throw new ControllerError(`Node is not stale for its active claim: ${nodeId}`);
     if (node.attempt >= MAX_NODE_ATTEMPTS) throw new ControllerError(`Node exceeded the ${MAX_NODE_ATTEMPTS}-attempt limit: ${nodeId}`);
-    const packet = recoveryPacket(state, node, stale, reason);
+    const replacement = replacementExecutionOwner(state, node, parameters); const priorExecutionOwner = rebindExecutionOwner(node, replacement);
+    const packet = recoveryPacket(state, node, stale, reason, priorExecutionOwner);
     node.recovery_history.push({ at: utcNow(), ...packet.previous_attempt });
     if (node.recovery_history.length > MAX_NODE_ATTEMPTS) node.recovery_history.splice(0, node.recovery_history.length - MAX_NODE_ATTEMPTS);
     clearAttemptForRetry(node);
-    const details = { node_id: nodeId, prior_claim_id: claimId, reason, stale_reason: stale.reason, previous_agent_stopped: true, auto_requeue: true };
+    const details = { node_id: nodeId, prior_claim_id: claimId, prior_execution_owner: priorExecutionOwner, replacement_execution_owner: replacement, reason, stale_reason: stale.reason, previous_agent_stopped: true, auto_requeue: true };
     if (node.kind === 'total_review') addEvent(state, 'stale_node_requeued', details); else bumpWorkflowRevision(state, 'stale_node_requeued', details);
     await atomicWrite(filePath, state);
     return { task_id: state.task_id, node, recovery_package: packet, ready_nodes: readyNodes(state) };
@@ -882,23 +899,68 @@ async function retryNode(parameters) {
     if (!node || (!['failed', 'blocked', 'unavailable', 'abandoned'].includes(node.status) && !orphanedTotalReview)) throw new ControllerError(`Only failed, blocked, unavailable, abandoned, or an unrecorded successful total_review can be retried: ${nodeId}`);
     const downstreamStarted = Object.values(state.nodes).some(candidate => candidate.depends_on.includes(nodeId) && candidate.status !== PENDING);
     if (downstreamStarted) throw new ControllerError(`Cannot retry after a dependent node changed state: ${nodeId}`);
+    const replacement = node.routing_legacy ? null : replacementExecutionOwner(state, node, parameters); const priorExecutionOwner = replacement ? rebindExecutionOwner(node, replacement) : node.execution_owner;
     const priorClaimId = node.claim_id; clearAttemptForRetry(node);
-    const details = { node_id: nodeId, prior_claim_id: priorClaimId, reason, previous_agent_stopped: true, orphaned_total_review: orphanedTotalReview };
+    const details = { node_id: nodeId, prior_claim_id: priorClaimId, prior_execution_owner: priorExecutionOwner, replacement_execution_owner: replacement, reason, previous_agent_stopped: true, orphaned_total_review: orphanedTotalReview };
     if (node.kind === 'total_review') addEvent(state, 'node_retried', details); else bumpWorkflowRevision(state, 'node_retried', details);
     await atomicWrite(filePath, state);
     return { task_id: state.task_id, node, ready_nodes: readyNodes(state) };
   });
 }
 
+const PRUNABLE_STATE_FIELDS = new Set(['version', 'routing_schema_version', 'task_id', 'workspace', 'goal', 'requirements', 'scope', 'non_goals', 'nodes', 'participants', 'reviews', 'events', 'workflow_revision', 'closed_revision', 'closed_at', 'created_at', 'updated_at', 'workspace_lease']);
+const PRUNABLE_NODE_FIELDS = new Set(['id', 'kind', 'agent_type', 'depends_on', 'execution_risk', 'routing_reason', 'execution_owner', 'integration_owner', 'quality_guard', 'routing_legacy', 'status', 'agent_task_path', 'agent_thread_id', 'agent_role', 'claim_id', 'claimed_at', 'activation_at', 'activation_deadline_at', 'heartbeat_at', 'heartbeat_count', 'lease_duration_sec', 'attempt', 'result', 'checkpoint', 'checkpoint_at', 'recovery_history']);
+const PRUNABLE_LEASE_FIELDS = new Set(['version', 'workspace', 'active_task', 'updated_at']);
+const PRUNABLE_TASK_LEASE_FIELDS = new Set(['registry_path', 'state_path', 'status', 'acquired_at', 'released_at']);
+const PRUNE_SWEEP_FIELDS = new Set(['version', 'last_sweep_at']);
+
+function hasExactFields(value, fields) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const keys = Object.keys(value);
+  return keys.length === fields.size && keys.every(key => fields.has(key));
+}
+function validTimestamp(value) { return typeof value === 'string' && Number.isFinite(Date.parse(value)); }
+
 function taskPruneEligibility(state, filePath, now) {
+  if (!hasExactFields(state, PRUNABLE_STATE_FIELDS)) return { eligible: false, reason: 'incomplete or unknown state fields' };
+  if (state.version !== VERSION || state.routing_schema_version !== 1) return { eligible: false, reason: 'legacy or unsupported state schema' };
+  try { requiredIdentifier(state.task_id, 'task_id'); requiredString(state.workspace, 'workspace'); requiredString(state.goal, 'goal'); }
+  catch (error) { return { eligible: false, reason: `invalid task identity: ${error.message}` }; }
+  if (!path.isAbsolute(state.workspace) || path.resolve(state.workspace) !== state.workspace) return { eligible: false, reason: 'workspace is not canonical absolute path' };
+  if (!Array.isArray(state.requirements) || !Array.isArray(state.scope) || !Array.isArray(state.non_goals) || !Array.isArray(state.participants) || !Array.isArray(state.reviews) || !Array.isArray(state.events)) return { eligible: false, reason: 'invalid state collection' };
+  if (state.requirements.some(item => !item || typeof item !== 'object' || Array.isArray(item) || typeof item.id !== 'string' || !item.id.trim() || typeof item.text !== 'string' || !item.text.trim()) || state.participants.some(item => !item || typeof item !== 'object' || Array.isArray(item)) || state.reviews.some(item => !item || typeof item !== 'object' || Array.isArray(item)) || state.events.some(item => !item || typeof item !== 'object' || Array.isArray(item) || !validTimestamp(item.at) || typeof item.type !== 'string' || !item.type.trim())) return { eligible: false, reason: 'malformed state collection item' };
+  if (!state.nodes || typeof state.nodes !== 'object' || Array.isArray(state.nodes) || !Object.keys(state.nodes).length) return { eligible: false, reason: 'invalid node collection' };
+  for (const [id, node] of Object.entries(state.nodes)) {
+    if (!hasExactFields(node, PRUNABLE_NODE_FIELDS) || node.id !== id || (node.status !== PENDING && !TERMINAL.has(node.status))) return { eligible: false, reason: 'incomplete, unknown, or active node state' };
+    try { requiredIdentifier(node.id, 'node.id'); requiredString(node.kind, 'node.kind'); requiredString(node.execution_risk, 'node.execution_risk'); requiredString(node.routing_reason, 'node.routing_reason'); requiredString(node.execution_owner, 'node.execution_owner'); requiredString(node.integration_owner, 'node.integration_owner'); requiredString(node.quality_guard, 'node.quality_guard'); }
+    catch (error) { return { eligible: false, reason: `invalid node state: ${error.message}` }; }
+    if (!['delegable', 'protected'].includes(node.execution_risk) || !Array.isArray(node.depends_on) || node.depends_on.some(dependency => typeof dependency !== 'string') || node.routing_legacy !== false || !Number.isSafeInteger(node.attempt) || node.attempt < 0 || node.attempt > MAX_NODE_ATTEMPTS || !Number.isSafeInteger(node.heartbeat_count) || node.heartbeat_count < 0 || !Array.isArray(node.recovery_history)) return { eligible: false, reason: 'legacy or invalid node routing' };
+  }
+  try { validateNodes(state.nodes); validateTotalReviewTopology(state.nodes); }
+  catch (error) { return { eligible: false, reason: `invalid task topology: ${error.message}` }; }
+  if (!Number.isSafeInteger(state.workflow_revision) || state.workflow_revision < 0 || !validTimestamp(state.created_at) || !validTimestamp(state.updated_at)) return { eligible: false, reason: 'invalid task timestamps or revision' };
   const updatedAt = Date.parse(state.updated_at);
   if (!Number.isFinite(updatedAt)) return { eligible: false, reason: 'invalid updated_at' };
   if (now - updatedAt < DEFAULT_TASK_RETENTION_DAYS * DAY_MS) return { eligible: false, reason: 'younger than retention period' };
   if (!state.workspace_lease || state.workspace_lease.status !== 'released') return { eligible: false, reason: 'workspace lease is not released' };
+  if (!hasExactFields(state.workspace_lease, PRUNABLE_TASK_LEASE_FIELDS)) return { eligible: false, reason: 'workspace lease is not a complete released state' };
   if (Object.values(state.nodes).some(node => node.status === RUNNING)) return { eligible: false, reason: 'has running nodes' };
-  if (typeof state.workspace_lease.registry_path !== 'string' || !path.isAbsolute(state.workspace_lease.registry_path)) return { eligible: false, reason: 'invalid workspace lease path' };
+  if (typeof state.workspace_lease.registry_path !== 'string' || !path.isAbsolute(state.workspace_lease.registry_path) || path.resolve(state.workspace_lease.registry_path) !== workspaceLeasePath(state.workspace)) return { eligible: false, reason: 'invalid workspace lease path' };
+  if (state.workspace_lease.state_path !== filePath || !validTimestamp(state.workspace_lease.acquired_at) || !validTimestamp(state.workspace_lease.released_at)) return { eligible: false, reason: 'invalid released workspace lease state' };
   if (path.resolve(state.workspace_lease.registry_path) === path.resolve(filePath)) return { eligible: false, reason: 'state path conflicts with workspace lease path' };
   return { eligible: true };
+}
+
+async function releasedLeaseEligibility(leasePath, state) {
+  let lease;
+  try { lease = await readJson(leasePath, { label: 'Workspace lease', maxBytes: MAX_MANIFEST_BYTES }); }
+  catch (error) { return { eligible: false, reason: `workspace lease is unreadable: ${error.message}` }; }
+  if (!hasExactFields(lease, PRUNABLE_LEASE_FIELDS) || lease.version !== WORKSPACE_LEASE_VERSION || lease.workspace !== state.workspace || lease.active_task !== null || !validTimestamp(lease.updated_at)) return { eligible: false, reason: 'workspace lease is not a verified released registry' };
+  return { eligible: true };
+}
+
+function appendPruneReport(deleted, retained, target, value) {
+  if (deleted.length + retained.length < MAX_PRUNE_REPORT_ENTRIES) target.push(value);
 }
 
 async function pruneExpiredTasks(parameters) {
@@ -906,35 +968,55 @@ async function pruneExpiredTasks(parameters) {
   let entries;
   try { entries = await fs.readdir(stateDir, { withFileTypes: true }); }
   catch (error) { if (error.code === 'ENOENT') return { state_dir: stateDir, retention_days: DEFAULT_TASK_RETENTION_DAYS, deleted: [], retained: [] }; throw error; }
-  const now = Date.now(); const deleted = []; const retained = [];
+  const now = Date.now(); const deleted = []; const retained = []; let deletedCount = 0; let retainedCount = 0;
   for (const entry of entries) {
-    if (!entry.isFile() || !entry.name.endsWith('.json') || entry.name === 'workspace-lease.json') continue;
+    if (!entry.isFile() || !entry.name.endsWith('.json') || entry.name === 'workspace-lease.json' || entry.name === PRUNE_SWEEP_FILENAME) continue;
     const filePath = path.join(stateDir, entry.name);
     let initial;
-    try { initial = normalizeState(await loadState(filePath)); }
-    catch (error) { retained.push({ state_path: filePath, reason: `unreadable state: ${error.message}` }); continue; }
+    try { initial = await loadState(filePath); }
+    catch (error) { retainedCount++; appendPruneReport(deleted, retained, retained, { state_path: filePath, reason: `unreadable state: ${error.message}` }); continue; }
     const initialEligibility = taskPruneEligibility(initial, filePath, now);
-    if (!initialEligibility.eligible) { retained.push({ task_id: initial.task_id, state_path: filePath, reason: initialEligibility.reason }); continue; }
+    if (!initialEligibility.eligible) { retainedCount++; appendPruneReport(deleted, retained, retained, { task_id: initial.task_id ?? null, state_path: filePath, reason: initialEligibility.reason }); continue; }
     const leasePath = initial.workspace_lease.registry_path;
     try {
       const outcome = await withStateLock(leasePath, async () => withStateLock(filePath, async () => {
         let state;
-        try { state = normalizeState(await loadState(filePath)); }
+        try { state = await loadState(filePath); }
         catch (error) { if (error instanceof ControllerError && error.message.startsWith('JSON input does not exist:')) return { deleted: false, reason: 'state disappeared before cleanup' }; throw error; }
         const eligibility = taskPruneEligibility(state, filePath, now);
         if (!eligibility.eligible) return { deleted: false, reason: eligibility.reason, task_id: state.task_id };
-        const lease = await loadWorkspaceLease(leasePath, state.workspace);
-        if (lease.active_task?.state_path === filePath || lease.active_task?.task_id === state.task_id) return { deleted: false, reason: 'workspace lease still references task', task_id: state.task_id };
+        const leaseEligibility = await releasedLeaseEligibility(leasePath, state);
+        if (!leaseEligibility.eligible) return { deleted: false, reason: leaseEligibility.reason, task_id: state.task_id };
         await fs.unlink(filePath);
         return { deleted: true, task_id: state.task_id };
       }));
-      if (outcome.deleted) deleted.push({ task_id: outcome.task_id, state_path: filePath });
-      else retained.push({ task_id: outcome.task_id ?? initial.task_id, state_path: filePath, reason: outcome.reason });
+      if (outcome.deleted) { deletedCount++; appendPruneReport(deleted, retained, deleted, { task_id: outcome.task_id, state_path: filePath }); }
+      else { retainedCount++; appendPruneReport(deleted, retained, retained, { task_id: outcome.task_id ?? initial.task_id, state_path: filePath, reason: outcome.reason }); }
     } catch (error) {
-      retained.push({ task_id: initial.task_id, state_path: filePath, reason: `cleanup failed: ${error.message}` });
+      retainedCount++; appendPruneReport(deleted, retained, retained, { task_id: initial.task_id, state_path: filePath, reason: `cleanup failed: ${error.message}` });
     }
   }
-  return { state_dir: stateDir, retention_days: DEFAULT_TASK_RETENTION_DAYS, deleted, retained };
+  return { state_dir: stateDir, retention_days: DEFAULT_TASK_RETENTION_DAYS, deleted_count: deletedCount, retained_count: retainedCount, report_truncated: deletedCount > deleted.length || retainedCount > retained.length, deleted, retained };
+}
+
+async function maybePruneExpiredTasks(parameters) {
+  const stateDir = requiredStateDirectory(parameters.state_dir);
+  try {
+    const directory = await fs.stat(stateDir);
+    if (!directory.isDirectory()) throw new ControllerError(`state_dir is not a directory: ${stateDir}`);
+  } catch (error) {
+    if (error.code === 'ENOENT') return;
+    throw error;
+  }
+  const sweepPath = path.join(stateDir, PRUNE_SWEEP_FILENAME);
+  await withStateLock(sweepPath, async () => {
+    let prior = null;
+    try { prior = await readJson(sweepPath, { label: 'Prune sweep state', maxBytes: 1024 }); }
+    catch (error) { if (!error.message.startsWith('JSON input does not exist:')) prior = null; }
+    if (hasExactFields(prior, PRUNE_SWEEP_FIELDS) && prior.version === 1 && validTimestamp(prior.last_sweep_at) && Date.now() - Date.parse(prior.last_sweep_at) < PRUNE_SWEEP_INTERVAL_MS) return;
+    await pruneExpiredTasks({ state_dir: stateDir });
+    await atomicWrite(sweepPath, { version: 1, last_sweep_at: utcNow() });
+  });
 }
 
 async function recoverTaskLock(parameters) {
@@ -1030,8 +1112,8 @@ async function closeCheck(parameters) {
 
 export async function dispatch(command, parameters) {
   if (command === 'prune-expired') return [await pruneExpiredTasks(parameters), 0];
-  // MCP is not a persistent daemon. Each state-dir operation performs the seven-day cleanup sweep.
-  if (parameters && hasOwn(parameters, 'state_dir')) await pruneExpiredTasks(parameters);
+  // The state-dir marker keeps ordinary cleanup bounded even when each CLI call starts a new process.
+  if (parameters && hasOwn(parameters, 'state_dir')) await maybePruneExpiredTasks(parameters);
   switch (command) {
     case 'init': return [await initTask(parameters), 0]; case 'reconcile-workspace': return [await reconcileWorkspace(parameters), 0]; case 'add-node': return [await addNode(parameters), 0];
     case 'ready': return [{ ready_nodes: readyNodes((await readTask(parameters))[1]) }, 0]; case 'claim': return [await claimNode(parameters), 0];

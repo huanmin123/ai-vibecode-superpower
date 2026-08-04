@@ -53,7 +53,7 @@ role 会先应用，但 child 随后继承父 turn 的 approval policy 和 permi
 
 Luna readonly 真正不可用时才一对一改用对应 Terra low/medium readonly 并保留原错。所选 Sol role 或模型真正不可用时才改用 Terra xhigh readonly 并披露独立性下降；timeout、证据不足或普通失败不属于不可用。executor 失败时，`integration_owner` 核验状态、diff、产物和输出，确认旧 executor 已停止或不再写入后，才可用新完整契约替换一次或交由 Terra 接管。Terra high 不可用时，main/root 可在契约仍完整、`delegable` 且自身承担 `integration_owner` 时直派 executor；其他情况停止报告。所有 fallback 都是父 agent 的显式动作，不是 Codex 自动行为。
 
-若 session persistence/state DB 未启用、写入失败或重启后没有可读的必要状态，只做一次当前状态、diff 和输出盘点，保留原始错误与缺失条件，停止当前恢复或替换并交回父级或用户。对于持久化控制器节点，main/root 可在原生状态已确认旧执行者停止后自动调用 `workflow_requeue_stale` 并派发替代实例；这不是 Codex 内部会话恢复，也不适用于未受控制器管理的任务。不得声称自动恢复、已排队或自动重试，也不得重复只读验证。
+若 session persistence/state DB 未启用、写入失败或重启后没有可读的必要状态，只做一次当前状态、diff 和输出盘点，保留原始错误与缺失条件，停止当前恢复或替换并交回父级或用户。对于持久化控制器节点，main/root 可在原生状态已确认旧执行者停止后，先创建并核对新的原生实例，再以其真实路径作为 `replacement_agent_task_path` 自动调用 `workflow_requeue_stale`；控制器会记录旧 attempt 并将现代节点的 `execution_owner` 显式重绑定给替代实例。该路径必须不同于旧执行者，总审替代者还必须从未参与该任务。这不是 Codex 内部会话恢复，也不适用于未受控制器管理的任务。不得声称自动恢复、已排队或自动重试，也不得重复只读验证。
 
 总审开始前，main/root 先完成所有会写入被审工作区的验证、清理已知测试产物，并调用 `audit-context` 冻结工作区指纹和 `workflow_snapshot`。总审实例不得在该被指纹绑定的工作区执行可能写入文件的命令（包括可能生成 WAL、锁、工作区校验和或快照的测试）；需要独立复跑时，在临时副本执行，复跑输出作为证据而不改变被审工作区。大型外部归档的 Sol 审查使用受控证据包：目标、需求、允许范围、当前指纹、当前工作流快照、实际测试输出、改动文件和与非目标对应的少量哨兵路径；Sol 必须亲查改动与必要相邻调用链，但不得为发现范围漂移无边界枚举整棵归档。
 

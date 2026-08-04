@@ -157,7 +157,9 @@ configure_project() {
 
   config_needs_write=0
   agents_needs_write=0
+  tool_error_rule_needs_write=0
   ignore_needs_write=0
+  tool_error_rule='- 工具调用报错时，只有工具注册表或 `--help` 未列出目标命令，才可判定其不存在；否则不得归因于能力缺失。'
   if [ -f "$config" ] && rg -q '^\[mcp_servers\.codegraph\][[:space:]]*$' "$config"; then
     main_body=$(toml_table_body "$config" '[mcp_servers.codegraph]') || die ".codex/config.toml 的 CodeGraph 主表重复或无效"
     env_body=$(toml_table_body "$config" '[mcp_servers.codegraph.env]') || die ".codex/config.toml 的 CodeGraph env 表缺失、重复或无效"
@@ -176,6 +178,7 @@ configure_project() {
   if [ -f "$agents" ] && rg -q '^## AI 工具[[:space:]]*$' "$agents"; then
     rg -Fq '$agent-toolchain' "$agents" || die 'AGENTS.md 的 AI 工具规则缺少 $agent-toolchain'
     rg -Fq 'rtk rewrite' "$agents" || die "AGENTS.md 的 AI 工具规则缺少 RTK 路由"
+    rg -Fxq "$tool_error_rule" "$agents" || tool_error_rule_needs_write=1
   else
     agents_needs_write=1
   fi
@@ -199,7 +202,9 @@ DO_NOT_TRACK = "1"'
 
 - CodeGraph/RTK 的安装、初始化、维护和验证使用全局 `$agent-toolchain`。
 - CodeGraph MCP 用于查询跨模块依赖、调用链和影响范围；处理跨模块任务时使用它。
-- 对只读高输出命令，优先使用匹配的 `rtk` 子命令：`git`、`rg`、`log`、`diff`、`test`、`mvn`、`npm`、`pnpm`、`read`、`find`、`ls`、`tree`。未列出的只读命令先用 `rtk rewrite "<command>"` 或 `rtk --help` 判断；写操作和精确排障使用原生命令。'
+- 对只读高输出命令，优先使用匹配的 `rtk` 子命令：`git`、`rg`、`log`、`diff`、`test`、`mvn`、`npm`、`pnpm`、`read`、`find`、`ls`、`tree`。未列出的只读命令先用 `rtk rewrite "<command>"` 或 `rtk --help` 判断；写操作和精确排障使用原生命令。
+- 工具调用报错时，只有工具注册表或 `--help` 未列出目标命令，才可判定其不存在；否则不得归因于能力缺失。'
+  [ "$tool_error_rule_needs_write" -eq 0 ] || append_project_text "$agents" "$tool_error_rule"
   [ "$ignore_needs_write" -eq 0 ] || append_project_text "$ignore" '/.codegraph/'
   note "项目 CodeGraph/RTK 路由已就绪"
 }

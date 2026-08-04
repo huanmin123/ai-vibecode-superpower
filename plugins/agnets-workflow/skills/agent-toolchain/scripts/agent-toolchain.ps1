@@ -134,7 +134,8 @@ function Configure-Project {
   Assert-PlainFileOrAbsent $agentsPath
   Assert-PlainFileOrAbsent $ignorePath
 
-  $needsConfig = $false; $needsAgents = $false; $needsIgnore = $false
+  $needsConfig = $false; $needsAgents = $false; $needsToolErrorRule = $false; $needsIgnore = $false
+  $toolErrorRule = '- 工具调用报错时，只有工具注册表或 `--help` 未列出目标命令，才可判定其不存在；否则不得归因于能力缺失。'
   $configText = if (Test-Path -LiteralPath $configPath) { Get-Content -LiteralPath $configPath -Raw } else { '' }
   if ($configText -match '(?m)^\[mcp_servers\.codegraph\]\s*$') {
     $mainBody = Get-TomlTableBody $configPath '[mcp_servers.codegraph]'
@@ -149,6 +150,7 @@ function Configure-Project {
   $agentsText = if (Test-Path -LiteralPath $agentsPath) { Get-Content -LiteralPath $agentsPath -Raw } else { '' }
   if ($agentsText -match '(?m)^## AI 工具\s*$') {
     if (-not $agentsText.Contains('$agent-toolchain') -or -not $agentsText.Contains('rtk rewrite')) { Fail 'AGENTS.md 的 AI 工具路由冲突' }
+    if (-not $agentsText.Contains($toolErrorRule)) { $needsToolErrorRule = $true }
   } else {
     $needsAgents = $true
   }
@@ -179,8 +181,10 @@ DO_NOT_TRACK = "1"
 - CodeGraph/RTK 的安装、初始化、维护和验证使用全局 `$agent-toolchain`。
 - CodeGraph MCP 用于查询跨模块依赖、调用链和影响范围；处理跨模块任务时使用它。
 - 对只读高输出命令，优先使用匹配的 `rtk` 子命令：`git`、`rg`、`log`、`diff`、`test`、`mvn`、`npm`、`pnpm`、`read`、`find`、`ls`、`tree`。未列出的只读命令先用 `rtk rewrite "<command>"` 或 `rtk --help` 判断；写操作和精确排障使用原生命令。
+- 工具调用报错时，只有工具注册表或 `--help` 未列出目标命令，才可判定其不存在；否则不得归因于能力缺失。
 '@
   }
+  if ($needsToolErrorRule) { Append-ProjectText $agentsPath $toolErrorRule }
   if ($needsIgnore) { Append-ProjectText $ignorePath '/.codegraph/' }
   Note '项目 CodeGraph/RTK 路由已就绪'
 }
