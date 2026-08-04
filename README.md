@@ -48,7 +48,7 @@ macOS 或 Linux：
 sh ./install-codex.sh
 ```
 
-安装目录优先使用非空的 `CODEX_HOME`；未设置时使用当前用户的 `~/.codex`。安装器会备份它管理的已有内容，并注册、安装或更新 `agnets-workflow`，同时安装或更新两个独立全局 skill，并移除旧版安装的三个插件同名全局 skill 和旧的独立 `workflow-controller` 插件，避免重复加载。完成后重启 Codex 相关程序，或新建 task 以加载新配置。
+安装目录优先使用非空的 `CODEX_HOME`；未设置时使用当前用户的 `~/.codex`。安装器会备份它管理的已有内容，并注册、安装或更新 `agnets-workflow`，同时安装或更新两个独立全局 skill，并移除旧版安装的三个插件同名全局 skill 和旧的独立 `workflow-controller` 插件，避免重复加载。完成后必须完全重启 Codex Desktop 或 CLI 进程；仅新建 task 不能保证已运行的 Desktop 加载新增 agent role。
 
 `workflow-controller` 使用 Codex 所需的 Node.js 运行时；安装器会在写入前检查 `node` 命令。
 

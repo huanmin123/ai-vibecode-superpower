@@ -616,6 +616,8 @@ $managedAgentRoleContracts = @(
     [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_luna_xhigh.toml'; RoleName = 'avsp_luna_xhigh'; Model = 'gpt-5.6-luna'; ReasoningEffort = 'xhigh'; SandboxMode = 'read-only' }
     [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_luna_high_writer.toml'; RoleName = 'avsp_luna_high_writer'; Model = 'gpt-5.6-luna'; ReasoningEffort = 'high'; SandboxMode = 'danger-full-access' }
     [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_luna_xhigh_writer.toml'; RoleName = 'avsp_luna_xhigh_writer'; Model = 'gpt-5.6-luna'; ReasoningEffort = 'xhigh'; SandboxMode = 'danger-full-access' }
+    [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_luna_high_executor.toml'; RoleName = 'avsp_luna_high_executor'; Model = 'gpt-5.6-luna'; ReasoningEffort = 'high'; SandboxMode = 'danger-full-access' }
+    [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_luna_xhigh_executor.toml'; RoleName = 'avsp_luna_xhigh_executor'; Model = 'gpt-5.6-luna'; ReasoningEffort = 'xhigh'; SandboxMode = 'danger-full-access' }
     [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_sol_high.toml'; RoleName = 'avsp_sol_high'; Model = 'gpt-5.6-sol'; ReasoningEffort = 'high'; SandboxMode = 'read-only' }
     [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_sol_xhigh.toml'; RoleName = 'avsp_sol_xhigh'; Model = 'gpt-5.6-sol'; ReasoningEffort = 'xhigh'; SandboxMode = 'read-only' }
     [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_terra_high.toml'; RoleName = 'avsp_terra_high'; Model = 'gpt-5.6-terra'; ReasoningEffort = 'high'; SandboxMode = 'danger-full-access' }
@@ -794,6 +796,10 @@ try {
         $target.InstallStarted = $true
     }
 
+    # Re-validate the installed role directory, not only the staging copy.
+    # Codex Desktop/CLI loads role profiles at process start and does not hot-reload them.
+    Assert-ManagedAgentRoleProfiles -RoleDirectory $targetAgentRoles -Contracts $managedAgentRoleContracts -ManifestPath $sourceAgentRoleManifest
+
     Write-Host "Codex configuration installed in: $codexHome"
     Write-Host "Managed plugin installed: $managedPluginName@$managedMarketplaceName"
     Write-Host 'Managed standalone skills installed; obsolete global copies of plugin skills removed.'
@@ -802,6 +808,7 @@ try {
     } else {
         Write-Host 'Backup directory: none (no managed targets existed)'
     }
+    Write-Warning 'Restart Codex Desktop/CLI before starting a new workflow so newly installed agent roles are loaded.'
 }
 catch {
     $rollbackErrors = Invoke-InstallRollback -Targets $transactionTargets -BackupDirectory $backupDirectory -AgentsTarget $agentsTarget -AgentsParentCreated $agentsParentCreated

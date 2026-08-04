@@ -329,7 +329,7 @@ export CODEGRAPH_NO_DOWNLOAD=1
 exec "$npm_binary" "\$@"
 EOF
   chmod 755 "$temporary"
-  mv -f -h "$temporary" "$path"
+  atomic_replace "$temporary" "$path"
 }
 
 rtk_launcher_matches() {
@@ -354,7 +354,7 @@ export RTK_TELEMETRY_DISABLED=1
 exec "$TOOLCHAIN_HOME/rtk/current/rtk" "\$@"
 EOF
   chmod 755 "$temporary"
-  mv -f -h "$temporary" "$path"
+  atomic_replace "$temporary" "$path"
   INSTALL_PUBLIC_CREATED=1
 }
 
@@ -680,6 +680,16 @@ atomic_link() {
   fi
 }
 
+atomic_replace() {
+  source_path=$1
+  destination_path=$2
+  if [ "$PLATFORM_OS" = darwin ]; then
+    mv -f -h "$source_path" "$destination_path"
+  else
+    mv -f -T "$source_path" "$destination_path"
+  fi
+}
+
 cleanup_install() {
   result=$?
   trap - EXIT HUP INT TERM
@@ -846,7 +856,7 @@ ensure_posix_command_path() {
     printf '%s\n' '# >>> agent-toolchain command path >>>' >> "$temporary"
     printf 'export PATH="%s:$PATH"\n' "$TOOLCHAIN_BIN" >> "$temporary"
     printf '%s\n' '# <<< agent-toolchain command path <<<' >> "$temporary"
-    mv -f -h "$temporary" "$profile"
+    atomic_replace "$temporary" "$profile"
     note "已将 CodeGraph/RTK 命令路径写入 ${profile}；新开的终端会自动生效。"
   done
   if [ "$PLATFORM_OS" = darwin ] && command -v launchctl >/dev/null 2>&1; then
@@ -875,7 +885,7 @@ ensure_posix_command_path() {
     printf '%s\n' '# >>> agent-toolchain command path >>>' >> "$temporary"
     printf 'PATH=%s:${PATH}\n' "$TOOLCHAIN_BIN" >> "$temporary"
     printf '%s\n' '# <<< agent-toolchain command path <<<' >> "$temporary"
-    mv -f -h "$temporary" "$environment_file"
+    atomic_replace "$temporary" "$environment_file"
     note "已写入 Linux 用户环境路径；新会话会自动加载。"
   fi
 }
@@ -968,7 +978,9 @@ main() {
       load_trusted_manifest
       ;;
     configure)
+      detect_platform
       check_project
+      command -v rg >/dev/null 2>&1 || die '缺少 rg；configure 未写入任何文件'
       ;;
     rollback)
       detect_platform

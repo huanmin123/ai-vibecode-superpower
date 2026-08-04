@@ -1,18 +1,22 @@
 # Agnets 工作流
 
-`agnets-workflow` 是给 Codex 使用的统一工作流插件。它包含多代理编排、项目文档规划、GPT Image 2 CLI、CodeGraph/RTK 工具链，以及将任务 DAG、子任务产物、参与者和总审记录保存到工作区的本地状态控制器。
+`agnets-workflow` 是给 Codex 使用的统一工作流插件。它包含多代理编排、CodeGraph/RTK 工具链，以及将任务 DAG、子任务产物、参与者和总审记录保存到工作区的本地状态控制器。
 
 ## 解决的问题
 
 - `workflow_ready` 返回所有依赖已满足的节点，main/root 可以一次并行派发它们，而不是顺序等待。
-- 每个节点完成后都记录结构化产物；`workflow_audit_context` 汇集目标、需求、范围、节点结果和当前工作区指纹，作为独立 Sol 总审的输入。
-- `workflow_close_check` 只在全部节点完成、独立总审为 `pass` 且工作区未在总审后改变时允许关闭。
+- 每个节点完成后都记录结构化产物；`workflow_audit_context` 汇集目标、需求、范围、节点结果、当前工作区指纹和 `workflow_snapshot`，作为独立 Sol 总审的输入。
+- `workflow_close_check` 只在全部工作节点完成、唯一独立 Sol 总审为 `pass`、总审快照和工作区均未变化时允许关闭，并在通过时释放该工作区的活动任务租约。
 
 控制器不创建、停止或直接通信 Codex 子代理。main/root 仍须使用原生 `spawn_agent`、`send_message`、`wait_agent` 和 `interrupt_agent`，并遵守 `orchestrate-model-workflow` 的 role 拓扑。
 
 ## 状态与清理
 
-默认状态目录是目标工作区的 `.codex/workflow-controller/`。该目录属于控制数据，不应纳入业务改动或总审的工作区指纹；任务关闭后可按项目保留策略归档或删除。
+每次控制器调用都必须传入同一个绝对 `state_dir`，推荐目标工作区的 `.codex/workflow-controller/`。该目录属于控制数据，不应纳入业务改动或总审的工作区指纹；连续 7 天没有状态更新、租约已释放且不存在运行节点的任务状态，会在下一次该 `state_dir` 的控制器操作时删除，也可以显式调用 `workflow_prune_expired`。控制器不是常驻服务，因此没有任何调用时不会在第 7 天整点自行运行；活动、未知、legacy 或无法解析的状态不会删除。
+
+控制器会在目标工作区的 `.codex/workflow-controller/workspace-lease.json` 保留活动任务租约。因此多个不同工作区可并行，而同一工作区即使使用不同状态目录也只能有一个活动工作流。运行中的代理应定期写入 `workflow_checkpoint`，保存完成步骤、下一步、证据和阻塞。会话或进程中断后，协调者先检查实际代理、diff 和产物；只有确认旧代理已停止，才能调用 `workflow_requeue_stale` 原子保存旧 attempt/checkpoint、取得恢复包并派发新代理。若当前 Codex 运行时实际暴露 `resume_agent` 且 claim 保存了原生 `agent_thread_id`，协调者可优先恢复原代理会话；控制器本身不能读取或调用 Codex 的内部 session/rollout。确认没有旧代理仍在写入后，才能用 `workflow_release_workspace` 释放中断任务的租约。
+
+初始化在状态文件和租约之间使用持久阶段标记。若进程在 `workflow_init` 返回前中断，先调用 `workflow_reconcile_workspace`：它只会激活与租约一致的已有状态，或清理确认不存在状态的初始化登记，不会猜测或接管未知任务。租约释放后，旧任务不能再写入任何 DAG 状态。
 
 每个任务先创建 manifest：
 
@@ -27,12 +31,44 @@
   ],
   "scope": ["src/payments"],
   "non_goals": ["修改结算协议"],
+  "routing_schema_version": 1,
   "nodes": [
-    { "id": "implementation", "kind": "implementation", "agent_type": "avsp_terra_high" },
-    { "id": "verification", "kind": "verification", "depends_on": ["implementation"] }
+    {
+      "id": "implementation",
+      "kind": "implementation",
+      "agent_type": "avsp_luna_high_executor",
+      "execution_risk": "delegable",
+      "routing_reason": "影响局限于支付路由；可回滚且已有定向测试",
+      "execution_owner": "/root/payments-executor",
+      "integration_owner": "/root",
+      "quality_guard": "支付路由测试与独立 Sol 总审"
+    },
+    {
+      "id": "verification",
+      "kind": "verification",
+      "depends_on": ["implementation"],
+      "execution_risk": "protected",
+      "routing_reason": "只读验证由 root 协调",
+      "execution_owner": "/root/verification",
+      "integration_owner": "/root",
+      "quality_guard": "独立 Sol 总审"
+    },
+    {
+      "id": "total-review",
+      "kind": "total_review",
+      "agent_type": "avsp_sol_high",
+      "depends_on": ["implementation", "verification"],
+      "execution_risk": "protected",
+      "routing_reason": "独立只读总审必须等待全部工作节点完成",
+      "execution_owner": "/root/payments-total-review",
+      "integration_owner": "/root",
+      "quality_guard": "任务关闭关卡"
+    }
   ]
 }
 ```
+
+`routing_schema_version=1` 要求每个节点记录 `execution_risk`、`routing_reason`、`execution_owner`、`integration_owner` 与 `quality_guard`。没有该版本标记的旧清单仍可读取，但控制器会写入明确的 legacy/protected 路由，且禁止 Luna executor 认领，不能把缺失字段默认为可委派。
 
 Windows 上也可以直接使用 CLI：
 
@@ -41,7 +77,13 @@ node .\scripts\workflow_controller.mjs --state-dir "$pwd\.codex\workflow-control
 node .\scripts\workflow_controller.mjs --state-dir "$pwd\.codex\workflow-controller" ready --task-id payments-refactor
 ```
 
-插件的 MCP 工具提供相同的 `workflow_init`、`workflow_ready`、`workflow_claim`、`workflow_heartbeat`、`workflow_complete`、`workflow_abandon`、`workflow_retry`、`workflow_recover_lock`、`workflow_audit_context`、`workflow_record_review`、`workflow_close_check` 和 `workflow_status` 操作。`workflow_claim` 返回 `claim_id`；完成、心跳、放弃与总审记录必须携带该值。总审记录还会校验它属于同路径、同角色的运行中 `total_review` 节点。`abandoned` 只能通过 `workflow_abandon` 写入，以保留停止确认和审计原因；重试前调用方必须先实际确认旧执行者已停止。陈旧锁恢复会串行化；已有恢复操作时会明确报错而不冒险移动锁文件。
+Windows 的独立 Sol CLI 总审通过包装器运行：`node .\scripts\sol_review_cli.mjs -- <prompt>`。它显式继承或解析当前账户的 `CODEX_HOME` 并传给子 `codex exec --model gpt-5.6-sol --sandbox read-only`；仅当 `.sandbox/deny_read_acl_state.json` 不能解析为 JSON 时，才并发安全地备份为 `.corrupt-*` 并重建 `{ "principals": {} }`。有效状态、缺失状态和任何其他 Codex CLI 失败均不被清空、吞掉或降级；`unavailable` 的输出和退出状态原样保留。
+
+新任务的 DAG 在 `workflow_init` 后不可追加，并且必须包含唯一的 `total_review` 汇点；该节点直接依赖所有其他节点，其他节点不得依赖它。总审 JSON 除已有字段外必须回填 `workflow_audit_context` 返回的 `workflow_snapshot`。任何非总审节点的结果、状态或重试发生变化都会使旧总审失效，必须新建独立总审。
+
+插件的 MCP 工具提供相同的 `workflow_init`、`workflow_reconcile_workspace`、`workflow_ready`、`workflow_claim`、`workflow_heartbeat`、`workflow_checkpoint`、`workflow_complete`、`workflow_abandon`、`workflow_retry`、`workflow_requeue_stale`、`workflow_recover_lock`、`workflow_audit_context`、`workflow_record_review`、`workflow_close_check`、`workflow_release_workspace`、`workflow_stale`、`workflow_status` 和 `workflow_prune_expired` 操作。`workflow_claim` 返回 `claim_id`；完成、心跳、checkpoint、放弃与总审记录必须携带该值。`agent_thread_id` 只在宿主确实提供时保存，不能由 `agent_task_path` 推导。总审记录还会校验它属于同路径、同角色的运行中 `total_review` 节点。`workflow_requeue_stale` 还要求当前 claim 确已过期和 `previous_agent_stopped=true`，它保存旧 attempt/checkpoint 并返回给替代代理的恢复包，但不伪装为原会话恢复。陈旧锁、写入意图和恢复保护只会在同主机、创建时间可解析且与文件时间一致、超过阈值、原 PID 不存在且文件身份在归档前未变化时归档；其他情况明确报错，不会冒险移除。
+
+为防止长任务无限膨胀，清单最多 64 个节点和 64 条需求，每个节点最多 8 次尝试；结构化节点结果上限 64 KiB、审核上限 128 KiB。大日志或完整测试输出应放在外部制品中，结果 JSON 只保留路径、摘要和关键结论。指纹以流式方式覆盖源码、配置、锁文件和构建输出，排除 `.git`、`.codex`、`node_modules` 与 `.venv`；遇到符号链接、持续变化的工作区或超过容量上限时明确失败，不能把失败当作通过。
 
 ## MCP 启动时限
 

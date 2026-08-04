@@ -36,8 +36,10 @@ stop_conditions: <停止并交回父级的条件>
 # 仅状态变更任务添加
 execution_contract: <已定步骤、不变量、领域边界/精度、失败语义和回滚/恢复方式>
 execution_risk: <delegable | protected>
-operation_owner: <当前唯一 agent task path>
-effort_reason: <仅 xhigh writer；填写具体局部理解理由>
+execution_owner: <当前唯一执行 agent task path>
+integration_owner: <负责审核并集成的 main/root 或 Terra task path>
+quality_guard: <负责核验契约、diff、产物和验证的实例或检查>
+routing_reason: <为何该风险分流和 role 选择成立；xhigh executor 说明具体局部理解理由>
 ```
 
 默认使用自包含消息。只有确需有限最近上下文时，`fork_turns` 才能改为正整数；`all` 只能用于不传自定义 `agent_type` 的 full-history fork。
@@ -71,9 +73,9 @@ fallback_reason: <仅 Terra fallback；保留 Sol 不可用原始错误>
 
 ## 协调检查
 
-- main/root 可为独立目标并行创建 `1..N` 个 Luna、Terra 或 Sol；状态变更只能直派 `1..N` 个 Terra，且写入目标必须互斥。只有该 Terra 可直接委派 Luna writer，且 writer 为叶节点。
-- 同一 Terra 可并行管理 `1..N` 个 Luna；只读分支必须提供互补证据，writer 分支必须使用独立、完整且写入目标互斥的契约。
-- 状态变更任务的契约完整后才选择 executor；`protected` 不交 Luna；xhigh writer 有具体理由。
+- main/root 可为独立目标并行创建 `1..N` 个 Luna、Terra 或 Sol；完整、低风险且互斥的状态变更可由 main/root 或 `avsp_terra_high` 直接派 `1..N` 个 Luna executor。executor 为叶节点，Sol 与 executor 都不得派写入节点。
+- 同一 Terra 可并行管理 `1..N` 个 Luna executor；只读分支必须提供互补证据，executor 分支必须使用独立、完整且写入目标互斥的契约。main/root 直派时自身是 `integration_owner`；Terra 对 protected 执行与 executor 集成负责。
+- 状态变更任务的契约完整且五项路由字段齐全后才选择 executor；`protected` 不交 Luna；xhigh executor 有具体理由。旧清单或不完整字段按 `protected` 处理，不得静默委派。
 - 并行写入目标互斥；接管或替代前确认旧 executor 已终止或不再写入。
 - 只有证据满足验收时才关闭；保留实际验证、未覆盖行为和残余风险。
 - 仅在实际可读的运行时持久状态存在时使用它；缺失时只盘点当前状态、diff 和输出，保留原始错误与缺失条件并交回父级或用户，不声称自动恢复、已排队或自动重试。
