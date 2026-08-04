@@ -3,6 +3,7 @@ import { createReadStream, promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { deleteTaskState, readTaskState, taskStateExists, writeTaskState } from './sqlite_task_store.mjs';
 
 export const VERSION = 1;
 const PENDING = 'pending';
@@ -31,10 +32,20 @@ const MAX_REVIEWS = 16;
 const MAX_CHECKPOINT_BYTES = 32 * 1024;
 const MAX_RECOVERY_RESULT_BYTES = 8 * 1024;
 const DEFAULT_TASK_RETENTION_DAYS = 7;
+const QUARANTINE_AFTER_DAYS = 30;
+const ERROR_STATE_RETENTION_DAYS = 365;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const PRUNE_SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const MAX_PRUNE_REPORT_ENTRIES = 128;
 const PRUNE_SWEEP_FILENAME = '.workflow-prune-sweep.json';
+const SQLITE_STATE_SUFFIX = '.sqlite';
+const ERROR_STATE_DIRECTORY = '.workflow-errors';
+const ERROR_QUARANTINE_FILENAME = 'quarantine.json';
+const QUARANTINE_EXPIRY_FILENAME = '.quarantine-expiry.json';
+const REVIEW_ARTIFACT_DIRECTORY = '.workflow-review-results';
+const QUARANTINE_REVIEW_DIRECTORY = 'review-results';
+const MAX_QUARANTINE_BYTES = 32 * 1024;
+const READ_ONLY_COMMANDS = new Set(['audit-context', 'doctor', 'fingerprint', 'ready', 'stale', 'status']);
 
 export class ControllerError extends Error {}
 
@@ -42,8 +53,9 @@ const utcNow = () => new Date().toISOString();
 const hasOwn = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
 const DEFAULT_STALE_LOCK_SEC = 30;
 const DEFAULT_LEASE_SEC = 1800;
-const DEFAULT_ACTIVATION_TIMEOUT_SEC = 120;
+const DEFAULT_ACTIVATION_TIMEOUT_SEC = 600;
 const WORKSPACE_LEASE_VERSION = 1;
+const ROOT_RESCUE_ROLE = 'main/root';
 
 function requiredString(value, name) {
   if (typeof value !== 'string' || !value.trim()) throw new ControllerError(`${name} must be a non-empty string`);
@@ -115,14 +127,93 @@ async function atomicWrite(filePath, value, maxBytes = MAX_STATE_BYTES) {
   const temporary = `${filePath}.${randomUUID()}.tmp`;
   const serialized = `${JSON.stringify(value, null, 2)}\n`;
   if (Buffer.byteLength(serialized, 'utf8') > maxBytes) throw new ControllerError(`State exceeds the ${maxBytes}-byte limit: ${filePath}`);
-  await fs.writeFile(temporary, serialized, 'utf8');
-  await fs.rename(temporary, filePath);
+  let handle;
+  try {
+    handle = await fs.open(temporary, 'wx');
+    await handle.writeFile(serialized, 'utf8');
+    await handle.sync();
+    await handle.close(); handle = null;
+    await fs.rename(temporary, filePath);
+    handle = await fs.open(filePath, 'r+');
+    await handle.sync();
+    if (process.platform !== 'win32') {
+      const directoryHandle = await fs.open(path.dirname(filePath), 'r');
+      try { await directoryHandle.sync(); } finally { await directoryHandle.close(); }
+    }
+  } catch (error) {
+    await handle?.close(); handle = null;
+    await fs.unlink(temporary).catch(cleanupError => {
+      if (cleanupError.code !== 'ENOENT') throw cleanupError;
+    });
+    throw error;
+  } finally {
+    await handle?.close();
+  }
 }
 
 function statePath(stateDir, taskId) {
   requiredIdentifier(taskId, 'task_id');
   return path.join(path.resolve(stateDir), `${taskId}.json`);
 }
+
+function databasePath(filePath) {
+  if (!filePath.endsWith('.json')) throw new ControllerError(`Invalid logical task state path: ${filePath}`);
+  return `${filePath.slice(0, -'.json'.length)}${SQLITE_STATE_SUFFIX}`;
+}
+
+async function stateExists(filePath) {
+  if (await taskStateExists(databasePath(filePath))) return true;
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch (error) {
+    if (error.code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
+async function writeState(filePath, state) {
+  let legacyStateExists = false;
+  try {
+    const legacyState = await fs.stat(filePath);
+    if (!legacyState.isFile()) throw new ControllerError(`Legacy controller state is not a regular file: ${filePath}`);
+    legacyStateExists = true;
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+  if (legacyStateExists) {
+    try {
+      const archive = await fs.stat(`${filePath}.legacy`);
+      if (!archive.isFile()) throw new ControllerError(`Legacy controller archive is not a regular file: ${filePath}.legacy`);
+      throw new ControllerError(`Both legacy controller state and archive exist; resolve migration manually: ${filePath}`);
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+  }
+  await writeTaskState(databasePath(filePath), state);
+  // A legacy file is retained as an immutable recovery copy after the SQLite commit succeeds.
+  if (legacyStateExists) {
+    try { await fs.rename(filePath, `${filePath}.legacy`); }
+    catch (error) {
+      if (error.code !== 'ENOENT') throw new ControllerError(`SQLite state committed but legacy state could not be archived: ${filePath}: ${error.message}`);
+    }
+  }
+}
+
+async function deleteState(filePath) {
+  const taskId = path.basename(filePath, '.json');
+  if (/^[A-Za-z][A-Za-z0-9._-]{0,79}$/.test(taskId)) {
+    // Remove review evidence first; if this fails, keep the task indexable for a later sweep.
+    await fs.rm(path.join(path.dirname(filePath), REVIEW_ARTIFACT_DIRECTORY, taskId), { recursive: true, force: true });
+  }
+  await deleteTaskState(databasePath(filePath));
+  for (const suffix of ['', '.legacy']) {
+    await fs.unlink(`${filePath}${suffix}`).catch(error => {
+      if (error.code !== 'ENOENT') throw error;
+    });
+  }
+}
+
 
 async function canonicalWorkspace(workspaceValue) {
   const requested = path.resolve(requiredString(workspaceValue, 'workspace'));
@@ -341,7 +432,8 @@ async function withStateLock(filePath, callback) {
 }
 
 async function loadState(filePath) {
-  const state = await readJson(filePath, { label: 'Controller state', maxBytes: MAX_STATE_BYTES });
+  let state = await readTaskState(databasePath(filePath));
+  if (state === null) state = await readJson(filePath, { label: 'Controller state', maxBytes: MAX_STATE_BYTES });
   if (!state || typeof state !== 'object' || state.version !== VERSION) throw new ControllerError(`Unsupported controller state: ${filePath}`);
   return state;
 }
@@ -358,7 +450,7 @@ async function walkFiles(root, directory = root, files = []) {
   for (const entry of entries) {
     const entryPath = path.join(directory, entry.name);
     if (entry.isDirectory()) {
-      if (!IGNORED_DIRECTORIES.has(entry.name)) await walkFiles(root, path.join(directory, entry.name), files);
+      if (!isIgnoredFingerprintDirectory(entry.name)) await walkFiles(root, path.join(directory, entry.name), files);
     } else if (entry.isSymbolicLink()) {
       throw new ControllerError(`Workspace contains a symbolic link that cannot be fingerprinted safely: ${entryPath}`);
     } else if (entry.isFile()) {
@@ -367,6 +459,13 @@ async function walkFiles(root, directory = root, files = []) {
     }
   }
   return files;
+}
+
+function isIgnoredFingerprintDirectory(name) {
+  // Package-manager caches are derived download artifacts, like node_modules.
+  // They may be populated while verification runs and must not invalidate a
+  // source review or make the fingerprint traverse a large transient cache.
+  return IGNORED_DIRECTORIES.has(name) || name === '.yarn' || name.startsWith('.yarn-cache');
 }
 
 class WorkspaceChangedDuringFingerprint extends Error {}
@@ -546,19 +645,26 @@ function nodeRecord(raw, options = {}) {
   if (raw.agent_type !== undefined && raw.agent_type !== null) requiredString(raw.agent_type, 'node.agent_type');
   const dependencies = raw.depends_on ?? [];
   if (!Array.isArray(dependencies) || dependencies.some(dependency => typeof dependency !== 'string' || !dependency.trim())) throw new ControllerError('node.depends_on must contain non-empty string identifiers');
-  return { id, kind, agent_type: raw.agent_type ?? null, depends_on: dependencies, ...nodeRouting(raw, options.routingRequired === true), status: PENDING, agent_task_path: null, agent_thread_id: null, agent_role: null, claim_id: null, claimed_at: null, activation_at: null, activation_deadline_at: null, heartbeat_at: null, heartbeat_count: 0, lease_duration_sec: null, attempt: 0, result: null, checkpoint: null, checkpoint_at: null, recovery_history: [] };
+  return { id, kind, agent_type: raw.agent_type ?? null, depends_on: dependencies, ...nodeRouting(raw, options.routingRequired === true), rescue_role: null, rescue_reason: null, rescued_at: null, rescue_count: 0, status: PENDING, agent_task_path: null, agent_thread_id: null, agent_role: null, claim_id: null, claimed_at: null, activation_at: null, activation_deadline_at: null, heartbeat_at: null, heartbeat_count: 0, lease_duration_sec: null, attempt: 0, result: null, checkpoint: null, checkpoint_at: null, recovery_history: [] };
 }
 
 function normalizeState(state) {
+  if (!state || typeof state !== 'object' || Array.isArray(state)) throw new ControllerError('Task state must be an object');
+  if (!state.nodes || typeof state.nodes !== 'object' || Array.isArray(state.nodes) || !Object.keys(state.nodes).length) throw new ControllerError('Task state must contain nodes');
   state.workflow_revision ??= 0;
   state.closed_revision ??= null;
   state.closed_at ??= null;
-  for (const node of Object.values(state.nodes ?? {})) {
+  for (const [nodeId, node] of Object.entries(state.nodes)) {
+    if (!node || typeof node !== 'object' || Array.isArray(node)) throw new ControllerError(`Task node must be an object: ${nodeId}`);
+    if (node.id !== nodeId) throw new ControllerError(`Task node key and id must match: ${nodeId}`);
     node.agent_thread_id ??= null; node.agent_role ??= null; node.claim_id ??= null; node.claimed_at ??= null; node.activation_at ??= null; node.activation_deadline_at ??= null; node.heartbeat_at ??= null;
     node.lease_duration_sec ??= null; node.heartbeat_count ??= 0; node.attempt ??= node.agent_task_path ? 1 : 0;
     node.checkpoint ??= null; node.checkpoint_at ??= null; node.recovery_history ??= [];
+    node.rescue_role ??= null; node.rescue_reason ??= null; node.rescued_at ??= null; node.rescue_count ??= 0;
     if (!hasOwn(node, 'execution_risk')) Object.assign(node, nodeRouting(node, false));
   }
+  validateNodes(state.nodes);
+  validateTotalReviewTopology(state.nodes);
   return state;
 }
 
@@ -626,6 +732,149 @@ function compactState(state) {
   return { task_id: state.task_id, workspace: state.workspace, workspace_lease: state.workspace_lease ?? null, goal: state.goal, nodes: Object.values(state.nodes), ready_nodes: readyNodes(state), stale_nodes: staleNodes(state), participants: state.participants, reviews: state.reviews, updated_at: state.updated_at };
 }
 
+async function coordinationStatus(lockPath) {
+  const files = [];
+  for (const suffix of ['', '.writer', '.release', '.recover']) {
+    const candidate = `${lockPath}${suffix}`;
+    try {
+      const details = await lockDetails(candidate);
+      let owner_alive = null;
+      if (details.hostname === os.hostname()) {
+        try { owner_alive = await processIsAlive(details.pid); }
+        catch { owner_alive = null; }
+      }
+      files.push({ path: candidate, kind: suffix || '.lock', present: true, hostname: details.hostname || null, pid: Number.isSafeInteger(details.pid) ? details.pid : null, created_at: details.created || null, age_ms: details.ageMs, owner_alive });
+    } catch (error) {
+      if (error.code === 'ENOENT') continue;
+      files.push({ path: candidate, kind: suffix || '.lock', present: true, readable: false, error: error.message });
+    }
+  }
+  return files;
+}
+
+function doctorCheck(id, status, detail) { return { id, status, detail }; }
+
+async function unreadableDoctor(parameters, filePath, error) {
+  const database = databasePath(filePath);
+  let databaseDetail = { path: database, error: error.message };
+  try {
+    const metadata = await fs.stat(database);
+    databaseDetail = { path: database, bytes: metadata.size, modified_at: metadata.mtime.toISOString(), error: error.message };
+  } catch (statError) {
+    if (statError.code !== 'ENOENT') databaseDetail = { path: database, error: `${error.message}; ${statError.message}` };
+  }
+  const coordinationFiles = await coordinationStatus(`${filePath}.lock`);
+  return {
+    task_id: requiredString(parameters.task_id, 'task_id'),
+    workspace: null,
+    health: 'blocked',
+    checks: [
+      doctorCheck('state_database', 'fail', databaseDetail),
+      doctorCheck('task_state', 'fail', { path: filePath, error: error.message }),
+      doctorCheck('coordination', coordinationFiles.length ? 'attention' : 'pass', { files: coordinationFiles }),
+    ],
+    recovery_candidates: [],
+    close_status: { close_allowed: false, reasons: [`task state is unreadable: ${error.message}`] },
+  };
+}
+
+async function quarantinedDoctor(parameters, filePath, metadata) {
+  const coordinationFiles = await coordinationStatus(`${filePath}.lock`);
+  return {
+    task_id: requiredString(parameters.task_id, 'task_id'),
+    workspace: null,
+    health: 'blocked',
+    checks: [
+      doctorCheck('quarantined_state', 'fail', {
+        state_path: filePath,
+        error_path: metadata.error_path,
+        reason: metadata.reason,
+        status: metadata.status,
+        quarantined_at: metadata.quarantined_at,
+        delete_after: metadata.delete_after,
+        files: metadata.files,
+        move_error: metadata.move_error,
+      }),
+      doctorCheck('coordination', coordinationFiles.length ? 'attention' : 'pass', { files: coordinationFiles }),
+    ],
+    recovery_candidates: [],
+    close_status: { close_allowed: false, reasons: [`task state is quarantined until ${metadata.delete_after}`] },
+  };
+}
+
+async function doctorTask(parameters) {
+  if (parameters.task_id === undefined || parameters.task_id === null) return doctorStateDirectory(parameters);
+  const filePath = configuredStatePath(parameters, requiredString(parameters.task_id, 'task_id'));
+  let state;
+  try { state = normalizeState(await loadState(filePath)); }
+  catch (error) {
+    const metadata = await findQuarantinedState(path.dirname(filePath), filePath);
+    if (metadata) return quarantinedDoctor(parameters, filePath, metadata);
+    return unreadableDoctor(parameters, filePath, error);
+  }
+  const checks = [];
+  const database = databasePath(filePath);
+  try {
+    const metadata = await fs.stat(database);
+    checks.push(doctorCheck('state_database', 'pass', { path: database, bytes: metadata.size, modified_at: metadata.mtime.toISOString() }));
+  } catch (error) {
+    if (error.code === 'ENOENT') checks.push(doctorCheck('state_database', 'attention', { path: database, reason: 'legacy JSON state is in use' }));
+    else checks.push(doctorCheck('state_database', 'fail', { path: database, error: error.message }));
+  }
+
+  if (!state.workspace_lease) {
+    checks.push(doctorCheck('workspace_lease', 'attention', { reason: 'legacy task has no workspace lease' }));
+  } else {
+    try {
+      const lease = await loadWorkspaceLease(state.workspace_lease.registry_path, state.workspace);
+      const active = state.workspace_lease.status === 'active';
+      const released = state.workspace_lease.status === 'released';
+      const matches = active ? workspaceLeaseMatches(lease, state, filePath) : released && lease.active_task === null;
+      checks.push(doctorCheck('workspace_lease', matches ? 'pass' : 'fail', {
+        path: state.workspace_lease.registry_path,
+        task_status: state.workspace_lease.status,
+        registry_active_task: lease.active_task?.task_id ?? null,
+        reason: matches ? null : 'workspace lease does not match task state',
+      }));
+    } catch (error) {
+      checks.push(doctorCheck('workspace_lease', 'fail', { path: state.workspace_lease.registry_path, error: error.message }));
+    }
+  }
+
+  const stale = staleNodes(state);
+  checks.push(doctorCheck('running_nodes', stale.length ? 'attention' : 'pass', {
+    running: Object.values(state.nodes).filter(node => node.status === RUNNING).map(node => node.id),
+    stale: stale.map(node => ({ id: node.id, reason: node.reason, claim_id: node.claim_id })),
+  }));
+  const coordination_files = await coordinationStatus(`${filePath}.lock`);
+  checks.push(doctorCheck('coordination', coordination_files.length ? 'attention' : 'pass', { files: coordination_files }));
+
+  let closeStatus;
+  try {
+    const closeReasonsList = await closeReasons(state);
+    closeStatus = { close_allowed: closeReasonsList.length === 0, reasons: closeReasonsList };
+  } catch (error) {
+    checks.push(doctorCheck('close_gate', 'fail', { error: error.message }));
+    closeStatus = { close_allowed: false, reasons: [`close check unavailable: ${error.message}`] };
+  }
+  const failed = checks.some(check => check.status === 'fail');
+  const attention = checks.some(check => check.status === 'attention');
+  return {
+    task_id: state.task_id,
+    workspace: state.workspace,
+    health: failed ? 'blocked' : attention ? 'attention' : 'healthy',
+    checks,
+    recovery_candidates: stale.map(node => ({
+      node_id: node.id,
+      claim_id: node.claim_id,
+      reason: node.reason,
+      required_actions: ['确认旧原生代理已停止且不再写入工作区', '创建新的替代代理实例', '使用 replacement_agent_task_path 和 previous_agent_stopped=true 调用 workflow_requeue_stale'],
+      automatic_requeue: 'controller cannot prove native agent termination or create a Codex agent; the coordinator must perform these actions before requeueing',
+    })),
+    close_status: closeStatus,
+  };
+}
+
 async function loadWorkspaceLease(leasePath, workspace) {
   try {
     const lease = await readJson(leasePath);
@@ -653,12 +902,20 @@ async function requireActiveWorkspaceLease(state, filePath) {
 }
 
 async function releaseWorkspaceLease(parameters, { closeAllowed = false } = {}) {
-  const [filePath, initialState] = await readTask(parameters);
+  const filePath = configuredStatePath(parameters, requiredString(parameters.task_id, 'task_id'));
+  const initialState = await loadState(filePath);
   const stateLease = initialState.workspace_lease;
   if (!stateLease) return { released: false, reason: 'legacy task has no workspace lease' };
+  if (!stateLease || typeof stateLease !== 'object' || typeof initialState.workspace !== 'string' || !path.isAbsolute(initialState.workspace)
+    || typeof stateLease.registry_path !== 'string' || !path.isAbsolute(stateLease.registry_path)
+    || path.resolve(stateLease.registry_path) !== workspaceLeasePath(initialState.workspace)
+    || stateLease.state_path !== filePath) throw new ControllerError('Cannot release workspace lease: lease metadata is not a complete matching registry');
   const leasePath = stateLease.registry_path;
   return withStateLock(leasePath, async () => withStateLock(filePath, async () => {
-    const state = normalizeState(await loadState(filePath));
+    const state = await loadState(filePath);
+    if (!state.nodes || typeof state.nodes !== 'object' || Array.isArray(state.nodes)) throw new ControllerError('Cannot release workspace lease: task nodes are unreadable');
+    const unknownNodes = Object.values(state.nodes).filter(node => !node || typeof node !== 'object' || ![PENDING, RUNNING, ...TERMINAL].includes(node.status));
+    if (unknownNodes.length) throw new ControllerError('Cannot release workspace lease while node statuses are unknown');
     const running = Object.values(state.nodes).filter(node => node.status === RUNNING).map(node => node.id);
     if (running.length) throw new ControllerError(`Cannot release workspace lease while nodes are running: ${running.join(', ')}`);
     if (!closeAllowed) trueValue(parameters.previous_agents_stopped, 'previous_agents_stopped');
@@ -666,8 +923,9 @@ async function releaseWorkspaceLease(parameters, { closeAllowed = false } = {}) 
     if (state.workspace_lease.status === 'released' && !lease.active_task) return { released: true, already_released: true, lease_path: leasePath };
     if (!workspaceLeaseMatches(lease, state, filePath)) throw new ControllerError(`Workspace lease does not belong to this active task: ${leasePath}`);
     if (state.workspace_lease.status !== 'released') {
+      state.workflow_revision ??= 0; state.events ??= []; state.updated_at = utcNow();
       state.workspace_lease.status = 'released'; state.workspace_lease.released_at = utcNow();
-      addEvent(state, 'workspace_lease_released', { close_allowed: closeAllowed }); await atomicWrite(filePath, state);
+      addEvent(state, 'workspace_lease_released', { close_allowed: closeAllowed }); await writeState(filePath, state);
     }
     lease.active_task = null; lease.updated_at = utcNow(); await atomicWrite(leasePath, lease);
     return { released: true, lease_path: leasePath };
@@ -684,10 +942,10 @@ async function initTask(parameters) {
     const lease = await loadWorkspaceLease(leasePath, state.workspace);
     if (lease.active_task) throw new ControllerError(`Workspace already has an active workflow task: ${lease.active_task.task_id} (${lease.active_task.state_path})`);
     await withStateLock(filePath, async () => {
-      try { await fs.access(filePath); throw new ControllerError(`Task already exists: ${state.task_id}`); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+      if (await stateExists(filePath)) throw new ControllerError(`Task already exists: ${state.task_id}`);
       lease.active_task = { task_id: state.task_id, state_path: filePath, state_dir: path.dirname(filePath), acquired_at: state.workspace_lease.acquired_at, phase: 'initializing' };
       lease.updated_at = utcNow(); await atomicWrite(leasePath, lease);
-      try { await atomicWrite(filePath, state); }
+      try { await writeState(filePath, state); }
       catch (error) {
         lease.active_task = null; lease.updated_at = utcNow(); await atomicWrite(leasePath, lease);
         throw error;
@@ -696,7 +954,7 @@ async function initTask(parameters) {
     lease.active_task.phase = 'active'; lease.updated_at = utcNow();
     try { await atomicWrite(leasePath, lease); }
     catch (error) {
-      await fs.unlink(filePath).catch(cleanupError => { if (cleanupError.code !== 'ENOENT') throw cleanupError; });
+      await deleteState(filePath);
       lease.active_task = null; lease.updated_at = utcNow(); await atomicWrite(leasePath, lease);
       throw error;
     }
@@ -737,14 +995,15 @@ async function addNode(parameters) {
   throw new ControllerError('Task DAG is immutable after workflow_init; create a replacement workflow task for additional work');
 }
 
-async function claimNode(parameters) {
+async function claimNode(parameters, activateImmediately = false) {
   const [filePath] = await readTask(parameters); const nodeId = requiredIdentifier(parameters.node_id, 'node_id'); const taskPath = requiredString(parameters.agent_task_path, 'agent_task_path'); const threadId = optionalString(parameters.agent_thread_id, 'agent_thread_id'); const role = requiredString(parameters.agent_role, 'agent_role'); const leaseDurationSec = positiveInteger(parameters.lease_duration_sec, 'lease_duration_sec', DEFAULT_LEASE_SEC); const activationTimeoutSec = positiveInteger(parameters.activation_timeout_sec, 'activation_timeout_sec', Math.min(DEFAULT_ACTIVATION_TIMEOUT_SEC, leaseDurationSec));
   return withStateLock(filePath, async () => {
     const state = normalizeState(await loadState(filePath)); await requireActiveWorkspaceLease(state, filePath); const node = state.nodes[nodeId];
     if (!node || !readyNodes(state).some(candidate => candidate.id === nodeId)) throw new ControllerError(`Node is not ready: ${nodeId}`);
     if (runningParticipantPaths(state).has(taskPath)) throw new ControllerError('Agent already has a running node in this task');
     if (node.kind === 'total_review' && participantPaths(state).has(taskPath)) throw new ControllerError('A prior participant cannot claim the total review');
-    if (node.agent_type && node.agent_type !== role) throw new ControllerError(`Node agent_type must match claimed role: ${node.agent_type}`);
+    const expectedAgentType = node.rescue_role ?? node.agent_type;
+    if (expectedAgentType && expectedAgentType !== role) throw new ControllerError(`Node agent_type must match claimed role: ${expectedAgentType}`);
     // Total reviews are read-only guards, not protected execution work.
     if (node.execution_risk === 'protected' && node.kind !== 'total_review' && role !== PROTECTED_EXECUTOR_ROLE) throw new ControllerError('Only avsp_terra_high can claim protected work');
     if (LUNA_EXECUTOR_ROLES.has(role)) {
@@ -753,9 +1012,9 @@ async function claimNode(parameters) {
     }
     if (!node.routing_legacy && node.execution_owner !== taskPath) throw new ControllerError('Node claim must match execution_owner');
     if (node.attempt >= MAX_NODE_ATTEMPTS) throw new ControllerError(`Node exceeded the ${MAX_NODE_ATTEMPTS}-attempt limit: ${nodeId}`);
-    const now = utcNow(); node.status = RUNNING; node.agent_task_path = taskPath; node.agent_thread_id = threadId; node.agent_role = role; node.claim_id = randomUUID(); node.claimed_at = now; node.activation_at = null; node.activation_deadline_at = new Date(Date.now() + activationTimeoutSec * 1000).toISOString(); node.heartbeat_at = now; node.heartbeat_count = 0; node.lease_duration_sec = leaseDurationSec; node.attempt += 1;
+    const now = utcNow(); node.status = RUNNING; node.agent_task_path = taskPath; node.agent_thread_id = threadId; node.agent_role = role; node.claim_id = randomUUID(); node.claimed_at = now; node.activation_at = activateImmediately ? now : null; node.activation_deadline_at = activateImmediately ? null : new Date(Date.now() + activationTimeoutSec * 1000).toISOString(); node.heartbeat_at = now; node.heartbeat_count = activateImmediately ? 1 : 0; node.lease_duration_sec = leaseDurationSec; node.attempt += 1;
     state.participants.push({ agent_task_path: taskPath, agent_thread_id: threadId, agent_role: role, node_id: nodeId, claim_id: node.claim_id, attempt: node.attempt });
-    addEvent(state, 'node_claimed', { node_id: nodeId, agent_task_path: taskPath, agent_thread_id: threadId, agent_role: role, claim_id: node.claim_id, attempt: node.attempt }); await atomicWrite(filePath, state);
+    addEvent(state, 'node_claimed', { node_id: nodeId, agent_task_path: taskPath, agent_thread_id: threadId, agent_role: role, claim_id: node.claim_id, attempt: node.attempt }); await writeState(filePath, state);
     return { task_id: state.task_id, node };
   });
 }
@@ -781,7 +1040,7 @@ async function completeNode(parameters) {
     node.status = status; node.result = result;
     if (node.kind === 'total_review') addEvent(state, 'node_completed', { node_id: nodeId, status });
     else bumpWorkflowRevision(state, 'node_completed', { node_id: nodeId, status });
-    await atomicWrite(filePath, state);
+    await writeState(filePath, state);
     return { task_id: state.task_id, node, ready_nodes: readyNodes(state) };
   });
 }
@@ -790,7 +1049,7 @@ async function heartbeatNode(parameters) {
   const [filePath] = await readTask(parameters); const nodeId = requiredIdentifier(parameters.node_id, 'node_id');
   return withStateLock(filePath, async () => {
     const state = normalizeState(await loadState(filePath)); await requireActiveWorkspaceLease(state, filePath); const node = state.nodes[nodeId]; requireActiveClaim(node, parameters);
-    const now = utcNow(); node.activation_at ??= now; node.activation_deadline_at = null; node.heartbeat_at = now; node.heartbeat_count += 1; state.updated_at = now; await atomicWrite(filePath, state);
+    const now = utcNow(); node.activation_at ??= now; node.activation_deadline_at = null; node.heartbeat_at = now; node.heartbeat_count += 1; state.updated_at = now; await writeState(filePath, state);
     return { task_id: state.task_id, node };
   });
 }
@@ -802,7 +1061,7 @@ async function checkpointNode(parameters) {
   const [filePath] = await readTask(parameters); const nodeId = requiredIdentifier(parameters.node_id, 'node_id');
   return withStateLock(filePath, async () => {
     const state = normalizeState(await loadState(filePath)); await requireActiveWorkspaceLease(state, filePath); const node = state.nodes[nodeId]; requireActiveClaim(node, parameters);
-    node.checkpoint = checkpoint; node.checkpoint_at = utcNow(); state.updated_at = node.checkpoint_at; await atomicWrite(filePath, state);
+    node.checkpoint = checkpoint; node.checkpoint_at = utcNow(); node.activation_at ??= node.checkpoint_at; node.activation_deadline_at = null; node.heartbeat_at = node.checkpoint_at; node.heartbeat_count += 1; state.updated_at = node.checkpoint_at; await writeState(filePath, state);
     return { task_id: state.task_id, node_id: nodeId, checkpoint_at: node.checkpoint_at };
   });
 }
@@ -835,7 +1094,7 @@ function recoveryPacket(state, node, stale, reason, priorExecutionOwner = node.e
     version: 1,
     continuation: { kind: 'new_agent_required', prior_agent_thread_id: node.agent_thread_id, reason: 'This operation invalidated the old claim. Native session resumption, when available, must be attempted before workflow_requeue_stale.' },
     task: { task_id: state.task_id, workspace: state.workspace, goal: state.goal, requirements: state.requirements, scope: state.scope, non_goals: state.non_goals },
-    node: { id: node.id, kind: node.kind, agent_type: node.agent_type, depends_on: node.depends_on, execution_risk: node.execution_risk, routing_reason: node.routing_reason, execution_owner: node.execution_owner, integration_owner: node.integration_owner, quality_guard: node.quality_guard },
+    node: { id: node.id, kind: node.kind, agent_type: node.agent_type, rescue_role: node.rescue_role, depends_on: node.depends_on, execution_risk: node.execution_risk, routing_reason: node.routing_reason, execution_owner: node.execution_owner, integration_owner: node.integration_owner, quality_guard: node.quality_guard },
     completed_dependencies: node.depends_on.map(id => ({ id, status: state.nodes[id].status, result: compactRecoveryResult(state.nodes[id].result) })),
     previous_attempt: previousAttempt,
     instructions: 'This is a replacement agent. Do not assume the previous agent session was restored. Inspect the current workspace and diff, validate the saved checkpoint and dependency evidence, then write a fresh checkpoint before material work.',
@@ -860,6 +1119,10 @@ function clearAttemptForRetry(node) {
   node.status = PENDING; node.agent_task_path = null; node.agent_thread_id = null; node.agent_role = null; node.claim_id = null; node.claimed_at = null; node.activation_at = null; node.activation_deadline_at = null; node.heartbeat_at = null; node.heartbeat_count = 0; node.lease_duration_sec = null; node.result = null; node.checkpoint = null; node.checkpoint_at = null;
 }
 
+function clearRescueRouting(node) {
+  node.rescue_role = null; node.rescue_reason = null; node.rescued_at = null;
+}
+
 async function requeueStaleNode(parameters) {
   const [filePath] = await readTask(parameters); const nodeId = requiredIdentifier(parameters.node_id, 'node_id'); const reason = requiredString(parameters.reason, 'reason'); retryConfirmation(parameters); const claimId = requiredString(parameters.claim_id, 'claim_id');
   return withStateLock(filePath, async () => {
@@ -871,11 +1134,34 @@ async function requeueStaleNode(parameters) {
     const packet = recoveryPacket(state, node, stale, reason, priorExecutionOwner);
     node.recovery_history.push({ at: utcNow(), ...packet.previous_attempt });
     if (node.recovery_history.length > MAX_NODE_ATTEMPTS) node.recovery_history.splice(0, node.recovery_history.length - MAX_NODE_ATTEMPTS);
-    clearAttemptForRetry(node);
+    clearRescueRouting(node); clearAttemptForRetry(node);
     const details = { node_id: nodeId, prior_claim_id: claimId, prior_execution_owner: priorExecutionOwner, replacement_execution_owner: replacement, reason, stale_reason: stale.reason, previous_agent_stopped: true, auto_requeue: true };
     if (node.kind === 'total_review') addEvent(state, 'stale_node_requeued', details); else bumpWorkflowRevision(state, 'stale_node_requeued', details);
-    await atomicWrite(filePath, state);
+    await writeState(filePath, state);
     return { task_id: state.task_id, node, recovery_package: packet, ready_nodes: readyNodes(state) };
+  });
+}
+
+async function rescueNode(parameters) {
+  const [filePath] = await readTask(parameters); const nodeId = requiredIdentifier(parameters.node_id, 'node_id'); const reason = requiredString(parameters.reason, 'reason'); retryConfirmation(parameters); const claimId = requiredString(parameters.claim_id, 'claim_id');
+  return withStateLock(filePath, async () => {
+    const state = normalizeState(await loadState(filePath)); await requireActiveWorkspaceLease(state, filePath); const node = state.nodes[nodeId]; requireActiveClaim(node, parameters);
+    if (node.kind === 'total_review') throw new ControllerError('A total_review node cannot be rescued by main/root');
+    if (node.execution_risk !== 'delegable') throw new ControllerError('Only delegable Luna execution can be rescued by main/root');
+    if (node.rescue_role) throw new ControllerError(`Node already has an active rescue role: ${nodeId}`);
+    if (node.attempt >= MAX_NODE_ATTEMPTS) throw new ControllerError(`Node exceeded the ${MAX_NODE_ATTEMPTS}-attempt limit: ${nodeId}`);
+    const replacement = replacementExecutionOwner(state, node, parameters);
+    const priorExecutionOwner = rebindExecutionOwner(node, replacement);
+    const now = utcNow();
+    const stale = staleNodes(state).find(candidate => candidate.id === nodeId && candidate.claim_id === claimId) ?? { reason: 'explicit_root_rescue' };
+    const packet = recoveryPacket(state, node, stale, reason, priorExecutionOwner);
+    node.recovery_history.push({ at: now, ...packet.previous_attempt });
+    if (node.recovery_history.length > MAX_NODE_ATTEMPTS) node.recovery_history.splice(0, node.recovery_history.length - MAX_NODE_ATTEMPTS);
+    node.rescue_role = ROOT_RESCUE_ROLE; node.rescue_reason = reason; node.rescued_at = now; node.rescue_count += 1;
+    clearAttemptForRetry(node);
+    bumpWorkflowRevision(state, 'root_rescue', { node_id: nodeId, prior_claim_id: claimId, prior_execution_owner: priorExecutionOwner, replacement_execution_owner: replacement, reason, previous_agent_stopped: true, rescue_role: ROOT_RESCUE_ROLE });
+    await writeState(filePath, state);
+    return { task_id: state.task_id, node, recovery_package: packet, rescue_role: ROOT_RESCUE_ROLE, ready_nodes: readyNodes(state) };
   });
 }
 
@@ -886,7 +1172,7 @@ async function abandonNode(parameters) {
     node.status = 'abandoned'; node.result = { summary: 'Node abandoned after explicit reconciliation.', reason, abandoned_at: utcNow(), claim_id: node.claim_id };
     if (node.kind === 'total_review') addEvent(state, 'node_abandoned', { node_id: nodeId, claim_id: node.claim_id, reason });
     else bumpWorkflowRevision(state, 'node_abandoned', { node_id: nodeId, claim_id: node.claim_id, reason });
-    await atomicWrite(filePath, state);
+    await writeState(filePath, state);
     return { task_id: state.task_id, node };
   });
 }
@@ -900,19 +1186,23 @@ async function retryNode(parameters) {
     const downstreamStarted = Object.values(state.nodes).some(candidate => candidate.depends_on.includes(nodeId) && candidate.status !== PENDING);
     if (downstreamStarted) throw new ControllerError(`Cannot retry after a dependent node changed state: ${nodeId}`);
     const replacement = node.routing_legacy ? null : replacementExecutionOwner(state, node, parameters); const priorExecutionOwner = replacement ? rebindExecutionOwner(node, replacement) : node.execution_owner;
-    const priorClaimId = node.claim_id; clearAttemptForRetry(node);
+    const priorClaimId = node.claim_id; clearRescueRouting(node); clearAttemptForRetry(node);
     const details = { node_id: nodeId, prior_claim_id: priorClaimId, prior_execution_owner: priorExecutionOwner, replacement_execution_owner: replacement, reason, previous_agent_stopped: true, orphaned_total_review: orphanedTotalReview };
     if (node.kind === 'total_review') addEvent(state, 'node_retried', details); else bumpWorkflowRevision(state, 'node_retried', details);
-    await atomicWrite(filePath, state);
+    await writeState(filePath, state);
     return { task_id: state.task_id, node, ready_nodes: readyNodes(state) };
   });
 }
 
 const PRUNABLE_STATE_FIELDS = new Set(['version', 'routing_schema_version', 'task_id', 'workspace', 'goal', 'requirements', 'scope', 'non_goals', 'nodes', 'participants', 'reviews', 'events', 'workflow_revision', 'closed_revision', 'closed_at', 'created_at', 'updated_at', 'workspace_lease']);
-const PRUNABLE_NODE_FIELDS = new Set(['id', 'kind', 'agent_type', 'depends_on', 'execution_risk', 'routing_reason', 'execution_owner', 'integration_owner', 'quality_guard', 'routing_legacy', 'status', 'agent_task_path', 'agent_thread_id', 'agent_role', 'claim_id', 'claimed_at', 'activation_at', 'activation_deadline_at', 'heartbeat_at', 'heartbeat_count', 'lease_duration_sec', 'attempt', 'result', 'checkpoint', 'checkpoint_at', 'recovery_history']);
+const PRUNABLE_NODE_FIELDS = new Set(['id', 'kind', 'agent_type', 'depends_on', 'execution_risk', 'routing_reason', 'execution_owner', 'integration_owner', 'quality_guard', 'routing_legacy', 'rescue_role', 'rescue_reason', 'rescued_at', 'rescue_count', 'status', 'agent_task_path', 'agent_thread_id', 'agent_role', 'claim_id', 'claimed_at', 'activation_at', 'activation_deadline_at', 'heartbeat_at', 'heartbeat_count', 'lease_duration_sec', 'attempt', 'result', 'checkpoint', 'checkpoint_at', 'recovery_history']);
 const PRUNABLE_LEASE_FIELDS = new Set(['version', 'workspace', 'active_task', 'updated_at']);
 const PRUNABLE_TASK_LEASE_FIELDS = new Set(['registry_path', 'state_path', 'status', 'acquired_at', 'released_at']);
-const PRUNE_SWEEP_FIELDS = new Set(['version', 'last_sweep_at']);
+const PRUNE_SWEEP_FIELDS = new Set(['version', 'last_sweep_at', 'last_result']);
+const QUARANTINE_FIELDS_V1 = new Set(['version', 'status', 'task_id', 'original_state_path', 'error_path', 'reason', 'quarantined_at', 'delete_after', 'files', 'move_error']);
+const QUARANTINE_FIELDS = new Set([...QUARANTINE_FIELDS_V1, 'review_artifacts']);
+const QUARANTINE_EXPIRY_FIELDS = new Set(['version', 'task_id', 'original_state_path', 'quarantined_at', 'delete_after', 'files', 'review_artifacts']);
+const PRUNE_RESULT_FIELDS = new Set(['deleted_count', 'quarantined_count', 'retained_count', 'quarantine_deleted_count', 'quarantine_retained_count', 'report_truncated']);
 
 function hasExactFields(value, fields) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
@@ -926,6 +1216,7 @@ function taskPruneEligibility(state, filePath, now) {
   if (state.version !== VERSION || state.routing_schema_version !== 1) return { eligible: false, reason: 'legacy or unsupported state schema' };
   try { requiredIdentifier(state.task_id, 'task_id'); requiredString(state.workspace, 'workspace'); requiredString(state.goal, 'goal'); }
   catch (error) { return { eligible: false, reason: `invalid task identity: ${error.message}` }; }
+  if (state.task_id !== path.basename(filePath, '.json')) return { eligible: false, reason: 'task_id does not match state path' };
   if (!path.isAbsolute(state.workspace) || path.resolve(state.workspace) !== state.workspace) return { eligible: false, reason: 'workspace is not canonical absolute path' };
   if (!Array.isArray(state.requirements) || !Array.isArray(state.scope) || !Array.isArray(state.non_goals) || !Array.isArray(state.participants) || !Array.isArray(state.reviews) || !Array.isArray(state.events)) return { eligible: false, reason: 'invalid state collection' };
   if (state.requirements.some(item => !item || typeof item !== 'object' || Array.isArray(item) || typeof item.id !== 'string' || !item.id.trim() || typeof item.text !== 'string' || !item.text.trim()) || state.participants.some(item => !item || typeof item !== 'object' || Array.isArray(item)) || state.reviews.some(item => !item || typeof item !== 'object' || Array.isArray(item)) || state.events.some(item => !item || typeof item !== 'object' || Array.isArray(item) || !validTimestamp(item.at) || typeof item.type !== 'string' || !item.type.trim())) return { eligible: false, reason: 'malformed state collection item' };
@@ -959,24 +1250,602 @@ async function releasedLeaseEligibility(leasePath, state) {
   return { eligible: true };
 }
 
-function appendPruneReport(deleted, retained, target, value) {
-  if (deleted.length + retained.length < MAX_PRUNE_REPORT_ENTRIES) target.push(value);
+async function quarantineEligibility(state, filePath, now) {
+  let storageMetadata;
+  try { storageMetadata = await fs.stat(databasePath(filePath)); }
+  catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    try { storageMetadata = await fs.stat(filePath); }
+    catch (legacyError) {
+      if (legacyError.code !== 'ENOENT') throw legacyError;
+      try { storageMetadata = await fs.stat(`${filePath}.legacy`); }
+      catch (archiveError) {
+        if (archiveError.code === 'ENOENT') return { eligible: false, reason: 'state disappeared before quarantine' };
+        throw archiveError;
+      }
+    }
+  }
+  const updatedAt = state && validTimestamp(state.updated_at) ? Date.parse(state.updated_at) : storageMetadata.mtimeMs;
+  if (now - updatedAt < QUARANTINE_AFTER_DAYS * DAY_MS) return { eligible: false, reason: 'younger than quarantine retention period' };
+  if (!state || typeof state !== 'object' || Array.isArray(state)) return { eligible: true, unverified: true, reason: 'state is unreadable; direct quarantine is required' };
+  if (state.nodes !== undefined && (!state.nodes || typeof state.nodes !== 'object' || Array.isArray(state.nodes))) return { eligible: true, unverified: true, reason: 'node collection is not verifiable; direct quarantine is required' };
+  if (state.nodes && Object.values(state.nodes).some(node => node?.status === RUNNING)) return { eligible: false, reason: 'has running nodes' };
+  if (state.nodes && Object.values(state.nodes).some(node => !node || typeof node !== 'object' || ![PENDING, ...TERMINAL].includes(node.status))) return { eligible: true, unverified: true, reason: 'node states are unknown; direct quarantine is required' };
+  if (state.workspace_lease?.status === 'active') return { eligible: false, reason: 'state workspace lease is still active' };
+  const leasePath = state?.workspace_lease?.registry_path;
+  const canonicalLeasePath = typeof state.workspace === 'string' && path.isAbsolute(state.workspace) && path.resolve(state.workspace) === state.workspace
+    ? workspaceLeasePath(state.workspace)
+    : null;
+  const lockableLeasePath = typeof leasePath === 'string' && path.isAbsolute(leasePath) && canonicalLeasePath && path.resolve(leasePath) === canonicalLeasePath ? leasePath : null;
+  if (!lockableLeasePath) return { eligible: true, unverified: true, reason: 'state has no verifiable workspace lease; direct quarantine is required' };
+  let lease;
+  try { lease = await readJson(lockableLeasePath, { label: 'Workspace lease', maxBytes: MAX_MANIFEST_BYTES }); }
+  catch (error) { return { eligible: true, unverified: true, reason: `workspace lease is unreadable; direct quarantine is required: ${error.message}`, lease_path: lockableLeasePath }; }
+  if (!hasExactFields(lease, PRUNABLE_LEASE_FIELDS)
+    || lease.version !== WORKSPACE_LEASE_VERSION
+    || typeof state.workspace !== 'string'
+    || !path.isAbsolute(state.workspace)
+    || path.resolve(state.workspace) !== state.workspace
+    || lease.workspace !== state.workspace
+    || !validTimestamp(lease.updated_at)
+     || path.resolve(lockableLeasePath) !== workspaceLeasePath(state.workspace)) {
+    return { eligible: true, unverified: true, reason: 'workspace lease is not a complete matching registry; direct quarantine is required', lease_path: lockableLeasePath };
+  }
+  if (lease.active_task !== null) return { eligible: false, reason: 'workspace lease still has an active task' };
+  return { eligible: true, verified: true, lease_path: lockableLeasePath, reason: 'verified inactive workspace lease' };
+}
+
+function errorStateRoot(stateDir) { return path.join(path.resolve(stateDir), ERROR_STATE_DIRECTORY); }
+function errorQuarantinePath(errorPath) { return path.join(errorPath, ERROR_QUARANTINE_FILENAME); }
+function quarantineExpiryPath(errorPath) { return path.join(errorPath, QUARANTINE_EXPIRY_FILENAME); }
+function reviewArtifactTaskPath(stateDir, taskId) { return path.join(path.resolve(stateDir), REVIEW_ARTIFACT_DIRECTORY, taskId); }
+function quarantineReviewArtifactPath(errorPath) { return path.join(errorPath, QUARANTINE_REVIEW_DIRECTORY); }
+
+async function reviewArtifactDirectoryIsSafe(directoryPath) {
+  let entries;
+  try { entries = await fs.readdir(directoryPath, { withFileTypes: true }); }
+  catch { return false; }
+  for (const entry of entries) {
+    if (entry.isSymbolicLink()) return false;
+    const childPath = path.join(directoryPath, entry.name);
+    if (entry.isDirectory()) {
+      if (!await reviewArtifactDirectoryIsSafe(childPath)) return false;
+    } else if (!entry.isFile()) return false;
+  }
+  return true;
+}
+
+function isDirectChild(parent, candidate) {
+  return path.dirname(path.resolve(candidate)) === path.resolve(parent);
+}
+
+async function stateFilesForQuarantine(filePath) {
+  const files = [];
+  for (const sourcePath of [databasePath(filePath), filePath, `${filePath}.legacy`]) {
+    try {
+      const metadata = await fs.lstat(sourcePath);
+      if (!metadata.isFile()) return { files: null, reason: `state component is not a regular file: ${sourcePath}` };
+      files.push(sourcePath);
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+  }
+  if (!files.length) return { files: null, reason: 'state disappeared before quarantine' };
+  return { files };
+}
+
+function quarantineMetadataIsValid(metadata, stateDir, errorPath) {
+  const currentMetadata = hasExactFields(metadata, QUARANTINE_FIELDS) && metadata.version === 2;
+  const legacyMetadata = hasExactFields(metadata, QUARANTINE_FIELDS_V1) && metadata.version === 1;
+  if ((!currentMetadata && !legacyMetadata) || !['quarantining', 'quarantined'].includes(metadata.status)) return false;
+  if (currentMetadata && metadata.review_artifacts !== null && metadata.review_artifacts !== QUARANTINE_REVIEW_DIRECTORY) return false;
+  if (metadata.task_id !== null && (typeof metadata.task_id !== 'string' || !metadata.task_id.trim())) return false;
+  if (typeof metadata.original_state_path !== 'string' || typeof metadata.error_path !== 'string' || typeof metadata.reason !== 'string' || !metadata.reason.trim()) return false;
+  if (!validTimestamp(metadata.quarantined_at) || !validTimestamp(metadata.delete_after) || (metadata.move_error !== null && (typeof metadata.move_error !== 'string' || !metadata.move_error.trim()))) return false;
+  if (!Array.isArray(metadata.files) || !metadata.files.length || metadata.files.some(name => typeof name !== 'string' || !name || path.basename(name) !== name) || new Set(metadata.files).size !== metadata.files.length) return false;
+  const root = errorStateRoot(stateDir);
+  if (!isDirectChild(root, errorPath) || path.resolve(metadata.error_path) !== path.resolve(errorPath)) return false;
+  if (path.dirname(path.resolve(metadata.original_state_path)) !== path.resolve(stateDir) || !metadata.original_state_path.endsWith('.json')) return false;
+  const logicalName = path.basename(metadata.original_state_path);
+  const allowedNames = new Set([logicalName, databasePath(metadata.original_state_path), `${logicalName}.legacy`].map(candidate => path.basename(candidate)));
+  if (metadata.files.some(name => !allowedNames.has(name))) return false;
+  const expiry = Date.parse(metadata.quarantined_at) + ERROR_STATE_RETENTION_DAYS * DAY_MS;
+  return metadata.delete_after === new Date(expiry).toISOString();
+}
+
+function quarantineExpiryFromMetadata(metadata) {
+  return {
+    version: 1,
+    task_id: metadata.task_id,
+    original_state_path: metadata.original_state_path,
+    quarantined_at: metadata.quarantined_at,
+    delete_after: metadata.delete_after,
+    files: metadata.files,
+    review_artifacts: metadata.review_artifacts ?? null,
+  };
+}
+
+function quarantineExpiryIsValid(expiry, stateDir, errorPath) {
+  if (!hasExactFields(expiry, QUARANTINE_EXPIRY_FIELDS) || expiry.version !== 1) return false;
+  if (expiry.task_id !== null && (typeof expiry.task_id !== 'string' || !expiry.task_id.trim())) return false;
+  if (typeof expiry.original_state_path !== 'string' || !validTimestamp(expiry.quarantined_at) || !validTimestamp(expiry.delete_after)) return false;
+  if (!Array.isArray(expiry.files) || !expiry.files.length || expiry.files.some(name => typeof name !== 'string' || !name || path.basename(name) !== name) || new Set(expiry.files).size !== expiry.files.length) return false;
+  if (expiry.review_artifacts !== null && expiry.review_artifacts !== QUARANTINE_REVIEW_DIRECTORY) return false;
+  if (path.dirname(path.resolve(expiry.original_state_path)) !== path.resolve(stateDir) || !expiry.original_state_path.endsWith('.json')) return false;
+  const logicalName = path.basename(expiry.original_state_path);
+  const allowedNames = new Set([logicalName, databasePath(expiry.original_state_path), `${logicalName}.legacy`].map(candidate => path.basename(candidate)));
+  if (expiry.files.some(name => !allowedNames.has(name))) return false;
+  const expectedDeleteAfter = new Date(Date.parse(expiry.quarantined_at) + ERROR_STATE_RETENTION_DAYS * DAY_MS).toISOString();
+  return expiry.delete_after === expectedDeleteAfter && isDirectChild(errorStateRoot(stateDir), errorPath);
+}
+
+async function readQuarantineExpiry(stateDir, errorPath) {
+  try {
+    const expiry = await readJson(quarantineExpiryPath(errorPath), { label: 'Quarantined workflow expiry metadata', maxBytes: MAX_QUARANTINE_BYTES });
+    if (!quarantineExpiryIsValid(expiry, stateDir, errorPath)) throw new ControllerError(`Quarantined workflow expiry metadata is invalid: ${quarantineExpiryPath(errorPath)}`);
+    return expiry;
+  } catch (error) {
+    if (error instanceof ControllerError && error.message.includes('does not exist:')) return null;
+    throw error;
+  }
+}
+
+async function ensureQuarantineExpiry(stateDir, errorPath, metadata) {
+  const existing = await readQuarantineExpiry(stateDir, errorPath);
+  if (existing) return existing;
+  const expiry = quarantineExpiryFromMetadata(metadata);
+  await atomicWrite(quarantineExpiryPath(errorPath), expiry, MAX_QUARANTINE_BYTES);
+  return expiry;
+}
+
+async function readQuarantineMetadata(stateDir, errorPath) {
+  const metadata = await readJson(errorQuarantinePath(errorPath), { label: 'Quarantined workflow state metadata', maxBytes: MAX_QUARANTINE_BYTES });
+  if (!quarantineMetadataIsValid(metadata, stateDir, errorPath)) throw new ControllerError(`Quarantined workflow state metadata is invalid: ${errorQuarantinePath(errorPath)}`);
+  return metadata;
+}
+
+async function quarantineIfEligible(filePath, initialState, now) {
+  const initial = await quarantineEligibility(initialState, filePath, now);
+  if (!initial.eligible) return { quarantined: false, reason: initial.reason, task_id: initialState?.task_id ?? null };
+  try {
+    const run = async () => withStateLock(filePath, async () => {
+      let state;
+      try { state = await loadState(filePath); } catch { state = null; }
+      const current = await quarantineEligibility(state, filePath, now);
+      if (!current.eligible) return { quarantined: false, reason: current.reason, task_id: state?.task_id ?? null };
+      const components = await stateFilesForQuarantine(filePath);
+      if (!components.files) return { quarantined: false, reason: components.reason, task_id: state?.task_id ?? null };
+      const taskId = typeof state?.task_id === 'string' && /^[A-Za-z][A-Za-z0-9._-]{0,79}$/.test(state.task_id)
+        ? state.task_id
+        : path.basename(filePath, '.json');
+      let artifactSource = null;
+      if (/^[A-Za-z][A-Za-z0-9._-]{0,79}$/.test(taskId)) {
+        const candidate = reviewArtifactTaskPath(path.dirname(filePath), taskId);
+        try {
+          const artifactMetadata = await fs.lstat(candidate);
+          if (artifactMetadata.isSymbolicLink() || !artifactMetadata.isDirectory()) return { quarantined: false, reason: `review artifact path is not a regular directory: ${candidate}`, task_id: state?.task_id ?? null };
+          artifactSource = candidate;
+        } catch (error) {
+          if (error.code !== 'ENOENT') throw error;
+        }
+      }
+      const errorRoot = errorStateRoot(path.dirname(filePath));
+      await fs.mkdir(errorRoot, { recursive: true });
+      const errorPath = path.join(errorRoot, randomUUID());
+      await fs.mkdir(errorPath, { recursive: false });
+      const metadata = {
+        version: 2,
+        status: 'quarantining',
+        task_id: typeof state?.task_id === 'string' && state.task_id.trim() ? state.task_id : null,
+        original_state_path: filePath,
+        error_path: errorPath,
+        reason: current.verified ? 'legacy or incomplete task state passed the verified inactive-lease quarantine gate' : current.reason,
+        quarantined_at: new Date(now).toISOString(),
+        delete_after: new Date(now + ERROR_STATE_RETENTION_DAYS * DAY_MS).toISOString(),
+        files: components.files.map(component => path.basename(component)),
+        move_error: null,
+        review_artifacts: artifactSource ? QUARANTINE_REVIEW_DIRECTORY : null,
+      };
+      await atomicWrite(errorQuarantinePath(errorPath), metadata, MAX_QUARANTINE_BYTES);
+      await atomicWrite(quarantineExpiryPath(errorPath), quarantineExpiryFromMetadata(metadata), MAX_QUARANTINE_BYTES);
+      try {
+        for (const sourcePath of components.files) await fs.rename(sourcePath, path.join(errorPath, path.basename(sourcePath)));
+        if (artifactSource) await fs.rename(artifactSource, quarantineReviewArtifactPath(errorPath));
+      } catch (error) {
+        metadata.move_error = error.message;
+        try { await atomicWrite(errorQuarantinePath(errorPath), metadata, MAX_QUARANTINE_BYTES); }
+        catch (metadataError) { return { quarantined: false, reason: `quarantine move failed: ${error.message}; metadata update failed: ${metadataError.message}`, task_id: metadata.task_id, error_path: errorPath }; }
+        return { quarantined: false, reason: `quarantine move failed: ${error.message}`, task_id: metadata.task_id, error_path: errorPath };
+      }
+      metadata.status = 'quarantined';
+      await atomicWrite(errorQuarantinePath(errorPath), metadata, MAX_QUARANTINE_BYTES);
+      return { quarantined: true, task_id: metadata.task_id, error_path: errorPath, delete_after: metadata.delete_after };
+    });
+    return initial.lease_path ? await withStateLock(initial.lease_path, run) : await run();
+  } catch (error) {
+    return { quarantined: false, reason: `quarantine lock unavailable: ${error.message}`, task_id: initialState?.task_id ?? null };
+  }
+}
+
+function validQuarantineTaskId(taskId) {
+  return typeof taskId === 'string' && /^[A-Za-z][A-Za-z0-9._-]{0,79}$/.test(taskId);
+}
+
+async function quarantineContentsAreSafe(errorPath, record) {
+  const contents = await fs.readdir(errorPath, { withFileTypes: true });
+  const expectedFiles = new Set([...record.files, ERROR_QUARANTINE_FILENAME, QUARANTINE_EXPIRY_FILENAME]);
+  if (record.review_artifacts) expectedFiles.add(record.review_artifacts);
+  const unexpected = contents.filter(entry => !expectedFiles.has(entry.name) || (entry.name === record.review_artifacts ? !entry.isDirectory() : !entry.isFile()));
+  if (contents.length !== expectedFiles.size || unexpected.length) return false;
+  return !record.review_artifacts || await reviewArtifactDirectoryIsSafe(quarantineReviewArtifactPath(errorPath));
+}
+
+async function upgradeLegacyQuarantine(stateDir, errorPath, metadata) {
+  if (metadata.version !== 1 || metadata.status !== 'quarantined' || metadata.move_error !== null) return metadata;
+  let reviewArtifacts = null;
+  if (validQuarantineTaskId(metadata.task_id)) {
+    const artifactPath = reviewArtifactTaskPath(stateDir, metadata.task_id);
+    try {
+      const artifact = await fs.lstat(artifactPath);
+      if (artifact.isSymbolicLink() || !artifact.isDirectory() || !await reviewArtifactDirectoryIsSafe(artifactPath)) {
+        throw new ControllerError(`Legacy review artifact is not a safe regular directory: ${artifactPath}`);
+      }
+      reviewArtifacts = QUARANTINE_REVIEW_DIRECTORY;
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+  }
+  const upgraded = {
+    ...metadata,
+    version: 2,
+    status: reviewArtifacts ? 'quarantining' : 'quarantined',
+    move_error: reviewArtifacts ? 'legacy review artifact migration is pending' : null,
+    review_artifacts: reviewArtifacts,
+  };
+  await atomicWrite(errorQuarantinePath(errorPath), upgraded, MAX_QUARANTINE_BYTES);
+  await ensureQuarantineExpiry(stateDir, errorPath, upgraded);
+  return upgraded;
+}
+
+async function reconcileQuarantineEntry(stateDir, errorPath, metadata) {
+  let current = await upgradeLegacyQuarantine(stateDir, errorPath, metadata);
+  await ensureQuarantineExpiry(stateDir, errorPath, current);
+  if (current.status === 'quarantined' && current.move_error === null) return { complete: true, metadata: current };
+  const sourceDirectory = path.dirname(current.original_state_path);
+  const missing = [];
+  try {
+    for (const name of current.files) {
+      const destination = path.join(errorPath, name);
+      try {
+        const target = await fs.lstat(destination);
+        if (target.isSymbolicLink() || !target.isFile()) throw new ControllerError(`Quarantine destination is not a regular file: ${destination}`);
+        continue;
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+      }
+      const source = path.join(sourceDirectory, name);
+      try {
+        const sourceMetadata = await fs.lstat(source);
+        if (sourceMetadata.isSymbolicLink() || !sourceMetadata.isFile()) throw new ControllerError(`Quarantine source is not a regular file: ${source}`);
+        await fs.rename(source, destination);
+      } catch (error) {
+        if (error.code === 'ENOENT') missing.push(name);
+        else throw error;
+      }
+    }
+    if (current.review_artifacts) {
+      const destination = quarantineReviewArtifactPath(errorPath);
+      try {
+        const target = await fs.lstat(destination);
+        if (target.isSymbolicLink() || !target.isDirectory() || !await reviewArtifactDirectoryIsSafe(destination)) throw new ControllerError(`Quarantine review artifact destination is unsafe: ${destination}`);
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+        if (!validQuarantineTaskId(current.task_id)) throw new ControllerError('Quarantine review artifact has no valid task_id');
+        const source = reviewArtifactTaskPath(stateDir, current.task_id);
+        try {
+          const sourceMetadata = await fs.lstat(source);
+          if (sourceMetadata.isSymbolicLink() || !sourceMetadata.isDirectory() || !await reviewArtifactDirectoryIsSafe(source)) throw new ControllerError(`Quarantine review artifact source is unsafe: ${source}`);
+          await fs.rename(source, destination);
+        } catch (sourceError) {
+          if (sourceError.code === 'ENOENT') missing.push(QUARANTINE_REVIEW_DIRECTORY);
+          else throw sourceError;
+        }
+      }
+    }
+  } catch (error) {
+    current = { ...current, status: 'quarantining', move_error: error.message };
+    await atomicWrite(errorQuarantinePath(errorPath), current, MAX_QUARANTINE_BYTES);
+    return { complete: false, metadata: current };
+  }
+  if (missing.length) {
+    current = { ...current, status: 'quarantining', move_error: `quarantine transfer is missing: ${missing.join(', ')}` };
+    await atomicWrite(errorQuarantinePath(errorPath), current, MAX_QUARANTINE_BYTES);
+    return { complete: false, metadata: current };
+  }
+  current = { ...current, status: 'quarantined', move_error: null };
+  await atomicWrite(errorQuarantinePath(errorPath), current, MAX_QUARANTINE_BYTES);
+  return { complete: true, metadata: current };
+}
+
+async function pruneQuarantinedStates(stateDir, now) {
+  const root = errorStateRoot(stateDir); const deleted = []; const retained = []; let deletedCount = 0; let retainedCount = 0;
+  let entries;
+  try { entries = await fs.readdir(root, { withFileTypes: true }); }
+  catch (error) { if (error.code === 'ENOENT') return { deleted, retained, deleted_count: deletedCount, retained_count: retainedCount }; throw error; }
+  for (const entry of entries) {
+    const errorPath = path.join(root, entry.name);
+    if (!entry.isDirectory() || !isDirectChild(root, errorPath)) {
+      retainedCount++; retained.push({ error_path: errorPath, reason: 'unknown quarantine entry is not a direct regular directory' });
+      continue;
+    }
+    let metadata = null;
+    try { metadata = await readQuarantineMetadata(stateDir, errorPath); }
+    catch (metadataError) {
+      let expiry;
+      try { expiry = await readQuarantineExpiry(stateDir, errorPath); }
+      catch (expiryError) { retainedCount++; retained.push({ error_path: errorPath, reason: `${metadataError.message}; ${expiryError.message}` }); continue; }
+      if (!expiry) { retainedCount++; retained.push({ error_path: errorPath, reason: `${metadataError.message}; expiry metadata is unavailable` }); continue; }
+      if (now < Date.parse(expiry.delete_after)) {
+        retainedCount++; retained.push({ task_id: expiry.task_id, error_path: errorPath, delete_after: expiry.delete_after, reason: 'quarantine metadata is unreadable; expiry retention period has not elapsed' });
+        continue;
+      }
+      try {
+        if (!await quarantineContentsAreSafe(errorPath, expiry)) {
+          retainedCount++; retained.push({ task_id: expiry.task_id, error_path: errorPath, reason: 'quarantine contains unexpected files and requires manual recovery' });
+          continue;
+        }
+        await fs.rm(errorPath, { recursive: true, force: false });
+        deletedCount++; deleted.push({ task_id: expiry.task_id, error_path: errorPath, quarantined_at: expiry.quarantined_at, delete_after: expiry.delete_after, recovered_from_invalid_metadata: true });
+      } catch (error) {
+        retainedCount++; retained.push({ task_id: expiry.task_id, error_path: errorPath, reason: `quarantined state deletion failed: ${error.message}` });
+      }
+      continue;
+    }
+    try {
+      const reconciled = await reconcileQuarantineEntry(stateDir, errorPath, metadata);
+      metadata = reconciled.metadata;
+      if (!reconciled.complete) {
+        retainedCount++; retained.push({ task_id: metadata.task_id, error_path: errorPath, reason: 'quarantine transfer is incomplete and will be retried by a later cleanup' });
+        continue;
+      }
+    } catch (error) {
+      retainedCount++; retained.push({ task_id: metadata.task_id, error_path: errorPath, reason: `quarantine reconciliation failed: ${error.message}` });
+      continue;
+    }
+    let expiry;
+    try { expiry = await ensureQuarantineExpiry(stateDir, errorPath, metadata); }
+    catch (error) { retainedCount++; retained.push({ task_id: metadata.task_id, error_path: errorPath, reason: `quarantine expiry metadata failed: ${error.message}` }); continue; }
+    if (now < Date.parse(expiry.delete_after)) {
+      retainedCount++; retained.push({ task_id: metadata.task_id, error_path: errorPath, delete_after: expiry.delete_after, reason: 'quarantined state retention period has not elapsed' });
+      continue;
+    }
+    try {
+      if (!await quarantineContentsAreSafe(errorPath, expiry)) {
+        retainedCount++; retained.push({ task_id: metadata.task_id, error_path: errorPath, reason: 'quarantine contains unexpected files and requires manual recovery' });
+        continue;
+      }
+      await fs.rm(errorPath, { recursive: true, force: false });
+      deletedCount++; deleted.push({ task_id: metadata.task_id, error_path: errorPath, quarantined_at: metadata.quarantined_at, delete_after: metadata.delete_after });
+    } catch (error) {
+      retainedCount++; retained.push({ task_id: metadata.task_id, error_path: errorPath, reason: `quarantined state deletion failed: ${error.message}` });
+    }
+  }
+  return { deleted, retained, deleted_count: deletedCount, retained_count: retainedCount };
+}
+
+async function reconcileQuarantinedStates(parameters) {
+  const stateDir = requiredStateDirectory(parameters.state_dir);
+  const root = errorStateRoot(stateDir);
+  const reconciled = []; const retained = [];
+  let entries;
+  try { entries = await fs.readdir(root, { withFileTypes: true }); }
+  catch (error) { if (error.code === 'ENOENT') return { state_dir: stateDir, reconciled, retained, reconciled_count: 0, retained_count: 0 }; throw error; }
+  for (const entry of entries) {
+    const errorPath = path.join(root, entry.name);
+    if (!entry.isDirectory() || !isDirectChild(root, errorPath)) {
+      retained.push({ error_path: errorPath, reason: 'unknown quarantine entry is not a direct regular directory' });
+      continue;
+    }
+    let metadata;
+    try { metadata = await readQuarantineMetadata(stateDir, errorPath); }
+    catch (error) { retained.push({ error_path: errorPath, reason: error.message }); continue; }
+    try {
+      const outcome = await reconcileQuarantineEntry(stateDir, errorPath, metadata);
+      if (outcome.complete) reconciled.push({ task_id: outcome.metadata.task_id, error_path: errorPath, status: outcome.metadata.status });
+      else retained.push({ task_id: outcome.metadata.task_id, error_path: errorPath, reason: outcome.metadata.move_error ?? 'quarantine transfer is incomplete' });
+    } catch (error) {
+      retained.push({ task_id: metadata.task_id, error_path: errorPath, reason: error.message });
+    }
+  }
+  return { state_dir: stateDir, reconciled, retained, reconciled_count: reconciled.length, retained_count: retained.length };
+}
+
+async function findQuarantinedState(stateDir, filePath) {
+  const root = errorStateRoot(stateDir);
+  let entries;
+  try { entries = await fs.readdir(root, { withFileTypes: true }); }
+  catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const errorPath = path.join(root, entry.name);
+    try {
+      const metadata = await readQuarantineMetadata(stateDir, errorPath);
+      if (path.resolve(metadata.original_state_path) === path.resolve(filePath)) return metadata;
+    } catch {
+      // Malformed entries are intentionally left in place and are not attributed to a task.
+    }
+  }
+  return null;
+}
+
+async function listOrphanLegacyPaths(stateDir) {
+  let entries;
+  try { entries = await fs.readdir(stateDir, { withFileTypes: true }); }
+  catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+  const orphaned = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith('.json.legacy')) continue;
+    const logicalPath = path.join(stateDir, entry.name.slice(0, -'.legacy'.length));
+    try {
+      await fs.access(logicalPath);
+      continue;
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+    try {
+      await fs.access(databasePath(logicalPath));
+    } catch (error) {
+      if (error.code === 'ENOENT') orphaned.push(entry.name);
+      else throw error;
+    }
+  }
+  return orphaned.sort();
+}
+
+async function doctorStateDirectory(parameters) {
+  const stateDir = requiredStateDirectory(parameters.state_dir);
+  const root = errorStateRoot(stateDir);
+  const quarantinedStates = [];
+  const invalidEntries = [];
+  try {
+    const entries = await fs.readdir(root, { withFileTypes: true });
+    for (const entry of entries) {
+      const errorPath = path.join(root, entry.name);
+      if (!entry.isDirectory()) { invalidEntries.push({ path: errorPath, reason: 'entry is not a quarantine directory' }); continue; }
+      try {
+        const metadata = await readQuarantineMetadata(stateDir, errorPath);
+        quarantinedStates.push({ task_id: metadata.task_id, state_path: metadata.original_state_path, error_path: errorPath, status: metadata.status, delete_after: metadata.delete_after, review_artifacts: metadata.review_artifacts ?? null });
+      } catch (error) {
+        invalidEntries.push({ path: errorPath, reason: error.message });
+      }
+    }
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+  const orphanLegacy = await listOrphanLegacyPaths(stateDir);
+  const pruneSweep = await readPruneSweep(stateDir);
+  const attention = quarantinedStates.length > 0 || orphanLegacy.length > 0 || Boolean(pruneSweep.error);
+  return {
+    task_id: null,
+    state_dir: stateDir,
+    health: invalidEntries.length ? 'blocked' : attention ? 'attention' : 'healthy',
+    checks: [
+      doctorCheck('quarantined_states', invalidEntries.length ? 'fail' : quarantinedStates.length ? 'attention' : 'pass', { entries: quarantinedStates, invalid_entries: invalidEntries }),
+      doctorCheck('orphan_legacy', orphanLegacy.length ? 'attention' : 'pass', { paths: orphanLegacy }),
+      doctorCheck('prune_sweep', pruneSweep.error ? 'attention' : 'pass', pruneSweep.error ? { error: pruneSweep.error } : pruneSweep.sweep ?? { last_sweep_at: null, last_result: null }),
+    ],
+    close_status: { close_allowed: false, reasons: ['directory-level diagnosis does not represent a task close gate'] },
+  };
+}
+
+async function listTaskStatePaths(stateDir) {
+  const entries = await fs.readdir(stateDir, { withFileTypes: true });
+  const paths = new Set();
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    if (entry.name.endsWith(SQLITE_STATE_SUFFIX)) {
+      paths.add(path.join(stateDir, `${entry.name.slice(0, -SQLITE_STATE_SUFFIX.length)}.json`));
+      continue;
+    }
+    if (!entry.name.endsWith('.json') || entry.name === 'workspace-lease.json' || entry.name === PRUNE_SWEEP_FILENAME) continue;
+    const logicalPath = path.join(stateDir, entry.name);
+    try {
+      await fs.access(databasePath(logicalPath));
+    } catch (error) {
+      if (error.code === 'ENOENT') paths.add(logicalPath);
+      else throw error;
+    }
+  }
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith('.json.legacy')) continue;
+    const logicalPath = path.join(stateDir, entry.name.slice(0, -'.legacy'.length));
+    if (paths.has(logicalPath)) continue;
+    try {
+      await fs.access(databasePath(logicalPath));
+    } catch (error) {
+      if (error.code === 'ENOENT') paths.add(logicalPath);
+      else throw error;
+    }
+  }
+  return [...paths].sort();
+}
+
+function appendPruneReport(reports, target, value) {
+  if (Object.values(reports).reduce((count, entries) => count + entries.length, 0) < MAX_PRUNE_REPORT_ENTRIES) target.push(value);
+}
+
+function compactPruneResult(result) {
+  return {
+    deleted_count: result.deleted_count,
+    quarantined_count: result.quarantined_count,
+    retained_count: result.retained_count,
+    quarantine_deleted_count: result.quarantine_deleted_count,
+    quarantine_retained_count: result.quarantine_retained_count,
+    report_truncated: result.report_truncated,
+  };
+}
+
+function pruneSweepIsValid(value) {
+  return hasExactFields(value, PRUNE_SWEEP_FIELDS)
+    && value.version === 1
+    && validTimestamp(value.last_sweep_at)
+    && hasExactFields(value.last_result, PRUNE_RESULT_FIELDS)
+    && Object.values(value.last_result).every(item => typeof item === 'boolean' || (Number.isSafeInteger(item) && item >= 0));
+}
+
+async function readPruneSweep(stateDir) {
+  try {
+    const sweep = await readJson(path.join(stateDir, PRUNE_SWEEP_FILENAME), { label: 'Prune sweep state', maxBytes: 4096 });
+    if (!pruneSweepIsValid(sweep)) throw new ControllerError('Prune sweep state is invalid');
+    return { sweep, error: null };
+  } catch (error) {
+    if (error instanceof ControllerError && error.message.includes('does not exist:')) return { sweep: null, error: null };
+    return { sweep: null, error: error.message };
+  }
 }
 
 async function pruneExpiredTasks(parameters) {
   const stateDir = requiredStateDirectory(parameters.state_dir);
-  let entries;
-  try { entries = await fs.readdir(stateDir, { withFileTypes: true }); }
-  catch (error) { if (error.code === 'ENOENT') return { state_dir: stateDir, retention_days: DEFAULT_TASK_RETENTION_DAYS, deleted: [], retained: [] }; throw error; }
-  const now = Date.now(); const deleted = []; const retained = []; let deletedCount = 0; let retainedCount = 0;
-  for (const entry of entries) {
-    if (!entry.isFile() || !entry.name.endsWith('.json') || entry.name === 'workspace-lease.json' || entry.name === PRUNE_SWEEP_FILENAME) continue;
-    const filePath = path.join(stateDir, entry.name);
+  const now = Date.now();
+  const reports = { deleted: [], quarantined: [], retained: [], quarantine_deleted: [], quarantine_retained: [] };
+  const quarantinedStateCleanup = await pruneQuarantinedStates(stateDir, now);
+  for (const entry of quarantinedStateCleanup.deleted) appendPruneReport(reports, reports.quarantine_deleted, entry);
+  for (const entry of quarantinedStateCleanup.retained) appendPruneReport(reports, reports.quarantine_retained, entry);
+  let filePaths;
+  try { filePaths = await listTaskStatePaths(stateDir); }
+  catch (error) {
+    if (error.code === 'ENOENT') return {
+      state_dir: stateDir,
+      retention_days: DEFAULT_TASK_RETENTION_DAYS,
+      quarantine_after_days: QUARANTINE_AFTER_DAYS,
+      error_retention_days: ERROR_STATE_RETENTION_DAYS,
+      deleted_count: 0,
+      quarantined_count: 0,
+      retained_count: 0,
+      quarantine_deleted_count: quarantinedStateCleanup.deleted_count,
+      quarantine_retained_count: quarantinedStateCleanup.retained_count,
+      report_truncated: quarantinedStateCleanup.deleted_count > reports.quarantine_deleted.length || quarantinedStateCleanup.retained_count > reports.quarantine_retained.length,
+      ...reports,
+    };
+    throw error;
+  }
+  let deletedCount = 0; let quarantinedCount = 0; let retainedCount = 0;
+  for (const filePath of filePaths) {
     let initial;
     try { initial = await loadState(filePath); }
-    catch (error) { retainedCount++; appendPruneReport(deleted, retained, retained, { state_path: filePath, reason: `unreadable state: ${error.message}` }); continue; }
+    catch (error) {
+      const quarantine = await quarantineIfEligible(filePath, null, now);
+      if (quarantine.quarantined) { quarantinedCount++; appendPruneReport(reports, reports.quarantined, { task_id: quarantine.task_id, state_path: filePath, error_path: quarantine.error_path, delete_after: quarantine.delete_after }); }
+      else { retainedCount++; appendPruneReport(reports, reports.retained, { state_path: filePath, reason: `unreadable state: ${error.message}; ${quarantine.reason}` }); }
+      continue;
+    }
     const initialEligibility = taskPruneEligibility(initial, filePath, now);
-    if (!initialEligibility.eligible) { retainedCount++; appendPruneReport(deleted, retained, retained, { task_id: initial.task_id ?? null, state_path: filePath, reason: initialEligibility.reason }); continue; }
+    if (!initialEligibility.eligible) {
+      const quarantine = await quarantineIfEligible(filePath, initial, now);
+      if (quarantine.quarantined) { quarantinedCount++; appendPruneReport(reports, reports.quarantined, { task_id: quarantine.task_id, state_path: filePath, error_path: quarantine.error_path, delete_after: quarantine.delete_after }); }
+      else { retainedCount++; appendPruneReport(reports, reports.retained, { task_id: initial.task_id ?? null, state_path: filePath, reason: quarantine.reason === 'younger than quarantine retention period' ? initialEligibility.reason : `${initialEligibility.reason}; ${quarantine.reason}` }); }
+      continue;
+    }
     const leasePath = initial.workspace_lease.registry_path;
     try {
       const outcome = await withStateLock(leasePath, async () => withStateLock(filePath, async () => {
@@ -987,16 +1856,32 @@ async function pruneExpiredTasks(parameters) {
         if (!eligibility.eligible) return { deleted: false, reason: eligibility.reason, task_id: state.task_id };
         const leaseEligibility = await releasedLeaseEligibility(leasePath, state);
         if (!leaseEligibility.eligible) return { deleted: false, reason: leaseEligibility.reason, task_id: state.task_id };
-        await fs.unlink(filePath);
+        await deleteState(filePath);
         return { deleted: true, task_id: state.task_id };
       }));
-      if (outcome.deleted) { deletedCount++; appendPruneReport(deleted, retained, deleted, { task_id: outcome.task_id, state_path: filePath }); }
-      else { retainedCount++; appendPruneReport(deleted, retained, retained, { task_id: outcome.task_id ?? initial.task_id, state_path: filePath, reason: outcome.reason }); }
+      if (outcome.deleted) { deletedCount++; appendPruneReport(reports, reports.deleted, { task_id: outcome.task_id, state_path: filePath }); }
+      else { retainedCount++; appendPruneReport(reports, reports.retained, { task_id: outcome.task_id ?? initial.task_id, state_path: filePath, reason: outcome.reason }); }
     } catch (error) {
-      retainedCount++; appendPruneReport(deleted, retained, retained, { task_id: initial.task_id, state_path: filePath, reason: `cleanup failed: ${error.message}` });
+      retainedCount++; appendPruneReport(reports, reports.retained, { task_id: initial.task_id, state_path: filePath, reason: `cleanup failed: ${error.message}` });
     }
   }
-  return { state_dir: stateDir, retention_days: DEFAULT_TASK_RETENTION_DAYS, deleted_count: deletedCount, retained_count: retainedCount, report_truncated: deletedCount > deleted.length || retainedCount > retained.length, deleted, retained };
+  return {
+    state_dir: stateDir,
+    retention_days: DEFAULT_TASK_RETENTION_DAYS,
+    quarantine_after_days: QUARANTINE_AFTER_DAYS,
+    error_retention_days: ERROR_STATE_RETENTION_DAYS,
+    deleted_count: deletedCount,
+    quarantined_count: quarantinedCount,
+    retained_count: retainedCount,
+    quarantine_deleted_count: quarantinedStateCleanup.deleted_count,
+    quarantine_retained_count: quarantinedStateCleanup.retained_count,
+    report_truncated: deletedCount > reports.deleted.length
+      || quarantinedCount > reports.quarantined.length
+      || retainedCount > reports.retained.length
+      || quarantinedStateCleanup.deleted_count > reports.quarantine_deleted.length
+      || quarantinedStateCleanup.retained_count > reports.quarantine_retained.length,
+    ...reports,
+  };
 }
 
 async function maybePruneExpiredTasks(parameters) {
@@ -1010,12 +1895,10 @@ async function maybePruneExpiredTasks(parameters) {
   }
   const sweepPath = path.join(stateDir, PRUNE_SWEEP_FILENAME);
   await withStateLock(sweepPath, async () => {
-    let prior = null;
-    try { prior = await readJson(sweepPath, { label: 'Prune sweep state', maxBytes: 1024 }); }
-    catch (error) { if (!error.message.startsWith('JSON input does not exist:')) prior = null; }
-    if (hasExactFields(prior, PRUNE_SWEEP_FIELDS) && prior.version === 1 && validTimestamp(prior.last_sweep_at) && Date.now() - Date.parse(prior.last_sweep_at) < PRUNE_SWEEP_INTERVAL_MS) return;
-    await pruneExpiredTasks({ state_dir: stateDir });
-    await atomicWrite(sweepPath, { version: 1, last_sweep_at: utcNow() });
+    const { sweep: prior } = await readPruneSweep(stateDir);
+    if (prior && Date.now() - Date.parse(prior.last_sweep_at) < PRUNE_SWEEP_INTERVAL_MS) return;
+    const result = await pruneExpiredTasks({ state_dir: stateDir });
+    await atomicWrite(sweepPath, { version: 1, last_sweep_at: utcNow(), last_result: compactPruneResult(result) });
   });
 }
 
@@ -1037,7 +1920,7 @@ async function recordReview(parameters) {
   const review = await readJson(parameters.review, { label: 'Review', maxBytes: MAX_REVIEW_BYTES }); if (!review || typeof review !== 'object') throw new ControllerError('Review must be a JSON object');
   const [filePath] = await readTask(parameters);
   return withStateLock(filePath, async () => {
-    const state = await loadState(filePath); await requireActiveWorkspaceLease(state, filePath); const auditor = String(review.auditor_task ?? ''); const role = String(review.auditor_role ?? ''); const verdict = String(review.verdict ?? '');
+    const state = normalizeState(await loadState(filePath)); await requireActiveWorkspaceLease(state, filePath); const auditor = String(review.auditor_task ?? ''); const role = String(review.auditor_role ?? ''); const verdict = String(review.verdict ?? '');
     const priorReviewers = new Set(state.reviews.map(item => item.auditor_task));
     const participatedOutsideTotalReview = state.participants.some(item => item.agent_task_path === auditor && state.nodes[item.node_id]?.kind !== 'total_review');
     if (!auditor || participatedOutsideTotalReview || priorReviewers.has(auditor)) throw new ControllerError('Total reviewer must be a new agent that did not previously participate');
@@ -1062,7 +1945,7 @@ async function recordReview(parameters) {
     const residualRisk = requiredReviewValue(review.residual_risk, 'residual_risk');
     if (state.reviews.length >= MAX_REVIEWS) throw new ControllerError(`Task exceeded the ${MAX_REVIEWS}-review limit; create a replacement workflow task`);
     const stored = { auditor_task: auditor, auditor_role: role, node_id: totalReviewNode.id, claim_id: totalReviewNode.claim_id, verdict, requirement_coverage: coverage, scope_and_regression: scopeAndRegression, verification_gaps: verificationGaps, residual_risk: residualRisk, fallback_reason: review.fallback_reason ?? null, workflow_snapshot: snapshot, workspace_fingerprint: fingerprint, recorded_at: utcNow() };
-    state.reviews.push(stored); addEvent(state, 'total_review_recorded', { auditor_task: auditor, verdict }); await atomicWrite(filePath, state);
+    state.reviews.push(stored); addEvent(state, 'total_review_recorded', { auditor_task: auditor, verdict }); await writeState(filePath, state);
     return { task_id: state.task_id, review: stored };
   });
 }
@@ -1104,7 +1987,7 @@ async function closeCheck(parameters) {
     const reasons = await closeReasons(state);
     if (reasons.length) return [{ task_id: state.task_id, close_allowed: false, reasons }, 2];
     state.workspace_lease.status = 'released'; state.workspace_lease.released_at = utcNow(); state.closed_revision = state.workflow_revision; state.closed_at = utcNow();
-    addEvent(state, 'workspace_lease_released', { close_allowed: true }); await atomicWrite(filePath, state);
+    addEvent(state, 'workspace_lease_released', { close_allowed: true }); await writeState(filePath, state);
     lease.active_task = null; lease.updated_at = utcNow(); await atomicWrite(leasePath, lease);
     return [{ task_id: state.task_id, close_allowed: true, reasons: [], workspace_lease: { released: true, lease_path: leasePath } }, 0];
   }));
@@ -1112,13 +1995,14 @@ async function closeCheck(parameters) {
 
 export async function dispatch(command, parameters) {
   if (command === 'prune-expired') return [await pruneExpiredTasks(parameters), 0];
-  // The state-dir marker keeps ordinary cleanup bounded even when each CLI call starts a new process.
-  if (parameters && hasOwn(parameters, 'state_dir')) await maybePruneExpiredTasks(parameters);
+  if (command === 'reconcile-quarantine') return [await reconcileQuarantinedStates(parameters), 0];
+  // Diagnostic commands stay side-effect free; other operations lazily keep expired state bounded.
+  if (parameters && hasOwn(parameters, 'state_dir') && !READ_ONLY_COMMANDS.has(command)) await maybePruneExpiredTasks(parameters);
   switch (command) {
     case 'init': return [await initTask(parameters), 0]; case 'reconcile-workspace': return [await reconcileWorkspace(parameters), 0]; case 'add-node': return [await addNode(parameters), 0];
-    case 'ready': return [{ ready_nodes: readyNodes((await readTask(parameters))[1]) }, 0]; case 'claim': return [await claimNode(parameters), 0];
+    case 'ready': return [{ ready_nodes: readyNodes((await readTask(parameters))[1]) }, 0]; case 'claim': return [await claimNode(parameters), 0]; case 'start': return [await claimNode(parameters, true), 0];
     case 'complete': return [await completeNode(parameters), 0]; case 'heartbeat': return [await heartbeatNode(parameters), 0]; case 'checkpoint': return [await checkpointNode(parameters), 0];
-    case 'abandon': return [await abandonNode(parameters), 0]; case 'retry': return [await retryNode(parameters), 0]; case 'requeue-stale': return [await requeueStaleNode(parameters), 0];
+    case 'abandon': return [await abandonNode(parameters), 0]; case 'retry': return [await retryNode(parameters), 0]; case 'requeue-stale': return [await requeueStaleNode(parameters), 0]; case 'rescue': return [await rescueNode(parameters), 0];
     case 'recover-lock': return [await recoverTaskLock(parameters), 0]; case 'audit-context': return [await auditContext(parameters), 0];
     case 'record-review': return [await recordReview(parameters), 0]; case 'close-check': return closeCheck(parameters);
     case 'release-workspace': return [await releaseWorkspaceLease(parameters), 0];
@@ -1126,7 +2010,7 @@ export async function dispatch(command, parameters) {
       const [, state] = await readTask(parameters);
       return [{ task_id: state.task_id, stale_nodes: staleNodes(state) }, 0];
     }
-    case 'status': return [compactState((await readTask(parameters))[1]), 0]; case 'fingerprint': return [{ workspace_fingerprint: await workspaceFingerprint(parameters.workspace) }, 0];
+    case 'status': return [compactState((await readTask(parameters))[1]), 0]; case 'doctor': return [await doctorTask(parameters), 0]; case 'fingerprint': return [{ workspace_fingerprint: await workspaceFingerprint(parameters.workspace) }, 0];
     default: throw new ControllerError(`Unknown command: ${command}`);
   }
 }

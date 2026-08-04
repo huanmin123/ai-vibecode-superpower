@@ -12,7 +12,9 @@
 
 ## 状态与清理
 
-每次控制器调用都必须传入同一个绝对 `state_dir`，推荐目标工作区的 `.codex/workflow-controller/`。该目录属于控制数据，不应纳入业务改动或总审的工作区指纹；连续 7 天没有状态更新、租约已释放且不存在运行节点的任务状态，会在下一次该 `state_dir` 的控制器操作时删除，也可以显式调用 `workflow_prune_expired`。控制器不是常驻服务，因此没有任何调用时不会在第 7 天整点自行运行；活动、未知、legacy 或无法解析的状态不会删除。
+每次控制器调用都必须传入同一个绝对 `state_dir`，推荐目标工作区的 `.codex/workflow-controller/`。任务主体保存在 `<task_id>.sqlite`；旧版 `<task_id>.json` 会在首次成功写入 SQLite 后保留为 `<task_id>.json.legacy` 恢复副本。该目录属于控制数据，不应纳入业务改动或总审的工作区指纹。`workflow_doctor` 可只读检查状态库、工作区租约、协调文件、过期节点和受控重派前提；省略 `task_id` 时会列出错误隔离项和孤立 legacy 副本。它不会删除、修复或接管状态。
+
+连续 7 天没有状态更新、租约已释放且不存在运行节点的完整任务状态，会在下一次该 `state_dir` 的非只读控制器操作时删除，关联的 `.workflow-review-results/<task_id>/` 也会一起删除。未知、legacy 或无法验证租约的状态连续 30 天后，会先移入 `state_dir/.workflow-errors/<id>/`；其中的 `quarantine.json` 与独立的 `.quarantine-expiry.json` 记录原因、原路径、review 证据和删除时间，隔离内容保留 365 天后才会在后续清理中删除。主隔离元数据损坏但到期凭证和内容仍完整时，仍可安全到期删除。`workflow_reconcile_quarantine` 会幂等补齐中断的隔离传输，不删除未知文件。`workflow_doctor` 指定 `task_id` 时返回单项隔离位置，省略 `task_id` 时列出全部隔离项、孤立 legacy 副本与最近一次惰性清理摘要。控制器不是常驻服务，因此没有任何调用时不会在第 7、30 或 365 天整点自行运行。
 
 控制器会在目标工作区的 `.codex/workflow-controller/workspace-lease.json` 保留活动任务租约。因此多个不同工作区可并行，而同一工作区即使使用不同状态目录也只能有一个活动工作流。运行中的代理应定期写入 `workflow_checkpoint`，保存完成步骤、下一步、证据和阻塞。会话或进程中断后，协调者先检查实际代理、diff 和产物；只有确认旧代理已停止，才能调用 `workflow_requeue_stale` 原子保存旧 attempt/checkpoint、取得恢复包并派发新代理。若当前 Codex 运行时实际暴露 `resume_agent` 且 claim 保存了原生 `agent_thread_id`，协调者可优先恢复原代理会话；控制器本身不能读取或调用 Codex 的内部 session/rollout。确认没有旧代理仍在写入后，才能用 `workflow_release_workspace` 释放中断任务的租约。
 
@@ -77,17 +79,19 @@ node .\scripts\workflow_controller.mjs --state-dir "$pwd\.codex\workflow-control
 node .\scripts\workflow_controller.mjs --state-dir "$pwd\.codex\workflow-controller" ready --task-id payments-refactor
 ```
 
-Windows 的独立 Sol CLI 总审通过包装器运行：`node .\scripts\sol_review_cli.mjs -- <prompt>`。它显式继承或解析当前账户的 `CODEX_HOME` 并传给子 `codex exec --model gpt-5.6-sol --sandbox read-only`；仅当 `.sandbox/deny_read_acl_state.json` 不能解析为 JSON 时，才并发安全地备份为 `.corrupt-*` 并重建 `{ "principals": {} }`。有效状态、缺失状态和任何其他 Codex CLI 失败均不被清空、吞掉或降级；`unavailable` 的输出和退出状态原样保留。
+Windows 的独立 Sol CLI 总审通过包装器运行：`node .\scripts\sol_review_cli.mjs -- <prompt>`。它显式继承或解析当前账户的 `CODEX_HOME` 并传给子 `codex exec --model gpt-5.6-sol --sandbox read-only`。`--timeout-sec <1..7200>` 默认是软截止：到点只记录 `deadline_reached` 并提示，Sol 继续运行直到自己退出，不会因为到达该时间被限制；因此默认不会自动终止长复审。只有显式传入 `--hard-timeout-sec <1..7200>` 才启用强制终止，终止后最多再等待 15 秒确认进程退出。工作流总审应额外传入 `--workflow-state-dir`、`--workflow-task-id`、`--workflow-node-id` 和 `--workflow-claim-id`：包装器会把有界 stdout/stderr 与 PID、退出码、软截止、硬截止和终止确认写入固定的 `state_dir/.workflow-review-results/<task_id>/<claim_id>/outcome.json`，并拒绝覆盖其他 task/claim 的结果。Windows `.cmd/.bat` 通过固定 PowerShell 参数数组调用，提示词不会拼进 shell 源码；提示词作为 `--` 后的单一位置参数传入。子进程非零退出，或显式硬截止后已确认退出时，包装器只会将该 claim 收为 `unavailable`；仅到达软截止不会改变运行中的 claim 状态，也不会自动重试。随后仍必须确认旧代理停止、创建新的独立总审实例并调用 `workflow_retry`。成功的总审仍须由审核代理调用 `workflow_record_review` 和 `workflow_complete`。仅当 `.sandbox/deny_read_acl_state.json` 不能解析为 JSON 时，才并发安全地备份为 `.corrupt-*` 并重建 `{ "principals": {} }`；其他 Codex CLI 失败不会被清空或降级。
 
 新任务的 DAG 在 `workflow_init` 后不可追加，并且必须包含唯一的 `total_review` 汇点；该节点直接依赖所有其他节点，其他节点不得依赖它。总审 JSON 除已有字段外必须回填 `workflow_audit_context` 返回的 `workflow_snapshot`。任何非总审节点的结果、状态或重试发生变化都会使旧总审失效，必须新建独立总审。
 
-插件的 MCP 工具提供相同的 `workflow_init`、`workflow_reconcile_workspace`、`workflow_ready`、`workflow_claim`、`workflow_heartbeat`、`workflow_checkpoint`、`workflow_complete`、`workflow_abandon`、`workflow_retry`、`workflow_requeue_stale`、`workflow_recover_lock`、`workflow_audit_context`、`workflow_record_review`、`workflow_close_check`、`workflow_release_workspace`、`workflow_stale`、`workflow_status` 和 `workflow_prune_expired` 操作。`workflow_claim` 返回 `claim_id`；完成、心跳、checkpoint、放弃与总审记录必须携带该值。`agent_thread_id` 只在宿主确实提供时保存，不能由 `agent_task_path` 推导。总审记录还会校验它属于同路径、同角色的运行中 `total_review` 节点。`workflow_requeue_stale` 还要求当前 claim 确已过期和 `previous_agent_stopped=true`，它保存旧 attempt/checkpoint 并返回给替代代理的恢复包，但不伪装为原会话恢复。陈旧锁、写入意图和恢复保护只会在同主机、创建时间可解析且与文件时间一致、超过阈值、原 PID 不存在且文件身份在归档前未变化时归档；其他情况明确报错，不会冒险移除。
+插件的 MCP 工具提供相同的 `workflow_init`、`workflow_reconcile_workspace`、`workflow_ready`、`workflow_claim`、`workflow_start`、`workflow_heartbeat`、`workflow_checkpoint`、`workflow_complete`、`workflow_abandon`、`workflow_retry`、`workflow_requeue_stale`、`workflow_rescue`、`workflow_recover_lock`、`workflow_audit_context`、`workflow_record_review`、`workflow_close_check`、`workflow_release_workspace`、`workflow_stale`、`workflow_status`、`workflow_doctor`、`workflow_reconcile_quarantine` 和 `workflow_prune_expired` 操作。新派发优先使用 `workflow_start`，它在一次状态提交中完成认领和首个激活心跳，避免启动竞态；`workflow_claim` 返回 `claim_id`，完成、心跳、checkpoint、放弃与总审记录必须携带该值。`workflow_checkpoint` 同时刷新节点租约心跳。`agent_thread_id` 只在宿主确实提供时保存，不能由 `agent_task_path` 推导。总审记录还会校验它属于同路径、同角色的运行中 `total_review` 节点。`workflow_requeue_stale` 还要求当前 claim 确已过期和 `previous_agent_stopped=true`，它保存旧 attempt/checkpoint 并返回给替代代理的恢复包，但不伪装为原会话恢复。Luna 停止后若 Root 必须接管，必须调用 `workflow_rescue` 并以 `main/root` 重新启动，状态会保留原 Luna attempt 和救援原因。陈旧锁、写入意图和恢复保护只会在同主机、创建时间可解析且与文件时间一致、超过阈值、原 PID 不存在且文件身份在归档前未变化时归档；其他情况明确报错，不会冒险移除。
 
-为防止长任务无限膨胀，清单最多 64 个节点和 64 条需求，每个节点最多 8 次尝试；结构化节点结果上限 64 KiB、审核上限 128 KiB。大日志或完整测试输出应放在外部制品中，结果 JSON 只保留路径、摘要和关键结论。指纹以流式方式覆盖源码、配置、锁文件和构建输出，排除 `.git`、`.codex`、`node_modules` 与 `.venv`；遇到符号链接、持续变化的工作区或超过容量上限时明确失败，不能把失败当作通过。
+为防止长任务无限膨胀，清单最多 64 个节点和 64 条需求，每个节点最多 8 次尝试；结构化节点结果上限 64 KiB、审核上限 128 KiB。大日志或完整测试输出应放在外部制品中，结果 JSON 只保留路径、摘要和关键结论。指纹以流式方式覆盖源码、配置、锁文件和构建输出，排除 `.git`、`.codex`、`node_modules`、`.venv`、`.yarn` 与 `.yarn-cache*`；后两类为派生下载缓存。遇到符号链接、持续变化的工作区或超过容量上限时明确失败，不能把失败当作通过。
 
 ## MCP 启动时限
 
 `workflow-controller` 的 `.mcp.json` 将 `startup_timeout_sec` 设为 120 秒。此时限同时覆盖 MCP `initialize` 和连接后的首次 `tools/list`，不适用于后续 `tools/call` 工具调用。
+
+节点默认激活窗口为 600 秒（10 分钟），租约默认 1,800 秒；新派发应使用 `workflow_start` 原子完成激活，长任务通过 `workflow_heartbeat` 或 `workflow_checkpoint` 续租。两者都不是任务总运行时限。
 
 ## 安全边界
 

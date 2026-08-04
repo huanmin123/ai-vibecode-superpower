@@ -2,3 +2,5 @@
 .local/
 .codex/
 .idea
+external-projects
+examples
