@@ -1,65 +1,82 @@
-# Codex 全局配置安装包
+# ai-vibecode-superpower
 
-这是一套给 Codex 使用者的全局配置与统一插件：统一工作约定、可分工的 agent role，以及 `agnets-workflow` 提供的常用 skills 和工作流工具。安装后，新建的 Codex task 可以直接使用它们。
+## 定位与注意事项
 
-本项目不安装或升级 Codex CLI，也不安装 Codex 桌面应用。   还有就是内置的`superpowser`插件请关闭使用否则可能会冲突和加大成本 。 
+本项目是面向 Codex 使用者的可安装配置包，提供全局规则与文档、agent role profiles，以及 `agnets-workflow` 插件和若干独立 skill。它帮助复杂开发任务建立更清晰的调查、实施和复查工作方式。
+
+本项目不安装或升级 Codex CLI，也不安装 Codex Desktop。若已启用同类 `superpowers` 插件，请先禁用它，以避免潜在的规则冲突和额外使用成本。
 
 ## 你会得到
 
-- 统一的全局规则和跨平台命令文档。
-- 12 个分工角色，用于调查、判断、实施和复查；另保留 2 个 legacy writer 角色兼容旧任务。
-- `agnets-workflow` 插件，包含 `orchestrate-model-workflow`、`agent-toolchain` 和 `workflow-controller`。
+- 可供 Codex 使用的全局规则与跨平台文档。
+- 可按任务需要使用的 agent role profiles。
+- `agnets-workflow` 插件及其工作流工具。
 - 独立全局 skill：`project-doc-planner` 与 `gpt-image-2-cli`。
 
 ## 适合什么时候
 
-适合日常开发、维护多个项目，或希望复杂任务有稳定工作方式的个人和团队。
+适合日常开发与维护，尤其是需要跨文件理解、分阶段实施、并行处理或独立复查的复杂任务。单文件、一次性的小改动通常不需要额外配置；安装完成后，直接告诉 Codex 目标、范围和限制即可。
 
-一般不需要先了解每个角色。直接告诉 Codex 你的目标、范围和限制即可；任务复杂时，它会按需要安排调查、方案、实施和复查。
-
-## 工作流一眼看懂
+## 工作流概览
 
 ```mermaid
 flowchart TD
-    A["提出任务目标"] --> B["协调者判断需要什么"]
-    B --> R["按需要并行安排多个调查或评审分支"]
-    R --> P["形成结论或方案"]
-    P --> D{"需要修改吗"}
-    D -->|"否"| Z["交付结果"]
-    D -->|"是"| M["按需要并行安排多个管理分支"]
-    M --> W["执行互不冲突的工作"]
-    W --> V["验证与独立复查"]
-    V --> Z
+    A[提出目标与约束] --> B[分析任务范围]
+    B --> C[调查与形成方案]
+    C --> D[实施改动]
+    D --> E[验证与复查]
+    E --> F[交付结果]
 ```
 
-多个分支可以按任务需要并行；相互影响的工作会顺序处理。
+任务会根据实际范围选择必要步骤；上图只展示常见路径，不代表固定的执行方式。
 
-## 安装
+## 快速安装
 
-Windows（PowerShell 7）：
+### 前置条件
+
+- 已安装并可运行的 Codex CLI。
+- Node.js `>=20`。
+- macOS/Linux 还需要 `rg`（ripgrep）。
+
+安装目标优先使用非空的 `CODEX_HOME`；未设置时使用 `~/.codex`。
+
+### Windows（PowerShell 7）
+
+在仓库根目录运行：
 
 ```powershell
 & .\install-codex.ps1
 ```
 
-macOS 或 Linux：
+### macOS 或 Linux
+
+在仓库根目录运行：
 
 ```sh
 sh ./install-codex.sh
 ```
 
-安装目录优先使用非空的 `CODEX_HOME`；未设置时使用当前用户的 `~/.codex`。安装器会备份它管理的已有内容，并注册、安装或更新 `agnets-workflow`，同时安装或更新两个独立全局 skill，并移除旧版安装的三个插件同名全局 skill 和旧的独立 `workflow-controller` 插件，避免重复加载。完成后必须完全重启 Codex Desktop 或 CLI 进程；仅新建 task 不能保证已运行的 Desktop 加载新增 agent role。
+安装成功后，必须完全重启 Codex Desktop 或 Codex CLI 进程，使新增配置与能力生效。
 
-`workflow-controller` 使用 Codex 所需的 Node.js 运行时；安装器会在写入前检查 `node` 命令。
+## 使用方式与可选能力
 
-## 可选能力
+安装并重启后，在目标项目中直接描述任务即可。需要特定能力时，可以明确提及对应 skill：
 
-`agent-toolchain` 用于为另一个目标项目接入 CodeGraph 与 RTK，适合复杂重构、跨模块理解和大范围排障。在目标项目中对 Codex 说：
+| 能力 | 适用场景 | 说明 |
+| --- | --- | --- |
+| [`agent-toolchain`](plugins/agnets-workflow/skills/agent-toolchain/SKILL.md) | 复杂重构、跨模块理解和大范围排障 | 为目标项目接入 CodeGraph 与 RTK。 |
+| [`workflow-controller`](plugins/agnets-workflow/skills/workflow-controller/SKILL.md) | 需要持久化状态和可恢复交接的复杂任务 | 管理任务状态、就绪节点、checkpoint 与收口检查。 |
+| [`project-doc-planner`](skills/project-doc-planner/SKILL.md) | 新项目或大型改造的文档规划 | 生成和维护项目级文档结构。 |
+| [`gpt-image-2-cli`](skills/gpt-image-2-cli/SKILL.md) | 需要生成或编辑图片素材 | 通过命令行调用图像生成能力。 |
 
-> 使用 `$agent-toolchain` 给我安装工具。
+例如，可以说：“使用 `$agent-toolchain` 给这个项目接入工具链”，或“使用 `$workflow-controller` 管理这个任务”。是否需要这些能力，应以任务范围为准。
 
-单文件或一次性任务通常不需要接入。
+## 进一步阅读
 
-`workflow-controller` 随 `agnets-workflow` 一起安装。它为复杂状态变更任务保存 DAG、并行 ready 节点、总审证据包和关闭校验，适合希望降低协调开销并保留总审闭环的项目。
+- [`agnets-workflow` 使用说明](plugins/agnets-workflow/README.md)
+- [`orchestrate-model-workflow` 工作流规范](plugins/agnets-workflow/skills/orchestrate-model-workflow/SKILL.md)
+- [agent role profiles](codex-global-config/agents/ai-vibecode-superpower/)
+- [macOS/Linux 安装脚本](install-codex.sh)
+- [Windows 安装脚本](install-codex.ps1)
 
-联系作者：QQ群 1105515344
+问题或建议：QQ群 `1105515344`
