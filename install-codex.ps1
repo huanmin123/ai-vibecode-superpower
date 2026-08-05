@@ -619,6 +619,7 @@ $managedAgentRoleContracts = @(
     [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_luna_high_executor.toml'; RoleName = 'avsp_luna_high_executor'; Model = 'gpt-5.6-luna'; ReasoningEffort = 'high'; SandboxMode = 'danger-full-access' }
     [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_luna_xhigh_executor.toml'; RoleName = 'avsp_luna_xhigh_executor'; Model = 'gpt-5.6-luna'; ReasoningEffort = 'xhigh'; SandboxMode = 'danger-full-access' }
     [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_sol_high.toml'; RoleName = 'avsp_sol_high'; Model = 'gpt-5.6-sol'; ReasoningEffort = 'high'; SandboxMode = 'read-only' }
+    [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_sol_max.toml'; RoleName = 'avsp_sol_max'; Model = 'gpt-5.6-sol'; ReasoningEffort = 'max'; SandboxMode = 'read-only' }
     [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_sol_xhigh.toml'; RoleName = 'avsp_sol_xhigh'; Model = 'gpt-5.6-sol'; ReasoningEffort = 'xhigh'; SandboxMode = 'read-only' }
     [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_terra_high.toml'; RoleName = 'avsp_terra_high'; Model = 'gpt-5.6-terra'; ReasoningEffort = 'high'; SandboxMode = 'danger-full-access' }
     [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_terra_xhigh.toml'; RoleName = 'avsp_terra_xhigh'; Model = 'gpt-5.6-terra'; ReasoningEffort = 'xhigh'; SandboxMode = 'read-only' }

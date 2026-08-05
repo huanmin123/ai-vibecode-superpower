@@ -1,10 +1,10 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
-import { dispatch } from './workflow_controller.mjs';
+import { dispatch, sameJson } from './workflow_controller.mjs';
 
 const STATE_FILE = 'deny_read_acl_state.json';
 const REPAIR_LOCK_WAIT_MS = 5_000;
@@ -12,17 +12,40 @@ const REPAIR_LOCK_RETRY_MS = 25;
 export const DEFAULT_SOL_REVIEW_TIMEOUT_SEC = 30 * 60;
 export const MAX_SOL_REVIEW_TIMEOUT_SEC = 2 * 60 * 60;
 export const BOUNDED_EXTERNAL_REVIEW_PROFILE = 'bounded-external';
+const EVIDENCE_MANIFEST = 'evidence-manifest.json';
 const BOUNDED_EXTERNAL_REVIEW_INSTRUCTIONS = [
   'Review profile: bounded-external.',
   'Use the caller-provided fixed evidence package as the primary source.',
+  `The package boundary is defined by ${EVIDENCE_MANIFEST}; inspect only files listed in its allowed_files array.`,
   'Inspect only the listed changed files and necessary adjacent call chains.',
   'Do not enumerate the entire workspace to search for scope drift.',
   'Do not inspect .git, .codex, node_modules, .venv, .yarn, or .yarn-cache*.',
   'If evidence is insufficient, stop and emit the required final JSON with verdict "unavailable" or "fail"; do not guess.',
 ].join('\n');
+const DIRECT_SOL_REVIEW_INSTRUCTIONS = [
+  'You are already the independent leaf Sol reviewer selected by the caller.',
+  'Directly perform this read-only review yourself.',
+  'Do not create, request, wait for, delegate to, or cite any agent or collaboration tool.',
+  'Do not return a progress acknowledgement; inspect the supplied task and produce the final review JSON in this invocation.',
+].join(' ');
 const TERMINATION_GRACE_MS = 15_000;
 const MAX_CAPTURE_BYTES = 256 * 1024;
 const WORKFLOW_RESULT_DIRECTORY = '.workflow-review-results';
+const REVIEW_VERDICTS = new Set(['pass', 'fail', 'unavailable']);
+const SOL_REVIEW_ROLE_EFFORTS = new Map([
+  ['avsp_sol_high', 'high'],
+  ['avsp_sol_xhigh', 'xhigh'],
+  ['avsp_sol_max', 'max'],
+]);
+const DEFAULT_SOL_REVIEW_ROLE = 'avsp_sol_high';
+const REVIEW_REQUIRED_FIELDS = ['auditor_task', 'auditor_role', 'claim_id', 'verdict', 'requirement_coverage', 'workflow_snapshot', 'workspace_fingerprint', 'scope_and_regression', 'verification_gaps', 'residual_risk'];
+const NATIVE_AGENT_EXIT_CONFIRMED = 'native_agent_exit_confirmed';
+const NATIVE_AGENT_START_FAILED = 'native_agent_start_failed';
+const MAX_EVIDENCE_FILES = 512;
+const MAX_EVIDENCE_FILE_BYTES = 64 * 1024 * 1024;
+const MAX_EVIDENCE_TOTAL_BYTES = 128 * 1024 * 1024;
+const MAX_EVIDENCE_PATH_DEPTH = 32;
+const MAX_EVIDENCE_DIRECTORIES = 512;
 
 export function resolveCodexHome(environment = process.env, platform = process.platform) {
   const configured = environment.CODEX_HOME?.trim();
@@ -123,6 +146,11 @@ function safeWorkflowToken(value, option) {
   return value;
 }
 
+function solReviewRole(value, option) {
+  if (!SOL_REVIEW_ROLE_EFFORTS.has(value)) throw new Error(`${option} must be avsp_sol_high, avsp_sol_xhigh, or avsp_sol_max`);
+  return value;
+}
+
 function parseInvocation(argv, environment = process.env, platform = process.platform) {
   const args = [...argv];
   // Windows PATH resolution can prefer the Desktop package's inaccessible codex.exe.
@@ -132,6 +160,7 @@ function parseInvocation(argv, environment = process.env, platform = process.pla
   let reviewProfile = null;
   let evidenceDirectory = null;
   let resultPath = null;
+  let reviewRole = null;
   const workflow = { state_dir: null, task_id: null, node_id: null, claim_id: null };
   let index = 0;
   while (index < args.length && args[index] !== '--' && args[index].startsWith('--')) {
@@ -154,6 +183,7 @@ function parseInvocation(argv, environment = process.env, platform = process.pla
       continue;
     }
     if (option === '--result') { resultPath = path.resolve(requiredOption(args, index, option)); index += 2; continue; }
+    if (option === '--review-role') { reviewRole = solReviewRole(requiredOption(args, index, option), option); index += 2; continue; }
     if (option === '--workflow-state-dir') { workflow.state_dir = path.resolve(requiredOption(args, index, option)); index += 2; continue; }
     if (option === '--workflow-task-id') { workflow.task_id = safeWorkflowIdentifier(requiredOption(args, index, option), option); index += 2; continue; }
     if (option === '--workflow-node-id') { workflow.node_id = safeWorkflowIdentifier(requiredOption(args, index, option), option); index += 2; continue; }
@@ -172,25 +202,187 @@ function parseInvocation(argv, environment = process.env, platform = process.pla
     if (!resultPath) resultPath = expectedResultPath;
     if (path.resolve(resultPath) !== path.resolve(expectedResultPath)) throw new Error(`--result must be exactly ${expectedResultPath} when workflow binding is used`);
   }
-  return { codexBin, timeoutSec, hardTimeoutSec, reviewProfile, evidenceDirectory, resultPath, workflow: workflowConfigured ? workflow : null, promptArgs: args.slice(index) };
+  return { codexBin, timeoutSec, hardTimeoutSec, reviewProfile, evidenceDirectory, resultPath, reviewRole: reviewRole ?? DEFAULT_SOL_REVIEW_ROLE, reviewRoleExplicit: reviewRole !== null, workflow: workflowConfigured ? workflow : null, promptArgs: args.slice(index) };
 }
 
-function reviewPrompt(promptArgs, reviewProfile) {
+function reviewOutputContract(workflow, reviewRole) {
+  const claim = workflow
+    ? `Set claim_id to exactly "${workflow.claim_id}".`
+    : 'Set claim_id to a non-empty value; use "unavailable-not-provided" for an independent review without a workflow claim.';
+  const role = `Set auditor_role to exactly "${reviewRole}".`;
+  return [
+    'Final response contract: return exactly one final JSON object, with no Markdown or prose after it.',
+    `auditor_task, auditor_role, and claim_id must be non-empty strings. requirement_coverage, workflow_snapshot, and workspace_fingerprint must be non-empty objects. scope_and_regression, verification_gaps, and residual_risk must be non-empty strings, arrays, or objects. verdict must be pass, fail, or unavailable. ${claim} ${role}`,
+  ].join(' ');
+}
+
+function reviewPrompt(promptArgs, reviewProfile, workflow, reviewRole) {
   const callerPrompt = promptArgs.join(' ');
-  if (reviewProfile === null) return callerPrompt;
-  return callerPrompt ? `${BOUNDED_EXTERNAL_REVIEW_INSTRUCTIONS}\n\n${callerPrompt}` : BOUNDED_EXTERNAL_REVIEW_INSTRUCTIONS;
+  const instructions = [DIRECT_SOL_REVIEW_INSTRUCTIONS, reviewOutputContract(workflow, reviewRole)];
+  if (reviewProfile !== null) instructions.push(BOUNDED_EXTERNAL_REVIEW_INSTRUCTIONS);
+  if (callerPrompt) instructions.push(callerPrompt);
+  // Windows cmd bridges do not preserve embedded newlines in an argument reliably.
+  return instructions.join(' ').replace(/\s+/g, ' ').trim();
 }
 
-async function resolveEvidenceDirectory(reviewProfile, evidenceDirectory) {
+async function resolveEvidenceDirectory(reviewProfile, evidenceDirectory, platform = process.platform) {
   if (reviewProfile !== BOUNDED_EXTERNAL_REVIEW_PROFILE) return null;
+  const absoluteDirectory = path.resolve(evidenceDirectory);
+  const sameManifestName = value => platform === 'win32' ? value.toLowerCase() === EVIDENCE_MANIFEST.toLowerCase() : value === EVIDENCE_MANIFEST;
+  const isWithin = (root, target) => {
+    const relative = path.relative(root, target);
+    return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
+  };
+  const samePath = (left, right) => platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right;
+  const identityOf = details => ({ dev: details.dev ?? null, ino: details.ino ?? null, size: details.size, mtimeMs: details.mtimeMs, ctimeMs: details.ctimeMs });
+  const sameIdentity = (left, right) => left.dev === right.dev && left.ino === right.ino && left.size === right.size && left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs;
+  const digestFile = async filePath => createHash('sha256').update(await fs.readFile(filePath)).digest('hex');
   try {
-    const details = await fs.stat(evidenceDirectory);
+    const details = await fs.lstat(absoluteDirectory);
+    if (details.isSymbolicLink()) throw new Error('--evidence-dir must not be a symlink or junction');
     if (!details.isDirectory()) throw new Error('--evidence-dir must name an existing directory');
+    const realDirectory = await fs.realpath(absoluteDirectory);
+    const directoryIdentity = identityOf(details);
+
+    const manifestPath = path.join(absoluteDirectory, EVIDENCE_MANIFEST);
+    const manifestDetails = await fs.lstat(manifestPath).catch(error => { if (error?.code === 'ENOENT') throw new Error(`--evidence-dir must contain ${EVIDENCE_MANIFEST}`); throw error; });
+    if (!manifestDetails.isFile() || manifestDetails.isSymbolicLink()) throw new Error(`${EVIDENCE_MANIFEST} must be a regular file inside the evidence directory`);
+    if (manifestDetails.size > MAX_EVIDENCE_FILE_BYTES) throw new Error(`${EVIDENCE_MANIFEST} exceeds the ${MAX_EVIDENCE_FILE_BYTES}-byte limit`);
+    const realManifest = await fs.realpath(manifestPath);
+    if (!isWithin(realDirectory, realManifest)) throw new Error(`${EVIDENCE_MANIFEST} escapes the evidence directory`);
+    let manifest;
+    let manifestContents;
+    try { manifestContents = await fs.readFile(manifestPath); manifest = JSON.parse(manifestContents.toString('utf8')); }
+    catch (error) {
+      if (error instanceof SyntaxError) throw new Error(`${EVIDENCE_MANIFEST} must contain valid JSON`);
+      throw error;
+    }
+    if (!manifest || manifest.version !== 1 || !Array.isArray(manifest.allowed_files)) {
+      throw new Error(`${EVIDENCE_MANIFEST} must contain version 1 and an allowed_files array`);
+    }
+    const manifestIdentity = identityOf(manifestDetails);
+    const manifestDetailsAfterRead = await fs.lstat(manifestPath);
+    const realManifestAfterRead = await fs.realpath(manifestPath);
+    if (!sameIdentity(identityOf(manifestDetailsAfterRead), manifestIdentity) || !samePath(realManifestAfterRead, realManifest)) throw new Error(`${EVIDENCE_MANIFEST} changed during validation`);
+    const manifestDigest = createHash('sha256').update(manifestContents).digest('hex');
+    const allowed = new Set();
+    const validatedEntries = new Map();
+    let totalBytes = manifestDetails.size;
+    for (const entry of manifest.allowed_files) {
+      if (allowed.size >= MAX_EVIDENCE_FILES - 1) throw new Error(`${EVIDENCE_MANIFEST} exceeds the ${MAX_EVIDENCE_FILES}-file limit including ${EVIDENCE_MANIFEST}`);
+      if (typeof entry !== 'string' || !entry.trim() || path.isAbsolute(entry)) throw new Error(`${EVIDENCE_MANIFEST} allowed_files entries must be relative paths`);
+      const resolved = path.resolve(absoluteDirectory, entry);
+      if (!isWithin(absoluteDirectory, resolved) || path.normalize(entry) === '.') throw new Error(`${EVIDENCE_MANIFEST} contains a path outside the evidence directory`);
+      const relative = path.relative(absoluteDirectory, resolved);
+      if (relative.split(path.sep).length > MAX_EVIDENCE_PATH_DEPTH) throw new Error(`${EVIDENCE_MANIFEST} contains a path deeper than ${MAX_EVIDENCE_PATH_DEPTH} levels`);
+      if (sameManifestName(relative)) throw new Error(`${EVIDENCE_MANIFEST} cannot list itself`);
+      if (allowed.has(relative)) throw new Error(`${EVIDENCE_MANIFEST} contains a duplicate file: ${entry}`);
+      allowed.add(relative);
+      const fileDetails = await fs.lstat(resolved).catch(error => { if (error?.code === 'ENOENT') throw new Error(`evidence file is missing: ${entry}`); throw error; });
+      if (!fileDetails.isFile() || fileDetails.isSymbolicLink()) throw new Error(`evidence file must be a regular file: ${entry}`);
+      const realFile = await fs.realpath(resolved);
+      if (!isWithin(realDirectory, realFile)) throw new Error(`evidence file escapes the package: ${entry}`);
+      if (fileDetails.size > MAX_EVIDENCE_FILE_BYTES) throw new Error(`evidence file exceeds the ${MAX_EVIDENCE_FILE_BYTES}-byte limit: ${entry}`);
+      totalBytes += fileDetails.size;
+      if (totalBytes > MAX_EVIDENCE_TOTAL_BYTES) throw new Error(`evidence package exceeds the ${MAX_EVIDENCE_TOTAL_BYTES}-byte limit`);
+      const identity = identityOf(fileDetails);
+      const digest = await digestFile(resolved);
+      const fileDetailsAfterRead = await fs.lstat(resolved);
+      const realFileAfterRead = await fs.realpath(resolved);
+      if (!sameIdentity(identityOf(fileDetailsAfterRead), identity) || !samePath(realFileAfterRead, realFile)) throw new Error(`evidence file changed during validation: ${entry}`);
+      validatedEntries.set(relative, { realPath: realFile, identity, digest });
+    }
+
+    const discovered = [];
+    const validatedDirectories = new Map();
+    let discoveredDirectoryCount = 0;
+    const visit = async directory => {
+      const handle = await fs.opendir(directory);
+      try {
+        for await (const entry of handle) {
+        const current = path.join(directory, entry.name);
+        const relative = path.relative(absoluteDirectory, current);
+        const details = await fs.lstat(current);
+        if (details.isSymbolicLink()) throw new Error(`evidence package cannot contain symlinks: ${relative}`);
+        const realCurrent = await fs.realpath(current);
+        if (!isWithin(realDirectory, realCurrent)) throw new Error(`evidence package path escapes the package: ${relative}`);
+        if (sameManifestName(path.basename(relative))) {
+          if (path.dirname(relative) === '.') continue;
+          throw new Error(`evidence package cannot contain a nested ${EVIDENCE_MANIFEST}: ${relative}`);
+        }
+        if (relative.split(path.sep).length > MAX_EVIDENCE_PATH_DEPTH) throw new Error(`evidence package path is deeper than ${MAX_EVIDENCE_PATH_DEPTH} levels: ${relative}`);
+        if (details.isDirectory()) {
+          discoveredDirectoryCount += 1;
+          if (discoveredDirectoryCount > MAX_EVIDENCE_DIRECTORIES) throw new Error(`evidence package exceeds the ${MAX_EVIDENCE_DIRECTORIES}-directory limit excluding the evidence root`);
+          validatedDirectories.set(relative, { realPath: realCurrent, identity: identityOf(details) });
+          await visit(current);
+        }
+        else if (details.isFile()) {
+          discovered.push(relative);
+          if (discovered.length > MAX_EVIDENCE_FILES - 1) throw new Error(`evidence package exceeds the ${MAX_EVIDENCE_FILES}-file limit including ${EVIDENCE_MANIFEST}`);
+        }
+        else throw new Error(`evidence package contains an unsupported entry: ${relative}`);
+      }
+      } finally {
+        await handle.close().catch(error => { if (error?.code !== 'ERR_DIR_CLOSED') throw error; });
+      }
+    };
+    await visit(absoluteDirectory);
+    const unexpected = discovered.filter(entry => !allowed.has(entry));
+    if (unexpected.length) throw new Error(`evidence package contains file not listed in ${EVIDENCE_MANIFEST}: ${unexpected[0]}`);
+
+    // Review a private snapshot so changes to the caller's package cannot alter the process after validation.
+    const snapshotDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'agnets-sol-evidence-'));
+    const sourceEntries = [EVIDENCE_MANIFEST, ...allowed];
+    const signatures = new Map([[EVIDENCE_MANIFEST, { realPath: realManifest, identity: manifestIdentity, digest: manifestDigest }], ...validatedEntries]);
+    try {
+      const verifyDirectories = async () => {
+        for (const [relative, expected] of validatedDirectories) {
+          const current = path.join(absoluteDirectory, relative);
+          const currentDetails = await fs.lstat(current);
+          if (!currentDetails.isDirectory() || currentDetails.isSymbolicLink()) throw new Error(`evidence package changed during snapshot: ${relative}`);
+          const currentRealPath = await fs.realpath(current);
+          if (!samePath(currentRealPath, expected.realPath) || !sameIdentity(identityOf(currentDetails), expected.identity)) throw new Error(`evidence package changed during snapshot: ${relative}`);
+        }
+      };
+      const currentRoot = await fs.lstat(absoluteDirectory);
+      const currentRealDirectory = await fs.realpath(absoluteDirectory);
+      if (!sameIdentity(identityOf(currentRoot), directoryIdentity) || !samePath(currentRealDirectory, realDirectory)) throw new Error('evidence directory changed during snapshot');
+      await verifyDirectories();
+      for (const relative of sourceEntries) {
+        const source = path.join(absoluteDirectory, relative);
+        const sourceDetails = await fs.lstat(source);
+        if (!sourceDetails.isFile() || sourceDetails.isSymbolicLink()) throw new Error(`evidence package changed during snapshot: ${relative}`);
+        const sourceRealPath = await fs.realpath(source);
+        const expected = signatures.get(relative);
+        if (!samePath(sourceRealPath, expected.realPath) || !sameIdentity(identityOf(sourceDetails), expected.identity)) throw new Error(`evidence package changed during snapshot: ${relative}`);
+        const destination = path.join(snapshotDirectory, relative);
+        await fs.mkdir(path.dirname(destination), { recursive: true });
+        await fs.copyFile(source, destination);
+        if (await digestFile(destination) !== expected.digest) throw new Error(`evidence package changed during snapshot: ${relative}`);
+      }
+      for (const relative of sourceEntries) {
+        const source = path.join(absoluteDirectory, relative);
+        const sourceDetails = await fs.lstat(source);
+        const sourceRealPath = await fs.realpath(source);
+        const sourceDigest = await digestFile(source);
+        const before = signatures.get(relative);
+        const currentRootAfterCopy = await fs.lstat(absoluteDirectory);
+        const currentRealDirectoryAfterCopy = await fs.realpath(absoluteDirectory);
+        if (!sameIdentity(identityOf(currentRootAfterCopy), directoryIdentity) || !samePath(currentRealDirectoryAfterCopy, realDirectory) || sourceDetails.isSymbolicLink() || !samePath(sourceRealPath, before.realPath) || !sameIdentity(identityOf(sourceDetails), before.identity) || sourceDigest !== before.digest) {
+          throw new Error(`evidence package changed during snapshot: ${relative}`);
+        }
+      }
+      await verifyDirectories();
+      return { source: absoluteDirectory, workspace: snapshotDirectory, cleanup: () => fs.rm(snapshotDirectory, { recursive: true, force: true }) };
+    } catch (error) {
+      await fs.rm(snapshotDirectory, { recursive: true, force: true });
+      throw error;
+    }
   } catch (error) {
     if (error?.code === 'ENOENT') throw new Error('--evidence-dir must name an existing directory');
     throw error;
   }
-  return evidenceDirectory;
 }
 
 async function writeAtomically(filePath, value) {
@@ -242,6 +434,114 @@ function captureStream(stream, destination) {
   return capture;
 }
 
+function isTopLevelObject(text, end) {
+  let objectDepth = 0; let arrayDepth = 0; let inString = false; let escaped = false;
+  for (let index = 0; index < end; index++) {
+    const character = text[index];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (character === '\\') escaped = true;
+      else if (character === '"') inString = false;
+      continue;
+    }
+    if (character === '"') { inString = true; continue; }
+    if (character === '{') objectDepth += 1;
+    else if (character === '}') objectDepth -= 1;
+    else if (character === '[') arrayDepth += 1;
+    else if (character === ']') arrayDepth -= 1;
+    if (objectDepth < 0 || arrayDepth < 0) return false;
+  }
+  return objectDepth === 0 && arrayDepth === 0 && !inString && !escaped;
+}
+
+function extractJsonObjects(text) {
+  const values = [];
+  for (let start = text.lastIndexOf('{'); start >= 0; start = start === 0 ? -1 : text.lastIndexOf('{', start - 1)) {
+    let depth = 0; let inString = false; let escaped = false;
+    for (let index = start; index < text.length; index++) {
+      const character = text[index];
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (character === '\\') escaped = true;
+        else if (character === '"') inString = false;
+        continue;
+      }
+      if (character === '"') { inString = true; continue; }
+      if (character === '{') depth += 1;
+      else if (character === '}' && --depth === 0) {
+        try {
+          const value = JSON.parse(text.slice(start, index + 1));
+          if (value && typeof value === 'object' && !Array.isArray(value) && isTopLevelObject(text, start)) values.push({ value, start, end: index });
+        } catch { /* Keep looking for the last complete JSON object. */ }
+        break;
+      }
+    }
+  }
+  return values;
+}
+
+function nonEmptyString(value) {
+  return typeof value === 'string' && Boolean(value.trim());
+}
+
+function nonEmptyObject(value) {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length > 0;
+}
+
+function nonEmptyReviewValue(value) {
+  if (typeof value === 'string') return Boolean(value.trim());
+  if (Array.isArray(value)) return value.length > 0;
+  return Boolean(value) && typeof value === 'object' && Object.keys(value).length > 0;
+}
+
+async function readWorkflowReviewContract(workflow) {
+  if (!workflow) return null;
+  try {
+    const [context] = await dispatch('audit-context', { state_dir: workflow.state_dir, task_id: workflow.task_id });
+    const node = context.nodes.find(candidate => candidate.id === workflow.node_id);
+    if (!node || node.kind !== 'total_review' || node.status !== 'running' || node.claim_id !== workflow.claim_id) {
+      return { error: 'workflow total-review claim is no longer active' };
+    }
+    return {
+      auditor_task: node.agent_task_path,
+      auditor_role: node.agent_role,
+      claim_id: node.claim_id,
+      requirement_ids: context.requirements.map(requirement => requirement.id),
+      workflow_snapshot: context.workflow_snapshot,
+      workspace_fingerprint: context.workspace_fingerprint,
+    };
+  } catch (error) {
+    return { error: `workflow audit context is unavailable: ${error.message}` };
+  }
+}
+
+function validateReviewOutput(stdout, workflowContract) {
+  if (stdout.truncated || stdout.drain_timed_out) return { valid: false, reason: 'review output capture is incomplete' };
+  const text = Buffer.concat(stdout.chunks).toString('utf8');
+  const values = extractJsonObjects(text);
+  if (!values.length) return { valid: false, reason: 'review output did not contain a JSON object' };
+  const terminal = values.filter(candidate => !text.slice(candidate.end + 1).trim());
+  if (!terminal.length) return { valid: false, reason: 'review output must end with a final JSON object' };
+  const candidate = terminal.find(item => REVIEW_REQUIRED_FIELDS.every(field => Object.prototype.hasOwnProperty.call(item.value, field))) ?? terminal.at(-1);
+  const value = candidate.value;
+  const missing = REVIEW_REQUIRED_FIELDS.filter(field => !Object.prototype.hasOwnProperty.call(value, field));
+  if (missing.length) return { valid: false, reason: `review output is missing required fields: ${missing.join(', ')}` };
+  if (!REVIEW_VERDICTS.has(value.verdict)) return { valid: false, reason: 'review output verdict must be pass, fail, or unavailable' };
+  if (!nonEmptyString(value.auditor_task) || !nonEmptyString(value.auditor_role) || !nonEmptyString(value.claim_id)) return { valid: false, reason: 'review output auditor_task, auditor_role, and claim_id must be non-empty strings' };
+  if (!nonEmptyObject(value.requirement_coverage) || !nonEmptyObject(value.workflow_snapshot) || !nonEmptyObject(value.workspace_fingerprint)) return { valid: false, reason: 'review output requirement_coverage, workflow_snapshot, and workspace_fingerprint must be non-empty objects' };
+  if (Object.values(value.requirement_coverage).some(item => !nonEmptyReviewValue(item))) return { valid: false, reason: 'review output requirement_coverage values must be non-empty strings, arrays, or objects' };
+  if (!nonEmptyReviewValue(value.scope_and_regression) || !nonEmptyReviewValue(value.verification_gaps) || !nonEmptyReviewValue(value.residual_risk)) return { valid: false, reason: 'review output scope_and_regression, verification_gaps, and residual_risk must be non-empty strings, arrays, or objects' };
+  if (workflowContract?.error) return { valid: false, reason: workflowContract.error };
+  if (workflowContract) {
+    if (value.auditor_task !== workflowContract.auditor_task || value.auditor_role !== workflowContract.auditor_role || value.claim_id !== workflowContract.claim_id) return { valid: false, reason: 'review output auditor identity or claim_id does not match the active workflow review' };
+    const expectedIds = new Set(workflowContract.requirement_ids);
+    if (Object.keys(value.requirement_coverage).length !== expectedIds.size || [...expectedIds].some(id => !Object.prototype.hasOwnProperty.call(value.requirement_coverage, id) || !nonEmptyReviewValue(value.requirement_coverage[id]))) return { valid: false, reason: 'review output does not cover every workflow requirement' };
+    if (!sameJson(value.workflow_snapshot, workflowContract.workflow_snapshot)) return { valid: false, reason: 'review output workflow_snapshot does not match the current workflow' };
+    if (!sameJson(value.workspace_fingerprint, workflowContract.workspace_fingerprint)) return { valid: false, reason: 'review output workspace_fingerprint does not match the current workspace' };
+  }
+  return { valid: true, verdict: value.verdict };
+}
+
 function waitForCaptureDrain(capture, milliseconds = 250) {
   return new Promise(resolve => {
     const timer = setTimeout(() => { capture.drain_timed_out = true; resolve(false); }, milliseconds);
@@ -249,10 +549,56 @@ function waitForCaptureDrain(capture, milliseconds = 250) {
   });
 }
 
+function startWindowsPromptWrite(stream, prompt) {
+  if (!stream || typeof stream.end !== 'function') return null;
+  let error = null;
+  let settle;
+  let settled = false;
+  let graceTimer;
+  const done = new Promise(resolve => { settle = resolve; });
+  const cleanup = () => {
+    clearTimeout(graceTimer);
+    clearTimeout(maxTimer);
+    stream.removeListener?.('error', onError);
+    stream.removeListener?.('finish', onTerminal);
+    stream.removeListener?.('close', onTerminal);
+  };
+  const finish = () => {
+    if (settled) return;
+    settled = true;
+    cleanup();
+    settle();
+  };
+  const onError = value => { error = value; finish(); };
+  const onTerminal = () => {
+    clearTimeout(graceTimer);
+    graceTimer = setTimeout(finish, 250);
+  };
+  const maxTimer = setTimeout(finish, 1500);
+  stream.once?.('error', onError);
+  stream.once?.('finish', onTerminal);
+  stream.once?.('close', onTerminal);
+  try { stream.end(prompt ? `${prompt}\n` : ''); }
+  catch (caught) { onError(caught); }
+  return { wait: () => done, get error() { return error; } };
+}
+
 function waitForExit(child) {
   return new Promise(resolve => {
-    child.once('error', error => resolve({ code: null, signal: null, spawn_error: error.message }));
-    child.once('exit', (code, signal) => resolve({ code, signal }));
+    let spawned = false;
+    let settled = false;
+    let spawnError = null;
+    const finish = result => {
+      if (settled) return;
+      settled = true;
+      resolve({ spawn_started: spawned || result.code !== null || result.signal !== null, ...result });
+    };
+    child.once('spawn', () => { spawned = true; });
+    child.once('error', error => {
+      spawnError = error.message;
+      if (!spawned) finish({ code: null, signal: null, spawn_error: spawnError });
+    });
+    child.once('exit', (code, signal) => finish({ code, signal, spawn_error: spawnError }));
   });
 }
 
@@ -345,8 +691,14 @@ async function persistOutcome(resultPath, outcome, stdout, stderr) {
   return { result, paths };
 }
 
+async function persistWorkflowCompletion(stored, workflowCompletion) {
+  if (!stored || workflowCompletion?.completed !== true) return;
+  stored.result.workflow_completion = workflowCompletion;
+  await writeAtomically(stored.paths.result, `${JSON.stringify(stored.result, null, 2)}\n`);
+}
+
 async function completeUnavailableWorkflowReview(workflow, resultPath, outcome) {
-  if (!workflow || (!outcome.timed_out && outcome.exit_code === 0 && !outcome.signal)) return null;
+  if (!workflow || (!outcome.timed_out && outcome.exit_code === 0 && !outcome.signal && !outcome.spawn_error && outcome.review_verdict?.valid === true)) return null;
   if (outcome.timed_out && !outcome.termination?.confirmed) return { completed: false, reason: 'timed_out_process_exit_not_confirmed' };
   try {
     const [completion] = await dispatch('complete', {
@@ -356,50 +708,125 @@ async function completeUnavailableWorkflowReview(workflow, resultPath, outcome) 
       claim_id: workflow.claim_id,
       status: 'unavailable',
       result: resultPath,
+       completion_attestation: outcome.spawn_started === false ? NATIVE_AGENT_START_FAILED : NATIVE_AGENT_EXIT_CONFIRMED,
     });
-    return { completed: true, completion };
+    const workflowCompletion = completion?.workflow_outcome_completion;
+    if (!workflowCompletion?.completed) return { completed: false, reason: 'workflow completion did not return a finalized outcome' };
+    return workflowCompletion;
   } catch (error) {
     return { completed: false, reason: `workflow completion failed: ${error.message}` };
   }
 }
 
 export async function runSolReview(argv = process.argv.slice(2), environment = process.env, platform = process.platform, spawnProcess = spawn, terminateProcess = terminateSolReviewProcess) {
-  const { codexBin, timeoutSec, hardTimeoutSec, reviewProfile, evidenceDirectory, resultPath, workflow, promptArgs } = parseInvocation(argv, environment, platform);
+  const { codexBin, timeoutSec, hardTimeoutSec, reviewProfile, evidenceDirectory, resultPath, reviewRole: requestedReviewRole, reviewRoleExplicit, workflow, promptArgs } = parseInvocation(argv, environment, platform);
   const startedAt = new Date().toISOString(); const started = Date.now();
   const softDeadline = started + timeoutSec * 1000;
   const hardDeadline = hardTimeoutSec === null ? null : started + hardTimeoutSec * 1000;
   const codexHome = resolveCodexHome(environment, platform);
   const repair = await repairInvalidDenyReadAclState(codexHome, platform);
   const childEnvironment = { ...environment, CODEX_HOME: codexHome };
-  const prompt = reviewPrompt(promptArgs, reviewProfile);
-  const reviewWorkspace = await resolveEvidenceDirectory(reviewProfile, evidenceDirectory);
-  const childArgs = ['exec', '--model', 'gpt-5.6-sol', '--sandbox', 'read-only'];
+  const initialWorkflowContract = workflow ? await readWorkflowReviewContract(workflow) : null;
+  const workflowPreflightError = initialWorkflowContract?.error
+    ? initialWorkflowContract.error
+    : initialWorkflowContract && !SOL_REVIEW_ROLE_EFFORTS.has(initialWorkflowContract.auditor_role)
+      ? `workflow total-review role cannot be run by sol_review_cli: ${initialWorkflowContract.auditor_role}`
+      : null;
+  if (workflowPreflightError) {
+    if (!workflow || !resultPath) throw new Error(workflowPreflightError);
+    const outcome = {
+      codex_home: codexHome, codex_bin: codexBin, child_pid: null, timeout_sec: timeoutSec, hard_timeout_sec: hardTimeoutSec,
+      timeout_scope: hardTimeoutSec === null ? 'soft_deadline_to_child_exit' : 'soft_deadline_with_explicit_hard_cap', review_profile: reviewProfile,
+      review_role: requestedReviewRole, evidence_directory: evidenceDirectory, review_workspace: null, started_at: startedAt, finished_at: new Date().toISOString(), duration_ms: Date.now() - started,
+      exit_code: 1, child_exit_code: null, spawn_error: workflowPreflightError, spawn_started: false, signal: null, timed_out: false, deadline_reached: false, hard_timeout_reached: false,
+      termination: null, review_verdict: { valid: false, reason: workflowPreflightError }, repair, workflow,
+      workflow_completion: { state: 'pending' },
+    };
+    const emptyCapture = { chunks: [], bytes: 0, truncated: false, drain_timed_out: false };
+    const stored = await persistOutcome(resultPath, outcome, emptyCapture, emptyCapture);
+    const workflowCompletion = await completeUnavailableWorkflowReview(workflow, stored.paths.result, outcome);
+    await persistWorkflowCompletion(stored, workflowCompletion);
+    return { ...outcome, result_path: stored.paths.result, workflow_completion: workflowCompletion?.completed === true ? workflowCompletion : outcome.workflow_completion, workflow_completion_error: workflowCompletion?.completed === false ? workflowCompletion.reason : null };
+  }
+  if (reviewRoleExplicit && initialWorkflowContract && !initialWorkflowContract.error && requestedReviewRole !== initialWorkflowContract.auditor_role) {
+    throw new Error(`--review-role must match the active workflow total-review role: ${initialWorkflowContract.auditor_role}`);
+  }
+  const reviewRole = initialWorkflowContract && !initialWorkflowContract.error ? initialWorkflowContract.auditor_role : requestedReviewRole;
+  const reasoningEffort = SOL_REVIEW_ROLE_EFFORTS.get(reviewRole);
+  const prompt = reviewPrompt(promptArgs, reviewProfile, workflow, reviewRole);
+  let evidencePackage;
+  try { evidencePackage = await resolveEvidenceDirectory(reviewProfile, evidenceDirectory, platform); }
+  catch (error) {
+    if (!workflow || !resultPath) throw error;
+    const reason = `evidence validation failed: ${error.message}`;
+    const outcome = {
+      codex_home: codexHome, codex_bin: codexBin, child_pid: null, timeout_sec: timeoutSec, hard_timeout_sec: hardTimeoutSec,
+      timeout_scope: hardTimeoutSec === null ? 'soft_deadline_to_child_exit' : 'soft_deadline_with_explicit_hard_cap', review_profile: reviewProfile,
+      evidence_directory: evidenceDirectory, review_workspace: null, started_at: startedAt, finished_at: new Date().toISOString(), duration_ms: Date.now() - started,
+       exit_code: 1, child_exit_code: null, spawn_error: reason, spawn_started: false, signal: null, timed_out: false, deadline_reached: false, hard_timeout_reached: false,
+       termination: null, review_verdict: { valid: false, reason }, repair, workflow,
+       workflow_completion: workflow ? { state: 'pending' } : null,
+    };
+    const emptyCapture = { chunks: [], bytes: 0, truncated: false, drain_timed_out: false };
+    const stored = await persistOutcome(resultPath, outcome, emptyCapture, emptyCapture);
+    const workflowCompletion = await completeUnavailableWorkflowReview(workflow, stored.paths.result, outcome);
+    await persistWorkflowCompletion(stored, workflowCompletion);
+    return { ...outcome, result_path: stored.paths.result, workflow_completion: workflowCompletion?.completed === true ? workflowCompletion : outcome.workflow_completion, workflow_completion_error: workflowCompletion?.completed === false ? workflowCompletion.reason : null };
+  }
+  const reviewWorkspace = evidencePackage?.workspace ?? null;
+  const childArgs = ['exec', '--ephemeral', '--model', 'gpt-5.6-sol', '--config', `model_reasoning_effort="${reasoningEffort}"`, '--sandbox', 'read-only'];
   if (reviewWorkspace) childArgs.push('-C', reviewWorkspace, '--skip-git-repo-check');
-  if (prompt) childArgs.push('--', prompt);
   const usesWindowsCommandScript = platform === 'win32' && /\.(?:cmd|bat)$/i.test(codexBin);
+  if (!usesWindowsCommandScript && prompt) childArgs.push('--', prompt);
   let spawnCommand = codexBin;
   let spawnedArgs = childArgs;
   let spawnOptions = { env: childEnvironment, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, shell: false, detached: platform !== 'win32', ...(reviewWorkspace ? { cwd: reviewWorkspace } : {}) };
   if (usesWindowsCommandScript) {
-    // Keep untrusted prompt text in an environment value; it must never become PowerShell/cmd source.
+    // Keep the prompt out of the .cmd argument vector; cmd expands percent sequences in %*.
     childEnvironment.CODEX_REVIEW_BIN = codexBin;
-    childEnvironment.CODEX_REVIEW_PROMPT = prompt;
+    childEnvironment.CODEX_REVIEW_REASONING_EFFORT = reasoningEffort;
     if (reviewWorkspace) childEnvironment.CODEX_REVIEW_WORKSPACE = reviewWorkspace;
     spawnCommand = 'powershell.exe';
-    spawnedArgs = ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', "$prompt = [Environment]::GetEnvironmentVariable('CODEX_REVIEW_PROMPT'); $workspace = [Environment]::GetEnvironmentVariable('CODEX_REVIEW_WORKSPACE'); $arguments = @('exec','--model','gpt-5.6-sol','--sandbox','read-only'); if ($workspace) { $arguments += @('-C', $workspace, '--skip-git-repo-check') }; if ($prompt) { $arguments += '--'; $arguments += $prompt }; & $env:CODEX_REVIEW_BIN @arguments; exit $LASTEXITCODE"];
-    spawnOptions = { ...spawnOptions, detached: false };
+    spawnedArgs = ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', "$workspace = [Environment]::GetEnvironmentVariable('CODEX_REVIEW_WORKSPACE'); $effort = [Environment]::GetEnvironmentVariable('CODEX_REVIEW_REASONING_EFFORT'); $arguments = @('exec','--ephemeral','--model','gpt-5.6-sol','--config', ('model_reasoning_effort=\"' + $effort + '\"'),'--sandbox','read-only'); if ($workspace) { $arguments += @('-C', $workspace, '--skip-git-repo-check') }; & $env:CODEX_REVIEW_BIN @arguments; exit $LASTEXITCODE"];
+    spawnOptions = { ...spawnOptions, stdio: ['pipe', 'pipe', 'pipe'], detached: false };
   }
-  let child = null;
-  let childOutcome;
-  let stdout = captureStream(null, process.stdout);
-  let stderr = captureStream(null, process.stderr);
-  child = spawnProcess(spawnCommand, spawnedArgs, spawnOptions);
-  stdout = captureStream(child.stdout, process.stdout);
-  stderr = captureStream(child.stderr, process.stderr);
-  childOutcome = await waitForReviewOutcome(child, Math.max(0, softDeadline - Date.now()), hardDeadline === null ? null : Math.max(0, hardDeadline - Date.now()), platform, terminateProcess, spawnProcess);
-  await Promise.all([waitForCaptureDrain(stdout), waitForCaptureDrain(stderr)]);
-  const exitCode = childOutcome.timed_out ? 124 : childOutcome.signal ? 1 : childOutcome.code ?? 1;
-  const outcome = {
+  try {
+    let child = null;
+    let childOutcome;
+    let stdout = captureStream(null, process.stdout);
+    let stderr = captureStream(null, process.stderr);
+    try { child = spawnProcess(spawnCommand, spawnedArgs, spawnOptions); }
+    catch (error) {
+      const reason = `Sol review process could not start: ${error.message}`;
+      const outcome = {
+        codex_home: codexHome, codex_bin: codexBin, child_pid: null, timeout_sec: timeoutSec, hard_timeout_sec: hardTimeoutSec,
+        timeout_scope: hardTimeoutSec === null ? 'soft_deadline_to_child_exit' : 'soft_deadline_with_explicit_hard_cap', review_profile: reviewProfile,
+        evidence_directory: evidencePackage?.source ?? null, review_workspace: reviewWorkspace, started_at: startedAt, finished_at: new Date().toISOString(), duration_ms: Date.now() - started,
+        exit_code: 1, child_exit_code: null, spawn_error: reason, spawn_started: false, signal: null, timed_out: false, deadline_reached: false, hard_timeout_reached: false,
+        termination: null, review_verdict: { valid: false, reason }, repair, workflow, workflow_completion: workflow ? { state: 'pending' } : null,
+      };
+      const emptyCapture = { chunks: [], bytes: 0, truncated: false, drain_timed_out: false };
+      const stored = resultPath ? await persistOutcome(resultPath, outcome, emptyCapture, emptyCapture) : null;
+      const workflowCompletion = stored ? await completeUnavailableWorkflowReview(workflow, stored.paths.result, outcome) : null;
+      await persistWorkflowCompletion(stored, workflowCompletion);
+      return { ...outcome, result_path: stored?.paths.result ?? null, workflow_completion: workflowCompletion?.completed === true ? workflowCompletion : outcome.workflow_completion, workflow_completion_error: workflowCompletion?.completed === false ? workflowCompletion.reason : null };
+    }
+    const stdinWrite = usesWindowsCommandScript ? startWindowsPromptWrite(child.stdin, prompt) : null;
+    stdout = captureStream(child.stdout, process.stdout);
+    stderr = captureStream(child.stderr, process.stderr);
+    childOutcome = await waitForReviewOutcome(child, Math.max(0, softDeadline - Date.now()), hardDeadline === null ? null : Math.max(0, hardDeadline - Date.now()), platform, terminateProcess, spawnProcess);
+    await Promise.all([waitForCaptureDrain(stdout), waitForCaptureDrain(stderr)]);
+    await stdinWrite?.wait();
+    const stdinError = stdinWrite?.error ?? null;
+    const childExitCode = stdinError ? 1 : childOutcome.timed_out ? 124 : childOutcome.signal ? 1 : childOutcome.code ?? 1;
+    const workflowContract = !childOutcome.timed_out && childExitCode === 0 && !childOutcome.signal && !childOutcome.spawn_error
+      ? await readWorkflowReviewContract(workflow)
+      : null;
+    const reviewVerdict = !childOutcome.timed_out && childExitCode === 0 && !childOutcome.signal && !childOutcome.spawn_error
+      ? validateReviewOutput(stdout, workflowContract)
+      : null;
+    const exitCode = reviewVerdict && !reviewVerdict.valid ? 1 : childExitCode;
+    const outcome = {
     codex_home: codexHome,
     codex_bin: codexBin,
     child_pid: Number.isSafeInteger(child?.pid) ? child.pid : null,
@@ -407,25 +834,34 @@ export async function runSolReview(argv = process.argv.slice(2), environment = p
     hard_timeout_sec: hardTimeoutSec,
     timeout_scope: hardTimeoutSec === null ? 'soft_deadline_to_child_exit' : 'soft_deadline_with_explicit_hard_cap',
     review_profile: reviewProfile,
-    evidence_directory: reviewWorkspace,
+    evidence_directory: evidencePackage?.source ?? null,
+    review_workspace: reviewWorkspace,
     started_at: startedAt,
     finished_at: new Date().toISOString(),
     duration_ms: Date.now() - started,
     exit_code: exitCode,
     child_exit_code: childOutcome.code,
     spawn_error: childOutcome.spawn_error ?? null,
+    stdin_error: stdinError ? `Sol review prompt stdin failed: ${stdinError.message || stdinError}` : null,
     signal: childOutcome.signal,
     timed_out: childOutcome.timed_out,
     deadline_reached: childOutcome.deadline_reached,
     hard_timeout_reached: childOutcome.hard_timeout_reached,
     termination: childOutcome.termination,
+    review_verdict: reviewVerdict,
     repair,
     workflow,
-  };
-  let stored = null;
-  if (resultPath) stored = await persistOutcome(resultPath, outcome, stdout, stderr);
-  const workflowCompletion = stored ? await completeUnavailableWorkflowReview(workflow, stored.paths.result, outcome) : null;
-  return { ...outcome, result_path: stored?.paths.result ?? null, workflow_completion: workflowCompletion };
+    spawn_started: childOutcome.spawn_started === true,
+    workflow_completion: workflow ? { state: 'pending' } : null,
+    };
+    let stored = null;
+    if (resultPath) stored = await persistOutcome(resultPath, outcome, stdout, stderr);
+    const workflowCompletion = stored ? await completeUnavailableWorkflowReview(workflow, stored.paths.result, outcome) : null;
+    await persistWorkflowCompletion(stored, workflowCompletion);
+    return { ...outcome, result_path: stored?.paths.result ?? null, workflow_completion: workflowCompletion?.completed === true ? workflowCompletion : outcome.workflow_completion, workflow_completion_error: workflowCompletion?.completed === false ? workflowCompletion.reason : null };
+  } finally {
+    await evidencePackage?.cleanup?.();
+  }
 }
 
 export async function main() {

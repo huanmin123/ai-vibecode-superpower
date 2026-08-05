@@ -16,7 +16,7 @@ source_plugin_skills=$source_plugin/skills
 source_standalone_skills=$script_dir/skills
 managed_plugin_skill_names='agent-toolchain orchestrate-model-workflow workflow-controller'
 managed_standalone_skill_names='gpt-image-2-cli project-doc-planner'
-managed_agent_role_files='ai-vibecode-superpower-avsp_luna_high.toml ai-vibecode-superpower-avsp_luna_xhigh.toml ai-vibecode-superpower-avsp_luna_high_writer.toml ai-vibecode-superpower-avsp_luna_xhigh_writer.toml ai-vibecode-superpower-avsp_luna_high_executor.toml ai-vibecode-superpower-avsp_luna_xhigh_executor.toml ai-vibecode-superpower-avsp_sol_high.toml ai-vibecode-superpower-avsp_sol_xhigh.toml ai-vibecode-superpower-avsp_terra_high.toml ai-vibecode-superpower-avsp_terra_xhigh.toml ai-vibecode-superpower-avsp_terra_xhigh_readonly.toml ai-vibecode-superpower-avsp_terra_low_readonly.toml ai-vibecode-superpower-avsp_terra_medium_readonly.toml'
+managed_agent_role_files='ai-vibecode-superpower-avsp_luna_high.toml ai-vibecode-superpower-avsp_luna_xhigh.toml ai-vibecode-superpower-avsp_luna_high_writer.toml ai-vibecode-superpower-avsp_luna_xhigh_writer.toml ai-vibecode-superpower-avsp_luna_high_executor.toml ai-vibecode-superpower-avsp_luna_xhigh_executor.toml ai-vibecode-superpower-avsp_sol_high.toml ai-vibecode-superpower-avsp_sol_max.toml ai-vibecode-superpower-avsp_sol_xhigh.toml ai-vibecode-superpower-avsp_terra_high.toml ai-vibecode-superpower-avsp_terra_xhigh.toml ai-vibecode-superpower-avsp_terra_xhigh_readonly.toml ai-vibecode-superpower-avsp_terra_low_readonly.toml ai-vibecode-superpower-avsp_terra_medium_readonly.toml'
 
 for source_path in "$source_agents" "$source_config" "$source_agent_role_manifest" "$source_marketplace"; do
     if [ ! -f "$source_path" ]; then
@@ -172,6 +172,7 @@ is_managed_agent_role_file() {
         ai-vibecode-superpower-avsp_luna_high_executor.toml|\
         ai-vibecode-superpower-avsp_luna_xhigh_executor.toml|\
         ai-vibecode-superpower-avsp_sol_high.toml|\
+        ai-vibecode-superpower-avsp_sol_max.toml|\
         ai-vibecode-superpower-avsp_sol_xhigh.toml|\
         ai-vibecode-superpower-avsp_terra_high.toml|\
         ai-vibecode-superpower-avsp_terra_xhigh.toml|\
@@ -319,6 +320,12 @@ assert_managed_agent_role_contract() {
             expected_name=avsp_sol_high
             expected_model=gpt-5.6-sol
             expected_effort=high
+            expected_sandbox=read-only
+            ;;
+        ai-vibecode-superpower-avsp_sol_max.toml)
+            expected_name=avsp_sol_max
+            expected_model=gpt-5.6-sol
+            expected_effort=max
             expected_sandbox=read-only
             ;;
         ai-vibecode-superpower-avsp_sol_xhigh.toml)

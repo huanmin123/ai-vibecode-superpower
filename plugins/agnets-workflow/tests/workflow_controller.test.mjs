@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { execFile as execFileCallback } from 'node:child_process';
 import { promisify } from 'node:util';
 import { mkdtemp, readFile as readDiskFile, rm, writeFile as writeDiskFile, mkdir, rename, utimes } from 'node:fs/promises';
+import { promises as fsPromises } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -15,6 +16,16 @@ const controllerCli = fileURLToPath(new URL('../scripts/workflow_controller.mjs'
 
 const readFile = readDiskFile;
 const writeFile = writeDiskFile;
+
+async function callForFixture(fixture, command, parameters) {
+  const lifecycle = command === 'complete' && parameters.completion_attestation === undefined
+    ? { completion_attestation: 'native_agent_finished' }
+    : {};
+  if (command === 'complete') {
+    await dispatch('heartbeat', { state_dir: fixture.stateDir, task_id: parameters.task_id, node_id: parameters.node_id, claim_id: parameters.claim_id });
+  }
+  return dispatch(command, { state_dir: fixture.stateDir, ...parameters, ...lifecycle });
+}
 
 async function readControllerState(stateDir, taskId = 'feature-1') {
   const state = await readTaskState(path.join(stateDir, `${taskId}.sqlite`));
@@ -38,7 +49,7 @@ async function setup() {
 test('DAG, total review, and workspace fingerprint gate', async () => {
   const fixture = await setup();
   try {
-    const call = (command, parameters) => dispatch(command, { state_dir: fixture.stateDir, ...parameters });
+    const call = (command, parameters) => callForFixture(fixture, command, parameters);
     const [initialized] = await call('init', { manifest: fixture.manifest }); assert.equal(initialized.task.ready_nodes[0].id, 'implement');
     let [claim] = await call('claim', { task_id: 'feature-1', node_id: 'implement', agent_task_path: '/root/implement', agent_role: 'avsp_terra_high' });
     const implementation = path.join(fixture.root, 'implementation.json'); await writeFile(implementation, '{}'); await call('complete', { task_id: 'feature-1', node_id: 'implement', claim_id: claim.node.claim_id, status: 'succeeded', result: implementation });
@@ -47,7 +58,8 @@ test('DAG, total review, and workspace fingerprint gate', async () => {
     const [reviewClaim] = await call('claim', { task_id: 'feature-1', node_id: 'total-review', agent_task_path: '/root/total-review', agent_role: 'avsp_sol_high' });
     await call('heartbeat', { task_id: 'feature-1', node_id: 'total-review', claim_id: reviewClaim.node.claim_id });
     const [context] = await call('audit-context', { task_id: 'feature-1' }); const review = path.join(fixture.root, 'review.json');
-    await writeFile(review, JSON.stringify({ auditor_task: '/root/total-review', auditor_role: 'avsp_sol_high', claim_id: reviewClaim.node.claim_id, verdict: 'pass', requirement_coverage: { R1: 'verified' }, workflow_snapshot: context.workflow_snapshot, workspace_fingerprint: context.workspace_fingerprint, scope_and_regression: 'none', verification_gaps: 'none', residual_risk: 'none' }));
+    const reorderedFingerprint = Object.fromEntries(Object.entries(context.workspace_fingerprint).reverse());
+    await writeFile(review, JSON.stringify({ auditor_task: '/root/total-review', auditor_role: 'avsp_sol_high', claim_id: reviewClaim.node.claim_id, verdict: 'pass', requirement_coverage: { R1: 'verified' }, workflow_snapshot: context.workflow_snapshot, workspace_fingerprint: reorderedFingerprint, scope_and_regression: 'none', verification_gaps: 'none', residual_risk: 'none' }));
     await call('record-review', { task_id: 'feature-1', review }); const reviewResult = path.join(fixture.root, 'total-review.json'); await writeFile(reviewResult, '{}'); await call('complete', { task_id: 'feature-1', node_id: 'total-review', claim_id: reviewClaim.node.claim_id, status: 'succeeded', result: reviewResult }); let [allowed, code] = await call('close-check', { task_id: 'feature-1' }); assert.equal(code, 0); assert.equal(allowed.close_allowed, true);
     const closedState = await readControllerState(fixture.stateDir); const leasePath = path.join(fixture.workspace, '.codex', 'workflow-controller', 'workspace-lease.json'); const interruptedLease = JSON.parse(await readFile(leasePath, 'utf8'));
     interruptedLease.active_task = { task_id: 'feature-1', state_path: path.join(fixture.stateDir, 'feature-1.json'), state_dir: fixture.stateDir, acquired_at: closedState.workspace_lease.acquired_at, phase: 'active' }; await writeFile(leasePath, JSON.stringify(interruptedLease));
@@ -57,10 +69,168 @@ test('DAG, total review, and workspace fingerprint gate', async () => {
   } finally { await rm(fixture.root, { recursive: true, force: true }); }
 });
 
+test('keeps a total review retryable when final workflow outcome persistence fails', async () => {
+  const fixture = await setup();
+  const originalRename = fsPromises.rename;
+  try {
+    const call = (command, parameters) => callForFixture(fixture, command, parameters);
+    await call('init', { manifest: fixture.manifest });
+    for (const [nodeId, taskPath] of [['implement', '/root/implement'], ['verify', '/root/verify']]) {
+      const [claim] = await call('claim', { task_id: 'feature-1', node_id: nodeId, agent_task_path: taskPath, agent_role: 'avsp_terra_high' });
+      const result = path.join(fixture.root, `${nodeId}.json`); await writeFile(result, '{}');
+      await call('complete', { task_id: 'feature-1', node_id: nodeId, claim_id: claim.node.claim_id, status: 'succeeded', result });
+    }
+    const [reviewClaim] = await call('claim', { task_id: 'feature-1', node_id: 'total-review', agent_task_path: '/root/total-review', agent_role: 'avsp_sol_high' });
+    await call('heartbeat', { task_id: 'feature-1', node_id: 'total-review', claim_id: reviewClaim.node.claim_id });
+    const [context] = await call('audit-context', { task_id: 'feature-1' }); const review = path.join(fixture.root, 'review.json');
+    await writeFile(review, JSON.stringify({ auditor_task: '/root/total-review', auditor_role: 'avsp_sol_high', claim_id: reviewClaim.node.claim_id, verdict: 'pass', requirement_coverage: { R1: 'verified' }, workflow_snapshot: context.workflow_snapshot, workspace_fingerprint: context.workspace_fingerprint, scope_and_regression: 'none', verification_gaps: 'none', residual_risk: 'none' }));
+    await call('record-review', { task_id: 'feature-1', review });
+    const outcome = path.join(fixture.root, 'outcome.json');
+    await writeFile(outcome, JSON.stringify({ workflow: { state_dir: fixture.stateDir, task_id: 'feature-1', node_id: 'total-review', claim_id: reviewClaim.node.claim_id }, workflow_completion: { state: 'pending' } }));
+    fsPromises.rename = async (source, destination) => {
+      if (path.resolve(destination) === path.resolve(outcome)) {
+        const error = new Error('injected outcome write failure'); error.code = 'EIO'; throw error;
+      }
+      return originalRename(source, destination);
+    };
+    await assert.rejects(
+      () => call('complete', { task_id: 'feature-1', node_id: 'total-review', claim_id: reviewClaim.node.claim_id, status: 'succeeded', result: outcome }),
+      /injected outcome write failure/
+    );
+    fsPromises.rename = originalRename;
+    const state = await readControllerState(fixture.stateDir);
+    assert.equal(state.nodes['total-review'].status, 'running');
+    assert.equal(state.nodes['total-review'].result, null);
+    const [closeResult, closeCode] = await call('close-check', { task_id: 'feature-1' });
+    assert.equal(closeCode, 2);
+    assert.ok(closeResult.reasons.includes('incomplete nodes: total-review'));
+    const [completion] = await call('complete', { task_id: 'feature-1', node_id: 'total-review', claim_id: reviewClaim.node.claim_id, status: 'succeeded', result: outcome });
+    assert.equal(completion.workflow_outcome_completion.completed, true);
+    const completedState = await readControllerState(fixture.stateDir);
+    assert.equal(completedState.nodes['total-review'].status, 'succeeded');
+    assert.equal(completedState.nodes['total-review'].result.workflow_completion.completed, true);
+    completedState.nodes['total-review'].result.workflow_completion = null;
+    await writeControllerState(fixture.stateDir, completedState);
+    const [missingCompletionCloseResult, missingCompletionCloseCode] = await call('close-check', { task_id: 'feature-1' });
+    assert.equal(missingCompletionCloseCode, 2);
+    assert.ok(missingCompletionCloseResult.reasons.includes('total_review workflow outcome completion is pending or invalid'));
+  } finally {
+    fsPromises.rename = originalRename;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('keeps a total review retryable when controller state persistence fails after artifact finalization', async () => {
+  const fixture = await setup();
+  const originalRename = fsPromises.rename;
+  try {
+    const call = (command, parameters) => callForFixture(fixture, command, parameters);
+    await call('init', { manifest: fixture.manifest });
+    for (const [nodeId, taskPath] of [['implement', '/root/implement'], ['verify', '/root/verify']]) {
+      const [claim] = await call('claim', { task_id: 'feature-1', node_id: nodeId, agent_task_path: taskPath, agent_role: 'avsp_terra_high' });
+      const result = path.join(fixture.root, `${nodeId}.json`); await writeFile(result, '{}');
+      await call('complete', { task_id: 'feature-1', node_id: nodeId, claim_id: claim.node.claim_id, status: 'succeeded', result });
+    }
+    const [reviewClaim] = await call('claim', { task_id: 'feature-1', node_id: 'total-review', agent_task_path: '/root/review-state-failure', agent_role: 'avsp_sol_high' });
+    await call('heartbeat', { task_id: 'feature-1', node_id: 'total-review', claim_id: reviewClaim.node.claim_id });
+    const [context] = await call('audit-context', { task_id: 'feature-1' }); const review = path.join(fixture.root, 'state-failure.review.json');
+    await writeFile(review, JSON.stringify({ auditor_task: '/root/review-state-failure', auditor_role: 'avsp_sol_high', claim_id: reviewClaim.node.claim_id, verdict: 'pass', requirement_coverage: { R1: 'verified' }, workflow_snapshot: context.workflow_snapshot, workspace_fingerprint: context.workspace_fingerprint, scope_and_regression: 'none', verification_gaps: 'none', residual_risk: 'none' }));
+    await call('record-review', { task_id: 'feature-1', review });
+    const outcome = path.join(fixture.root, 'state-failure.outcome.json'); await writeFile(outcome, JSON.stringify({ workflow: { state_dir: fixture.stateDir, task_id: 'feature-1', node_id: 'total-review', claim_id: reviewClaim.node.claim_id }, workflow_completion: { state: 'pending' } }));
+    const pendingOutcome = JSON.parse(await readFile(outcome, 'utf8'));
+    let databaseRenames = 0;
+    fsPromises.rename = async (source, destination) => {
+      if (path.extname(destination) === '.sqlite') {
+        databaseRenames += 1;
+        if (databaseRenames === 3) { const error = new Error('injected controller state write failure'); error.code = 'EIO'; throw error; }
+      }
+      return originalRename(source, destination);
+    };
+    await assert.rejects(() => call('complete', { task_id: 'feature-1', node_id: 'total-review', claim_id: reviewClaim.node.claim_id, status: 'succeeded', result: outcome }), /injected controller state write failure/);
+    fsPromises.rename = originalRename;
+    const pendingState = await readControllerState(fixture.stateDir);
+    assert.equal(pendingState.nodes['total-review'].status, 'running');
+    assert.equal(pendingState.nodes['total-review'].result, null);
+    assert.equal(pendingState.nodes['total-review'].workflow_completion_intent.claim_id, reviewClaim.node.claim_id);
+    const finalizedOutcome = JSON.parse(await readFile(outcome, 'utf8'));
+    assert.equal(finalizedOutcome.workflow_completion.completed, true);
+    await writeFile(outcome, JSON.stringify({ ...finalizedOutcome, forged_field: 'tampered' }));
+    await assert.rejects(
+      () => call('complete', { task_id: 'feature-1', node_id: 'total-review', claim_id: reviewClaim.node.claim_id, status: 'succeeded', result: outcome }),
+      /finalized result does not match its persisted completion intent/
+    );
+    await writeFile(outcome, JSON.stringify({ ...pendingOutcome, workflow_completion: finalizedOutcome.workflow_completion }));
+    const [completion] = await call('complete', { task_id: 'feature-1', node_id: 'total-review', claim_id: reviewClaim.node.claim_id, status: 'succeeded', result: outcome });
+    assert.equal(completion.workflow_outcome_completion.completed, true);
+    const completedState = await readControllerState(fixture.stateDir);
+    assert.equal(completedState.nodes['total-review'].status, 'succeeded');
+    assert.equal(completedState.nodes['total-review'].workflow_completion_intent, null);
+  } finally {
+    fsPromises.rename = originalRename;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('normalizes a direct total-review result and rejects a falsified workflow completion', async () => {
+  const fixture = await setup();
+  try {
+    const call = (command, parameters) => callForFixture(fixture, command, parameters);
+    await call('init', { manifest: fixture.manifest });
+    for (const [nodeId, taskPath] of [['implement', '/root/implement'], ['verify', '/root/verify']]) {
+      const [claim] = await call('claim', { task_id: 'feature-1', node_id: nodeId, agent_task_path: taskPath, agent_role: 'avsp_terra_high' });
+      const result = path.join(fixture.root, `${nodeId}.json`); await writeFile(result, '{}');
+      await call('complete', { task_id: 'feature-1', node_id: nodeId, claim_id: claim.node.claim_id, status: 'succeeded', result });
+    }
+    const [reviewClaim] = await call('claim', { task_id: 'feature-1', node_id: 'total-review', agent_task_path: '/root/total-review', agent_role: 'avsp_sol_high' });
+    await call('heartbeat', { task_id: 'feature-1', node_id: 'total-review', claim_id: reviewClaim.node.claim_id });
+    const [context] = await call('audit-context', { task_id: 'feature-1' });
+    const review = path.join(fixture.root, 'review.json');
+    await writeFile(review, JSON.stringify({ auditor_task: '/root/total-review', auditor_role: 'avsp_sol_high', claim_id: reviewClaim.node.claim_id, verdict: 'pass', requirement_coverage: { R1: 'verified' }, workflow_snapshot: context.workflow_snapshot, workspace_fingerprint: context.workspace_fingerprint, scope_and_regression: 'none', verification_gaps: 'none', residual_risk: 'none' }));
+    await call('record-review', { task_id: 'feature-1', review });
+    const resultPath = path.join(fixture.root, 'malformed-workflow-outcome.json');
+    const workflow = { state_dir: fixture.stateDir, task_id: 'feature-1', node_id: 'total-review', claim_id: reviewClaim.node.claim_id };
+    await writeFile(resultPath, JSON.stringify({
+      workflow,
+      workflow_completion: {
+        completed: true,
+        completed_at: new Date().toISOString(),
+        task_id: 'feature-1',
+        node_id: 'total-review',
+        claim_id: reviewClaim.node.claim_id,
+        status: 'succeeded',
+        completion_attestation: 'native_agent_finished',
+      },
+    }));
+    await assert.rejects(
+      () => call('complete', { task_id: 'feature-1', node_id: 'total-review', claim_id: reviewClaim.node.claim_id, status: 'succeeded', result: resultPath }),
+      /requires a persisted completion intent/
+    );
+    assert.equal((await readControllerState(fixture.stateDir)).nodes['total-review'].status, 'running');
+    for (const completion of [null, false, 0, '']) {
+      const result = { workflow };
+      result.workflow_completion = completion;
+      await writeFile(resultPath, JSON.stringify(result));
+      await assert.rejects(
+        () => call('complete', { task_id: 'feature-1', node_id: 'total-review', claim_id: reviewClaim.node.claim_id, status: 'succeeded', result: resultPath }),
+        /requires a matching workflow_completion\.state=pending outcome/
+      );
+      assert.equal((await readControllerState(fixture.stateDir)).nodes['total-review'].status, 'running');
+    }
+    await writeFile(resultPath, '{}');
+    const [completion] = await call('complete', { task_id: 'feature-1', node_id: 'total-review', claim_id: reviewClaim.node.claim_id, status: 'succeeded', result: resultPath });
+    assert.equal(completion.workflow_outcome_completion.completed, true);
+    const normalized = JSON.parse(await readFile(resultPath, 'utf8'));
+    assert.equal(normalized.workflow.task_id, 'feature-1');
+    assert.equal(normalized.workflow.node_id, 'total-review');
+    assert.equal(normalized.workflow.claim_id, reviewClaim.node.claim_id);
+    assert.equal(normalized.workflow_completion.completed, true);
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
 test('freezes the DAG and invalidates a pass review when reviewed task state changes', async () => {
   const fixture = await setup();
   try {
-    const call = (command, parameters) => dispatch(command, { state_dir: fixture.stateDir, ...parameters });
+    const call = (command, parameters) => callForFixture(fixture, command, parameters);
     await call('init', { manifest: fixture.manifest });
     const lateWork = await writeNode(fixture.root, { id: 'late-work', kind: 'implementation' });
     await assert.rejects(() => call('add-node', { task_id: 'feature-1', node: lateWork }), /DAG is immutable/);
@@ -141,7 +311,7 @@ test('rejects a participant as total reviewer', async () => {
 test('rejects a prior participant when it tries to claim total review', async () => {
   const fixture = await setup();
   try {
-    const call = (command, parameters) => dispatch(command, { state_dir: fixture.stateDir, ...parameters });
+    const call = (command, parameters) => callForFixture(fixture, command, parameters);
     await call('init', { manifest: fixture.manifest });
     const [implementationClaim] = await call('claim', { task_id: 'feature-1', node_id: 'implement', agent_task_path: '/root/prior-participant', agent_role: 'avsp_terra_high' });
     const implementation = path.join(fixture.root, 'implementation.json'); await writeFile(implementation, '{}');
@@ -159,7 +329,7 @@ test('rejects a prior participant when it tries to claim total review', async ()
 test('allows a newly claimed total-review node to record its own review', async () => {
   const fixture = await setup();
   try {
-    const call = (command, parameters) => dispatch(command, { state_dir: fixture.stateDir, ...parameters });
+    const call = (command, parameters) => callForFixture(fixture, command, parameters);
     await call('init', { manifest: fixture.manifest });
     for (const [nodeId, taskPath, role] of [['implement', '/root/implement', 'avsp_terra_high'], ['verify', '/root/verify', 'avsp_terra_high']]) {
       const [claim] = await call('claim', { task_id: 'feature-1', node_id: nodeId, agent_task_path: taskPath, agent_role: role });
@@ -183,7 +353,7 @@ test('allows a newly claimed total-review node to record its own review', async 
 test('requires a recorded review before total review succeeds and reconciles legacy orphaned reviews', async () => {
   const fixture = await setup();
   try {
-    const call = (command, parameters) => dispatch(command, { state_dir: fixture.stateDir, ...parameters });
+    const call = (command, parameters) => callForFixture(fixture, command, parameters);
     await call('init', { manifest: fixture.manifest });
     for (const [nodeId, taskPath, role] of [['implement', '/root/implement', 'avsp_terra_high'], ['verify', '/root/verify', 'avsp_terra_high']]) {
       const [claim] = await call('claim', { task_id: 'feature-1', node_id: nodeId, agent_task_path: taskPath, agent_role: role });
@@ -205,10 +375,81 @@ test('requires a recorded review before total review succeeds and reconciles leg
   } finally { await rm(fixture.root, { recursive: true, force: true }); }
 });
 
+test('escalates repeated failed total reviews from Sol high through xhigh to sticky max', async () => {
+  const fixture = await setup();
+  try {
+    const call = (command, parameters) => callForFixture(fixture, command, parameters);
+    await call('init', { manifest: fixture.manifest });
+    for (const [nodeId, taskPath] of [['implement', '/root/implement'], ['verify', '/root/verify']]) {
+      const [claim] = await call('claim', { task_id: 'feature-1', node_id: nodeId, agent_task_path: taskPath, agent_role: 'avsp_terra_high' });
+      const result = path.join(fixture.root, `${nodeId}.json`); await writeFile(result, '{}');
+      await call('complete', { task_id: 'feature-1', node_id: nodeId, claim_id: claim.node.claim_id, status: 'succeeded', result });
+    }
+    const reviewOnce = async (name, role, verdict = 'fail', completionStatus = verdict === 'fail' ? 'failed' : 'unavailable') => {
+      const taskPath = `/root/${name}`;
+      const [claim] = await call('claim', { task_id: 'feature-1', node_id: 'total-review', agent_task_path: taskPath, agent_role: role });
+      await call('heartbeat', { task_id: 'feature-1', node_id: 'total-review', claim_id: claim.node.claim_id });
+      const [context] = await call('audit-context', { task_id: 'feature-1' }); const review = path.join(fixture.root, `${name}.review.json`);
+      await writeFile(review, JSON.stringify({ auditor_task: taskPath, auditor_role: role, claim_id: claim.node.claim_id, verdict, requirement_coverage: { R1: `${name} coverage` }, workflow_snapshot: context.workflow_snapshot, workspace_fingerprint: context.workspace_fingerprint, scope_and_regression: `${name} scope`, verification_gaps: `${name} gaps`, residual_risk: `${name} risk` }));
+      await call('record-review', { task_id: 'feature-1', review });
+      const result = path.join(fixture.root, `${name}.outcome.json`); await writeFile(result, '{}');
+      await call('complete', { task_id: 'feature-1', node_id: 'total-review', claim_id: claim.node.claim_id, status: completionStatus, result });
+    };
+    const downgradeReviewCompletionToLegacy = async name => {
+      const state = await readControllerState(fixture.stateDir);
+      const review = state.reviews.find(candidate => candidate.auditor_task === `/root/${name}`);
+      delete review.completion_status; delete review.completion_attestation; delete review.completed_at;
+      const completionEvent = state.events.find(event => event.type === 'node_completed' && event.node_id === 'total-review' && event.claim_id === review.claim_id);
+      delete completionEvent.claim_id;
+      await writeControllerState(fixture.stateDir, state);
+    };
+    const retryReview = name => call('retry', { task_id: 'feature-1', node_id: 'total-review', reason: `${name} reviewer stopped`, previous_agent_stopped: true });
+
+    await reviewOnce('high-unavailable', 'avsp_sol_high', 'unavailable');
+    let [retried] = await retryReview('high-unavailable');
+    assert.equal(retried.node.agent_type, 'avsp_sol_high');
+
+    await reviewOnce('high-first-fail', 'avsp_sol_high');
+    await downgradeReviewCompletionToLegacy('high-first-fail');
+    [retried] = await retryReview('high-first-fail');
+    assert.equal(retried.node.agent_type, 'avsp_sol_high');
+
+    await reviewOnce('high-recorded-fail-unavailable', 'avsp_sol_high', 'fail', 'unavailable');
+    [retried] = await retryReview('high-recorded-fail-unavailable');
+    assert.equal(retried.node.agent_type, 'avsp_sol_high');
+
+    await reviewOnce('high-second-fail', 'avsp_sol_high');
+    await downgradeReviewCompletionToLegacy('high-second-fail');
+    [retried] = await retryReview('high-second-fail');
+    assert.equal(retried.node.agent_type, 'avsp_sol_high');
+
+    await reviewOnce('high-third-fail', 'avsp_sol_high');
+    [retried] = await retryReview('high-third-fail');
+    assert.equal(retried.node.agent_type, 'avsp_sol_xhigh');
+
+    const [invalidXhighClaim] = await call('claim', { task_id: 'feature-1', node_id: 'total-review', agent_task_path: '/root/xhigh-invalid', agent_role: 'avsp_sol_xhigh' });
+    const invalidXhighResult = path.join(fixture.root, 'xhigh-invalid.outcome.json'); await writeFile(invalidXhighResult, '{}');
+    await call('complete', { task_id: 'feature-1', node_id: 'total-review', claim_id: invalidXhighClaim.node.claim_id, status: 'unavailable', result: invalidXhighResult });
+    [retried] = await retryReview('xhigh-invalid');
+    assert.equal(retried.node.agent_type, 'avsp_sol_xhigh');
+
+    await reviewOnce('xhigh-fail', 'avsp_sol_xhigh');
+    [retried] = await retryReview('xhigh-fail');
+    assert.equal(retried.node.agent_type, 'avsp_sol_max');
+
+    await reviewOnce('max-fail', 'avsp_sol_max');
+    [retried] = await retryReview('max-fail');
+    assert.equal(retried.node.agent_type, 'avsp_sol_max');
+    const state = await readControllerState(fixture.stateDir);
+    const escalations = state.events.filter(event => event.type === 'total_review_escalated');
+    assert.deepEqual(escalations.map(event => [event.prior_role, event.role]), [['avsp_sol_high', 'avsp_sol_xhigh'], ['avsp_sol_xhigh', 'avsp_sol_max']]);
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
 test('claim ownership, abandon, retry, unavailable, and stale-lock recovery are explicit', async () => {
   const fixture = await setup();
   try {
-    const call = (command, parameters) => dispatch(command, { state_dir: fixture.stateDir, ...parameters });
+    const call = (command, parameters) => callForFixture(fixture, command, parameters);
     await writeFile(fixture.manifest, JSON.stringify({ task_id: 'feature-1', workspace: fixture.workspace, goal: 'Change app safely', requirements: [{ id: 'R1', text: 'app changes' }], nodes: [{ id: 'implement', kind: 'implementation', agent_type: 'avsp_terra_high' }, { id: 'parallel', kind: 'implementation', agent_type: 'avsp_terra_high' }, { id: 'verify', kind: 'verification', depends_on: ['implement'] }, { id: 'total-review', kind: 'total_review', agent_type: 'avsp_sol_high', depends_on: ['implement', 'parallel', 'verify'] }] }));
     await call('init', { manifest: fixture.manifest });
     await assert.rejects(() => call('claim', { task_id: 'feature-1', node_id: 'implement', agent_task_path: '', agent_role: 'avsp_terra_high' }), ControllerError);
@@ -217,7 +458,8 @@ test('claim ownership, abandon, retry, unavailable, and stale-lock recovery are 
     await assert.rejects(() => call('claim', { task_id: 'feature-1', node_id: 'parallel', agent_task_path: '/root/first', agent_role: 'avsp_terra_high' }), /already has a running node/);
     await assert.rejects(() => call('heartbeat', { task_id: 'feature-1', node_id: 'implement', claim_id: 'wrong' }), ControllerError);
     await call('heartbeat', { task_id: 'feature-1', node_id: 'implement', claim_id: firstClaim.node.claim_id });
-    await call('abandon', { task_id: 'feature-1', node_id: 'implement', claim_id: firstClaim.node.claim_id, reason: 'confirmed process stopped' });
+    await assert.rejects(() => call('abandon', { task_id: 'feature-1', node_id: 'implement', claim_id: firstClaim.node.claim_id, reason: 'missing stopped-agent confirmation' }), /previous_agent_stopped must be true/);
+    await call('abandon', { task_id: 'feature-1', node_id: 'implement', claim_id: firstClaim.node.claim_id, reason: 'confirmed process stopped', previous_agent_stopped: true });
     await assert.rejects(() => call('retry', { task_id: 'feature-1', node_id: 'implement', reason: 'replace worker', previous_agent_stopped: false }), ControllerError);
     await call('retry', { task_id: 'feature-1', node_id: 'implement', reason: 'replace worker', previous_agent_stopped: true });
     const stateFile = path.join(fixture.stateDir, 'feature-1.json');
@@ -247,7 +489,7 @@ test('claim ownership, abandon, retry, unavailable, and stale-lock recovery are 
 test('serializes simultaneous claims for the same node and execution owner', async () => {
   const fixture = await setup();
   try {
-    const call = (command, parameters) => dispatch(command, { state_dir: fixture.stateDir, ...parameters });
+    const call = (command, parameters) => callForFixture(fixture, command, parameters);
     await call('init', { manifest: fixture.manifest });
     const attempts = await Promise.allSettled([
       call('claim', { task_id: 'feature-1', node_id: 'implement', agent_task_path: '/root/concurrent-owner', agent_role: 'avsp_terra_high' }),
@@ -262,10 +504,10 @@ test('serializes simultaneous claims for the same node and execution owner', asy
 test('retry requires an unambiguous stopped-agent confirmation and accepts the legacy plural alias', async () => {
   const fixture = await setup();
   try {
-    const call = (command, parameters) => dispatch(command, { state_dir: fixture.stateDir, ...parameters });
+    const call = (command, parameters) => callForFixture(fixture, command, parameters);
     await call('init', { manifest: fixture.manifest });
     let [claim] = await call('claim', { task_id: 'feature-1', node_id: 'implement', agent_task_path: '/root/first', agent_role: 'avsp_terra_high' });
-    await call('abandon', { task_id: 'feature-1', node_id: 'implement', claim_id: claim.node.claim_id, reason: 'confirmed process stopped' });
+    await call('abandon', { task_id: 'feature-1', node_id: 'implement', claim_id: claim.node.claim_id, reason: 'confirmed process stopped', previous_agent_stopped: true });
     const retry = parameters => call('retry', { task_id: 'feature-1', node_id: 'implement', reason: 'replace worker', ...parameters });
     await assert.rejects(() => retry({}), /is required/);
     await assert.rejects(() => retry({ previous_agent_stopped: false }), /must be true/);
@@ -274,7 +516,7 @@ test('retry requires an unambiguous stopped-agent confirmation and accepts the l
     await retry({ previous_agent_stopped: true });
 
     [claim] = await call('claim', { task_id: 'feature-1', node_id: 'implement', agent_task_path: '/root/second', agent_role: 'avsp_terra_high' });
-    await call('abandon', { task_id: 'feature-1', node_id: 'implement', claim_id: claim.node.claim_id, reason: 'confirmed process stopped' });
+    await call('abandon', { task_id: 'feature-1', node_id: 'implement', claim_id: claim.node.claim_id, reason: 'confirmed process stopped', previous_agent_stopped: true });
     await retry({ previous_agents_stopped: true });
     const state = await readControllerState(fixture.stateDir);
     assert.equal(state.events.at(-1).previous_agent_stopped, true);
@@ -284,7 +526,7 @@ test('retry requires an unambiguous stopped-agent confirmation and accepts the l
 test('checkpoints a stale claim and returns a bounded recovery package only after stopped-agent confirmation', async () => {
   const fixture = await setup();
   try {
-    const call = (command, parameters) => dispatch(command, { state_dir: fixture.stateDir, ...parameters });
+    const call = (command, parameters) => callForFixture(fixture, command, parameters);
     await call('init', { manifest: fixture.manifest });
     const [claim] = await call('claim', { task_id: 'feature-1', node_id: 'implement', agent_task_path: '/root/original', agent_thread_id: '019f0000-0000-7000-8000-000000000001', agent_role: 'avsp_terra_high', lease_duration_sec: 1 });
     await call('heartbeat', { task_id: 'feature-1', node_id: 'implement', claim_id: claim.node.claim_id });
@@ -316,7 +558,7 @@ test('checkpoints a stale claim and returns a bounded recovery package only afte
 test('rebinds modern routing owners for replacement workers and independent total reviewers', async () => {
   const fixture = await setup();
   try {
-    const call = (command, parameters) => dispatch(command, { state_dir: fixture.stateDir, ...parameters });
+    const call = (command, parameters) => callForFixture(fixture, command, parameters);
     const workRoute = { execution_risk: 'protected', routing_reason: 'controlled recovery', execution_owner: '/root/original-worker', integration_owner: '/root', quality_guard: 'test' };
     const firstReviewRoute = { execution_risk: 'protected', routing_reason: 'independent review', execution_owner: '/root/first-reviewer', integration_owner: '/root', quality_guard: 'test' };
     await writeFile(fixture.manifest, JSON.stringify({ task_id: 'feature-1', workspace: fixture.workspace, goal: 'Recover modern routing', routing_schema_version: 1, requirements: [{ id: 'R1', text: 'recover task' }], nodes: [{ id: 'work', kind: 'implementation', ...workRoute }, { id: 'total-review', kind: 'total_review', agent_type: 'avsp_sol_high', depends_on: ['work'], ...firstReviewRoute }] }));
@@ -342,7 +584,7 @@ test('rebinds modern routing owners for replacement workers and independent tota
 test('doctor reports persistent state, lease health, and controlled recovery candidates without mutation', async () => {
   const fixture = await setup();
   try {
-    const call = (command, parameters) => dispatch(command, { state_dir: fixture.stateDir, ...parameters });
+    const call = (command, parameters) => callForFixture(fixture, command, parameters);
     await call('init', { manifest: fixture.manifest });
     let [diagnosis] = await call('doctor', { task_id: 'feature-1' });
     assert.equal(diagnosis.health, 'healthy');
@@ -369,7 +611,7 @@ test('doctor reports persistent state, lease health, and controlled recovery can
 test('doctor returns a blocked diagnosis for unreadable SQLite state without mutating it', async () => {
   const fixture = await setup();
   try {
-    const call = (command, parameters) => dispatch(command, { state_dir: fixture.stateDir, ...parameters });
+    const call = (command, parameters) => callForFixture(fixture, command, parameters);
     await call('init', { manifest: fixture.manifest });
     const databasePath = path.join(fixture.stateDir, 'feature-1.sqlite');
     await writeFile(databasePath, 'not a SQLite database');
@@ -385,7 +627,7 @@ test('doctor returns a blocked diagnosis for unreadable SQLite state without mut
 test('doctor preserves a close-gate error when a reviewed workspace is missing', async () => {
   const fixture = await setup();
   try {
-    const call = (command, parameters) => dispatch(command, { state_dir: fixture.stateDir, ...parameters });
+    const call = (command, parameters) => callForFixture(fixture, command, parameters);
     await call('init', { manifest: fixture.manifest });
     const state = await readControllerState(fixture.stateDir);
     for (const node of Object.values(state.nodes)) node.status = 'succeeded';
@@ -675,7 +917,7 @@ test('bounds the combined prune report to 128 entries', async () => {
 test('serializes stale-lock recovery and validates manifest and review fields', async () => {
   const fixture = await setup();
   try {
-    const call = (command, parameters) => dispatch(command, { state_dir: fixture.stateDir, ...parameters });
+    const call = (command, parameters) => callForFixture(fixture, command, parameters);
     const invalidManifest = path.join(fixture.root, 'invalid-manifest.json');
     await writeFile(invalidManifest, JSON.stringify({ task_id: ' ', workspace: fixture.workspace, goal: ' ', requirements: [{ id: '', text: ' ' }], nodes: [{ id: '', kind: '' }] }));
     await assert.rejects(() => call('init', { manifest: invalidManifest }), ControllerError);
@@ -713,7 +955,7 @@ test('serializes stale-lock recovery and validates manifest and review fields', 
 test('marks a claimed but never-heartbeating node as never_activated and requires activation for total review', async () => {
   const fixture = await setup();
   try {
-    const call = (command, parameters) => dispatch(command, { state_dir: fixture.stateDir, ...parameters });
+    const call = (command, parameters) => callForFixture(fixture, command, parameters);
     await call('init', { manifest: fixture.manifest });
     const [claim] = await call('claim', { task_id: 'feature-1', node_id: 'implement', agent_task_path: '/root/unstarted', agent_role: 'avsp_terra_high', lease_duration_sec: 1, activation_timeout_sec: 1 });
     const state = await readControllerState(fixture.stateDir);
@@ -730,9 +972,9 @@ test('marks a claimed but never-heartbeating node as never_activated and require
 test('workflow_start activates atomically and checkpoint refreshes the lease', async () => {
   const fixture = await setup();
   try {
-    const call = (command, parameters) => dispatch(command, { state_dir: fixture.stateDir, ...parameters });
+    const call = (command, parameters) => callForFixture(fixture, command, parameters);
     await call('init', { manifest: fixture.manifest });
-    const [started] = await call('start', { task_id: 'feature-1', node_id: 'implement', agent_task_path: '/root/implement', agent_role: 'avsp_terra_high', lease_duration_sec: 1, activation_timeout_sec: 1 });
+    const [started] = await call('start', { task_id: 'feature-1', node_id: 'implement', agent_task_path: '/root/implement', agent_role: 'avsp_terra_high', native_agent_started: true, lease_duration_sec: 1, activation_timeout_sec: 1 });
     assert.equal(started.node.activation_at !== null, true);
     assert.equal(started.node.activation_deadline_at, null);
     assert.equal(started.node.heartbeat_count, 1);
@@ -745,15 +987,66 @@ test('workflow_start activates atomically and checkpoint refreshes the lease', a
   } finally { await rm(fixture.root, { recursive: true, force: true }); }
 });
 
+test('does not complete a claimed node before its first activation handshake', async () => {
+  const fixture = await setup();
+  try {
+    await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+    const [claim] = await dispatch('claim', { state_dir: fixture.stateDir, task_id: 'feature-1', node_id: 'implement', agent_task_path: '/root/unactivated', agent_role: 'avsp_terra_high' });
+    const result = path.join(fixture.root, 'unactivated-result.json'); await writeFile(result, JSON.stringify({}));
+    await assert.rejects(
+      () => dispatch('complete', { state_dir: fixture.stateDir, task_id: 'feature-1', node_id: 'implement', claim_id: claim.node.claim_id, status: 'succeeded', result, completion_attestation: 'native_agent_finished' }),
+      /unactivated node cannot be completed/
+    );
+    assert.equal((await readControllerState(fixture.stateDir)).nodes.implement.status, 'running');
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test('reserves failed-process attestations for unavailable total reviews', async () => {
+  const fixture = await setup();
+  try {
+    const call = (command, parameters) => callForFixture(fixture, command, parameters);
+    await call('init', { manifest: fixture.manifest });
+    const implementation = await call('start', { task_id: 'feature-1', node_id: 'implement', agent_task_path: '/root/implement', agent_role: 'avsp_terra_high', native_agent_started: true });
+    const implementationResult = path.join(fixture.root, 'implementation-result.json'); await writeFile(implementationResult, JSON.stringify({ completed: true }));
+    await call('complete', { task_id: 'feature-1', node_id: 'implement', claim_id: implementation[0].node.claim_id, status: 'succeeded', result: implementationResult });
+    const verification = await call('start', { task_id: 'feature-1', node_id: 'verify', agent_task_path: '/root/verify', agent_role: 'avsp_terra_high', native_agent_started: true });
+    const verificationResult = path.join(fixture.root, 'verification-result.json'); await writeFile(verificationResult, JSON.stringify({ completed: true }));
+    await call('complete', { task_id: 'feature-1', node_id: 'verify', claim_id: verification[0].node.claim_id, status: 'succeeded', result: verificationResult });
+    const review = await call('start', { task_id: 'feature-1', node_id: 'total-review', agent_task_path: '/root/reviewer', agent_role: 'avsp_sol_high', native_agent_started: true });
+    const reviewResult = path.join(fixture.root, 'review-result.json'); await writeFile(reviewResult, JSON.stringify({ unavailable: true }));
+    await assert.rejects(
+      () => call('complete', { task_id: 'feature-1', node_id: 'total-review', claim_id: review[0].node.claim_id, status: 'succeeded', result: reviewResult, completion_attestation: 'native_agent_exit_confirmed' }),
+      /completion_attestation=native_agent_finished/
+    );
+    await call('complete', { task_id: 'feature-1', node_id: 'total-review', claim_id: review[0].node.claim_id, status: 'unavailable', result: reviewResult, completion_attestation: 'native_agent_exit_confirmed' });
+    const state = await readControllerState(fixture.stateDir);
+    assert.equal(state.nodes['total-review'].status, 'unavailable');
+    assert.ok(state.events.some(event => event.type === 'node_completed' && event.completion_attestation === 'native_agent_exit_confirmed'));
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test('CLI accepts lifecycle attestations for workflow start and completion', async () => {
+  const fixture = await setup();
+  try {
+    await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+    const started = await execFile(process.execPath, [controllerCli, 'start', '--task-id', 'feature-1', '--node-id', 'implement', '--agent-task-path', '/root/cli-worker', '--agent-role', 'avsp_terra_high', '--native-agent-started', 'true', '--state-dir', fixture.stateDir], { cwd: fixture.root, windowsHide: true });
+    const startedNode = JSON.parse(started.stdout).node;
+    assert.equal(startedNode.status, 'running');
+    const result = path.join(fixture.root, 'cli-result.json'); await writeFile(result, JSON.stringify({ source: 'cli' }));
+    const completed = await execFile(process.execPath, [controllerCli, 'complete', '--task-id', 'feature-1', '--node-id', 'implement', '--claim-id', startedNode.claim_id, '--status', 'succeeded', '--result', result, '--completion-attestation', 'native_agent_finished', '--state-dir', fixture.stateDir], { cwd: fixture.root, windowsHide: true });
+    assert.equal(JSON.parse(completed.stdout).node.status, 'succeeded');
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
 test('records an explicit Root rescue and requires the rescued role for the replacement claim', async () => {
   const fixture = await setup();
   try {
     const routing = { execution_risk: 'delegable', routing_reason: 'isolated reversible edit', execution_owner: '/root/luna', integration_owner: '/root', quality_guard: 'targeted test' };
     const reviewRouting = { execution_risk: 'protected', routing_reason: 'independent total review', execution_owner: '/root/reviewer', integration_owner: '/root', quality_guard: 'close gate' };
     await writeFile(fixture.manifest, JSON.stringify({ task_id: 'feature-1', workspace: fixture.workspace, goal: 'Record rescue handoff', routing_schema_version: 1, requirements: [{ id: 'R1', text: 'rescue is auditable' }], nodes: [{ id: 'implement', kind: 'implementation', agent_type: 'avsp_luna_high_executor', ...routing }, { id: 'total-review', kind: 'total_review', agent_type: 'avsp_sol_high', depends_on: ['implement'], ...reviewRouting }] }));
-    const call = (command, parameters) => dispatch(command, { state_dir: fixture.stateDir, ...parameters });
+    const call = (command, parameters) => callForFixture(fixture, command, parameters);
     await call('init', { manifest: fixture.manifest });
-    const [luna] = await call('start', { task_id: 'feature-1', node_id: 'implement', agent_task_path: '/root/luna', agent_role: 'avsp_luna_high_executor' });
+    const [luna] = await call('start', { task_id: 'feature-1', node_id: 'implement', agent_task_path: '/root/luna', agent_role: 'avsp_luna_high_executor', native_agent_started: true });
     const [rescue] = await call('rescue', { task_id: 'feature-1', node_id: 'implement', claim_id: luna.node.claim_id, reason: 'Luna executor stopped before producing a verifiable result', replacement_agent_task_path: '/root/rescue', previous_agent_stopped: true });
     assert.equal(rescue.node.status, 'pending');
     assert.equal(rescue.node.rescue_role, 'main/root');
@@ -761,13 +1054,29 @@ test('records an explicit Root rescue and requires the rescued role for the repl
     assert.equal(rescue.recovery_package.previous_attempt.agent_task_path, '/root/luna');
     assert.equal(rescue.recovery_package.previous_attempt.execution_owner, '/root/luna');
     assert.equal(rescue.node.recovery_history.length, 1);
-    const [root] = await call('start', { task_id: 'feature-1', node_id: 'implement', agent_task_path: '/root/rescue', agent_role: 'main/root' });
+    const [root] = await call('start', { task_id: 'feature-1', node_id: 'implement', agent_task_path: '/root/rescue', agent_role: 'main/root', native_agent_started: true });
     const result = path.join(fixture.root, 'rescue-result.json'); await writeFile(result, JSON.stringify({ rescued: true }));
-    await call('complete', { task_id: 'feature-1', node_id: 'implement', claim_id: root.node.claim_id, status: 'succeeded', result });
+    await assert.rejects(() => call('complete', { task_id: 'feature-1', node_id: 'implement', claim_id: root.node.claim_id, status: 'succeeded', result }), /completion_attestation=root_rescue_self_completion/);
+    await call('complete', { task_id: 'feature-1', node_id: 'implement', claim_id: root.node.claim_id, status: 'succeeded', result, completion_attestation: 'root_rescue_self_completion' });
     const state = await readControllerState(fixture.stateDir);
     assert.equal(state.nodes.implement.status, 'succeeded');
     assert.equal(state.nodes.implement.rescue_role, 'main/root');
     assert.ok(state.events.some(event => event.type === 'root_rescue'));
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test('refuses to turn a non-Luna delegable attempt into a Root rescue', async () => {
+  const fixture = await setup();
+  try {
+    const routing = { execution_risk: 'delegable', routing_reason: 'isolated reversible edit', execution_owner: '/root/terra', integration_owner: '/root', quality_guard: 'targeted test' };
+    const reviewRouting = { execution_risk: 'protected', routing_reason: 'independent total review', execution_owner: '/root/reviewer', integration_owner: '/root', quality_guard: 'close gate' };
+    await writeFile(fixture.manifest, JSON.stringify({ task_id: 'feature-1', workspace: fixture.workspace, goal: 'Reject invalid rescue source', routing_schema_version: 1, requirements: [{ id: 'R1', text: 'rescue source is Luna' }], nodes: [{ id: 'implement', kind: 'implementation', ...routing }, { id: 'total-review', kind: 'total_review', agent_type: 'avsp_sol_high', depends_on: ['implement'], ...reviewRouting }] }));
+    await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+    const [claim] = await dispatch('claim', { state_dir: fixture.stateDir, task_id: 'feature-1', node_id: 'implement', agent_task_path: '/root/terra', agent_role: 'avsp_terra_high' });
+    await assert.rejects(
+      () => dispatch('rescue', { state_dir: fixture.stateDir, task_id: 'feature-1', node_id: 'implement', claim_id: claim.node.claim_id, reason: 'Terra is still the valid integration owner', replacement_agent_task_path: '/root/rescue', previous_agent_stopped: true }),
+      /Only a Luna executor or explicitly matched legacy writer attempt/
+    );
   } finally { await rm(fixture.root, { recursive: true, force: true }); }
 });
 
@@ -795,7 +1104,7 @@ test('uses a workspace lease across state directories and releases it only after
 test('reclaims only provably stale coordination intents and keeps heartbeats compact', async () => {
   const fixture = await setup();
   try {
-    const call = (command, parameters) => dispatch(command, { state_dir: fixture.stateDir, ...parameters });
+    const call = (command, parameters) => callForFixture(fixture, command, parameters);
     await call('init', { manifest: fixture.manifest });
     const stateFile = path.join(fixture.stateDir, 'feature-1.json'); const staleWriter = `${stateFile}.lock.writer`;
     await writeFile(staleWriter, `pid=999999 hostname=${os.hostname()} created=1970-01-01T00:00:00.000Z\n`);
@@ -854,6 +1163,38 @@ test('only Terra can claim protected work, even when a Luna role matches executi
   } finally { await rm(fixture.root, { recursive: true, force: true }); }
 });
 
+test('routes read-only evidence to Luna without misclassifying it as delegable and records lifecycle attestations', async () => {
+  const fixture = await setup();
+  try {
+    const evidenceRouting = { execution_risk: 'read_only', routing_reason: 'independent evidence collection without state changes', execution_owner: '/root/evidence', integration_owner: '/root', quality_guard: 'evidence is cited and bounded' };
+    const writeRouting = { execution_risk: 'delegable', routing_reason: 'isolated reversible edit', execution_owner: '/root/reader', integration_owner: '/root', quality_guard: 'targeted test' };
+    const reviewRouting = { execution_risk: 'protected', routing_reason: 'independent total review', execution_owner: '/root/reviewer', integration_owner: '/root', quality_guard: 'close gate' };
+    await writeFile(fixture.manifest, JSON.stringify({ task_id: 'feature-1', workspace: fixture.workspace, goal: 'Separate evidence from execution', routing_schema_version: 1, requirements: [{ id: 'R1', text: 'Luna evidence is auditable' }], nodes: [{ id: 'evidence', kind: 'verification', agent_type: 'avsp_luna_high', ...evidenceRouting }, { id: 'write', kind: 'implementation', agent_type: 'avsp_luna_high_writer', ...writeRouting }, { id: 'untyped-write', kind: 'implementation', execution_risk: 'delegable', routing_reason: 'isolated reversible edit', execution_owner: '/root/untyped-reader', integration_owner: '/root', quality_guard: 'targeted test' }, { id: 'total-review', kind: 'total_review', agent_type: 'avsp_sol_high', depends_on: ['evidence', 'write', 'untyped-write'], ...reviewRouting }] }));
+    await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+    await assert.rejects(
+      () => dispatch('start', { state_dir: fixture.stateDir, task_id: 'feature-1', node_id: 'evidence', agent_task_path: '/root/evidence', agent_role: 'avsp_luna_high' }),
+      /native_agent_started must be true/
+    );
+    const [started] = await dispatch('start', { state_dir: fixture.stateDir, task_id: 'feature-1', node_id: 'evidence', agent_task_path: '/root/evidence', agent_role: 'avsp_luna_high', native_agent_started: true });
+    const stateAfterStart = await readControllerState(fixture.stateDir);
+    assert.ok(stateAfterStart.events.some(event => event.type === 'node_started' && event.node_id === 'evidence' && event.native_agent_started === true));
+    const evidenceResult = path.join(fixture.root, 'evidence.json'); await writeFile(evidenceResult, JSON.stringify({ findings: [] }));
+    await assert.rejects(
+      () => dispatch('complete', { state_dir: fixture.stateDir, task_id: 'feature-1', node_id: 'evidence', claim_id: started.node.claim_id, status: 'succeeded', result: evidenceResult }),
+      /completion_attestation=native_agent_finished/
+    );
+    await dispatch('complete', { state_dir: fixture.stateDir, task_id: 'feature-1', node_id: 'evidence', claim_id: started.node.claim_id, status: 'succeeded', result: evidenceResult, completion_attestation: 'native_agent_finished' });
+    const stateAfterComplete = await readControllerState(fixture.stateDir);
+    assert.ok(stateAfterComplete.events.some(event => event.type === 'node_completed' && event.node_id === 'evidence' && event.completion_attestation === 'native_agent_finished'));
+    await assert.rejects(
+      () => dispatch('claim', { state_dir: fixture.stateDir, task_id: 'feature-1', node_id: 'untyped-write', agent_task_path: '/root/untyped-reader', agent_role: 'avsp_luna_high' }),
+      /delegable node requires/
+    );
+    const [writer] = await dispatch('claim', { state_dir: fixture.stateDir, task_id: 'feature-1', node_id: 'write', agent_task_path: '/root/reader', agent_role: 'avsp_luna_high_writer' });
+    assert.equal(writer.node.agent_role, 'avsp_luna_high_writer');
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
 test('routing schema rejects incomplete fields and duplicate delegable execution owners', async () => {
   const fixture = await setup();
   try {
@@ -870,8 +1211,12 @@ test('MCP schema forwards the workspace-release confirmation parameter used by t
   const claim = TOOLS.find(tool => tool.name === 'workflow_claim');
   assert.equal(claim.inputSchema.properties.activation_timeout_sec.minimum, 1);
   const start = TOOLS.find(tool => tool.name === 'workflow_start');
-  assert.deepEqual(start.inputSchema.required, ['task_id', 'node_id', 'agent_task_path', 'agent_role', 'state_dir']);
+  assert.deepEqual(start.inputSchema.required, ['task_id', 'node_id', 'agent_task_path', 'agent_role', 'native_agent_started', 'state_dir']);
+  assert.equal(start.inputSchema.properties.native_agent_started.const, true);
   assert.equal(TOOL_COMMANDS.workflow_start, 'start');
+  const complete = TOOLS.find(tool => tool.name === 'workflow_complete');
+  assert.deepEqual(complete.inputSchema.required, ['task_id', 'node_id', 'claim_id', 'status', 'result', 'completion_attestation', 'state_dir']);
+  assert.deepEqual(complete.inputSchema.properties.completion_attestation.enum, ['native_agent_finished', 'root_rescue_self_completion', 'native_agent_exit_confirmed', 'native_agent_start_failed']);
   const release = TOOLS.find(tool => tool.name === 'workflow_release_workspace');
   assert.deepEqual(release.inputSchema.required, ['task_id', 'previous_agents_stopped', 'state_dir']);
   assert.equal(release.inputSchema.properties.previous_agents_stopped.const, true);
@@ -885,6 +1230,9 @@ test('MCP schema forwards the workspace-release confirmation parameter used by t
 });
 
 test('MCP retry schema retains only the canonical stopped-agent confirmation parameter', () => {
+  const abandon = TOOLS.find(tool => tool.name === 'workflow_abandon');
+  assert.deepEqual(abandon.inputSchema.required, ['task_id', 'node_id', 'claim_id', 'reason', 'previous_agent_stopped', 'state_dir']);
+  assert.equal(abandon.inputSchema.properties.previous_agent_stopped.const, true);
   const retry = TOOLS.find(tool => tool.name === 'workflow_retry');
   assert.deepEqual(retry.inputSchema.required, ['task_id', 'node_id', 'reason', 'previous_agent_stopped', 'state_dir']);
   assert.equal(retry.inputSchema.properties.previous_agent_stopped.const, true);

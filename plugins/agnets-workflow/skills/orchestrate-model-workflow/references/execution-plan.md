@@ -58,11 +58,11 @@ remaining_work_or_blocker: <未完成工作；保留原始错误和缺失条件>
 
 ## 任务级总验收
 
-每个有状态变更的任务在关闭前，由 main/root 新建此前未参与该任务的 `avsp_sol_high` 做总验收；仅在证据冲突、根因未证实、无可靠 oracle 或需受约束重设计时使用 `avsp_sol_xhigh`。所选 Sol role 或模型被实际证明不可用时，使用此前未参与该任务的 `avsp_terra_xhigh_readonly` 兜底同一验收并披露独立性降级；超时、证据不足或普通失败不得降级。输入必须包含原始目标、逐项验收条件、范围/非目标、执行契约、实际 diff/产物、验证输出和已知风险。验收返回 `pass`、`fail` 或 `unavailable`，并逐项说明需求覆盖、范围漂移、行为或回归风险、验证缺口与残余风险。缺少审核实例标识、逐项需求覆盖或证据时视为 `unavailable`。`fail` 或 `unavailable` 不得关闭任务；修复或补证后必须新建另一独立 Sol 实例重新验收。
+每个有状态变更的任务在关闭前，由 main/root 新建此前未参与该任务的 `avsp_sol_high` 做总验收；第一次 high `fail` 修复后仍由 high 复审一次，第二次连续 high `fail` 后控制器把下一次总审升级为 `avsp_sol_xhigh`；xhigh 修复后再次 `fail` 时升级为 `avsp_sol_max`，进入更高等级后不得降级，max 持续到 `pass` 或显式状态上限阻塞。`unavailable`、超时、证据不足或普通失败不得作为能力升级依据。所选 Sol role 或模型被实际证明不可用时，使用此前未参与该任务的 `avsp_terra_xhigh_readonly` 兜底同一验收并披露独立性降级。输入必须包含原始目标、逐项验收条件、范围/非目标、执行契约、实际 diff/产物、验证输出和已知风险。验收返回 `pass`、`fail` 或 `unavailable`，并逐项说明需求覆盖、范围漂移、行为或回归风险、验证缺口与残余风险。缺少审核实例标识、逐项需求覆盖或证据时视为 `unavailable`。`fail` 或 `unavailable` 不得关闭任务；修复或补证后必须新建另一独立 Sol 实例重新验收。
 
 ```markdown
 auditor_task: <新建且此前未参与本任务的 task path>
-auditor_role: <avsp_sol_high | avsp_sol_xhigh | avsp_terra_xhigh_readonly>
+auditor_role: <avsp_sol_high | avsp_sol_xhigh | avsp_sol_max | avsp_terra_xhigh_readonly>
 verdict: <pass | fail | unavailable>
 requirement_coverage: <逐项验收条件 -> 证据或缺口>
 scope_and_regression: <范围漂移、行为或回归风险>

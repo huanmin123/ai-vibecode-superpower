@@ -11,9 +11,28 @@ const RUNNING = 'running';
 const SUCCEEDED = 'succeeded';
 const TERMINAL = new Set([SUCCEEDED, 'failed', 'blocked', 'skipped', 'unavailable', 'abandoned']);
 const COMPLETABLE = new Set([SUCCEEDED, 'failed', 'blocked', 'skipped', 'unavailable']);
-const SOL_ROLES = new Set(['avsp_sol_high', 'avsp_sol_xhigh']);
+const SOL_ROLES = new Set(['avsp_sol_high', 'avsp_sol_xhigh', 'avsp_sol_max']);
+const SOL_ESCALATION_ORDER = ['avsp_sol_high', 'avsp_sol_xhigh', 'avsp_sol_max'];
 const FALLBACK_ROLE = 'avsp_terra_xhigh_readonly';
-const LUNA_EXECUTOR_ROLES = new Set(['avsp_luna_high_executor', 'avsp_luna_xhigh_executor']);
+const LUNA_EXECUTOR_ROLES = new Set([
+  'avsp_luna_high_executor',
+  'avsp_luna_xhigh_executor',
+  // Writers are retained for existing tasks; new tasks use the executor roles.
+  'avsp_luna_high_writer',
+  'avsp_luna_xhigh_writer',
+]);
+const LEGACY_LUNA_WRITER_ROLES = new Set(['avsp_luna_high_writer', 'avsp_luna_xhigh_writer']);
+const READ_ONLY_ROLES = new Set([
+  'avsp_luna_high',
+  'avsp_luna_xhigh',
+  'avsp_sol_high',
+  'avsp_sol_xhigh',
+  'avsp_sol_max',
+  'avsp_terra_low_readonly',
+  'avsp_terra_medium_readonly',
+  'avsp_terra_xhigh',
+  'avsp_terra_xhigh_readonly',
+]);
 const PROTECTED_EXECUTOR_ROLE = 'avsp_terra_high';
 const ROUTING_FIELDS = ['execution_risk', 'routing_reason', 'execution_owner', 'integration_owner', 'quality_guard'];
 const IGNORED_DIRECTORIES = new Set(['.git', '.codex', 'node_modules', '.venv']);
@@ -56,6 +75,10 @@ const DEFAULT_LEASE_SEC = 1800;
 const DEFAULT_ACTIVATION_TIMEOUT_SEC = 600;
 const WORKSPACE_LEASE_VERSION = 1;
 const ROOT_RESCUE_ROLE = 'main/root';
+const NATIVE_AGENT_FINISHED = 'native_agent_finished';
+const ROOT_RESCUE_SELF_COMPLETION = 'root_rescue_self_completion';
+const NATIVE_AGENT_EXIT_CONFIRMED = 'native_agent_exit_confirmed';
+const NATIVE_AGENT_START_FAILED = 'native_agent_start_failed';
 
 function requiredString(value, name) {
   if (typeof value !== 'string' || !value.trim()) throw new ControllerError(`${name} must be a non-empty string`);
@@ -101,11 +124,14 @@ function retryConfirmation(parameters) {
   if (hasLegacyAlias) trueValue(parameters.previous_agents_stopped, 'previous_agents_stopped');
 }
 
+function nonEmptyReviewValue(value) {
+  if (typeof value === 'string') return Boolean(value.trim());
+  if (Array.isArray(value)) return value.length > 0;
+  return Boolean(value) && typeof value === 'object' && Object.keys(value).length > 0;
+}
+
 function requiredReviewValue(value, name) {
-  if (value === undefined || value === null) throw new ControllerError(`${name} is required`);
-  if (typeof value === 'string' && !value.trim()) throw new ControllerError(`${name} must not be empty`);
-  if (Array.isArray(value) && !value.length) throw new ControllerError(`${name} must not be empty`);
-  if (typeof value === 'object' && !Array.isArray(value) && !Object.keys(value).length) throw new ControllerError(`${name} must not be empty`);
+  if (!nonEmptyReviewValue(value)) throw new ControllerError(`${name} must be a non-empty string, array, or object`);
   return value;
 }
 
@@ -567,7 +593,7 @@ function validateTotalReviewTopology(nodes) {
   }
 }
 
-function stableJson(value) {
+export function stableJson(value) {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
   return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`;
@@ -605,7 +631,7 @@ function workflowSnapshot(state) {
   };
 }
 
-function sameJson(left, right) { return stableJson(left) === stableJson(right); }
+export function sameJson(left, right) { return stableJson(left) === stableJson(right); }
 
 function bumpWorkflowRevision(state, eventType, details = {}) {
   state.workflow_revision = (state.workflow_revision ?? 0) + 1;
@@ -628,7 +654,7 @@ function nodeRouting(raw, routingRequired) {
   }
   if (supplied.length !== ROUTING_FIELDS.length) throw new ControllerError(`node routing fields must be complete: ${ROUTING_FIELDS.join(', ')}`);
   const executionRisk = requiredString(raw.execution_risk, 'node.execution_risk');
-  if (!['delegable', 'protected'].includes(executionRisk)) throw new ControllerError('node.execution_risk must be delegable or protected');
+  if (!['read_only', 'delegable', 'protected'].includes(executionRisk)) throw new ControllerError('node.execution_risk must be read_only, delegable, or protected');
   return {
     execution_risk: executionRisk,
     routing_reason: requiredString(raw.routing_reason, 'node.routing_reason'),
@@ -645,7 +671,7 @@ function nodeRecord(raw, options = {}) {
   if (raw.agent_type !== undefined && raw.agent_type !== null) requiredString(raw.agent_type, 'node.agent_type');
   const dependencies = raw.depends_on ?? [];
   if (!Array.isArray(dependencies) || dependencies.some(dependency => typeof dependency !== 'string' || !dependency.trim())) throw new ControllerError('node.depends_on must contain non-empty string identifiers');
-  return { id, kind, agent_type: raw.agent_type ?? null, depends_on: dependencies, ...nodeRouting(raw, options.routingRequired === true), rescue_role: null, rescue_reason: null, rescued_at: null, rescue_count: 0, status: PENDING, agent_task_path: null, agent_thread_id: null, agent_role: null, claim_id: null, claimed_at: null, activation_at: null, activation_deadline_at: null, heartbeat_at: null, heartbeat_count: 0, lease_duration_sec: null, attempt: 0, result: null, checkpoint: null, checkpoint_at: null, recovery_history: [] };
+  return { id, kind, agent_type: raw.agent_type ?? null, depends_on: dependencies, ...nodeRouting(raw, options.routingRequired === true), rescue_role: null, rescue_reason: null, rescued_at: null, rescue_count: 0, status: PENDING, agent_task_path: null, agent_thread_id: null, agent_role: null, claim_id: null, claimed_at: null, activation_at: null, activation_deadline_at: null, heartbeat_at: null, heartbeat_count: 0, lease_duration_sec: null, attempt: 0, result: null, checkpoint: null, checkpoint_at: null, workflow_completion_intent: null, recovery_history: [] };
 }
 
 function normalizeState(state) {
@@ -659,7 +685,7 @@ function normalizeState(state) {
     if (node.id !== nodeId) throw new ControllerError(`Task node key and id must match: ${nodeId}`);
     node.agent_thread_id ??= null; node.agent_role ??= null; node.claim_id ??= null; node.claimed_at ??= null; node.activation_at ??= null; node.activation_deadline_at ??= null; node.heartbeat_at ??= null;
     node.lease_duration_sec ??= null; node.heartbeat_count ??= 0; node.attempt ??= node.agent_task_path ? 1 : 0;
-    node.checkpoint ??= null; node.checkpoint_at ??= null; node.recovery_history ??= [];
+    node.checkpoint ??= null; node.checkpoint_at ??= null; node.recovery_history ??= []; node.workflow_completion_intent ??= null;
     node.rescue_role ??= null; node.rescue_reason ??= null; node.rescued_at ??= null; node.rescue_count ??= 0;
     if (!hasOwn(node, 'execution_risk')) Object.assign(node, nodeRouting(node, false));
   }
@@ -997,6 +1023,7 @@ async function addNode(parameters) {
 
 async function claimNode(parameters, activateImmediately = false) {
   const [filePath] = await readTask(parameters); const nodeId = requiredIdentifier(parameters.node_id, 'node_id'); const taskPath = requiredString(parameters.agent_task_path, 'agent_task_path'); const threadId = optionalString(parameters.agent_thread_id, 'agent_thread_id'); const role = requiredString(parameters.agent_role, 'agent_role'); const leaseDurationSec = positiveInteger(parameters.lease_duration_sec, 'lease_duration_sec', DEFAULT_LEASE_SEC); const activationTimeoutSec = positiveInteger(parameters.activation_timeout_sec, 'activation_timeout_sec', Math.min(DEFAULT_ACTIVATION_TIMEOUT_SEC, leaseDurationSec));
+  if (activateImmediately) trueValue(parameters.native_agent_started, 'native_agent_started');
   return withStateLock(filePath, async () => {
     const state = normalizeState(await loadState(filePath)); await requireActiveWorkspaceLease(state, filePath); const node = state.nodes[nodeId];
     if (!node || !readyNodes(state).some(candidate => candidate.id === nodeId)) throw new ControllerError(`Node is not ready: ${nodeId}`);
@@ -1006,6 +1033,9 @@ async function claimNode(parameters, activateImmediately = false) {
     if (expectedAgentType && expectedAgentType !== role) throw new ControllerError(`Node agent_type must match claimed role: ${expectedAgentType}`);
     // Total reviews are read-only guards, not protected execution work.
     if (node.execution_risk === 'protected' && node.kind !== 'total_review' && role !== PROTECTED_EXECUTOR_ROLE) throw new ControllerError('Only avsp_terra_high can claim protected work');
+    if (node.execution_risk === 'read_only' && node.kind !== 'total_review' && !READ_ONLY_ROLES.has(role)) throw new ControllerError('A read_only node requires a configured read-only role');
+    if (node.execution_risk === 'delegable' && !LUNA_EXECUTOR_ROLES.has(role) && role !== PROTECTED_EXECUTOR_ROLE && !(node.rescue_role === ROOT_RESCUE_ROLE && role === ROOT_RESCUE_ROLE)) throw new ControllerError('A delegable node requires a Luna executor or legacy writer, avsp_terra_high, or an explicit main/root rescue');
+    if (node.execution_risk === 'delegable' && LEGACY_LUNA_WRITER_ROLES.has(role) && node.agent_type !== role) throw new ControllerError('A legacy Luna writer requires an explicitly matching node agent_type');
     if (LUNA_EXECUTOR_ROLES.has(role)) {
       if (node.routing_legacy || node.execution_risk !== 'delegable') throw new ControllerError('A Luna executor requires complete delegable routing metadata');
       if (node.execution_owner !== taskPath) throw new ControllerError('Luna executor claim must match node execution_owner');
@@ -1014,7 +1044,9 @@ async function claimNode(parameters, activateImmediately = false) {
     if (node.attempt >= MAX_NODE_ATTEMPTS) throw new ControllerError(`Node exceeded the ${MAX_NODE_ATTEMPTS}-attempt limit: ${nodeId}`);
     const now = utcNow(); node.status = RUNNING; node.agent_task_path = taskPath; node.agent_thread_id = threadId; node.agent_role = role; node.claim_id = randomUUID(); node.claimed_at = now; node.activation_at = activateImmediately ? now : null; node.activation_deadline_at = activateImmediately ? null : new Date(Date.now() + activationTimeoutSec * 1000).toISOString(); node.heartbeat_at = now; node.heartbeat_count = activateImmediately ? 1 : 0; node.lease_duration_sec = leaseDurationSec; node.attempt += 1;
     state.participants.push({ agent_task_path: taskPath, agent_thread_id: threadId, agent_role: role, node_id: nodeId, claim_id: node.claim_id, attempt: node.attempt });
-    addEvent(state, 'node_claimed', { node_id: nodeId, agent_task_path: taskPath, agent_thread_id: threadId, agent_role: role, claim_id: node.claim_id, attempt: node.attempt }); await writeState(filePath, state);
+    addEvent(state, 'node_claimed', { node_id: nodeId, agent_task_path: taskPath, agent_thread_id: threadId, agent_role: role, claim_id: node.claim_id, attempt: node.attempt });
+    if (activateImmediately) addEvent(state, 'node_started', { node_id: nodeId, agent_task_path: taskPath, agent_thread_id: threadId, agent_role: role, claim_id: node.claim_id, native_agent_started: true });
+    await writeState(filePath, state);
     return { task_id: state.task_id, node };
   });
 }
@@ -1030,18 +1062,220 @@ function hasRecordedReview(state, node) {
   return state.reviews.some(review => review.auditor_task === node.agent_task_path && review.claim_id === node.claim_id);
 }
 
+function reviewCompletion(state, review) {
+  const completionEvent = [...state.events].reverse().find(event => event.type === 'node_completed' && event.node_id === review.node_id && event.claim_id === review.claim_id) ?? (() => {
+    const reviews = state.reviews.filter(candidate => candidate.node_id === review.node_id && !state.events.some(event => event.type === 'node_completed' && event.node_id === candidate.node_id && event.claim_id === candidate.claim_id)).sort((left, right) => Date.parse(left.recorded_at) - Date.parse(right.recorded_at));
+    const legacyEvents = state.events.filter(event => event.type === 'node_completed' && event.node_id === review.node_id && !hasOwn(event, 'claim_id')).sort((left, right) => Date.parse(left.at) - Date.parse(right.at));
+    const used = new Set();
+    for (const candidate of reviews) {
+      const recordedAt = Date.parse(candidate.recorded_at);
+      const eventIndex = legacyEvents.findIndex((event, index) => !used.has(index) && (!Number.isFinite(recordedAt) || !Number.isFinite(Date.parse(event.at)) || Date.parse(event.at) >= recordedAt));
+      if (eventIndex >= 0) {
+        used.add(eventIndex);
+        if (candidate === review) return legacyEvents[eventIndex];
+      }
+    }
+    return null;
+  })();
+  return {
+    status: review.completion_status ?? completionEvent?.status ?? null,
+    completion_attestation: review.completion_attestation ?? completionEvent?.completion_attestation ?? null,
+  };
+}
+
+function isFinalFailedReview(state, review) {
+  return review.verdict === 'fail' && reviewCompletion(state, review).status === 'failed';
+}
+
+function nextTotalReviewRole(state, node) {
+  if (!node || node.kind !== 'total_review') return null;
+  const reviews = state.reviews.filter(review => review.node_id === node.id);
+  const latest = reviews.at(-1);
+  const currentRole = SOL_ESCALATION_ORDER.includes(node.agent_type) ? node.agent_type : 'avsp_sol_high';
+  if (!latest || latest.auditor_role !== currentRole || !isFinalFailedReview(state, latest)) return currentRole;
+  const latestIndex = SOL_ESCALATION_ORDER.indexOf(currentRole);
+  if (latestIndex < 0) return currentRole;
+  if (currentRole === 'avsp_sol_high') {
+    let consecutiveHighFailures = 0;
+    for (let index = reviews.length - 1; index >= 0; index -= 1) {
+      const review = reviews[index];
+      if (review.auditor_role !== 'avsp_sol_high' || !isFinalFailedReview(state, review)) break;
+      consecutiveHighFailures += 1;
+    }
+    if (consecutiveHighFailures >= 2) return 'avsp_sol_xhigh';
+  } else if (currentRole === 'avsp_sol_xhigh') {
+    return 'avsp_sol_max';
+  }
+  return SOL_ESCALATION_ORDER[Math.min(latestIndex, SOL_ESCALATION_ORDER.length - 1)];
+}
+
+function hasWorkflowOutcomeMarker(result) {
+  return Boolean(result && typeof result === 'object' && !Array.isArray(result) && result.workflow !== null && result.workflow !== undefined);
+}
+
+function hasMatchingWorkflowBinding(workflow, parameters, node) {
+  return Boolean(
+    workflow && typeof workflow === 'object' && !Array.isArray(workflow) && typeof workflow.state_dir === 'string'
+    && workflow.task_id === parameters.task_id && workflow.node_id === parameters.node_id && workflow.claim_id === parameters.claim_id
+    && node.id === parameters.node_id && path.resolve(workflow.state_dir) === path.resolve(parameters.state_dir),
+  );
+}
+
+function isPendingWorkflowOutcome(result, parameters, node) {
+  if (!hasWorkflowOutcomeMarker(result)) return false;
+  const workflow = result?.workflow;
+  return Boolean(
+    hasMatchingWorkflowBinding(workflow, parameters, node)
+    && result.workflow_completion?.state === 'pending',
+  );
+}
+
+function isFinalizedWorkflowOutcome(result, parameters, node, status, completionAttestation) {
+  if (!hasWorkflowOutcomeMarker(result) || !hasMatchingWorkflowBinding(result.workflow, parameters, node)) return false;
+  const completion = result.workflow_completion;
+  return Boolean(
+    completion && typeof completion === 'object' && !Array.isArray(completion)
+    && completion.completed === true && typeof completion.completed_at === 'string' && completion.completed_at.length > 0
+    && completion.task_id === parameters.task_id && completion.node_id === parameters.node_id && completion.claim_id === parameters.claim_id
+    && completion.status === status && completion.completion_attestation === completionAttestation,
+  );
+}
+
+function workflowOutcomePayload(result) {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return result;
+  const { workflow_completion: _workflowCompletion, ...payload } = result;
+  return payload;
+}
+
+function workflowOutcomeDigest(result) {
+  return createHash('sha256').update(stableJson(workflowOutcomePayload(result))).digest('hex');
+}
+
+function workflowCompletionIntentResultDigest(intent) {
+  if (typeof intent?.result_digest === 'string' && /^[a-f0-9]{64}$/.test(intent.result_digest)) return intent.result_digest;
+  // Older persisted intents predate result_digest but retain the pending result.
+  return intent?.result && typeof intent.result === 'object' ? workflowOutcomeDigest(intent.result) : null;
+}
+
+function isCompletedWorkflowOutcome(result, state, node) {
+  if (!hasWorkflowOutcomeMarker(result)) return false;
+  const workflow = result.workflow;
+  const completion = result.workflow_completion;
+  return Boolean(
+    workflow && typeof workflow === 'object' && !Array.isArray(workflow)
+    && workflow.task_id === state.task_id && workflow.node_id === node.id && workflow.claim_id === node.claim_id
+    && completion && typeof completion === 'object' && !Array.isArray(completion)
+    && completion.completed === true && typeof completion.completed_at === 'string' && completion.completed_at.length > 0
+    && completion.task_id === state.task_id && completion.node_id === node.id && completion.claim_id === node.claim_id
+    && completion.status === node.status && typeof completion.completion_attestation === 'string' && completion.completion_attestation.length > 0,
+  );
+}
+
+function addWorkflowOutcomeEnvelope(result, parameters) {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) throw new ControllerError('A total_review result must be a JSON object');
+  if (hasWorkflowOutcomeMarker(result)) return result;
+  return {
+    ...result,
+    workflow: {
+      state_dir: path.resolve(parameters.state_dir),
+      task_id: parameters.task_id,
+      node_id: parameters.node_id,
+      claim_id: parameters.claim_id,
+    },
+    workflow_completion: { state: 'pending' },
+  };
+}
+
+async function finalizeWorkflowOutcome(result, parameters, node, status, completionAttestation) {
+  if (!isPendingWorkflowOutcome(result, parameters, node)) return null;
+  const workflowCompletion = {
+    completed: true,
+    completed_at: utcNow(),
+    task_id: parameters.task_id,
+    node_id: parameters.node_id,
+    claim_id: parameters.claim_id,
+    status,
+    completion_attestation: completionAttestation,
+  };
+  const finalized = { ...result, workflow_completion: workflowCompletion };
+  await atomicWrite(parameters.result, finalized, MAX_NODE_RESULT_BYTES);
+  Object.assign(result, finalized);
+  return workflowCompletion;
+}
+
+function workflowCompletionIntentMatches(intent, parameters, status, completionAttestation) {
+  return Boolean(
+    intent && typeof intent === 'object' && !Array.isArray(intent)
+    && intent.claim_id === parameters.claim_id && intent.task_id === parameters.task_id && intent.node_id === parameters.node_id
+    && intent.status === status && intent.completion_attestation === completionAttestation
+    && typeof intent.result_path === 'string' && path.resolve(intent.result_path) === path.resolve(parameters.result),
+  );
+}
+
 async function completeNode(parameters) {
   const status = String(parameters.status); if (!COMPLETABLE.has(status)) throw new ControllerError(`Completion status must be one of: ${[...COMPLETABLE].sort().join(', ')}`);
-  const result = await readJson(parameters.result, { label: 'Node result', maxBytes: MAX_NODE_RESULT_BYTES }); const [filePath] = await readTask(parameters); const nodeId = requiredIdentifier(parameters.node_id, 'node_id');
+  let result = await readJson(parameters.result, { label: 'Node result', maxBytes: MAX_NODE_RESULT_BYTES }); const [filePath] = await readTask(parameters); const nodeId = requiredIdentifier(parameters.node_id, 'node_id');
   return withStateLock(filePath, async () => {
     const state = normalizeState(await loadState(filePath)); await requireActiveWorkspaceLease(state, filePath); const node = state.nodes[nodeId]; requireActiveClaim(node, parameters);
+    if (!node.activation_at || node.heartbeat_count < 1) throw new ControllerError('An unactivated node cannot be completed; the claiming agent must first call workflow_heartbeat or workflow_start');
+    const expectedAttestation = node.rescue_role === ROOT_RESCUE_ROLE && node.agent_role === ROOT_RESCUE_ROLE
+      ? ROOT_RESCUE_SELF_COMPLETION
+      : node.kind === 'total_review' && status === 'unavailable' && [NATIVE_AGENT_EXIT_CONFIRMED, NATIVE_AGENT_START_FAILED].includes(parameters.completion_attestation)
+        ? parameters.completion_attestation
+        : NATIVE_AGENT_FINISHED;
+    if (parameters.completion_attestation !== expectedAttestation) throw new ControllerError(`workflow_complete requires completion_attestation=${expectedAttestation}`);
     if (node.kind === 'total_review' && status === 'skipped') throw new ControllerError('A total_review node cannot be skipped');
     if (node.kind === 'total_review' && status === SUCCEEDED && !hasRecordedReview(state, node)) throw new ControllerError('A successful total_review requires a recorded review for its active claim');
+    let workflowOutcomeCompletion = null;
+    if (node.kind === 'total_review') {
+      result = addWorkflowOutcomeEnvelope(result, parameters);
+      if (node.workflow_completion_intent && !workflowCompletionIntentMatches(node.workflow_completion_intent, parameters, status, expectedAttestation)) {
+        throw new ControllerError('A total_review completion is already pending for a different result, claim, or status');
+      }
+      if (isPendingWorkflowOutcome(result, parameters, node)) {
+        if (node.workflow_completion_intent && !sameJson(node.workflow_completion_intent.result, result)) throw new ControllerError('A total_review pending result does not match its persisted completion intent');
+        if (!node.workflow_completion_intent) {
+          node.workflow_completion_intent = {
+            task_id: parameters.task_id,
+            node_id: parameters.node_id,
+            claim_id: parameters.claim_id,
+            status,
+            completion_attestation: expectedAttestation,
+            result_path: path.resolve(parameters.result),
+            result_digest: workflowOutcomeDigest(result),
+            result,
+            created_at: utcNow(),
+          };
+          await writeState(filePath, state);
+        }
+        workflowOutcomeCompletion = await finalizeWorkflowOutcome(result, parameters, node, status, expectedAttestation);
+      } else if (isFinalizedWorkflowOutcome(result, parameters, node, status, expectedAttestation)) {
+        if (!node.workflow_completion_intent) {
+          throw new ControllerError('A finalized total_review result requires a persisted completion intent');
+        }
+        const intentResultDigest = workflowCompletionIntentResultDigest(node.workflow_completion_intent);
+        if (node.workflow_completion_intent && intentResultDigest !== workflowOutcomeDigest(result)) {
+          throw new ControllerError('A total_review finalized result does not match its persisted completion intent');
+        }
+        workflowOutcomeCompletion = result.workflow_completion;
+      } else {
+        throw new ControllerError('A workflow-bound total_review requires a matching workflow_completion.state=pending outcome');
+      }
+    }
+    if (node.kind === 'total_review') {
+      const recordedReview = state.reviews.find(review => review.node_id === node.id && review.claim_id === node.claim_id);
+      if (recordedReview) {
+        recordedReview.completion_status = status;
+        recordedReview.completion_attestation = expectedAttestation;
+        recordedReview.completed_at = utcNow();
+      }
+    }
+    if (node.kind === 'total_review') node.workflow_completion_intent = null;
     node.status = status; node.result = result;
-    if (node.kind === 'total_review') addEvent(state, 'node_completed', { node_id: nodeId, status });
-    else bumpWorkflowRevision(state, 'node_completed', { node_id: nodeId, status });
+    if (node.kind === 'total_review') addEvent(state, 'node_completed', { node_id: nodeId, claim_id: node.claim_id, status, completion_attestation: expectedAttestation });
+    else bumpWorkflowRevision(state, 'node_completed', { node_id: nodeId, status, completion_attestation: expectedAttestation });
     await writeState(filePath, state);
-    return { task_id: state.task_id, node, ready_nodes: readyNodes(state) };
+    return { task_id: state.task_id, node, ready_nodes: readyNodes(state), workflow_outcome_completion: workflowOutcomeCompletion };
   });
 }
 
@@ -1116,7 +1350,7 @@ function rebindExecutionOwner(node, replacement) {
 }
 
 function clearAttemptForRetry(node) {
-  node.status = PENDING; node.agent_task_path = null; node.agent_thread_id = null; node.agent_role = null; node.claim_id = null; node.claimed_at = null; node.activation_at = null; node.activation_deadline_at = null; node.heartbeat_at = null; node.heartbeat_count = 0; node.lease_duration_sec = null; node.result = null; node.checkpoint = null; node.checkpoint_at = null;
+  node.status = PENDING; node.agent_task_path = null; node.agent_thread_id = null; node.agent_role = null; node.claim_id = null; node.claimed_at = null; node.activation_at = null; node.activation_deadline_at = null; node.heartbeat_at = null; node.heartbeat_count = 0; node.lease_duration_sec = null; node.result = null; node.checkpoint = null; node.checkpoint_at = null; node.workflow_completion_intent = null;
 }
 
 function clearRescueRouting(node) {
@@ -1148,6 +1382,7 @@ async function rescueNode(parameters) {
     const state = normalizeState(await loadState(filePath)); await requireActiveWorkspaceLease(state, filePath); const node = state.nodes[nodeId]; requireActiveClaim(node, parameters);
     if (node.kind === 'total_review') throw new ControllerError('A total_review node cannot be rescued by main/root');
     if (node.execution_risk !== 'delegable') throw new ControllerError('Only delegable Luna execution can be rescued by main/root');
+    if (!LUNA_EXECUTOR_ROLES.has(node.agent_role)) throw new ControllerError('Only a Luna executor or explicitly matched legacy writer attempt can be rescued by main/root');
     if (node.rescue_role) throw new ControllerError(`Node already has an active rescue role: ${nodeId}`);
     if (node.attempt >= MAX_NODE_ATTEMPTS) throw new ControllerError(`Node exceeded the ${MAX_NODE_ATTEMPTS}-attempt limit: ${nodeId}`);
     const replacement = replacementExecutionOwner(state, node, parameters);
@@ -1166,12 +1401,12 @@ async function rescueNode(parameters) {
 }
 
 async function abandonNode(parameters) {
-  const [filePath] = await readTask(parameters); const nodeId = requiredIdentifier(parameters.node_id, 'node_id'); const reason = requiredString(parameters.reason, 'reason');
+  const [filePath] = await readTask(parameters); const nodeId = requiredIdentifier(parameters.node_id, 'node_id'); const reason = requiredString(parameters.reason, 'reason'); trueValue(parameters.previous_agent_stopped, 'previous_agent_stopped');
   return withStateLock(filePath, async () => {
     const state = normalizeState(await loadState(filePath)); await requireActiveWorkspaceLease(state, filePath); const node = state.nodes[nodeId]; requireActiveClaim(node, parameters);
-    node.status = 'abandoned'; node.result = { summary: 'Node abandoned after explicit reconciliation.', reason, abandoned_at: utcNow(), claim_id: node.claim_id };
-    if (node.kind === 'total_review') addEvent(state, 'node_abandoned', { node_id: nodeId, claim_id: node.claim_id, reason });
-    else bumpWorkflowRevision(state, 'node_abandoned', { node_id: nodeId, claim_id: node.claim_id, reason });
+    node.status = 'abandoned'; node.workflow_completion_intent = null; node.result = { summary: 'Node abandoned after explicit reconciliation.', reason, abandoned_at: utcNow(), claim_id: node.claim_id };
+    if (node.kind === 'total_review') addEvent(state, 'node_abandoned', { node_id: nodeId, claim_id: node.claim_id, reason, previous_agent_stopped: true });
+    else bumpWorkflowRevision(state, 'node_abandoned', { node_id: nodeId, claim_id: node.claim_id, reason, previous_agent_stopped: true });
     await writeState(filePath, state);
     return { task_id: state.task_id, node };
   });
@@ -1186,8 +1421,14 @@ async function retryNode(parameters) {
     const downstreamStarted = Object.values(state.nodes).some(candidate => candidate.depends_on.includes(nodeId) && candidate.status !== PENDING);
     if (downstreamStarted) throw new ControllerError(`Cannot retry after a dependent node changed state: ${nodeId}`);
     const replacement = node.routing_legacy ? null : replacementExecutionOwner(state, node, parameters); const priorExecutionOwner = replacement ? rebindExecutionOwner(node, replacement) : node.execution_owner;
-    const priorClaimId = node.claim_id; clearRescueRouting(node); clearAttemptForRetry(node);
-    const details = { node_id: nodeId, prior_claim_id: priorClaimId, prior_execution_owner: priorExecutionOwner, replacement_execution_owner: replacement, reason, previous_agent_stopped: true, orphaned_total_review: orphanedTotalReview };
+    const priorClaimId = node.claim_id; const priorReviewRole = node.kind === 'total_review' ? node.agent_type : null; const nextReviewRole = node.kind === 'total_review' ? nextTotalReviewRole(state, node) : null;
+    clearRescueRouting(node); clearAttemptForRetry(node);
+    if (nextReviewRole) node.agent_type = nextReviewRole;
+    const details = { node_id: nodeId, prior_claim_id: priorClaimId, prior_execution_owner: priorExecutionOwner, replacement_execution_owner: replacement, reason, previous_agent_stopped: true, orphaned_total_review: orphanedTotalReview, prior_review_role: priorReviewRole, review_role: nextReviewRole };
+    if (node.kind === 'total_review' && nextReviewRole && nextReviewRole !== priorReviewRole) {
+      details.review_escalated = true;
+      addEvent(state, 'total_review_escalated', { node_id: nodeId, prior_role: priorReviewRole, role: nextReviewRole, reason, prior_claim_id: priorClaimId });
+    }
     if (node.kind === 'total_review') addEvent(state, 'node_retried', details); else bumpWorkflowRevision(state, 'node_retried', details);
     await writeState(filePath, state);
     return { task_id: state.task_id, node, ready_nodes: readyNodes(state) };
@@ -1195,7 +1436,7 @@ async function retryNode(parameters) {
 }
 
 const PRUNABLE_STATE_FIELDS = new Set(['version', 'routing_schema_version', 'task_id', 'workspace', 'goal', 'requirements', 'scope', 'non_goals', 'nodes', 'participants', 'reviews', 'events', 'workflow_revision', 'closed_revision', 'closed_at', 'created_at', 'updated_at', 'workspace_lease']);
-const PRUNABLE_NODE_FIELDS = new Set(['id', 'kind', 'agent_type', 'depends_on', 'execution_risk', 'routing_reason', 'execution_owner', 'integration_owner', 'quality_guard', 'routing_legacy', 'rescue_role', 'rescue_reason', 'rescued_at', 'rescue_count', 'status', 'agent_task_path', 'agent_thread_id', 'agent_role', 'claim_id', 'claimed_at', 'activation_at', 'activation_deadline_at', 'heartbeat_at', 'heartbeat_count', 'lease_duration_sec', 'attempt', 'result', 'checkpoint', 'checkpoint_at', 'recovery_history']);
+const PRUNABLE_NODE_FIELDS = new Set(['id', 'kind', 'agent_type', 'depends_on', 'execution_risk', 'routing_reason', 'execution_owner', 'integration_owner', 'quality_guard', 'routing_legacy', 'rescue_role', 'rescue_reason', 'rescued_at', 'rescue_count', 'status', 'agent_task_path', 'agent_thread_id', 'agent_role', 'claim_id', 'claimed_at', 'activation_at', 'activation_deadline_at', 'heartbeat_at', 'heartbeat_count', 'lease_duration_sec', 'attempt', 'result', 'checkpoint', 'checkpoint_at', 'workflow_completion_intent', 'recovery_history']);
 const PRUNABLE_LEASE_FIELDS = new Set(['version', 'workspace', 'active_task', 'updated_at']);
 const PRUNABLE_TASK_LEASE_FIELDS = new Set(['registry_path', 'state_path', 'status', 'acquired_at', 'released_at']);
 const PRUNE_SWEEP_FIELDS = new Set(['version', 'last_sweep_at', 'last_result']);
@@ -1225,7 +1466,7 @@ function taskPruneEligibility(state, filePath, now) {
     if (!hasExactFields(node, PRUNABLE_NODE_FIELDS) || node.id !== id || (node.status !== PENDING && !TERMINAL.has(node.status))) return { eligible: false, reason: 'incomplete, unknown, or active node state' };
     try { requiredIdentifier(node.id, 'node.id'); requiredString(node.kind, 'node.kind'); requiredString(node.execution_risk, 'node.execution_risk'); requiredString(node.routing_reason, 'node.routing_reason'); requiredString(node.execution_owner, 'node.execution_owner'); requiredString(node.integration_owner, 'node.integration_owner'); requiredString(node.quality_guard, 'node.quality_guard'); }
     catch (error) { return { eligible: false, reason: `invalid node state: ${error.message}` }; }
-    if (!['delegable', 'protected'].includes(node.execution_risk) || !Array.isArray(node.depends_on) || node.depends_on.some(dependency => typeof dependency !== 'string') || node.routing_legacy !== false || !Number.isSafeInteger(node.attempt) || node.attempt < 0 || node.attempt > MAX_NODE_ATTEMPTS || !Number.isSafeInteger(node.heartbeat_count) || node.heartbeat_count < 0 || !Array.isArray(node.recovery_history)) return { eligible: false, reason: 'legacy or invalid node routing' };
+    if (!['read_only', 'delegable', 'protected'].includes(node.execution_risk) || !Array.isArray(node.depends_on) || node.depends_on.some(dependency => typeof dependency !== 'string') || node.routing_legacy !== false || !Number.isSafeInteger(node.attempt) || node.attempt < 0 || node.attempt > MAX_NODE_ATTEMPTS || !Number.isSafeInteger(node.heartbeat_count) || node.heartbeat_count < 0 || !Array.isArray(node.recovery_history)) return { eligible: false, reason: 'legacy or invalid node routing' };
   }
   try { validateNodes(state.nodes); validateTotalReviewTopology(state.nodes); }
   catch (error) { return { eligible: false, reason: `invalid task topology: ${error.message}` }; }
@@ -1933,13 +2174,13 @@ async function recordReview(parameters) {
     if (role === FALLBACK_ROLE && !review.fallback_reason) throw new ControllerError('Terra fallback review requires fallback_reason');
     if (!['pass', 'fail', 'unavailable'].includes(verdict)) throw new ControllerError('Review verdict must be pass, fail, or unavailable');
     const expectedIds = new Set(state.requirements.map(item => item.id)); const coverage = review.requirement_coverage;
-    if (!coverage || typeof coverage !== 'object' || Object.keys(coverage).length !== expectedIds.size || [...expectedIds].some(id => !hasOwn(coverage, id) || !coverage[id])) throw new ControllerError('Review must provide non-empty coverage for every requirement');
+    if (!coverage || typeof coverage !== 'object' || Array.isArray(coverage) || Object.keys(coverage).length !== expectedIds.size || [...expectedIds].some(id => !hasOwn(coverage, id) || !nonEmptyReviewValue(coverage[id]))) throw new ControllerError('Review must provide non-empty coverage for every requirement');
     const snapshot = workflowSnapshot(state);
     if (!sameJson(review.workflow_snapshot, snapshot)) throw new ControllerError('Review workflow_snapshot does not match the current task state');
     const unfinishedMaterialNodes = Object.values(state.nodes).filter(node => node.kind !== 'total_review' && ![SUCCEEDED, 'skipped'].includes(node.status));
     if (unfinishedMaterialNodes.length) throw new ControllerError(`Total review cannot be recorded before all work nodes finish: ${unfinishedMaterialNodes.map(node => node.id).join(', ')}`);
     const fingerprint = await workspaceFingerprint(state.workspace);
-    if (JSON.stringify(review.workspace_fingerprint) !== JSON.stringify(fingerprint)) throw new ControllerError('Review fingerprint does not match the current workspace');
+    if (!sameJson(review.workspace_fingerprint, fingerprint)) throw new ControllerError('Review fingerprint does not match the current workspace');
     const scopeAndRegression = requiredReviewValue(review.scope_and_regression, 'scope_and_regression');
     const verificationGaps = requiredReviewValue(review.verification_gaps, 'verification_gaps');
     const residualRisk = requiredReviewValue(review.residual_risk, 'residual_risk');
@@ -1955,6 +2196,7 @@ async function closeReasons(state) {
   const reasons = incomplete.length ? [`incomplete nodes: ${incomplete.join(', ')}`] : [];
   const totalReview = Object.values(state.nodes).find(node => node.kind === 'total_review');
   if (!totalReview || totalReview.status !== SUCCEEDED) reasons.push('total_review is not succeeded');
+  if (totalReview && !isCompletedWorkflowOutcome(totalReview.result, state, totalReview)) reasons.push('total_review workflow outcome completion is pending or invalid');
   const review = state.reviews.at(-1);
   if (!review) reasons.push('no total review'); else {
     if (review.verdict !== 'pass') reasons.push(`latest review verdict is ${review.verdict}`);

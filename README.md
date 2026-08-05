@@ -7,7 +7,7 @@
 ## 你会得到
 
 - 统一的全局规则和跨平台命令文档。
-- 11 个分工角色，用于调查、判断、实施和复查。
+- 12 个分工角色，用于调查、判断、实施和复查；另保留 2 个 legacy writer 角色兼容旧任务。
 - `agnets-workflow` 插件，包含 `orchestrate-model-workflow`、`agent-toolchain` 和 `workflow-controller`。
 - 独立全局 skill：`project-doc-planner` 与 `gpt-image-2-cli`。
 
