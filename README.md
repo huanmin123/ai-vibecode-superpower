@@ -17,18 +17,50 @@
 
 适合日常开发与维护，尤其是需要跨文件理解、分阶段实施、并行处理或独立复查的复杂任务。单文件、一次性的小改动通常不需要额外配置；安装完成后，直接告诉 Codex 目标、范围和限制即可。
 
+## 成本预期
+
+对于可拆分的复杂任务，按工作流分工相较于全程使用 `avsp_sol_high`，经验上可实现约 5 倍模型调用成本节省。这是预期而非保证或价格承诺；实际效果取决于任务规模、上下文、重试次数和人工介入程度。对于跨模块理解、大型代码库或重复探索明显的场景，叠加 `agent-toolchain` 可进一步减少重复读取、无效调用与探索成本；一次性小改动通常不适合为了这一收益专门接入。
+
+成本优化的原则是：把重复性、范围明确且可验证的工作交给成本更低的模型，把复杂判断、跨域权衡和独立复查交给高级模型。因此，优化调用成本不以省略验证为代价；高级模型的复查与最终验收提供质量兜底，最终质量以独立复查和验收结果为准。这不构成对任何任务的绝对质量保证。
+
 ## 工作流概览
 
 ```mermaid
-flowchart TD
-    A[提出目标与约束] --> B[分析任务范围]
-    B --> C[调查与形成方案]
-    C --> D[实施改动]
-    D --> E[验证与复查]
-    E --> F[交付结果]
+flowchart TB
+    GOAL["用户目标与验收标准"] --> SPLIT["协调与任务拆分"]
+    SPLIT --> COST["成本与速度层：低成本模型处理取证、整理、范围明确且可验证的工作"]
+    COST --> EXEC["受控执行与验证"]
+    EXEC --> JUDGE["高级模型处理复杂判断与独立总审"]
+    JUDGE -->|通过| DELIVER["通过验收并交付"]
+    JUDGE -->|未通过| REPAIR["回到修复并重新验证"]
+    REPAIR --> EXEC
+
+    subgraph MCP["workflow-controller MCP：可查状态与关闭闭环"]
+        DAG["DAG 与依赖"] --> READY["按依赖识别就绪节点"]
+        READY --> CHECKPOINT["记录 checkpoint 与进度"]
+        CHECKPOINT --> DIAG["状态诊断与受控恢复"]
+        DIAG --> REVIEW["保存总审证据"]
+        REVIEW --> CLOSE["关闭检查"]
+    end
+    SPLIT -.-> DAG
+    COST -.-> READY
+    EXEC -.-> CHECKPOINT
+    JUDGE -.-> REVIEW
+    CLOSE -.-> DELIVER
 ```
 
-任务会根据实际范围选择必要步骤；上图只展示常见路径，不代表固定的执行方式。
+MCP 不是替代 Codex agent 的调度器；它把任务进度、依赖、checkpoint、审核证据和关闭门禁持久化为可查、可恢复的状态。
+
+### workflow-controller MCP 如何支撑闭环
+
+| 机制 | 用户看到的结果 |
+| --- | --- |
+| DAG/依赖 | 可并行且按顺序交接 |
+| checkpoint/状态诊断 | 中断后有可核对的恢复线索 |
+| 工作区状态与关闭检查 | 未满足验收不得作为已完成交付 |
+| 总审证据 | 高级独立复查有据可查 |
+
+上述机制由 [`agnets-workflow` 使用说明](plugins/agnets-workflow/README.md) 和 [`workflow-controller` 工作流控制器](plugins/agnets-workflow/skills/workflow-controller/SKILL.md) 支持。
 
 ## 快速安装
 
@@ -64,7 +96,7 @@ sh ./install-codex.sh
 
 | 能力 | 适用场景 | 说明 |
 | --- | --- | --- |
-| [`agent-toolchain`](plugins/agnets-workflow/skills/agent-toolchain/SKILL.md) | 复杂重构、跨模块理解和大范围排障 | 为目标项目接入 CodeGraph 与 RTK。 |
+| [`agent-toolchain`](plugins/agnets-workflow/skills/agent-toolchain/SKILL.md) | 复杂重构、跨模块理解和大范围排障 | 为目标项目接入 CodeGraph 与 RTK；在跨模块理解、大型代码库或重复探索明显的场景下，可进一步减少重复探索与调用成本；一次性小改动通常不适合为了这一收益专门接入。 |
 | [`workflow-controller`](plugins/agnets-workflow/skills/workflow-controller/SKILL.md) | 需要持久化状态和可恢复交接的复杂任务 | 管理任务状态、就绪节点、checkpoint 与收口检查。 |
 | [`project-doc-planner`](skills/project-doc-planner/SKILL.md) | 新项目或大型改造的文档规划 | 生成和维护项目级文档结构。 |
 | [`gpt-image-2-cli`](skills/gpt-image-2-cli/SKILL.md) | 需要生成或编辑图片素材 | 通过命令行调用图像生成能力。 |
