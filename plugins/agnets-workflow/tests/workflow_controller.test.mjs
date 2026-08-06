@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile as execFileCallback } from 'node:child_process';
+import { createRequire } from 'node:module';
 import { promisify } from 'node:util';
 import { mkdtemp, readFile as readDiskFile, rm, writeFile as writeDiskFile, mkdir, rename, utimes } from 'node:fs/promises';
 import { promises as fsPromises } from 'node:fs';
@@ -12,10 +13,22 @@ import { readTaskState, writeTaskState } from '../scripts/sqlite_task_store.mjs'
 import { TOOLS, TOOL_COMMANDS } from '../scripts/workflow_controller_mcp.mjs';
 
 const execFile = promisify(execFileCallback);
+const require = createRequire(import.meta.url);
 const controllerCli = fileURLToPath(new URL('../scripts/workflow_controller.mjs', import.meta.url));
 
 const readFile = readDiskFile;
 const writeFile = writeDiskFile;
+
+async function emptyControllerDatabase() {
+  const initSqlJs = require('../vendor/sqljs/sql-wasm.js');
+  const vendorDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'vendor', 'sqljs');
+  const SQL = await initSqlJs({ locateFile: name => path.join(vendorDirectory, name) });
+  const database = new SQL.Database();
+  try {
+    database.run('CREATE TABLE controller_state (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL, payload TEXT NOT NULL, updated_at TEXT NOT NULL)');
+    return database.export();
+  } finally { database.close(); }
+}
 
 async function callForFixture(fixture, command, parameters) {
   const lifecycle = command === 'complete' && parameters.completion_attestation === undefined
@@ -46,6 +59,27 @@ async function setup() {
   return { root, workspace, stateDir, manifest };
 }
 
+function alternateWindowsDriveCase(value) {
+  return `${value[0] === value[0].toLowerCase() ? value[0].toUpperCase() : value[0].toLowerCase()}${value.slice(1)}`;
+}
+
+async function preparePassingTotalReview(fixture, reviewerPath) {
+  const call = (command, parameters) => callForFixture(fixture, command, parameters);
+  await call('init', { manifest: fixture.manifest });
+  for (const [nodeId, taskPath] of [['implement', `${reviewerPath}/implement`], ['verify', `${reviewerPath}/verify`]]) {
+    const [claim] = await call('claim', { task_id: 'feature-1', node_id: nodeId, agent_task_path: taskPath, agent_role: 'avsp_terra_high' });
+    const result = path.join(fixture.root, `${nodeId}.json`); await writeFile(result, '{}');
+    await call('complete', { task_id: 'feature-1', node_id: nodeId, claim_id: claim.node.claim_id, status: 'succeeded', result });
+  }
+  const [reviewClaim] = await call('claim', { task_id: 'feature-1', node_id: 'total-review', agent_task_path: reviewerPath, agent_role: 'avsp_sol_high' });
+  await call('heartbeat', { task_id: 'feature-1', node_id: 'total-review', claim_id: reviewClaim.node.claim_id });
+  const [context] = await call('audit-context', { task_id: 'feature-1' });
+  const reviewPath = path.join(fixture.root, 'review.json');
+  await writeFile(reviewPath, JSON.stringify({ auditor_task: reviewerPath, auditor_role: 'avsp_sol_high', claim_id: reviewClaim.node.claim_id, verdict: 'pass', requirement_coverage: { R1: 'verified' }, workflow_snapshot: context.workflow_snapshot, workspace_fingerprint: context.workspace_fingerprint, scope_and_regression: 'none', verification_gaps: 'none', residual_risk: 'none' }));
+  await call('record-review', { task_id: 'feature-1', review: reviewPath });
+  return { call, reviewClaim };
+}
+
 test('DAG, total review, and workspace fingerprint gate', async () => {
   const fixture = await setup();
   try {
@@ -62,7 +96,7 @@ test('DAG, total review, and workspace fingerprint gate', async () => {
     await writeFile(review, JSON.stringify({ auditor_task: '/root/total-review', auditor_role: 'avsp_sol_high', claim_id: reviewClaim.node.claim_id, verdict: 'pass', requirement_coverage: { R1: 'verified' }, workflow_snapshot: context.workflow_snapshot, workspace_fingerprint: reorderedFingerprint, scope_and_regression: 'none', verification_gaps: 'none', residual_risk: 'none' }));
     await call('record-review', { task_id: 'feature-1', review }); const reviewResult = path.join(fixture.root, 'total-review.json'); await writeFile(reviewResult, '{}'); await call('complete', { task_id: 'feature-1', node_id: 'total-review', claim_id: reviewClaim.node.claim_id, status: 'succeeded', result: reviewResult }); let [allowed, code] = await call('close-check', { task_id: 'feature-1' }); assert.equal(code, 0); assert.equal(allowed.close_allowed, true);
     const closedState = await readControllerState(fixture.stateDir); const leasePath = path.join(fixture.workspace, '.codex', 'workflow-controller', 'workspace-lease.json'); const interruptedLease = JSON.parse(await readFile(leasePath, 'utf8'));
-    interruptedLease.active_task = { task_id: 'feature-1', state_path: path.join(fixture.stateDir, 'feature-1.json'), state_dir: fixture.stateDir, acquired_at: closedState.workspace_lease.acquired_at, phase: 'active' }; await writeFile(leasePath, JSON.stringify(interruptedLease));
+    interruptedLease.status = 'active'; interruptedLease.active_task = { task_id: 'feature-1', state_path: path.join(fixture.stateDir, 'feature-1.json'), state_dir: fixture.stateDir, acquired_at: closedState.workspace_lease.acquired_at, phase: 'active' }; await writeFile(leasePath, JSON.stringify(interruptedLease));
     [allowed, code] = await call('close-check', { task_id: 'feature-1' }); assert.equal(code, 0); assert.equal(allowed.workspace_lease.self_healed, true); assert.equal(JSON.parse(await readFile(leasePath, 'utf8')).active_task, null);
     const postCloseNode = await writeNode(fixture.root, { id: 'post-close', kind: 'implementation' }); await assert.rejects(() => call('add-node', { task_id: 'feature-1', node: postCloseNode }), /DAG is immutable/);
     await writeFile(path.join(fixture.workspace, 'app.txt'), 'after\n'); [allowed, code] = await call('close-check', { task_id: 'feature-1' }); assert.equal(code, 2); assert.ok(allowed.reasons.includes('workspace changed after total review'));
@@ -168,6 +202,33 @@ test('keeps a total review retryable when controller state persistence fails aft
   } finally {
     fsPromises.rename = originalRename;
     await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('Windows path equivalence preserves pending and finalized total-review completion recovery', { skip: process.platform !== 'win32' }, async () => {
+  for (const recovery of ['pending', 'finalized']) {
+    const fixture = await setup();
+    try {
+      const { call, reviewClaim } = await preparePassingTotalReview(fixture, `/root/windows-${recovery}`);
+      const outcomePath = path.join(fixture.root, `${recovery}-outcome.json`);
+      const alternateStateDir = alternateWindowsDriveCase(fixture.stateDir);
+      const alternateOutcomePath = alternateWindowsDriveCase(outcomePath);
+      const pending = { workflow: { state_dir: fixture.stateDir, task_id: 'feature-1', node_id: 'total-review', claim_id: reviewClaim.node.claim_id }, workflow_completion: { state: 'pending' } };
+      if (recovery === 'pending') {
+        await writeFile(outcomePath, JSON.stringify(pending));
+      } else {
+        const completion = { completed: true, completed_at: new Date().toISOString(), task_id: 'feature-1', node_id: 'total-review', claim_id: reviewClaim.node.claim_id, status: 'succeeded', completion_attestation: 'native_agent_finished' };
+        await writeFile(outcomePath, JSON.stringify({ ...pending, workflow_completion: completion }));
+        const state = await readControllerState(fixture.stateDir);
+        state.nodes['total-review'].workflow_completion_intent = { task_id: 'feature-1', node_id: 'total-review', claim_id: reviewClaim.node.claim_id, status: 'succeeded', completion_attestation: 'native_agent_finished', result_path: outcomePath, result: pending, created_at: new Date().toISOString() };
+        await writeControllerState(fixture.stateDir, state);
+      }
+      const [result] = await call('complete', { state_dir: alternateStateDir, task_id: 'feature-1', node_id: 'total-review', claim_id: reviewClaim.node.claim_id, status: 'succeeded', result: alternateOutcomePath });
+      assert.equal(result.workflow_outcome_completion.completed, true, recovery);
+      const [closed, code] = await call('close-check', { state_dir: alternateStateDir, task_id: 'feature-1' });
+      assert.equal(code, 0, recovery);
+      assert.equal(closed.close_allowed, true, recovery);
+    } finally { await rm(fixture.root, { recursive: true, force: true }); }
   }
 });
 
@@ -372,6 +433,33 @@ test('requires a recorded review before total review succeeds and reconciles leg
     const recovered = await readControllerState(fixture.stateDir);
     assert.equal(recovered.nodes['total-review'].status, 'pending');
     assert.equal(recovered.events.at(-1).orphaned_total_review, true);
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test('rejects succeeded completion for non-pass total reviews and keeps them retryable', async () => {
+  const fixture = await setup();
+  try {
+    const call = (command, parameters) => callForFixture(fixture, command, parameters);
+    await call('init', { manifest: fixture.manifest });
+    for (const [nodeId, taskPath] of [['implement', '/root/implement'], ['verify', '/root/verify']]) {
+      const [claim] = await call('claim', { task_id: 'feature-1', node_id: nodeId, agent_task_path: taskPath, agent_role: 'avsp_terra_high' });
+      const result = path.join(fixture.root, `${nodeId}.json`); await writeFile(result, '{}');
+      await call('complete', { task_id: 'feature-1', node_id: nodeId, claim_id: claim.node.claim_id, status: 'succeeded', result });
+    }
+    for (const verdict of ['fail', 'unavailable']) {
+      const reviewer = `/root/reject-${verdict}`;
+      const [claim] = await call('claim', { task_id: 'feature-1', node_id: 'total-review', agent_task_path: reviewer, agent_role: 'avsp_sol_high' });
+      await call('heartbeat', { task_id: 'feature-1', node_id: 'total-review', claim_id: claim.node.claim_id });
+      const [context] = await call('audit-context', { task_id: 'feature-1' }); const review = path.join(fixture.root, `${verdict}.review.json`);
+      await writeFile(review, JSON.stringify({ auditor_task: reviewer, auditor_role: 'avsp_sol_high', claim_id: claim.node.claim_id, verdict, requirement_coverage: { R1: 'covered' }, workflow_snapshot: context.workflow_snapshot, workspace_fingerprint: context.workspace_fingerprint, scope_and_regression: 'none', verification_gaps: 'none', residual_risk: verdict }));
+      await call('record-review', { task_id: 'feature-1', review });
+      const result = path.join(fixture.root, `${verdict}.outcome.json`); await writeFile(result, '{}');
+      await assert.rejects(() => call('complete', { task_id: 'feature-1', node_id: 'total-review', claim_id: claim.node.claim_id, status: 'succeeded', result }), /requires a pass verdict/);
+      assert.equal((await readControllerState(fixture.stateDir)).nodes['total-review'].status, 'running');
+      await call('complete', { task_id: 'feature-1', node_id: 'total-review', claim_id: claim.node.claim_id, status: verdict === 'fail' ? 'failed' : 'unavailable', result });
+      const [retried] = await call('retry', { task_id: 'feature-1', node_id: 'total-review', reason: `${verdict} reviewer stopped`, previous_agent_stopped: true });
+      assert.equal(retried.node.status, 'pending');
+    }
   } finally { await rm(fixture.root, { recursive: true, force: true }); }
 });
 
@@ -624,7 +712,7 @@ test('doctor returns a blocked diagnosis for unreadable SQLite state without mut
   } finally { await rm(fixture.root, { recursive: true, force: true }); }
 });
 
-test('doctor preserves a close-gate error when a reviewed workspace is missing', async () => {
+test('doctor blocks incomplete review state before evaluating a missing workspace close gate', async () => {
   const fixture = await setup();
   try {
     const call = (command, parameters) => callForFixture(fixture, command, parameters);
@@ -637,8 +725,8 @@ test('doctor preserves a close-gate error when a reviewed workspace is missing',
     const [diagnosis] = await call('doctor', { task_id: 'feature-1' });
     assert.equal(diagnosis.health, 'blocked');
     assert.equal(diagnosis.close_status.close_allowed, false);
-    assert.equal(diagnosis.checks.find(check => check.id === 'close_gate').status, 'fail');
-    assert.match(diagnosis.close_status.reasons[0], /close check unavailable/);
+    assert.equal(diagnosis.checks.find(check => check.id === 'task_state').status, 'fail');
+    assert.match(diagnosis.close_status.reasons[0], /task state is unreadable/);
   } finally { await rm(fixture.root, { recursive: true, force: true }); }
 });
 
@@ -650,7 +738,7 @@ test('prunes only verified seven-day idle released task states and retains activ
     await dispatch('init', { state_dir: released.stateDir, manifest: released.manifest });
     await dispatch('release-workspace', { state_dir: released.stateDir, task_id: 'feature-1', previous_agents_stopped: true });
     const releasedState = await readControllerState(released.stateDir);
-    releasedState.updated_at = '1970-01-01T00:00:00.000Z'; await writeControllerState(released.stateDir, releasedState);
+    releasedState.created_at = '1970-01-01T00:00:00.000Z'; releasedState.updated_at = '1970-01-01T00:00:00.000Z'; await writeControllerState(released.stateDir, releasedState);
     await mkdir(path.join(released.stateDir, '.workflow-review-results', 'feature-1', 'claim-1'), { recursive: true });
     await writeFile(path.join(released.stateDir, '.workflow-review-results', 'feature-1', 'claim-1', 'outcome.json'), '{}');
     const [pruned] = await dispatch('prune-expired', { state_dir: released.stateDir });
@@ -661,6 +749,9 @@ test('prunes only verified seven-day idle released task states and retains activ
     await modernManifest(mismatch, '/root/mismatch-implement', '/root/mismatch-reviewer');
     await dispatch('init', { state_dir: mismatch.stateDir, manifest: mismatch.manifest });
     await dispatch('release-workspace', { state_dir: mismatch.stateDir, task_id: 'feature-1', previous_agents_stopped: true });
+    const otherWorkspace = path.join(mismatch.root, 'other-workspace'); const otherManifest = path.join(mismatch.root, 'other-manifest.json');
+    await mkdir(otherWorkspace); await writeFile(otherManifest, JSON.stringify({ task_id: 'other-task', workspace: otherWorkspace, goal: 'Preserve another task', requirements: [{ id: 'R1', text: 'remain intact' }], nodes: [{ id: 'total-review', kind: 'total_review', agent_type: 'avsp_sol_high', depends_on: [] }] }));
+    await dispatch('init', { state_dir: mismatch.stateDir, manifest: otherManifest });
     const mismatchState = await readControllerState(mismatch.stateDir);
     mismatchState.task_id = 'other-task'; mismatchState.updated_at = '1970-01-01T00:00:00.000Z'; await writeControllerState(mismatch.stateDir, mismatchState);
     await mkdir(path.join(mismatch.stateDir, '.workflow-review-results', 'other-task', 'claim-1'), { recursive: true });
@@ -668,9 +759,11 @@ test('prunes only verified seven-day idle released task states and retains activ
     const [mismatchQuarantined] = await dispatch('prune-expired', { state_dir: mismatch.stateDir });
     assert.equal(mismatchQuarantined.deleted_count, 0);
     assert.equal(mismatchQuarantined.quarantined_count, 1);
-    assert.equal(mismatchQuarantined.quarantined[0].task_id, 'other-task');
+    assert.equal(mismatchQuarantined.quarantined[0].task_id, 'feature-1');
     await assert.rejects(() => readControllerState(mismatch.stateDir), /does not exist/);
-    assert.equal(await readFile(path.join(mismatchQuarantined.quarantined[0].error_path, 'review-results', 'claim-1', 'outcome.json'), 'utf8'), '{}');
+    assert.equal((await readControllerState(mismatch.stateDir, 'other-task')).task_id, 'other-task');
+    assert.equal(await readFile(path.join(mismatch.stateDir, '.workflow-review-results', 'other-task', 'claim-1', 'outcome.json'), 'utf8'), '{}');
+    assert.equal(JSON.parse(await readFile(path.join(mismatchQuarantined.quarantined[0].error_path, 'quarantine.json'), 'utf8')).review_artifacts, null);
 
     await modernManifest(active, '/root/active-implement', '/root/active-reviewer');
     await dispatch('init', { state_dir: active.stateDir, manifest: active.manifest });
@@ -762,6 +855,30 @@ test('prunes only verified seven-day idle released task states and retains activ
   } finally { await rm(released.root, { recursive: true, force: true }); await rm(mismatch.root, { recursive: true, force: true }); await rm(active.root, { recursive: true, force: true }); await rm(unknown.root, { recursive: true, force: true }); await rm(incomplete.root, { recursive: true, force: true }); }
 });
 
+test('prune retains released tasks with malformed nested state', async () => {
+  const cases = [
+    ['participant', state => { state.participants = [{}]; }],
+    ['review', state => { state.reviews = [{}]; }],
+    ['terminal result', state => { state.nodes.implement.status = 'succeeded'; state.nodes.implement.result = null; }],
+  ];
+  for (const [label, mutate] of cases) {
+    const fixture = await setup();
+    try {
+      await writeFile(fixture.manifest, JSON.stringify({ task_id: 'feature-1', workspace: fixture.workspace, goal: 'Change app safely', routing_schema_version: 1, requirements: [{ id: 'R1', text: 'app changes' }], nodes: [{ id: 'implement', kind: 'implementation', execution_risk: 'protected', routing_reason: 'controlled test', execution_owner: '/root/implement', integration_owner: '/root', quality_guard: 'test' }, { id: 'verify', kind: 'verification', depends_on: ['implement'], execution_risk: 'protected', routing_reason: 'controlled test', execution_owner: '/root/verify', integration_owner: '/root', quality_guard: 'test' }, { id: 'total-review', kind: 'total_review', agent_type: 'avsp_sol_high', depends_on: ['implement', 'verify'], execution_risk: 'protected', routing_reason: 'controlled test', execution_owner: '/root/reviewer', integration_owner: '/root', quality_guard: 'test' }] }));
+      await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+      await dispatch('release-workspace', { state_dir: fixture.stateDir, task_id: 'feature-1', previous_agents_stopped: true });
+      const state = await readControllerState(fixture.stateDir);
+      state.created_at = new Date(Date.now() - 9 * 24 * 60 * 60 * 1000).toISOString();
+      state.updated_at = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
+      mutate(state); await writeControllerState(fixture.stateDir, state);
+      const [result] = await dispatch('prune-expired', { state_dir: fixture.stateDir });
+      assert.equal(result.deleted_count, 0, label);
+      assert.match(result.retained.find(item => item.task_id === 'feature-1').reason, /invalid nested task state/, label);
+      assert.equal((await readControllerState(fixture.stateDir)).task_id, 'feature-1', label);
+    } finally { await rm(fixture.root, { recursive: true, force: true }); }
+  }
+});
+
 test('reconciles incomplete quarantine transfers and expires malformed metadata through its sidecar', async () => {
   const fixture = await setup();
   try {
@@ -796,6 +913,45 @@ test('reconciles incomplete quarantine transfers and expires malformed metadata 
   } finally { await rm(fixture.root, { recursive: true, force: true }); }
 });
 
+test('quarantine reconciliation retains mismatched legacy and current task identities', async () => {
+  const fixture = await setup();
+  try {
+    await mkdir(fixture.stateDir, { recursive: true });
+    const otherArtifact = path.join(fixture.stateDir, '.workflow-review-results', 'other-task', 'claim-1', 'outcome.json');
+    await mkdir(path.dirname(otherArtifact), { recursive: true }); await writeFile(otherArtifact, '{}');
+    const errorRoot = path.join(fixture.stateDir, '.workflow-errors'); await mkdir(errorRoot);
+    const quarantinedAt = new Date().toISOString();
+    const deleteAfter = new Date(Date.parse(quarantinedAt) + 365 * 24 * 60 * 60 * 1000).toISOString();
+    for (const version of [1, 2]) {
+      const errorPath = path.join(errorRoot, `mismatched-v${version}`); await mkdir(errorPath);
+      await writeFile(path.join(errorPath, 'feature-1.sqlite'), 'archived state');
+      const metadata = {
+        version,
+        status: version === 1 ? 'quarantined' : 'quarantining',
+        task_id: 'other-task',
+        original_state_path: path.join(fixture.stateDir, 'feature-1.json'),
+        error_path: errorPath,
+        reason: 'simulated old interrupted quarantine',
+        quarantined_at: quarantinedAt,
+        delete_after: deleteAfter,
+        files: ['feature-1.sqlite'],
+        move_error: version === 1 ? null : 'legacy transfer interrupted',
+        ...(version === 2 ? { review_artifacts: 'review-results' } : {}),
+      };
+      await writeFile(path.join(errorPath, 'quarantine.json'), JSON.stringify(metadata));
+    }
+    const [reconciled] = await dispatch('reconcile-quarantine', { state_dir: fixture.stateDir });
+    assert.equal(reconciled.reconciled_count, 0);
+    assert.equal(reconciled.retained_count, 2);
+    assert.ok(reconciled.retained.every(item => /metadata is invalid/.test(item.reason)));
+    assert.equal(await readFile(otherArtifact, 'utf8'), '{}');
+    const [pruned] = await dispatch('prune-expired', { state_dir: fixture.stateDir });
+    assert.equal(pruned.quarantine_deleted_count, 0);
+    assert.equal(pruned.quarantine_retained_count, 2);
+    assert.equal(await readFile(otherArtifact, 'utf8'), '{}');
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
 test('persists the six-hour automatic cleanup throttle across CLI processes while explicit pruning remains immediate', async () => {
   const fixture = await setup();
   try {
@@ -808,7 +964,7 @@ test('persists the six-hour automatic cleanup throttle across CLI processes whil
     assert.ok(firstSweep.last_sweep_at);
     assert.equal(firstSweep.last_result.deleted_count, 0);
     const state = await readControllerState(fixture.stateDir);
-    state.updated_at = '1970-01-01T00:00:00.000Z'; await writeControllerState(fixture.stateDir, state);
+    state.created_at = '1970-01-01T00:00:00.000Z'; state.updated_at = '1970-01-01T00:00:00.000Z'; await writeControllerState(fixture.stateDir, state);
     await execFile(process.execPath, [controllerCli, 'status', '--task-id', 'feature-1', '--state-dir', fixture.stateDir], { cwd: fixture.root, windowsHide: true });
     assert.equal((await readControllerState(fixture.stateDir)).task_id, 'feature-1');
     const [pruned] = await dispatch('prune-expired', { state_dir: fixture.stateDir });
@@ -846,7 +1002,7 @@ test('quarantines a corrupted SQLite task after the retention gate even when its
     const [pruned] = await dispatch('prune-expired', { state_dir: fixture.stateDir });
     assert.equal(pruned.deleted_count, 0);
     assert.equal(pruned.quarantined_count, 1);
-    assert.equal(pruned.quarantined[0].task_id, null);
+    assert.equal(pruned.quarantined[0].task_id, 'feature-1');
     await assert.rejects(() => readFile(databasePath, 'utf8'), /ENOENT/);
   } finally { await rm(fixture.root, { recursive: true, force: true }); }
 });
@@ -1229,6 +1385,858 @@ test('MCP schema forwards the workspace-release confirmation parameter used by t
   assert.equal(TOOL_COMMANDS.workflow_reconcile_quarantine, 'reconcile-quarantine');
 });
 
+test('ensure-context returns new without creating a task and active context is idempotent', async () => {
+  const fixture = await setup();
+  try {
+    const [fresh] = await dispatch('ensure-context', { workspace: fixture.workspace });
+    assert.equal(fresh.state, 'new');
+    const vacantLease = JSON.parse(await readFile(path.join(fixture.workspace, '.codex', 'workflow-controller', 'workspace-lease.json'), 'utf8'));
+    assert.equal(vacantLease.status, 'vacant');
+    assert.equal(vacantLease.active_task, null);
+    await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+    const [first] = await dispatch('ensure-context', { workspace: fixture.workspace, state_dir: fixture.stateDir, task_id: 'feature-1' });
+    assert.equal(first.state, 'active');
+    assert.equal(first.task_id, 'feature-1');
+    assert.equal(first.state_path, path.join(fixture.stateDir, 'feature-1.json'));
+    assert.deepEqual(first.ready_nodes.map(node => node.id), ['implement']);
+    const before = await readControllerState(fixture.stateDir);
+    const [second] = await dispatch('ensure-context', { workspace: fixture.workspace, state_dir: fixture.stateDir, task_id: 'feature-1' });
+    const after = await readControllerState(fixture.stateDir);
+    assert.equal(second.state, 'active');
+    assert.deepEqual(after.events, before.events);
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test('recovers a workspace lease lock left by a crashed local process and reports it through doctor', async () => {
+  const fixture = await setup();
+  try {
+    await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+    const leasePath = path.join(fixture.workspace, '.codex', 'workflow-controller', 'workspace-lease.json');
+    const lockPath = `${leasePath}.lock`;
+    const script = `const fs=require('node:fs');const target=process.argv[1];fs.writeFileSync(target,'pid='+process.pid+' hostname='+require('node:os').hostname()+' created=1970-01-01T00:00:00.000Z\\n');fs.utimesSync(target,new Date(0),new Date(0));`;
+    await execFile(process.execPath, ['-e', script, lockPath]);
+    assert.equal(await fsPromises.stat(lockPath).then(() => true), true);
+
+    const [before] = await dispatch('doctor', { state_dir: fixture.stateDir, task_id: 'feature-1' });
+    assert.equal(before.checks.find(check => check.id === 'coordination').status, 'attention');
+    const coordinationFiles = before.checks.find(check => check.id === 'coordination').detail.files;
+    const canonicalLockPath = (await fsPromises.realpath(lockPath)).toLowerCase();
+    const reportedPaths = await Promise.all(coordinationFiles.map(file => fsPromises.realpath(file.path).then(value => value.toLowerCase())));
+    assert.ok(reportedPaths.includes(canonicalLockPath), JSON.stringify(coordinationFiles));
+
+    const [recovered] = await dispatch('recover-lock', { state_dir: fixture.stateDir, task_id: 'feature-1', stale_after_sec: 1 });
+    assert.equal(recovered.recovered, true);
+    assert.equal(recovered.workspace_lock.recovered, true);
+    const [ensured] = await dispatch('ensure-context', { workspace: fixture.workspace });
+    assert.equal(ensured.state, 'active');
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test('reconcile-workspace persists an explicit vacancy for a new workspace', async () => {
+  const fixture = await setup();
+  try {
+    const [reconciled] = await dispatch('reconcile-workspace', { workspace: fixture.workspace });
+    assert.equal(reconciled.reason, 'no active task');
+    const leasePath = path.join(fixture.workspace, '.codex', 'workflow-controller', 'workspace-lease.json');
+    const lease = JSON.parse(await readFile(leasePath, 'utf8'));
+    assert.equal(lease.status, 'vacant');
+    assert.equal(lease.active_task, null);
+
+    const [ensured] = await dispatch('ensure-context', { workspace: fixture.workspace });
+    assert.equal(ensured.state, 'new');
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test('init verifies a committed SQLite state after a post-rename sync failure', async () => {
+  const fixture = await setup();
+  const originalOpen = fsPromises.open;
+  try {
+    const databasePath = path.join(fixture.stateDir, 'feature-1.sqlite');
+    let injected = false;
+    fsPromises.open = async (target, flags, ...rest) => {
+      if (!injected && flags === 'r+' && path.resolve(String(target)) === path.resolve(databasePath)) {
+        injected = true;
+        const error = new Error('injected post-rename SQLite sync failure'); error.code = 'EIO'; throw error;
+      }
+      return originalOpen(target, flags, ...rest);
+    };
+    const [initialized] = await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+    assert.equal(injected, true);
+    assert.equal(initialized.task.task_id, 'feature-1');
+    fsPromises.open = originalOpen;
+    const [ensured] = await dispatch('ensure-context', { workspace: fixture.workspace });
+    assert.equal(ensured.state, 'active');
+  } finally {
+    fsPromises.open = originalOpen;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('init preserves an initializing lease when a failed write commits mismatched task content', async () => {
+  const fixture = await setup();
+  const originalOpen = fsPromises.open;
+  try {
+    const databasePath = path.join(fixture.stateDir, 'feature-1.sqlite');
+    let injected = false;
+    fsPromises.open = async (target, flags, ...rest) => {
+      if (!injected && flags === 'r+' && path.resolve(String(target)) === path.resolve(databasePath)) {
+        injected = true;
+        const persisted = await readTaskState(databasePath);
+        persisted.goal = 'unexpected committed content';
+        await writeTaskState(databasePath, persisted);
+        const error = new Error('injected mismatched SQLite commit failure'); error.code = 'EIO'; throw error;
+      }
+      return originalOpen(target, flags, ...rest);
+    };
+    await assert.rejects(() => dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest }), /commit is uncertain/);
+    fsPromises.open = originalOpen;
+    const leasePath = path.join(await fsPromises.realpath(fixture.workspace), '.codex', 'workflow-controller', 'workspace-lease.json');
+    const lease = JSON.parse(await readFile(leasePath, 'utf8'));
+    assert.equal(lease.status, 'initializing');
+    assert.equal(lease.active_task.phase, 'initializing');
+    assert.equal((await readControllerState(fixture.stateDir)).goal, 'unexpected committed content');
+  } finally {
+    fsPromises.open = originalOpen;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('init distinguishes committed and uncommitted workspace activation failures without deleting task state', async () => {
+  for (const failure of ['post-rename', 'pre-rename']) {
+    const fixture = await setup();
+    const originalOpen = fsPromises.open;
+    const originalRename = fsPromises.rename;
+    try {
+      const canonicalWorkspace = await fsPromises.realpath(fixture.workspace);
+      const leasePath = path.join(canonicalWorkspace, '.codex', 'workflow-controller', 'workspace-lease.json');
+      let leaseWrites = 0;
+      if (failure === 'post-rename') {
+        fsPromises.open = async (target, flags, ...rest) => {
+          if (flags === 'r+' && path.resolve(String(target)) === path.resolve(leasePath) && ++leaseWrites === 2) {
+            const error = new Error('injected committed lease activation failure'); error.code = 'EIO'; throw error;
+          }
+          return originalOpen(target, flags, ...rest);
+        };
+        const [initialized] = await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+        assert.equal(initialized.task.task_id, 'feature-1');
+      } else {
+        fsPromises.rename = async (source, destination) => {
+          if (path.resolve(String(destination)).toLowerCase() === path.resolve(leasePath).toLowerCase() && ++leaseWrites === 2) {
+            const error = new Error('injected uncommitted lease activation failure'); error.code = 'EIO'; throw error;
+          }
+          return originalRename(source, destination);
+        };
+        await assert.rejects(() => dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest }), /activation is uncertain/);
+      }
+      fsPromises.open = originalOpen; fsPromises.rename = originalRename;
+      assert.equal(await fsPromises.stat(path.join(fixture.stateDir, 'feature-1.sqlite')).then(() => true), true);
+      const [ensured] = await dispatch('ensure-context', { workspace: fixture.workspace });
+      assert.equal(ensured.state, 'active', failure);
+    } finally {
+      fsPromises.open = originalOpen; fsPromises.rename = originalRename;
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test('ensure-context treats an existing rowless SQLite database as damaged state', async () => {
+  const fixture = await setup();
+  try {
+    await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+    const databasePath = path.join(fixture.stateDir, 'feature-1.sqlite');
+    await writeFile(databasePath, await emptyControllerDatabase());
+    const leasePath = path.join(fixture.workspace, '.codex', 'workflow-controller', 'workspace-lease.json');
+    const beforeLease = await readFile(leasePath, 'utf8');
+    const [result] = await dispatch('ensure-context', { workspace: fixture.workspace });
+    assert.equal(result.state, 'blocked');
+    assert.match(result.original_error, /has no committed row/);
+    assert.equal(await readFile(leasePath, 'utf8'), beforeLease);
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test('ensure-context activates a valid initializing lease and reports released work as new', async () => {
+  const fixture = await setup();
+  try {
+    await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+    const leasePath = path.join(fixture.workspace, '.codex', 'workflow-controller', 'workspace-lease.json');
+    const lease = JSON.parse(await readFile(leasePath, 'utf8'));
+    lease.status = 'initializing'; lease.active_task.phase = 'initializing';
+    await writeFile(leasePath, JSON.stringify(lease));
+    const [active] = await dispatch('ensure-context', { workspace: fixture.workspace });
+    assert.equal(active.state, 'active');
+    await dispatch('release-workspace', { state_dir: fixture.stateDir, task_id: 'feature-1', previous_agents_stopped: true });
+    const [fresh] = await dispatch('ensure-context', { workspace: fixture.workspace });
+    assert.equal(fresh.state, 'new');
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test('ensure-context clears an initializing registry whose task state was never written', async () => {
+  const fixture = await setup();
+  try {
+    await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+    const leasePath = path.join(fixture.workspace, '.codex', 'workflow-controller', 'workspace-lease.json');
+    const lease = JSON.parse(await readFile(leasePath, 'utf8'));
+    lease.status = 'initializing'; lease.active_task.phase = 'initializing';
+    await writeFile(leasePath, JSON.stringify(lease));
+    await rm(path.join(fixture.stateDir, 'feature-1.sqlite'));
+    const [result] = await dispatch('ensure-context', { workspace: fixture.workspace });
+    assert.equal(result.state, 'new');
+    assert.equal(result.reconciliation.action, 'cleared_missing_initialization');
+    assert.equal(JSON.parse(await readFile(leasePath, 'utf8')).active_task, null);
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test('ensure-context blocks initialization recovery when an immutable legacy copy remains', async () => {
+  const fixture = await setup();
+  try {
+    await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+    const leasePath = path.join(fixture.workspace, '.codex', 'workflow-controller', 'workspace-lease.json');
+    const lease = JSON.parse(await readFile(leasePath, 'utf8'));
+    lease.status = 'initializing'; lease.active_task.phase = 'initializing';
+    await writeFile(leasePath, JSON.stringify(lease));
+    await rm(path.join(fixture.stateDir, 'feature-1.sqlite'));
+    await writeFile(path.join(fixture.stateDir, 'feature-1.json.legacy'), '{}');
+    const [result] = await dispatch('ensure-context', { workspace: fixture.workspace });
+    assert.equal(result.state, 'blocked');
+    assert.match(result.original_error, /Controller state recovery copy exists without current state/);
+    await assert.rejects(() => dispatch('reconcile-workspace', { workspace: fixture.workspace }), /Controller state recovery copy exists without current state/);
+    assert.equal(JSON.parse(await readFile(leasePath, 'utf8')).active_task.phase, 'initializing');
+    lease.status = 'vacant'; lease.active_task = null;
+    lease.updated_at = new Date().toISOString();
+    await writeFile(leasePath, JSON.stringify(lease));
+    await assert.rejects(() => dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest }), /Controller state recovery copy exists without current state/);
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test('ensure-context finishes an interrupted release whose registry still names the active task', async () => {
+  const fixture = await setup();
+  try {
+    await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+    const leasePath = path.join(fixture.workspace, '.codex', 'workflow-controller', 'workspace-lease.json');
+    const state = await readControllerState(fixture.stateDir);
+    state.workspace_lease.status = 'released';
+    state.workspace_lease.released_at = new Date().toISOString();
+    await writeControllerState(fixture.stateDir, state);
+    const [fresh] = await dispatch('ensure-context', { workspace: fixture.workspace });
+    assert.equal(fresh.state, 'new');
+    assert.equal(fresh.reconciliation.action, 'cleared_released_task');
+    assert.equal(JSON.parse(await readFile(leasePath, 'utf8')).active_task, null);
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test('ensure-context never clears a released task state while a node is still running', async () => {
+  const fixture = await setup();
+  try {
+    await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+    await dispatch('claim', { state_dir: fixture.stateDir, task_id: 'feature-1', node_id: 'implement', agent_task_path: '/root/active', agent_role: 'avsp_terra_high' });
+    const leasePath = path.join(fixture.workspace, '.codex', 'workflow-controller', 'workspace-lease.json');
+    const state = await readControllerState(fixture.stateDir);
+    state.workspace_lease.status = 'released';
+    state.workspace_lease.released_at = new Date().toISOString();
+    await writeControllerState(fixture.stateDir, state);
+    const [result] = await dispatch('ensure-context', { workspace: fixture.workspace });
+    assert.equal(result.state, 'blocked');
+    assert.match(result.original_error, /Released task state: nodes are still running: implement/);
+    await assert.rejects(() => dispatch('reconcile-workspace', { workspace: fixture.workspace }), /Released task state: nodes are still running: implement/);
+    assert.equal(JSON.parse(await readFile(leasePath, 'utf8')).active_task.task_id, 'feature-1');
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test('ensure-context does not accept released or unknown node state as quiescent', async () => {
+  for (const scenario of ['running without registry', 'unknown with registry']) {
+    const fixture = await setup();
+    try {
+      await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+      const leasePath = path.join(fixture.workspace, '.codex', 'workflow-controller', 'workspace-lease.json');
+      const state = await readControllerState(fixture.stateDir);
+      state.workspace_lease.status = 'released';
+      state.workspace_lease.released_at = new Date().toISOString();
+      if (scenario === 'running without registry') {
+        state.nodes.implement.status = 'running';
+        state.nodes.implement.agent_task_path = '/root/active';
+        state.nodes.implement.agent_role = 'avsp_terra_high';
+        state.nodes.implement.claim_id = 'claim-1';
+        state.nodes.implement.claimed_at = new Date().toISOString();
+        state.nodes.implement.activation_deadline_at = new Date(Date.now() + 60_000).toISOString();
+        state.nodes.implement.heartbeat_at = state.nodes.implement.claimed_at;
+        state.nodes.implement.heartbeat_count = 0;
+        state.nodes.implement.lease_duration_sec = 1800;
+        state.nodes.implement.attempt = 1;
+        const lease = JSON.parse(await readFile(leasePath, 'utf8'));
+        lease.status = 'vacant'; lease.active_task = null;
+        lease.updated_at = new Date().toISOString();
+        await writeFile(leasePath, JSON.stringify(lease));
+      } else {
+        state.nodes.implement.status = 'unknown';
+      }
+      await writeControllerState(fixture.stateDir, state);
+      const [result] = await dispatch('ensure-context', { workspace: fixture.workspace, state_dir: fixture.stateDir, task_id: 'feature-1' });
+      assert.equal(result.state, 'blocked', scenario);
+      assert.match(result.original_error, scenario.startsWith('running') ? /nodes are still running: implement/ : /node statuses are unknown/, scenario);
+    } finally { await rm(fixture.root, { recursive: true, force: true }); }
+  }
+});
+
+test('ensure-context never clears a released task whose registry phase is invalid', async () => {
+  const fixture = await setup();
+  try {
+    await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+    const leasePath = path.join(fixture.workspace, '.codex', 'workflow-controller', 'workspace-lease.json');
+    const lease = JSON.parse(await readFile(leasePath, 'utf8'));
+    const state = await readControllerState(fixture.stateDir);
+    lease.active_task.phase = 'corrupt';
+    state.workspace_lease.status = 'released';
+    state.workspace_lease.released_at = new Date().toISOString();
+    await writeFile(leasePath, JSON.stringify(lease));
+    await writeControllerState(fixture.stateDir, state);
+    const [result] = await dispatch('ensure-context', { workspace: fixture.workspace });
+    assert.equal(result.state, 'blocked');
+    assert.match(result.original_error, /Unsupported workspace lease phase: corrupt/);
+    await assert.rejects(() => dispatch('reconcile-workspace', { workspace: fixture.workspace }), /Unsupported workspace lease phase: corrupt/);
+    assert.equal(JSON.parse(await readFile(leasePath, 'utf8')).active_task.phase, 'corrupt');
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test('ensure-context blocks lease mismatch and unreadable lease while preserving original errors', async () => {
+  const fixture = await setup();
+  try {
+    await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+    const leasePath = path.join(fixture.workspace, '.codex', 'workflow-controller', 'workspace-lease.json');
+    const lease = JSON.parse(await readFile(leasePath, 'utf8'));
+    lease.active_task.state_path = path.join(fixture.root, 'other-state.json');
+    await writeFile(leasePath, JSON.stringify(lease));
+    const [mismatch] = await dispatch('ensure-context', { workspace: fixture.workspace });
+    assert.equal(mismatch.state, 'blocked');
+    assert.match(mismatch.original_error, /active task state|state path metadata|canonical task state path|does not match/);
+    await writeFile(leasePath, '{ invalid json');
+    const [unreadable] = await dispatch('ensure-context', { workspace: fixture.workspace });
+    assert.equal(unreadable.state, 'blocked');
+    assert.match(unreadable.original_error, /Invalid JSON/);
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test('ensure-context blocks an active task state whose workspace registry was lost', async () => {
+  const fixture = await setup();
+  try {
+    await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+    const leasePath = path.join(fixture.workspace, '.codex', 'workflow-controller', 'workspace-lease.json');
+    const lease = JSON.parse(await readFile(leasePath, 'utf8'));
+    lease.active_task = null;
+    lease.updated_at = new Date().toISOString();
+    await writeFile(leasePath, JSON.stringify(lease));
+    for (const parameters of [{}, { state_dir: fixture.stateDir, task_id: 'feature-1' }]) {
+      const [result] = await dispatch('ensure-context', { workspace: fixture.workspace, ...parameters });
+      assert.equal(result.state, 'blocked');
+      assert.match(result.original_error, /not explicitly vacant/);
+    }
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test('ensure-context and init block a physically missing registry in an existing controller directory', async () => {
+  const fixture = await setup();
+  try {
+    await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+    const leasePath = path.join(fixture.workspace, '.codex', 'workflow-controller', 'workspace-lease.json');
+    await rm(leasePath);
+    const [result] = await dispatch('ensure-context', { workspace: fixture.workspace });
+    assert.equal(result.state, 'blocked');
+    assert.match(result.original_error, /registry is missing/);
+
+    const secondManifest = path.join(fixture.root, 'second-manifest.json');
+    await writeFile(secondManifest, JSON.stringify({ task_id: 'feature-2', workspace: fixture.workspace, goal: 'Must not overlap', requirements: [{ id: 'R2', text: 'second task' }], nodes: [{ id: 'total-review', kind: 'total_review', agent_type: 'avsp_sol_high', depends_on: [] }] }));
+    await assert.rejects(
+      () => dispatch('init', { state_dir: path.join(fixture.root, 'second-state'), manifest: secondManifest }),
+      /Workspace lease registry is missing from an existing controller directory/,
+    );
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test('ensure-context never rebuilds a physically missing registry from historical released task hints', async () => {
+  const fixture = await setup();
+  try {
+    await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+    await dispatch('release-workspace', { state_dir: fixture.stateDir, task_id: 'feature-1', previous_agents_stopped: true });
+    const leasePath = path.join(fixture.workspace, '.codex', 'workflow-controller', 'workspace-lease.json');
+    await rm(leasePath);
+    const [result] = await dispatch('ensure-context', { workspace: fixture.workspace, state_dir: fixture.stateDir, task_id: 'feature-1' });
+    assert.equal(result.state, 'blocked');
+    assert.match(result.original_error, /registry is missing/);
+    await assert.rejects(() => readFile(leasePath, 'utf8'), error => error.code === 'ENOENT');
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test('ensure-context migrates a legacy vacant lease only from a matching released task hint', async () => {
+  const fixture = await setup();
+  try {
+    await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+    await dispatch('release-workspace', { state_dir: fixture.stateDir, task_id: 'feature-1', previous_agents_stopped: true });
+    const leasePath = path.join(fixture.workspace, '.codex', 'workflow-controller', 'workspace-lease.json');
+    const legacyLease = JSON.parse(await readFile(leasePath, 'utf8'));
+    delete legacyLease.status;
+    await writeFile(leasePath, JSON.stringify(legacyLease));
+
+    const [unknown] = await dispatch('ensure-context', { workspace: fixture.workspace });
+    assert.equal(unknown.state, 'blocked');
+    assert.match(unknown.original_error, /recovery requires state_dir and task_id/);
+    assert.equal(Object.hasOwn(JSON.parse(await readFile(leasePath, 'utf8')), 'status'), false);
+
+    const [migrated] = await dispatch('ensure-context', { workspace: fixture.workspace, state_dir: fixture.stateDir, task_id: 'feature-1' });
+    assert.equal(migrated.state, 'new');
+    assert.equal(JSON.parse(await readFile(leasePath, 'utf8')).status, 'vacant');
+
+    const secondManifest = path.join(fixture.root, 'second-manifest.json');
+    const secondStateDir = path.join(fixture.root, 'second-state');
+    await writeFile(secondManifest, JSON.stringify({ task_id: 'feature-2', workspace: fixture.workspace, goal: 'Continue after migration', requirements: [{ id: 'R2', text: 'new task' }], nodes: [{ id: 'total-review', kind: 'total_review', agent_type: 'avsp_sol_high', depends_on: [] }] }));
+    const [initialized] = await dispatch('init', { state_dir: secondStateDir, manifest: secondManifest });
+    assert.equal(initialized.task.task_id, 'feature-2');
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test('ensure-context accepts a legacy active lease without a top-level lifecycle status', async () => {
+  const fixture = await setup();
+  try {
+    await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+    const leasePath = path.join(fixture.workspace, '.codex', 'workflow-controller', 'workspace-lease.json');
+    const legacyLease = JSON.parse(await readFile(leasePath, 'utf8'));
+    delete legacyLease.status;
+    await writeFile(leasePath, JSON.stringify(legacyLease));
+    const [result] = await dispatch('ensure-context', { workspace: fixture.workspace });
+    assert.equal(result.state, 'active');
+    assert.equal(result.task_id, 'feature-1');
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test('legacy released leases remain idempotent for release, close-check, and doctor', async () => {
+  for (const command of ['release-workspace', 'close-check', 'doctor']) {
+    const fixture = await setup();
+    try {
+      await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+      await dispatch('release-workspace', { state_dir: fixture.stateDir, task_id: 'feature-1', previous_agents_stopped: true });
+      const leasePath = path.join(fixture.workspace, '.codex', 'workflow-controller', 'workspace-lease.json');
+      const legacyLease = JSON.parse(await readFile(leasePath, 'utf8'));
+      delete legacyLease.status;
+      await writeFile(leasePath, JSON.stringify(legacyLease));
+
+      if (command === 'release-workspace') {
+        const [result] = await dispatch(command, { state_dir: fixture.stateDir, task_id: 'feature-1', previous_agents_stopped: true });
+        assert.equal(result.already_released, true);
+        assert.equal(JSON.parse(await readFile(leasePath, 'utf8')).status, 'vacant');
+      } else if (command === 'close-check') {
+        const [result] = await dispatch(command, { state_dir: fixture.stateDir, task_id: 'feature-1' });
+        assert.equal(result.workspace_lease.already_released, true);
+        assert.equal(JSON.parse(await readFile(leasePath, 'utf8')).status, 'vacant');
+      } else {
+        const [result] = await dispatch(command, { state_dir: fixture.stateDir, task_id: 'feature-1' });
+        assert.equal(result.checks.find(check => check.id === 'workspace_lease').status, 'pass');
+        assert.equal(Object.hasOwn(JSON.parse(await readFile(leasePath, 'utf8')), 'status'), false);
+      }
+    } finally { await rm(fixture.root, { recursive: true, force: true }); }
+  }
+});
+
+test('released task commands do not recreate a physically missing workspace registry', async () => {
+  for (const command of ['release-workspace', 'close-check', 'doctor']) {
+    const fixture = await setup();
+    try {
+      await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+      await dispatch('release-workspace', { state_dir: fixture.stateDir, task_id: 'feature-1', previous_agents_stopped: true });
+      const leasePath = path.join(fixture.workspace, '.codex', 'workflow-controller', 'workspace-lease.json');
+      await rm(leasePath);
+
+      if (command === 'doctor') {
+        const [result] = await dispatch(command, { state_dir: fixture.stateDir, task_id: 'feature-1' });
+        const check = result.checks.find(candidate => candidate.id === 'workspace_lease');
+        assert.equal(check.status, 'fail');
+        assert.match(check.detail.error, /registry is missing/);
+      } else {
+        await assert.rejects(
+          () => dispatch(command, {
+            state_dir: fixture.stateDir,
+            task_id: 'feature-1',
+            ...(command === 'release-workspace' ? { previous_agents_stopped: true } : {}),
+          }),
+          /registry is missing/,
+        );
+      }
+      await assert.rejects(() => readFile(leasePath, 'utf8'), error => error.code === 'ENOENT');
+    } finally { await rm(fixture.root, { recursive: true, force: true }); }
+  }
+});
+
+test('ensure-context blocks incomplete task hints when no active registry exists', async () => {
+  const fixture = await setup();
+  try {
+    await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+    const leasePath = path.join(fixture.workspace, '.codex', 'workflow-controller', 'workspace-lease.json');
+    const lease = JSON.parse(await readFile(leasePath, 'utf8'));
+    lease.status = 'vacant'; lease.active_task = null;
+    lease.updated_at = new Date().toISOString();
+    await writeFile(leasePath, JSON.stringify(lease));
+    for (const parameters of [{ task_id: 'feature-1' }, { state_dir: fixture.stateDir }]) {
+      const [result] = await dispatch('ensure-context', { workspace: fixture.workspace, ...parameters });
+      assert.equal(result.state, 'blocked');
+      assert.match(result.original_error, /state_dir and task_id must be provided together/);
+    }
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test('ensure-context blocks unknown node status in active and initializing task state', async () => {
+  for (const phase of ['active', 'initializing']) {
+    const fixture = await setup();
+    try {
+      await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+      const leasePath = path.join(fixture.workspace, '.codex', 'workflow-controller', 'workspace-lease.json');
+      const lease = JSON.parse(await readFile(leasePath, 'utf8'));
+      const state = await readControllerState(fixture.stateDir);
+      lease.status = phase; lease.active_task.phase = phase;
+      state.nodes.implement.status = 'unknown';
+      await writeFile(leasePath, JSON.stringify(lease));
+      await writeControllerState(fixture.stateDir, state);
+      const [result] = await dispatch('ensure-context', { workspace: fixture.workspace });
+      assert.equal(result.state, 'blocked', phase);
+      assert.match(result.original_error, /Task state: node statuses are unknown/, phase);
+    } finally { await rm(fixture.root, { recursive: true, force: true }); }
+  }
+});
+
+test('ensure-context preserves leases and task bindings with unknown fields', async () => {
+  const scenarios = [
+    ['workspace lease', (lease) => { lease.future_lifecycle_guard = true; }],
+    ['active task', lease => { lease.active_task.future_phase_guard = true; }],
+    ['task lease', (_lease, state) => { state.workspace_lease.future_task_guard = true; }],
+    ['task state', (_lease, state) => { state.future_state_guard = true; }],
+    ['task node', (_lease, state) => { state.nodes.implement.future_node_guard = true; }],
+  ];
+  for (const [label, mutate] of scenarios) {
+    const fixture = await setup();
+    try {
+      await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+      const leasePath = path.join(fixture.workspace, '.codex', 'workflow-controller', 'workspace-lease.json');
+      const lease = JSON.parse(await readFile(leasePath, 'utf8'));
+      const state = await readControllerState(fixture.stateDir);
+      state.workspace_lease.status = 'released';
+      state.workspace_lease.released_at = new Date().toISOString();
+      mutate(lease, state);
+      await writeFile(leasePath, JSON.stringify(lease));
+      await writeControllerState(fixture.stateDir, state);
+      const beforeLease = await readFile(leasePath, 'utf8');
+      const [result] = await dispatch('ensure-context', { workspace: fixture.workspace });
+      assert.equal(result.state, 'blocked', label);
+      assert.match(result.original_error, /unknown or incomplete fields/, label);
+      await assert.rejects(() => dispatch('reconcile-workspace', { workspace: fixture.workspace }), /unknown or incomplete fields/, label);
+      assert.equal(await readFile(leasePath, 'utf8'), beforeLease, label);
+    } finally { await rm(fixture.root, { recursive: true, force: true }); }
+  }
+});
+
+test('ensure-context blocks running nodes with unverifiable claim or heartbeat lifecycle metadata', async () => {
+  const cases = [
+    ['missing claim', false, node => { node.claim_id = null; }],
+    ['missing lease duration', false, node => { node.lease_duration_sec = null; }],
+    ['invalid claim timestamp', false, node => { node.claimed_at = 'invalid'; }],
+    ['invalid heartbeat timestamp', false, node => { node.heartbeat_at = 'invalid'; }],
+    ['invalid activation deadline', false, node => { node.activation_deadline_at = 'invalid'; }],
+    ['heartbeat before activation', false, node => { node.heartbeat_count = 1; }],
+    ['invalid activation timestamp', true, node => { node.activation_at = 'invalid'; }],
+    ['activated node retains deadline', true, node => { node.activation_deadline_at = new Date().toISOString(); }],
+    ['activated node loses heartbeat count', true, node => { node.heartbeat_count = 0; }],
+    ['heartbeat predates claim', true, node => { node.heartbeat_at = '1970-01-01T00:00:00.000Z'; }],
+  ];
+  for (const [label, activate, mutate] of cases) {
+    const fixture = await setup();
+    try {
+      await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+      const [claim] = await dispatch('claim', { state_dir: fixture.stateDir, task_id: 'feature-1', node_id: 'implement', agent_task_path: '/root/active', agent_role: 'avsp_terra_high' });
+      if (activate) await dispatch('heartbeat', { state_dir: fixture.stateDir, task_id: 'feature-1', node_id: 'implement', claim_id: claim.node.claim_id });
+      const state = await readControllerState(fixture.stateDir);
+      mutate(state.nodes.implement);
+      await writeControllerState(fixture.stateDir, state);
+      const [result] = await dispatch('ensure-context', { workspace: fixture.workspace });
+      assert.equal(result.state, 'blocked', label);
+      assert.match(result.original_error, /running node/, label);
+    } finally { await rm(fixture.root, { recursive: true, force: true }); }
+  }
+});
+
+test('ensure-context blocks whitespace-normalized identifiers and paths in persisted leases', async () => {
+  const scenarios = [
+    ['workspace task_id', (lease) => { lease.active_task.task_id = ` ${lease.active_task.task_id} `; }],
+    ['workspace state_path', (lease) => { lease.active_task.state_path = ` ${lease.active_task.state_path} `; }],
+    ['task registry_path', (_lease, state) => { state.workspace_lease.registry_path = ` ${state.workspace_lease.registry_path} `; }],
+  ];
+  for (const [label, mutate] of scenarios) {
+    const fixture = await setup();
+    try {
+      await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+      const leasePath = path.join(fixture.workspace, '.codex', 'workflow-controller', 'workspace-lease.json');
+      const lease = JSON.parse(await readFile(leasePath, 'utf8'));
+      const state = await readControllerState(fixture.stateDir);
+      mutate(lease, state);
+      await writeFile(leasePath, JSON.stringify(lease));
+      await writeControllerState(fixture.stateDir, state);
+      const [result] = await dispatch('ensure-context', { workspace: fixture.workspace });
+      assert.equal(result.state, 'blocked', label);
+      assert.match(result.original_error, /not canonical/, label);
+    } finally { await rm(fixture.root, { recursive: true, force: true }); }
+  }
+});
+
+test('ensure-context blocks a self-consistent but non-canonical active state path', async () => {
+  const fixture = await setup();
+  try {
+    await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+    const leasePath = path.join(fixture.workspace, '.codex', 'workflow-controller', 'workspace-lease.json');
+    const lease = JSON.parse(await readFile(leasePath, 'utf8'));
+    const state = await readControllerState(fixture.stateDir);
+    const nonCanonicalPath = path.join(fixture.stateDir, 'copied-task.json');
+    lease.status = 'initializing'; lease.active_task.phase = 'initializing';
+    state.workspace_lease.state_path = nonCanonicalPath;
+    lease.active_task.state_path = nonCanonicalPath;
+    await writeFile(nonCanonicalPath, JSON.stringify(state));
+    await writeFile(leasePath, JSON.stringify(lease));
+    const [result] = await dispatch('ensure-context', { workspace: fixture.workspace });
+    assert.equal(result.state, 'blocked');
+    assert.match(result.original_error, /canonical task state path/);
+    await assert.rejects(() => dispatch('reconcile-workspace', { workspace: fixture.workspace }), /canonical task state path/);
+    const unchangedLease = JSON.parse(await readFile(leasePath, 'utf8'));
+    assert.equal(unchangedLease.active_task.phase, 'initializing');
+    assert.equal(unchangedLease.active_task.state_path, nonCanonicalPath);
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test('ensure-context blocks an initializing lease with a non-canonical state directory', async () => {
+  const fixture = await setup();
+  try {
+    await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+    const leasePath = path.join(fixture.workspace, '.codex', 'workflow-controller', 'workspace-lease.json');
+    const lease = JSON.parse(await readFile(leasePath, 'utf8'));
+    lease.status = 'initializing'; lease.active_task.phase = 'initializing';
+    lease.active_task.state_dir = `${fixture.stateDir}${path.sep}child${path.sep}..`;
+    await writeFile(leasePath, JSON.stringify(lease));
+    const [result] = await dispatch('ensure-context', { workspace: fixture.workspace });
+    assert.equal(result.state, 'blocked');
+    assert.match(result.original_error, /state_dir is not canonical/);
+    const unchangedLease = JSON.parse(await readFile(leasePath, 'utf8'));
+    assert.equal(unchangedLease.active_task.phase, 'initializing');
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test('ensure-context preserves initializing leases with malformed time metadata', async () => {
+  const scenarios = [
+    ['missing registry updated_at', lease => delete lease.updated_at],
+    ['invalid registry updated_at', lease => { lease.updated_at = 'invalid'; }],
+    ['non-canonical parseable registry updated_at', lease => { lease.updated_at = '0'; }],
+    ['normalized impossible registry updated_at', lease => { lease.updated_at = '2026-02-30T00:00:00.000Z'; }],
+    ['missing active acquired_at', lease => delete lease.active_task.acquired_at],
+    ['invalid active acquired_at', lease => { lease.active_task.acquired_at = 'invalid'; }],
+    ['missing state acquired_at', (_lease, state) => delete state.workspace_lease.acquired_at],
+    ['invalid state acquired_at', (_lease, state) => { state.workspace_lease.acquired_at = 'invalid'; }],
+    ['missing released_at', (_lease, state) => { state.workspace_lease.status = 'released'; delete state.workspace_lease.released_at; }],
+    ['invalid released_at', (_lease, state) => { state.workspace_lease.status = 'released'; state.workspace_lease.released_at = 'invalid'; }],
+  ];
+  for (const [label, mutate] of scenarios) {
+    const fixture = await setup();
+    try {
+      await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+      const leasePath = path.join(fixture.workspace, '.codex', 'workflow-controller', 'workspace-lease.json');
+      const lease = JSON.parse(await readFile(leasePath, 'utf8'));
+      const state = await readControllerState(fixture.stateDir);
+      lease.status = 'initializing'; lease.active_task.phase = 'initializing';
+      mutate(lease, state);
+      await writeControllerState(fixture.stateDir, state);
+      await writeFile(leasePath, JSON.stringify(lease));
+      const [result] = await dispatch('ensure-context', { workspace: fixture.workspace });
+      assert.equal(result.state, 'blocked', label);
+      assert.match(result.original_error, /updated_at|acquired_at|released_at/, label);
+      await assert.rejects(() => dispatch('reconcile-workspace', { workspace: fixture.workspace }), /updated_at|acquired_at|released_at/, label);
+      assert.equal(JSON.parse(await readFile(leasePath, 'utf8')).active_task.phase, 'initializing', label);
+    } finally { await rm(fixture.root, { recursive: true, force: true }); }
+  }
+});
+
+test('ensure-context blocks an idle registry with malformed time metadata', async () => {
+  const fixture = await setup();
+  try {
+    await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+    await dispatch('release-workspace', { state_dir: fixture.stateDir, task_id: 'feature-1', previous_agents_stopped: true });
+    const leasePath = path.join(fixture.workspace, '.codex', 'workflow-controller', 'workspace-lease.json');
+    const lease = JSON.parse(await readFile(leasePath, 'utf8'));
+    lease.updated_at = 'invalid';
+    await writeFile(leasePath, JSON.stringify(lease));
+    const [result] = await dispatch('ensure-context', { workspace: fixture.workspace });
+    assert.equal(result.state, 'blocked');
+    assert.match(result.original_error, /updated_at/);
+    await assert.rejects(() => dispatch('reconcile-workspace', { workspace: fixture.workspace }), /updated_at/);
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test('ensure-context blocks non-null malformed active_task values', async () => {
+  for (const activeTask of [false, 0, '']) {
+    const fixture = await setup();
+    try {
+      const canonicalFixtureWorkspace = await fsPromises.realpath(fixture.workspace);
+      const leasePath = path.join(canonicalFixtureWorkspace, '.codex', 'workflow-controller', 'workspace-lease.json');
+      await mkdir(path.dirname(leasePath), { recursive: true });
+      await writeFile(leasePath, JSON.stringify({ version: 1, workspace: canonicalFixtureWorkspace, active_task: activeTask, updated_at: new Date().toISOString() }));
+      const [result] = await dispatch('ensure-context', { workspace: fixture.workspace });
+      assert.equal(result.state, 'blocked');
+      assert.match(result.original_error, /active_task is not an object/);
+      await assert.rejects(() => dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest }), /active_task is not an object/);
+    } finally { await rm(fixture.root, { recursive: true, force: true }); }
+  }
+});
+
+test('ensure-context converts workspace lock acquisition failures into blocked results', async () => {
+  const fixture = await setup();
+  try {
+    await writeFile(path.join(fixture.workspace, '.codex'), 'not a directory');
+    const [result] = await dispatch('ensure-context', { workspace: fixture.workspace });
+    assert.equal(result.state, 'blocked');
+    assert.match(result.original_error, /ENOTDIR|not a directory/i);
+    assert.match(result.error.code ?? '', /ENOTDIR/);
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test('ensure-context returns blocked when the requested workspace is unavailable', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-missing-'));
+  try {
+    const workspace = path.join(root, 'missing-workspace');
+    const [result] = await dispatch('ensure-context', { workspace });
+    assert.equal(result.state, 'blocked');
+    assert.equal(result.workspace, path.resolve(workspace));
+    assert.match(result.original_error, /Workspace is not a directory/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('ensure-context uses Windows path equivalence for an optional state directory', { skip: process.platform !== 'win32' }, async () => {
+  const fixture = await setup();
+  try {
+    await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+    const alternateDriveCase = `${fixture.stateDir[0] === fixture.stateDir[0].toLowerCase() ? fixture.stateDir[0].toUpperCase() : fixture.stateDir[0].toLowerCase()}${fixture.stateDir.slice(1)}`;
+    const [result] = await dispatch('ensure-context', { workspace: fixture.workspace, state_dir: alternateDriveCase, task_id: 'feature-1' });
+    assert.equal(result.state, 'active');
+    const [claim] = await dispatch('claim', { state_dir: alternateDriveCase, task_id: 'feature-1', node_id: 'implement', agent_task_path: '/root/windows-case', agent_role: 'avsp_terra_high' });
+    const [doctor] = await dispatch('doctor', { state_dir: alternateDriveCase, task_id: 'feature-1' });
+    assert.equal(doctor.checks.find(check => check.id === 'workspace_lease').status, 'pass');
+    await dispatch('abandon', { state_dir: alternateDriveCase, task_id: 'feature-1', node_id: 'implement', claim_id: claim.node.claim_id, reason: 'verify Windows path continuity', previous_agent_stopped: true });
+    const [released] = await dispatch('release-workspace', { state_dir: alternateDriveCase, task_id: 'feature-1', previous_agents_stopped: true });
+    assert.equal(released.released, true);
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test('ensure-context blocks relative or non-canonical paths inside task lease metadata', async () => {
+  const fixture = await setup();
+  try {
+    await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+    const state = await readControllerState(fixture.stateDir);
+    state.workspace_lease.registry_path = 'workspace-lease.json';
+    await writeControllerState(fixture.stateDir, state);
+    const [result] = await dispatch('ensure-context', { workspace: fixture.workspace });
+    assert.equal(result.state, 'blocked');
+    assert.match(result.original_error, /does not match its active task state|registry_path/);
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test('ensure-context blocks optional task or state directory mismatches', async () => {
+  const fixture = await setup();
+  try {
+    await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+    const [taskMismatch] = await dispatch('ensure-context', { workspace: fixture.workspace, task_id: 'other-task' });
+    assert.equal(taskMismatch.state, 'blocked');
+    assert.match(taskMismatch.original_error, /does not match requested task_id/);
+    const [stateDirMismatch] = await dispatch('ensure-context', { workspace: fixture.workspace, state_dir: path.join(fixture.root, 'other-state') });
+    assert.equal(stateDirMismatch.state, 'blocked');
+    assert.match(stateDirMismatch.original_error, /does not match requested state_dir/);
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test('all task entry points reject a workspace lease with a mismatched acquisition identity', async () => {
+  for (const command of ['claim', 'doctor', 'release-workspace', 'close-check']) {
+    const fixture = await setup();
+    try {
+      await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+      const leasePath = path.join(fixture.workspace, '.codex', 'workflow-controller', 'workspace-lease.json');
+      const lease = JSON.parse(await readFile(leasePath, 'utf8'));
+      const changedAcquisition = new Date(Date.parse(lease.active_task.acquired_at) + 1000).toISOString();
+      lease.active_task.acquired_at = changedAcquisition; lease.updated_at = changedAcquisition;
+      await writeFile(leasePath, JSON.stringify(lease));
+      const before = await readFile(leasePath, 'utf8');
+
+      if (command === 'doctor') {
+        const [result] = await dispatch(command, { state_dir: fixture.stateDir, task_id: 'feature-1' });
+        assert.equal(result.checks.find(check => check.id === 'workspace_lease').status, 'fail');
+      } else {
+        await assert.rejects(() => dispatch(command, {
+          state_dir: fixture.stateDir,
+          task_id: 'feature-1',
+          ...(command === 'claim' ? { node_id: 'implement', agent_task_path: '/root/mismatch', agent_role: 'avsp_terra_high' } : {}),
+          ...(command === 'release-workspace' ? { previous_agents_stopped: true } : {}),
+        }), /does not belong|does not match/);
+      }
+      assert.equal(await readFile(leasePath, 'utf8'), before);
+    } finally { await rm(fixture.root, { recursive: true, force: true }); }
+  }
+});
+
+test('continuity rejects inverted workspace lease lifecycle timestamps', async () => {
+  const active = await setup();
+  try {
+    await dispatch('init', { state_dir: active.stateDir, manifest: active.manifest });
+    const leasePath = path.join(active.workspace, '.codex', 'workflow-controller', 'workspace-lease.json');
+    const lease = JSON.parse(await readFile(leasePath, 'utf8'));
+    lease.updated_at = new Date(Date.parse(lease.active_task.acquired_at) - 1000).toISOString();
+    await writeFile(leasePath, JSON.stringify(lease));
+    const [result] = await dispatch('ensure-context', { workspace: active.workspace });
+    assert.equal(result.state, 'blocked');
+    assert.match(result.original_error, /predates acquired_at/);
+  } finally { await rm(active.root, { recursive: true, force: true }); }
+
+  const released = await setup();
+  try {
+    await dispatch('init', { state_dir: released.stateDir, manifest: released.manifest });
+    await dispatch('release-workspace', { state_dir: released.stateDir, task_id: 'feature-1', previous_agents_stopped: true });
+    const state = await readControllerState(released.stateDir);
+    state.workspace_lease.released_at = new Date(Date.parse(state.workspace_lease.acquired_at) - 1000).toISOString();
+    await writeControllerState(released.stateDir, state);
+    const [result] = await dispatch('ensure-context', { workspace: released.workspace, state_dir: released.stateDir, task_id: 'feature-1' });
+    assert.equal(result.state, 'blocked');
+    assert.match(result.original_error, /predates acquired_at/);
+  } finally { await rm(released.root, { recursive: true, force: true }); }
+});
+
+test('continuity and task commands block malformed nested task records without mutation', async () => {
+  const cases = [
+    ['requirement', state => { state.requirements = [{}]; }],
+    ['participant', state => { state.participants.push({ agent_task_path: '/root/incomplete' }); }],
+    ['participant identity', state => { state.participants.push({ agent_task_path: ' /root/forged ', agent_thread_id: null, agent_role: 'avsp_terra_high', node_id: 'implement', claim_id: 'forged-claim', attempt: 1 }); }],
+    ['review', state => { state.reviews.push({ auditor_task: '/root/incomplete' }); }],
+    ['event', state => { state.events.push({ at: 'invalid', type: 'corrupt' }); }],
+    ['terminal result', state => { state.nodes.implement.status = 'succeeded'; state.nodes.implement.result = null; }],
+  ];
+  for (const [label, mutate] of cases) {
+    const fixture = await setup();
+    try {
+      await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+      const state = await readControllerState(fixture.stateDir); mutate(state); await writeControllerState(fixture.stateDir, state);
+      const leasePath = path.join(fixture.workspace, '.codex', 'workflow-controller', 'workspace-lease.json');
+      const beforeLease = await readFile(leasePath, 'utf8');
+      const [result] = await dispatch('ensure-context', { workspace: fixture.workspace });
+      assert.equal(result.state, 'blocked', label);
+      await assert.rejects(() => dispatch('status', { state_dir: fixture.stateDir, task_id: 'feature-1' }), ControllerError, label);
+      assert.equal(await readFile(leasePath, 'utf8'), beforeLease, label);
+    } finally { await rm(fixture.root, { recursive: true, force: true }); }
+  }
+});
+
+test('MCP exposes ensure-context with matching command dispatch', () => {
+  const tool = TOOLS.find(candidate => candidate.name === 'workflow_ensure_context');
+  assert.ok(tool);
+  assert.deepEqual(tool.inputSchema.required, ['workspace']);
+  assert.equal(tool.inputSchema.properties.state_dir.type, 'string');
+  assert.equal(tool.inputSchema.properties.task_id.type, 'string');
+  assert.equal(TOOL_COMMANDS.workflow_ensure_context, 'ensure-context');
+});
+
 test('MCP retry schema retains only the canonical stopped-agent confirmation parameter', () => {
   const abandon = TOOLS.find(tool => tool.name === 'workflow_abandon');
   assert.deepEqual(abandon.inputSchema.required, ['task_id', 'node_id', 'claim_id', 'reason', 'previous_agent_stopped', 'state_dir']);
@@ -1256,7 +2264,7 @@ test('reconciles an interrupted initialization without allowing an unregistered 
     await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
     const leasePath = path.join(fixture.workspace, '.codex', 'workflow-controller', 'workspace-lease.json');
     const lease = JSON.parse(await readFile(leasePath, 'utf8'));
-    lease.active_task.phase = 'initializing';
+    lease.status = 'initializing'; lease.active_task.phase = 'initializing';
     await writeFile(leasePath, JSON.stringify(lease));
     await assert.rejects(() => dispatch('claim', { state_dir: fixture.stateDir, task_id: 'feature-1', node_id: 'implement', agent_task_path: '/root/blocked', agent_role: 'avsp_terra_high' }), /does not belong to this active task/);
     const [reconciled] = await dispatch('reconcile-workspace', { workspace: fixture.workspace });
@@ -1272,7 +2280,7 @@ test('reconcile never reactivates a released task state', async () => {
     await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
     await dispatch('release-workspace', { state_dir: fixture.stateDir, task_id: 'feature-1', previous_agents_stopped: true });
     const leasePath = path.join(fixture.workspace, '.codex', 'workflow-controller', 'workspace-lease.json'); const statePath = path.join(fixture.stateDir, 'feature-1.json'); const state = await readControllerState(fixture.stateDir);
-    await writeFile(leasePath, JSON.stringify({ version: 1, workspace: state.workspace, active_task: { task_id: 'feature-1', state_path: statePath, state_dir: fixture.stateDir, acquired_at: state.workspace_lease.acquired_at, phase: 'initializing' }, updated_at: new Date().toISOString() }));
+    await writeFile(leasePath, JSON.stringify({ version: 1, workspace: state.workspace, status: 'initializing', active_task: { task_id: 'feature-1', state_path: statePath, state_dir: fixture.stateDir, acquired_at: state.workspace_lease.acquired_at, phase: 'initializing' }, updated_at: new Date().toISOString() }));
     const [reconciled] = await dispatch('reconcile-workspace', { workspace: fixture.workspace });
     assert.equal(reconciled.action, 'cleared_released_initialization');
     assert.equal(JSON.parse(await readFile(leasePath, 'utf8')).active_task, null);

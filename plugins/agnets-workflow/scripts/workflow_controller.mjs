@@ -64,12 +64,14 @@ const QUARANTINE_EXPIRY_FILENAME = '.quarantine-expiry.json';
 const REVIEW_ARTIFACT_DIRECTORY = '.workflow-review-results';
 const QUARANTINE_REVIEW_DIRECTORY = 'review-results';
 const MAX_QUARANTINE_BYTES = 32 * 1024;
-const READ_ONLY_COMMANDS = new Set(['audit-context', 'doctor', 'fingerprint', 'ready', 'stale', 'status']);
+const SKIP_AUTOMATIC_PRUNE_COMMANDS = new Set(['audit-context', 'doctor', 'ensure-context', 'fingerprint', 'ready', 'stale', 'status']);
 
 export class ControllerError extends Error {}
 
 const utcNow = () => new Date().toISOString();
 const hasOwn = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
+const samePath = (left, right) => typeof left === 'string' && typeof right === 'string'
+  && (process.platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right);
 const DEFAULT_STALE_LOCK_SEC = 30;
 const DEFAULT_LEASE_SEC = 1800;
 const DEFAULT_ACTIVATION_TIMEOUT_SEC = 600;
@@ -83,6 +85,12 @@ const NATIVE_AGENT_START_FAILED = 'native_agent_start_failed';
 function requiredString(value, name) {
   if (typeof value !== 'string' || !value.trim()) throw new ControllerError(`${name} must be a non-empty string`);
   return value.trim();
+}
+
+function requiredCanonicalString(value, name) {
+  const canonical = requiredString(value, name);
+  if (value !== canonical) throw new ControllerError(`${name} must not contain surrounding whitespace`);
+  return canonical;
 }
 
 function requiredIdentifier(value, name) {
@@ -188,12 +196,30 @@ function databasePath(filePath) {
 }
 
 async function stateExists(filePath) {
-  if (await taskStateExists(databasePath(filePath))) return true;
+  const database = databasePath(filePath);
+  if (await pathEntryExists(database)) return true;
+  if (await taskStateExists(database)) return true;
   try {
     await fs.access(filePath);
     return true;
   } catch (error) {
     if (error.code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
+async function pathEntryExists(filePath) {
+  try { await fs.lstat(filePath); return true; }
+  catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+}
+
+async function assertNoControllerStateRecoveryCopy(filePath) {
+  const recoveryPath = `${filePath}.legacy`;
+  try {
+    await fs.lstat(recoveryPath);
+    throw new ControllerError(`Controller state recovery copy exists without current state: ${recoveryPath}`);
+  } catch (error) {
+    if (error.code === 'ENOENT') return;
     throw error;
   }
 }
@@ -458,10 +484,18 @@ async function withStateLock(filePath, callback) {
 }
 
 async function loadState(filePath) {
-  let state = await readTaskState(databasePath(filePath));
-  if (state === null) state = await readJson(filePath, { label: 'Controller state', maxBytes: MAX_STATE_BYTES });
+  const database = databasePath(filePath);
+  let state = await readTaskState(database);
+  if (state === null) {
+    if (await pathEntryExists(database)) throw new ControllerError(`SQLite controller state has no committed row: ${database}`);
+    state = await readJson(filePath, { label: 'Controller state', maxBytes: MAX_STATE_BYTES });
+  }
   if (!state || typeof state !== 'object' || state.version !== VERSION) throw new ControllerError(`Unsupported controller state: ${filePath}`);
   return state;
+}
+
+function isMissingControllerState(error, filePath) {
+  return error instanceof ControllerError && error.message === `Controller state does not exist: ${filePath}`;
 }
 
 function addEvent(state, type, details = {}) {
@@ -730,7 +764,12 @@ function readyNodes(state) {
 function participantPaths(state) { return new Set(state.participants.map(item => item.agent_task_path)); }
 function runningParticipantPaths(state) { return new Set(Object.values(state.nodes).filter(node => node.status === RUNNING && node.agent_task_path).map(node => node.agent_task_path)); }
 function configuredStatePath(parameters, taskId) { return statePath(requiredStateDirectory(parameters.state_dir), taskId); }
-async function readTask(parameters) { const filePath = configuredStatePath(parameters, requiredString(parameters.task_id, 'task_id')); return [filePath, normalizeState(await loadState(filePath))]; }
+async function readTask(parameters) {
+  const filePath = configuredStatePath(parameters, requiredString(parameters.task_id, 'task_id'));
+  const state = await loadState(filePath);
+  if (state.workspace_lease) requireKnownContinuityStateShape(state, 'Task state');
+  return [filePath, normalizeState(state)];
+}
 
 function activationDeadline(node) {
   const stored = Date.parse(node.activation_deadline_at);
@@ -832,7 +871,11 @@ async function doctorTask(parameters) {
   if (parameters.task_id === undefined || parameters.task_id === null) return doctorStateDirectory(parameters);
   const filePath = configuredStatePath(parameters, requiredString(parameters.task_id, 'task_id'));
   let state;
-  try { state = normalizeState(await loadState(filePath)); }
+  try {
+    state = await loadState(filePath);
+    if (state.workspace_lease) requireKnownContinuityStateShape(state, 'Task state');
+    state = normalizeState(state);
+  }
   catch (error) {
     const metadata = await findQuarantinedState(path.dirname(filePath), filePath);
     if (metadata) return quarantinedDoctor(parameters, filePath, metadata);
@@ -852,10 +895,14 @@ async function doctorTask(parameters) {
     checks.push(doctorCheck('workspace_lease', 'attention', { reason: 'legacy task has no workspace lease' }));
   } else {
     try {
+      validateTaskWorkspaceLeaseMetadata(state, filePath);
+      if (!await pathEntryExists(state.workspace_lease.registry_path)) throw new ControllerError(`Workspace lease registry is missing: ${state.workspace_lease.registry_path}`);
       const lease = await loadWorkspaceLease(state.workspace_lease.registry_path, state.workspace);
       const active = state.workspace_lease.status === 'active';
       const released = state.workspace_lease.status === 'released';
-      const matches = active ? workspaceLeaseMatches(lease, state, filePath) : released && lease.active_task === null;
+      const releasedVacant = releasedTaskMatchesVacantLease(lease, state, filePath, state.workspace_lease.registry_path);
+      if (!releasedVacant) validateActiveWorkspaceLeaseMetadata(lease, state.workspace_lease.registry_path);
+      const matches = active ? workspaceLeaseMatches(lease, state, filePath) : releasedVacant;
       checks.push(doctorCheck('workspace_lease', matches ? 'pass' : 'fail', {
         path: state.workspace_lease.registry_path,
         task_status: state.workspace_lease.status,
@@ -872,7 +919,10 @@ async function doctorTask(parameters) {
     running: Object.values(state.nodes).filter(node => node.status === RUNNING).map(node => node.id),
     stale: stale.map(node => ({ id: node.id, reason: node.reason, claim_id: node.claim_id })),
   }));
-  const coordination_files = await coordinationStatus(`${filePath}.lock`);
+  const coordination_files = [
+    ...(await coordinationStatus(`${filePath}.lock`)),
+    ...(state.workspace_lease ? await coordinationStatus(`${state.workspace_lease.registry_path}.lock`) : []),
+  ];
   checks.push(doctorCheck('coordination', coordination_files.length ? 'attention' : 'pass', { files: coordination_files }));
 
   let closeStatus;
@@ -904,26 +954,62 @@ async function doctorTask(parameters) {
 async function loadWorkspaceLease(leasePath, workspace) {
   try {
     const lease = await readJson(leasePath);
-    if (!lease || typeof lease !== 'object' || lease.version !== WORKSPACE_LEASE_VERSION || lease.workspace !== workspace || !hasOwn(lease, 'active_task')) throw new ControllerError(`Unsupported workspace lease: ${leasePath}`);
+    if (!lease || typeof lease !== 'object' || lease.version !== WORKSPACE_LEASE_VERSION || !samePath(lease.workspace, workspace) || !hasOwn(lease, 'active_task')) throw new ControllerError(`Unsupported workspace lease: ${leasePath}`);
     return lease;
   } catch (error) {
-    if (error instanceof ControllerError && error.message.startsWith('JSON input does not exist:')) return { version: WORKSPACE_LEASE_VERSION, workspace, active_task: null, updated_at: utcNow() };
+    if (error instanceof ControllerError && error.message.startsWith('JSON input does not exist:')) return { version: WORKSPACE_LEASE_VERSION, workspace, status: 'vacant', active_task: null, updated_at: utcNow() };
     throw error;
   }
 }
 
 function workspaceLeaseMatches(lease, state, filePath) {
   return lease.active_task
+    && (lease.status === undefined || lease.status === 'active')
     && lease.active_task.task_id === state.task_id
-    && lease.active_task.state_path === filePath
+    && samePath(lease.active_task.state_path, filePath)
+    && samePath(lease.active_task.state_dir, path.dirname(filePath))
+    && lease.active_task.acquired_at === state.workspace_lease?.acquired_at
     && (lease.active_task.phase ?? 'active') === 'active';
+}
+
+function validateTaskWorkspaceLeaseMetadata(state, filePath) {
+  const taskLease = state.workspace_lease;
+  if (!taskLease || typeof taskLease !== 'object' || Array.isArray(taskLease)) throw new ControllerError('Task workspace lease metadata is missing or invalid');
+  const expectedFields = taskLease.status === 'active' ? ACTIVE_TASK_LEASE_FIELDS
+    : taskLease.status === 'released' ? PRUNABLE_TASK_LEASE_FIELDS : null;
+  if (!expectedFields) throw new ControllerError(`Task workspace lease status is unsupported: ${taskLease.status}`);
+  const registryPath = requiredString(taskLease.registry_path, 'task workspace lease registry_path');
+  const taskStatePath = requiredString(taskLease.state_path, 'task workspace lease state_path');
+  const acquiredAt = requiredString(taskLease.acquired_at, 'task workspace lease acquired_at');
+  if (taskLease.status === 'released' && (!validTimestamp(taskLease.released_at) || !timestampAtOrAfter(taskLease.released_at, acquiredAt))) throw new ControllerError('Released task workspace lease released_at is invalid or predates acquired_at');
+  if (!hasExactFields(taskLease, expectedFields)) throw new ControllerError('Task workspace lease has unknown or incomplete fields');
+  if (taskLease.registry_path !== registryPath || taskLease.state_path !== taskStatePath || taskLease.acquired_at !== acquiredAt) throw new ControllerError('Task workspace lease metadata is not canonical');
+  if (typeof state.workspace !== 'string' || !path.isAbsolute(state.workspace) || state.workspace !== path.resolve(state.workspace)
+    || !samePath(registryPath, workspaceLeasePath(state.workspace)) || !samePath(taskStatePath, filePath) || !validTimestamp(acquiredAt)) {
+    throw new ControllerError('Task workspace lease registry_path, state_path, workspace, or acquired_at does not match its task state');
+  }
+  return taskLease;
+}
+
+function releasedTaskMatchesVacantLease(lease, state, filePath, leasePath) {
+  return workspaceLeaseIsVacant(lease)
+    && state.workspace_lease?.status === 'released'
+    && samePath(state.workspace_lease.registry_path, leasePath)
+    && samePath(state.workspace_lease.state_path, filePath)
+    && validTimestamp(state.workspace_lease.acquired_at)
+    && validTimestamp(state.workspace_lease.released_at)
+    && timestampAtOrAfter(state.workspace_lease.released_at, state.workspace_lease.acquired_at)
+    && timestampAtOrAfter(lease.updated_at, state.workspace_lease.released_at);
 }
 
 async function requireActiveWorkspaceLease(state, filePath) {
   if (!state.workspace_lease) throw new ControllerError('Legacy task has no workspace lease and cannot change state; create a new workflow task');
-  if (state.workspace_lease.status !== 'active') throw new ControllerError(`Workspace lease is not active for this task: ${state.workspace_lease.registry_path}`);
-  const lease = await loadWorkspaceLease(state.workspace_lease.registry_path, state.workspace);
-  if (!workspaceLeaseMatches(lease, state, filePath)) throw new ControllerError(`Workspace lease does not belong to this active task: ${state.workspace_lease.registry_path}`);
+  requireKnownContinuityStateShape(state, 'Task state');
+  const taskLease = validateTaskWorkspaceLeaseMetadata(state, filePath);
+  if (taskLease.status !== 'active') throw new ControllerError(`Workspace lease is not active for this task: ${taskLease.registry_path}`);
+  const lease = await loadWorkspaceLease(taskLease.registry_path, state.workspace);
+  validateActiveWorkspaceLeaseMetadata(lease, taskLease.registry_path);
+  if (!workspaceLeaseMatches(lease, state, filePath)) throw new ControllerError(`Workspace lease does not belong to this active task: ${taskLease.registry_path}`);
   return lease;
 }
 
@@ -932,28 +1018,37 @@ async function releaseWorkspaceLease(parameters, { closeAllowed = false } = {}) 
   const initialState = await loadState(filePath);
   const stateLease = initialState.workspace_lease;
   if (!stateLease) return { released: false, reason: 'legacy task has no workspace lease' };
-  if (!stateLease || typeof stateLease !== 'object' || typeof initialState.workspace !== 'string' || !path.isAbsolute(initialState.workspace)
-    || typeof stateLease.registry_path !== 'string' || !path.isAbsolute(stateLease.registry_path)
-    || path.resolve(stateLease.registry_path) !== workspaceLeasePath(initialState.workspace)
-    || stateLease.state_path !== filePath) throw new ControllerError('Cannot release workspace lease: lease metadata is not a complete matching registry');
+  requireKnownContinuityStateShape(initialState, 'Task state');
+  try { validateTaskWorkspaceLeaseMetadata(initialState, filePath); }
+  catch (error) { throw new ControllerError(`Cannot release workspace lease: ${error.message}`); }
   const leasePath = stateLease.registry_path;
   return withStateLock(leasePath, async () => withStateLock(filePath, async () => {
     const state = await loadState(filePath);
+    requireKnownContinuityStateShape(state, 'Task state');
+    try { validateTaskWorkspaceLeaseMetadata(state, filePath); }
+    catch (error) { throw new ControllerError(`Cannot release workspace lease: ${error.message}`); }
     if (!state.nodes || typeof state.nodes !== 'object' || Array.isArray(state.nodes)) throw new ControllerError('Cannot release workspace lease: task nodes are unreadable');
     const unknownNodes = Object.values(state.nodes).filter(node => !node || typeof node !== 'object' || ![PENDING, RUNNING, ...TERMINAL].includes(node.status));
     if (unknownNodes.length) throw new ControllerError('Cannot release workspace lease while node statuses are unknown');
     const running = Object.values(state.nodes).filter(node => node.status === RUNNING).map(node => node.id);
     if (running.length) throw new ControllerError(`Cannot release workspace lease while nodes are running: ${running.join(', ')}`);
     if (!closeAllowed) trueValue(parameters.previous_agents_stopped, 'previous_agents_stopped');
+    if (!await pathEntryExists(leasePath)) throw new ControllerError(`Workspace lease registry is missing: ${leasePath}`);
     const lease = await loadWorkspaceLease(leasePath, state.workspace);
-    if (state.workspace_lease.status === 'released' && !lease.active_task) return { released: true, already_released: true, lease_path: leasePath };
+    if (releasedTaskMatchesVacantLease(lease, state, filePath, leasePath)) {
+      if (!hasOwn(lease, 'status')) {
+        lease.status = 'vacant'; lease.updated_at = utcNow(); await atomicWrite(leasePath, lease);
+      }
+      return { released: true, already_released: true, lease_path: leasePath };
+    }
+    validateActiveWorkspaceLeaseMetadata(lease, leasePath);
     if (!workspaceLeaseMatches(lease, state, filePath)) throw new ControllerError(`Workspace lease does not belong to this active task: ${leasePath}`);
     if (state.workspace_lease.status !== 'released') {
       state.workflow_revision ??= 0; state.events ??= []; state.updated_at = utcNow();
       state.workspace_lease.status = 'released'; state.workspace_lease.released_at = utcNow();
       addEvent(state, 'workspace_lease_released', { close_allowed: closeAllowed }); await writeState(filePath, state);
     }
-    lease.active_task = null; lease.updated_at = utcNow(); await atomicWrite(leasePath, lease);
+    lease.status = 'vacant'; lease.active_task = null; lease.updated_at = utcNow(); await atomicWrite(leasePath, lease);
     return { released: true, lease_path: leasePath };
   }));
 }
@@ -963,57 +1058,370 @@ async function initTask(parameters) {
   const state = await makeState(manifest);
   const filePath = configuredStatePath(parameters, state.task_id);
   const leasePath = workspaceLeasePath(state.workspace);
+  const leaseDirectoryExisted = await pathEntryExists(path.dirname(leasePath));
   state.workspace_lease = { registry_path: leasePath, state_path: filePath, status: 'active', acquired_at: utcNow() };
   await withStateLock(leasePath, async () => {
+    if (leaseDirectoryExisted && !await pathEntryExists(leasePath)) throw new ControllerError(`Workspace lease registry is missing from an existing controller directory: ${leasePath}`);
     const lease = await loadWorkspaceLease(leasePath, state.workspace);
-    if (lease.active_task) throw new ControllerError(`Workspace already has an active workflow task: ${lease.active_task.task_id} (${lease.active_task.state_path})`);
+    const activeLease = validateActiveWorkspaceLeaseMetadata(lease, leasePath);
+    if (activeLease) throw new ControllerError(`Workspace already has an active workflow task: ${activeLease.task_id} (${activeLease.state_path})`);
     await withStateLock(filePath, async () => {
       if (await stateExists(filePath)) throw new ControllerError(`Task already exists: ${state.task_id}`);
+      await assertNoControllerStateRecoveryCopy(filePath);
+      lease.status = 'initializing';
       lease.active_task = { task_id: state.task_id, state_path: filePath, state_dir: path.dirname(filePath), acquired_at: state.workspace_lease.acquired_at, phase: 'initializing' };
       lease.updated_at = utcNow(); await atomicWrite(leasePath, lease);
       try { await writeState(filePath, state); }
       catch (error) {
-        lease.active_task = null; lease.updated_at = utcNow(); await atomicWrite(leasePath, lease);
-        throw error;
+        let committed = false;
+        let missing = false;
+        try {
+          const persisted = await loadState(filePath);
+          committed = sameJson(persisted, state);
+          if (!committed) throw new ControllerError(`Task state content does not match the initializing task: ${filePath}`);
+        } catch (verificationError) {
+          missing = isMissingControllerState(verificationError, filePath);
+          if (!missing) {
+            throw new ControllerError(`Task state commit is uncertain after initialization failure: ${error.message}; verification failed: ${verificationError.message}`);
+          }
+        }
+        if (missing) {
+          try {
+            lease.status = 'vacant'; lease.active_task = null; lease.updated_at = utcNow(); await atomicWrite(leasePath, lease);
+          } catch (rollbackError) {
+            throw new ControllerError(`Task state initialization failed and lease rollback is uncertain: ${error.message}; rollback failed: ${rollbackError.message}`);
+          }
+          throw error;
+        }
       }
     });
-    lease.active_task.phase = 'active'; lease.updated_at = utcNow();
+    lease.status = 'active'; lease.active_task.phase = 'active'; lease.updated_at = utcNow();
     try { await atomicWrite(leasePath, lease); }
     catch (error) {
-      await deleteState(filePath);
-      lease.active_task = null; lease.updated_at = utcNow(); await atomicWrite(leasePath, lease);
+      try {
+        const persistedLease = await loadWorkspaceLease(leasePath, state.workspace);
+        const metadata = validateActiveWorkspaceLeaseMetadata(persistedLease, leasePath);
+        if (metadata?.phase === 'active' && workspaceLeaseMatches(persistedLease, state, filePath)) return;
+        if (metadata?.phase === 'initializing' && samePath(metadata.state_path, filePath)) throw new ControllerError(`Workspace lease activation is uncertain after initialization failure: ${error.message}`);
+        if (metadata === null) {
+          lease.status = 'initializing'; lease.active_task.phase = 'initializing'; lease.updated_at = utcNow();
+          await atomicWrite(leasePath, lease);
+          throw new ControllerError(`Workspace lease activation is uncertain after initialization failure: ${error.message}`);
+        }
+      } catch (verificationError) {
+        if (verificationError instanceof ControllerError && verificationError.message.startsWith('Workspace lease activation is uncertain')) throw verificationError;
+        throw new ControllerError(`Workspace lease activation is uncertain after initialization failure: ${error.message}; verification failed: ${verificationError.message}`);
+      }
       throw error;
     }
   });
   return { state_path: filePath, task: compactState(state) };
 }
 
+function validateActiveWorkspaceLeaseMetadata(lease, leasePath) {
+  if (!validTimestamp(lease.updated_at)) throw new ControllerError(`Workspace lease updated_at is invalid: ${leasePath}`);
+  if (!hasSupportedWorkspaceLeaseShape(lease)) throw new ControllerError(`Workspace lease has unknown or incomplete fields: ${leasePath}`);
+  if (lease.active_task === null) {
+    if (lease.status !== 'vacant') throw new ControllerError(`Workspace lease has no active task but is not explicitly vacant: ${leasePath}`);
+    return null;
+  }
+  const active = lease.active_task;
+  if (!active || typeof active !== 'object' || Array.isArray(active)) throw new ControllerError(`Workspace lease active_task is not an object: ${leasePath}`);
+  const taskId = requiredIdentifier(active.task_id, 'workspace lease task_id');
+  const stateDir = requiredString(active.state_dir, 'workspace lease state_dir');
+  const activeStatePath = requiredString(active.state_path, 'workspace lease state_path');
+  const acquiredAt = requiredString(active.acquired_at, 'workspace lease acquired_at');
+  const activeFields = hasOwn(active, 'phase') ? WORKSPACE_ACTIVE_TASK_FIELDS : WORKSPACE_ACTIVE_TASK_FIELDS_V1;
+  if (!hasExactFields(active, activeFields)) throw new ControllerError(`Workspace lease active_task has unknown or incomplete fields: ${leasePath}`);
+  if (active.task_id !== taskId) throw new ControllerError(`Workspace lease task_id is not canonical: ${leasePath}`);
+  if (active.state_dir !== stateDir) throw new ControllerError(`Workspace lease state_dir is not canonical: ${leasePath}`);
+  if (active.state_path !== activeStatePath) throw new ControllerError(`Workspace lease state_path is not canonical: ${leasePath}`);
+  if (active.acquired_at !== acquiredAt) throw new ControllerError(`Workspace lease acquired_at is not canonical: ${leasePath}`);
+  const phase = active.phase ?? 'active';
+  if (!['active', 'initializing'].includes(phase)) throw new ControllerError(`Unsupported workspace lease phase: ${active.phase}`);
+  if (lease.status !== undefined && lease.status !== phase) throw new ControllerError(`Workspace lease status does not match active task phase: ${leasePath}`);
+  if (!validTimestamp(acquiredAt)) throw new ControllerError(`Workspace lease acquired_at is invalid: ${leasePath}`);
+  if (!path.isAbsolute(stateDir) || stateDir !== path.resolve(stateDir)) throw new ControllerError(`Workspace lease state_dir is not canonical: ${leasePath}`);
+  const canonicalStatePath = statePath(stateDir, taskId);
+  if (!path.isAbsolute(activeStatePath) || !samePath(activeStatePath, canonicalStatePath)) throw new ControllerError(`Workspace lease state_path is not the canonical task state path: ${leasePath}`);
+  if (!timestampAtOrAfter(lease.updated_at, acquiredAt)) throw new ControllerError(`Workspace lease updated_at predates acquired_at: ${leasePath}`);
+  return { task_id: taskId, state_dir: stateDir, state_path: canonicalStatePath, acquired_at: acquiredAt, phase };
+}
+
+async function validateExistingWorkspaceLeaseState(lease, workspace, leasePath, metadata) {
+  if (!metadata) return null;
+  let state;
+  try {
+    state = await loadState(metadata.state_path);
+    requireKnownContinuityStateShape(state, 'Task state');
+    state = normalizeState(state);
+  }
+  catch (error) {
+    if (isMissingControllerState(error, metadata.state_path)) return null;
+    throw error;
+  }
+  requireKnownNodeStatuses(state, 'Task state');
+  validateTaskWorkspaceLeaseMetadata(state, metadata.state_path);
+  const stateLeaseRegistryPath = requiredString(state.workspace_lease?.registry_path, 'task workspace lease registry_path');
+  const stateLeaseStatePath = requiredString(state.workspace_lease?.state_path, 'task workspace lease state_path');
+  const stateLeaseAcquiredAt = requiredString(state.workspace_lease?.acquired_at, 'task workspace lease acquired_at');
+  if (!samePath(state.workspace_lease.registry_path, stateLeaseRegistryPath) || !samePath(state.workspace_lease.state_path, stateLeaseStatePath)
+    || state.workspace_lease.acquired_at !== stateLeaseAcquiredAt) throw new ControllerError(`Task workspace lease metadata is not canonical: ${leasePath}`);
+  if (!validTimestamp(stateLeaseAcquiredAt)) throw new ControllerError(`Task workspace lease acquired_at is invalid: ${leasePath}`);
+  if (state.workspace_lease?.status === 'released' && !validTimestamp(state.workspace_lease.released_at)) throw new ControllerError(`Released task workspace lease released_at is invalid: ${leasePath}`);
+  if (state.task_id !== metadata.task_id || !samePath(state.workspace, workspace) || !state.workspace_lease
+    || !['active', 'released'].includes(state.workspace_lease.status)
+    || !path.isAbsolute(stateLeaseRegistryPath) || !samePath(stateLeaseRegistryPath, leasePath)
+    || !path.isAbsolute(stateLeaseStatePath) || !samePath(stateLeaseStatePath, metadata.state_path)
+    || stateLeaseAcquiredAt !== metadata.acquired_at) {
+    throw new ControllerError(`Workspace lease does not match its active task state: ${leasePath}`);
+  }
+  return state;
+}
+
+function requireKnownNodeStatuses(state, context) {
+  if (!state.nodes || typeof state.nodes !== 'object' || Array.isArray(state.nodes)) throw new ControllerError(`${context}: task nodes are unreadable`);
+  const unknown = Object.values(state.nodes).filter(node => !node || typeof node !== 'object' || ![PENDING, RUNNING, ...TERMINAL].includes(node.status));
+  if (unknown.length) throw new ControllerError(`${context}: node statuses are unknown`);
+  for (const node of Object.values(state.nodes).filter(candidate => candidate.status === RUNNING)) {
+    const agentTaskPath = requiredString(node.agent_task_path, `${context} running node agent_task_path`);
+    const agentRole = requiredString(node.agent_role, `${context} running node agent_role`);
+    const claimId = requiredString(node.claim_id, `${context} running node claim_id`);
+    if (node.agent_task_path !== agentTaskPath || node.agent_role !== agentRole || node.claim_id !== claimId) throw new ControllerError(`${context}: running node claim metadata is not canonical: ${node.id}`);
+    if (node.agent_thread_id !== null) {
+      const agentThreadId = requiredString(node.agent_thread_id, `${context} running node agent_thread_id`);
+      if (node.agent_thread_id !== agentThreadId) throw new ControllerError(`${context}: running node agent_thread_id is not canonical: ${node.id}`);
+    }
+    if (!Number.isSafeInteger(node.lease_duration_sec) || node.lease_duration_sec <= 0) throw new ControllerError(`${context}: running node lease_duration_sec is invalid: ${node.id}`);
+    if (!Number.isSafeInteger(node.attempt) || node.attempt <= 0) throw new ControllerError(`${context}: running node attempt is invalid: ${node.id}`);
+    if (!Number.isSafeInteger(node.heartbeat_count) || node.heartbeat_count < 0) throw new ControllerError(`${context}: running node heartbeat_count is invalid: ${node.id}`);
+    if (!validTimestamp(node.claimed_at) || !validTimestamp(node.heartbeat_at)) throw new ControllerError(`${context}: running node claim or heartbeat timestamp is invalid: ${node.id}`);
+    const claimedAt = Date.parse(node.claimed_at);
+    const heartbeatAt = Date.parse(node.heartbeat_at);
+    if (heartbeatAt < claimedAt) throw new ControllerError(`${context}: running node heartbeat predates its claim: ${node.id}`);
+    if (node.activation_at === null) {
+      if (node.heartbeat_count !== 0 || !validTimestamp(node.activation_deadline_at) || Date.parse(node.activation_deadline_at) < claimedAt) throw new ControllerError(`${context}: unactivated running node lifecycle is invalid: ${node.id}`);
+    } else {
+      if (!validTimestamp(node.activation_at) || node.activation_deadline_at !== null || node.heartbeat_count < 1
+        || Date.parse(node.activation_at) < claimedAt || heartbeatAt < Date.parse(node.activation_at)) throw new ControllerError(`${context}: activated running node lifecycle is invalid: ${node.id}`);
+    }
+  }
+}
+
+function requireKnownContinuityStateShape(state, context) {
+  if (!hasExactFields(state, PRUNABLE_STATE_FIELDS)) throw new ControllerError(`${context}: task state has unknown or incomplete fields`);
+  if (![null, 1].includes(state.routing_schema_version) || !Number.isSafeInteger(state.workflow_revision) || state.workflow_revision < 0
+    || !validTimestamp(state.created_at) || !validTimestamp(state.updated_at) || !timestampAtOrAfter(state.updated_at, state.created_at)) throw new ControllerError(`${context}: task state version or timestamps are invalid`);
+  if (!Array.isArray(state.requirements) || !Array.isArray(state.scope) || !Array.isArray(state.non_goals)
+    || !Array.isArray(state.participants) || !Array.isArray(state.reviews) || !Array.isArray(state.events)) throw new ControllerError(`${context}: task state collections are invalid`);
+  for (const node of Object.values(state.nodes)) {
+    if (!hasExactFields(node, PRUNABLE_NODE_FIELDS)) throw new ControllerError(`${context}: task node has unknown or incomplete fields: ${node?.id ?? 'unknown'}`);
+  }
+  validateContinuityNestedState(state, context);
+}
+
+function validateContinuityNestedState(state, context) {
+  if (!state.requirements.length || state.requirements.length > MAX_REQUIREMENTS || Object.keys(state.nodes).length > MAX_NODES) throw new ControllerError(`${context}: task state collection bounds are invalid`);
+  const requirementIds = new Set();
+  for (const requirement of state.requirements) {
+    if (!requirement || typeof requirement !== 'object' || Array.isArray(requirement)) throw new ControllerError(`${context}: requirement is invalid`);
+    const id = requiredIdentifier(requirement.id, `${context} requirement.id`);
+    requiredString(requirement.text, `${context} requirement.text`);
+    if (requirement.id !== id || requirementIds.has(id)) throw new ControllerError(`${context}: requirement identifiers are not canonical or unique`);
+    requirementIds.add(id);
+  }
+  for (const [nodeId, node] of Object.entries(state.nodes)) {
+    if (node.id !== nodeId || !requiredIdentifier(node.id, `${context} node.id`) || !requiredString(node.kind, `${context} node.kind`)) throw new ControllerError(`${context}: node identity is invalid: ${nodeId}`);
+    if (node.agent_type !== null) requiredString(node.agent_type, `${context} node.agent_type`);
+    if (!Array.isArray(node.depends_on) || new Set(node.depends_on).size !== node.depends_on.length || node.depends_on.some(dependency => !requiredIdentifier(dependency, `${context} node dependency`))) throw new ControllerError(`${context}: node dependencies are invalid: ${nodeId}`);
+    if (!['read_only', 'delegable', 'protected'].includes(node.execution_risk)) throw new ControllerError(`${context}: node execution_risk is invalid: ${nodeId}`);
+    requiredString(node.routing_reason, `${context} node.routing_reason`);
+    requiredString(node.quality_guard, `${context} node.quality_guard`);
+    if (node.routing_legacy) {
+      if (node.execution_owner !== null) requiredString(node.execution_owner, `${context} node.execution_owner`);
+      if (node.integration_owner !== null) requiredString(node.integration_owner, `${context} node.integration_owner`);
+    } else {
+      requiredString(node.execution_owner, `${context} node.execution_owner`);
+      requiredString(node.integration_owner, `${context} node.integration_owner`);
+    }
+    if (!Number.isSafeInteger(node.attempt) || node.attempt < 0 || !Number.isSafeInteger(node.heartbeat_count) || node.heartbeat_count < 0 || !Number.isSafeInteger(node.rescue_count) || node.rescue_count < 0) throw new ControllerError(`${context}: node counters are invalid: ${nodeId}`);
+    if (!Array.isArray(node.recovery_history)) throw new ControllerError(`${context}: node recovery_history is invalid: ${nodeId}`);
+    if (TERMINAL.has(node.status) && (node.result === null || node.result === undefined)) throw new ControllerError(`${context}: terminal node result is missing: ${nodeId}`);
+    if (node.status === PENDING && (node.result !== null || node.claim_id !== null || node.agent_task_path !== null || node.agent_role !== null || node.claimed_at !== null || node.activation_at !== null || node.heartbeat_at !== null)) throw new ControllerError(`${context}: pending node retains active state: ${nodeId}`);
+    for (const field of node.status === RUNNING ? ['checkpoint_at', 'rescued_at'] : ['claimed_at', 'activation_at', 'activation_deadline_at', 'heartbeat_at', 'checkpoint_at', 'rescued_at']) {
+      if (node[field] !== null && !validTimestamp(node[field])) throw new ControllerError(`${context}: node ${field} is invalid: ${nodeId}`);
+    }
+  }
+  for (const participant of state.participants) {
+    if (!participant || typeof participant !== 'object' || Array.isArray(participant)) throw new ControllerError(`${context}: participant is invalid`);
+    if (!hasExactFields(participant, new Set(['agent_task_path', 'agent_thread_id', 'agent_role', 'node_id', 'claim_id', 'attempt']))) throw new ControllerError(`${context}: participant has unknown or incomplete fields`);
+    requiredCanonicalString(participant.agent_task_path, `${context} participant.agent_task_path`);
+    if (participant.agent_thread_id !== null) requiredCanonicalString(participant.agent_thread_id, `${context} participant.agent_thread_id`);
+    requiredCanonicalString(participant.agent_role, `${context} participant.agent_role`);
+    if (participant.node_id !== requiredIdentifier(participant.node_id, `${context} participant.node_id`)) throw new ControllerError(`${context}: participant node_id is not canonical`);
+    requiredCanonicalString(participant.claim_id, `${context} participant.claim_id`);
+    if (!state.nodes[participant.node_id] || !Number.isSafeInteger(participant.attempt) || participant.attempt <= 0) throw new ControllerError(`${context}: participant binding is invalid`);
+  }
+  const reviewFields = new Set(['auditor_task', 'auditor_role', 'node_id', 'claim_id', 'verdict', 'requirement_coverage', 'scope_and_regression', 'verification_gaps', 'residual_risk', 'fallback_reason', 'workflow_snapshot', 'workspace_fingerprint', 'recorded_at', 'completion_status', 'completion_attestation', 'completed_at']);
+  const requiredReviewFields = new Set(['auditor_task', 'auditor_role', 'node_id', 'claim_id', 'verdict', 'requirement_coverage', 'scope_and_regression', 'verification_gaps', 'residual_risk', 'fallback_reason', 'workflow_snapshot', 'workspace_fingerprint', 'recorded_at']);
+  for (const review of state.reviews) {
+    if (!review || typeof review !== 'object' || Array.isArray(review) || ![...requiredReviewFields].every(field => hasOwn(review, field)) || Object.keys(review).some(field => !reviewFields.has(field))) throw new ControllerError(`${context}: review has unknown or incomplete fields`);
+    requiredCanonicalString(review.auditor_task, `${context} review.auditor_task`); requiredCanonicalString(review.auditor_role, `${context} review.auditor_role`); if (review.node_id !== requiredIdentifier(review.node_id, `${context} review.node_id`)) throw new ControllerError(`${context}: review node_id is not canonical`); requiredCanonicalString(review.claim_id, `${context} review.claim_id`);
+    if (!['pass', 'fail', 'unavailable'].includes(review.verdict) || !state.nodes[review.node_id] || state.nodes[review.node_id].kind !== 'total_review' || !review.requirement_coverage || typeof review.requirement_coverage !== 'object' || Array.isArray(review.requirement_coverage)
+      || Object.keys(review.requirement_coverage).length !== requirementIds.size || [...requirementIds].some(id => !hasOwn(review.requirement_coverage, id) || !nonEmptyReviewValue(review.requirement_coverage[id]))) throw new ControllerError(`${context}: review binding is invalid`);
+    if (!validTimestamp(review.recorded_at) || !nonEmptyReviewValue(review.scope_and_regression) || !nonEmptyReviewValue(review.verification_gaps) || !nonEmptyReviewValue(review.residual_risk)) throw new ControllerError(`${context}: review evidence is invalid`);
+    if (review.fallback_reason !== null) requiredCanonicalString(review.fallback_reason, `${context} review.fallback_reason`);
+    if (!review.workflow_snapshot || typeof review.workflow_snapshot !== 'object' || Array.isArray(review.workflow_snapshot) || !review.workspace_fingerprint || typeof review.workspace_fingerprint !== 'object' || Array.isArray(review.workspace_fingerprint)) throw new ControllerError(`${context}: review context is invalid`);
+    if (hasOwn(review, 'completion_status') || hasOwn(review, 'completion_attestation') || hasOwn(review, 'completed_at')) {
+      if (!COMPLETABLE.has(review.completion_status) || typeof review.completion_attestation !== 'string' || !validTimestamp(review.completed_at)) throw new ControllerError(`${context}: review completion metadata is invalid`);
+    }
+  }
+  for (const event of state.events) {
+    if (!event || typeof event !== 'object' || Array.isArray(event) || !requiredString(event.type, `${context} event.type`) || !validTimestamp(event.at)) throw new ControllerError(`${context}: event is invalid`);
+    if (hasOwn(event, 'workflow_revision') && (!Number.isSafeInteger(event.workflow_revision) || event.workflow_revision < 0 || event.workflow_revision > state.workflow_revision)) throw new ControllerError(`${context}: event workflow_revision is invalid`);
+    if (hasOwn(event, 'node_id')) requiredIdentifier(event.node_id, `${context} event.node_id`);
+    if (hasOwn(event, 'claim_id')) requiredString(event.claim_id, `${context} event.claim_id`);
+  }
+}
+
+function requireKnownQuiescentNodes(state, context) {
+  requireKnownNodeStatuses(state, context);
+  const running = Object.values(state.nodes).filter(node => node.status === RUNNING).map(node => node.id);
+  if (running.length) throw new ControllerError(`${context}: nodes are still running: ${running.join(', ')}`);
+}
+
+async function validateRequestedStateWithoutActiveLease(workspace, leasePath, stateDir, taskId, { requireReleasedState = false } = {}) {
+  if ((stateDir === null) !== (taskId === null)) throw new ControllerError('state_dir and task_id must be provided together when no active workspace lease exists');
+  if (stateDir === null) {
+    if (requireReleasedState) throw new ControllerError('Vacant workspace lease recovery requires state_dir and task_id');
+    return;
+  }
+  const filePath = statePath(stateDir, taskId);
+  if (!await stateExists(filePath)) {
+    await assertNoControllerStateRecoveryCopy(filePath);
+    if (requireReleasedState) throw new ControllerError(`Vacant workspace lease recovery requires a matching released task state: ${filePath}`);
+    return;
+  }
+  const state = await loadState(filePath);
+  requireKnownContinuityStateShape(state, 'Requested task state');
+  normalizeState(state);
+  validateTaskWorkspaceLeaseMetadata(state, filePath);
+  const stateLease = state.workspace_lease;
+  if (state.task_id === taskId && samePath(state.workspace, workspace) && stateLease?.status === 'released'
+    && samePath(stateLease.registry_path, leasePath) && samePath(stateLease.state_path, filePath)
+    && validTimestamp(stateLease.acquired_at) && validTimestamp(stateLease.released_at)) {
+    requireKnownQuiescentNodes(state, 'Released task state without an active workspace lease');
+    return;
+  }
+  throw new ControllerError(`Requested task state exists without an active workspace lease: ${filePath}`);
+}
+
+async function migrateLegacyVacantWorkspaceLease(lease, workspace, leasePath, stateDir, taskId) {
+  if (lease.active_task !== null || hasOwn(lease, 'status')) return false;
+  if (!hasSupportedWorkspaceLeaseShape(lease) || lease.version !== WORKSPACE_LEASE_VERSION || !samePath(lease.workspace, workspace) || !validTimestamp(lease.updated_at)) {
+    throw new ControllerError(`Unsupported legacy vacant workspace lease: ${leasePath}`);
+  }
+  await validateRequestedStateWithoutActiveLease(workspace, leasePath, stateDir, taskId, { requireReleasedState: true });
+  lease.status = 'vacant'; lease.updated_at = utcNow(); await atomicWrite(leasePath, lease);
+  return true;
+}
+
+async function reconcileWorkspaceLocked(workspace, leasePath, initialLease = null) {
+  const lease = initialLease ?? await loadWorkspaceLease(leasePath, workspace);
+  const metadata = validateActiveWorkspaceLeaseMetadata(lease, leasePath);
+  const existingState = await validateExistingWorkspaceLeaseState(lease, workspace, leasePath, metadata);
+  if (!lease.active_task) return { workspace, lease_path: leasePath, reconciled: false, reason: 'no active task' };
+  const phase = metadata.phase;
+  if (existingState?.workspace_lease.status === 'released') {
+    requireKnownQuiescentNodes(existingState, 'Released task state');
+    lease.status = 'vacant'; lease.active_task = null; lease.updated_at = utcNow(); await atomicWrite(leasePath, lease);
+    return { workspace, lease_path: leasePath, reconciled: true, action: phase === 'initializing' ? 'cleared_released_initialization' : 'cleared_released_task' };
+  }
+  if (phase === 'active') {
+    if (!existingState) throw new ControllerError(`Active workspace lease task state does not exist: ${leasePath}`);
+    return { workspace, lease_path: leasePath, reconciled: false, reason: 'active task is already consistent', active_task: lease.active_task };
+  }
+  if (!existingState) {
+    await assertNoControllerStateRecoveryCopy(metadata.state_path);
+    lease.status = 'vacant'; lease.active_task = null; lease.updated_at = utcNow(); await atomicWrite(leasePath, lease);
+    return { workspace, lease_path: leasePath, reconciled: true, action: 'cleared_missing_initialization' };
+  }
+  const state = existingState;
+  if (state.workspace_lease.status !== 'active') throw new ControllerError(`Initializing task state has unsupported lease status: ${state.workspace_lease.status}`);
+  lease.status = 'active'; lease.active_task.phase = 'active'; lease.updated_at = utcNow(); await atomicWrite(leasePath, lease);
+  return { workspace, lease_path: leasePath, reconciled: true, action: 'activated_existing_initialization', active_task: lease.active_task };
+}
+
 async function reconcileWorkspace(parameters) {
   const workspace = await canonicalWorkspace(parameters.workspace);
   const leasePath = workspaceLeasePath(workspace);
+  const leaseDirectoryExisted = await pathEntryExists(path.dirname(leasePath));
   return withStateLock(leasePath, async () => {
-    const lease = await loadWorkspaceLease(leasePath, workspace);
-    if (!lease.active_task) return { workspace, lease_path: leasePath, reconciled: false, reason: 'no active task' };
-    if ((lease.active_task.phase ?? 'active') === 'active') return { workspace, lease_path: leasePath, reconciled: false, reason: 'active task is already consistent', active_task: lease.active_task };
-    if (lease.active_task.phase !== 'initializing') throw new ControllerError(`Unsupported workspace lease phase: ${lease.active_task.phase}`);
-    let state;
-    try { state = normalizeState(await loadState(lease.active_task.state_path)); }
-    catch (error) {
-      if (error instanceof ControllerError && error.message.startsWith('JSON input does not exist:')) {
-        lease.active_task = null; lease.updated_at = utcNow(); await atomicWrite(leasePath, lease);
-        return { workspace, lease_path: leasePath, reconciled: true, action: 'cleared_missing_initialization' };
-      }
-      throw error;
+    if (!await pathEntryExists(leasePath)) {
+      if (leaseDirectoryExisted) throw new ControllerError(`Workspace lease registry is missing from an existing controller directory: ${leasePath}`);
+      await atomicWrite(leasePath, await loadWorkspaceLease(leasePath, workspace));
     }
-    if (state.task_id !== lease.active_task.task_id || state.workspace !== workspace || state.workspace_lease?.registry_path !== leasePath || state.workspace_lease?.state_path !== lease.active_task.state_path || state.workspace_lease?.acquired_at !== lease.active_task.acquired_at) throw new ControllerError(`Initializing workspace lease does not match its task state: ${leasePath}`);
-    if (state.workspace_lease.status === 'released') {
-      lease.active_task = null; lease.updated_at = utcNow(); await atomicWrite(leasePath, lease);
-      return { workspace, lease_path: leasePath, reconciled: true, action: 'cleared_released_initialization' };
-    }
-    if (state.workspace_lease.status !== 'active') throw new ControllerError(`Initializing task state has unsupported lease status: ${state.workspace_lease.status}`);
-    lease.active_task.phase = 'active'; lease.updated_at = utcNow(); await atomicWrite(leasePath, lease);
-    return { workspace, lease_path: leasePath, reconciled: true, action: 'activated_existing_initialization', active_task: lease.active_task };
+    return reconcileWorkspaceLocked(workspace, leasePath);
   });
+}
+
+// Probe continuity without creating or mutating a workflow task. Reconciliation
+// may only activate a verifiable initialization or clear a registration that is
+// provably missing/released; all other uncertainty is surfaced as blocked.
+async function ensureContext(parameters) {
+  let workspace = typeof parameters.workspace === 'string' && parameters.workspace.trim() ? path.resolve(parameters.workspace) : null;
+  let leasePath = workspace === null ? null : workspaceLeasePath(workspace);
+  const blocked = (error, reconciliation) => ({
+    state: 'blocked', ...(workspace === null ? {} : { workspace }), ...(leasePath === null ? {} : { lease_path: leasePath }), reconciliation,
+    error: { message: error.message, name: error.name, ...(error.code ? { code: error.code } : {}) },
+    original_error: error.message,
+  });
+  try {
+    workspace = await canonicalWorkspace(parameters.workspace);
+    leasePath = workspaceLeasePath(workspace);
+    const leaseDirectoryExisted = await pathEntryExists(path.dirname(leasePath));
+    const requestedTaskId = parameters.task_id === undefined || parameters.task_id === null ? null : requiredIdentifier(parameters.task_id, 'task_id');
+    const requestedStateDir = parameters.state_dir === undefined || parameters.state_dir === null ? null : requiredStateDirectory(parameters.state_dir);
+    return await withStateLock(leasePath, async () => {
+      let reconciliation;
+      let lease;
+      try {
+        if (!await pathEntryExists(leasePath)) {
+          if (leaseDirectoryExisted) throw new ControllerError(`Workspace lease registry is missing from an existing controller directory: ${leasePath}`);
+          lease = await loadWorkspaceLease(leasePath, workspace);
+          await atomicWrite(leasePath, lease);
+        }
+        lease = await loadWorkspaceLease(leasePath, workspace);
+        await migrateLegacyVacantWorkspaceLease(lease, workspace, leasePath, requestedStateDir, requestedTaskId);
+        reconciliation = await reconcileWorkspaceLocked(workspace, leasePath, lease);
+      } catch (error) {
+        return blocked(error);
+      }
+      try {
+        lease = await loadWorkspaceLease(leasePath, workspace);
+        const metadata = validateActiveWorkspaceLeaseMetadata(lease, leasePath);
+        if (!metadata) {
+          if (reconciliation?.active_task) throw new ControllerError(`Workspace lease became inactive while ensuring context: ${leasePath}`);
+          await validateRequestedStateWithoutActiveLease(workspace, leasePath, requestedStateDir, requestedTaskId);
+          return { state: 'new', workspace, lease_path: leasePath, reconciliation };
+        }
+        if (metadata.phase !== 'active') throw new ControllerError(`Unsupported workspace lease phase: ${lease.active_task.phase}`);
+        if (requestedTaskId !== null && requestedTaskId !== metadata.task_id) throw new ControllerError(`Workspace lease task_id does not match requested task_id: ${metadata.task_id}`);
+        if (requestedStateDir !== null && !samePath(requestedStateDir, metadata.state_dir)) throw new ControllerError(`Workspace lease state_dir does not match requested state_dir: ${metadata.state_dir}`);
+        const state = await validateExistingWorkspaceLeaseState(lease, workspace, leasePath, metadata);
+        if (!state || state.workspace_lease.status !== 'active') throw new ControllerError(`Workspace lease does not match its active task state: ${leasePath}`);
+        const compact = compactState(state);
+        return {
+          state: 'active', workspace, lease_path: leasePath, task_id: metadata.task_id, state_path: metadata.state_path,
+          task: compact, ready_nodes: compact.ready_nodes, stale_nodes: compact.stale_nodes,
+        };
+      } catch (error) {
+        return blocked(error, reconciliation);
+      }
+    });
+  } catch (error) {
+    return blocked(error);
+  }
 }
 
 async function addNode(parameters) {
@@ -1117,7 +1525,7 @@ function hasMatchingWorkflowBinding(workflow, parameters, node) {
   return Boolean(
     workflow && typeof workflow === 'object' && !Array.isArray(workflow) && typeof workflow.state_dir === 'string'
     && workflow.task_id === parameters.task_id && workflow.node_id === parameters.node_id && workflow.claim_id === parameters.claim_id
-    && node.id === parameters.node_id && path.resolve(workflow.state_dir) === path.resolve(parameters.state_dir),
+    && node.id === parameters.node_id && samePath(path.resolve(workflow.state_dir), path.resolve(parameters.state_dir)),
   );
 }
 
@@ -1208,7 +1616,7 @@ function workflowCompletionIntentMatches(intent, parameters, status, completionA
     intent && typeof intent === 'object' && !Array.isArray(intent)
     && intent.claim_id === parameters.claim_id && intent.task_id === parameters.task_id && intent.node_id === parameters.node_id
     && intent.status === status && intent.completion_attestation === completionAttestation
-    && typeof intent.result_path === 'string' && path.resolve(intent.result_path) === path.resolve(parameters.result),
+    && typeof intent.result_path === 'string' && samePath(path.resolve(intent.result_path), path.resolve(parameters.result)),
   );
 }
 
@@ -1225,7 +1633,11 @@ async function completeNode(parameters) {
         : NATIVE_AGENT_FINISHED;
     if (parameters.completion_attestation !== expectedAttestation) throw new ControllerError(`workflow_complete requires completion_attestation=${expectedAttestation}`);
     if (node.kind === 'total_review' && status === 'skipped') throw new ControllerError('A total_review node cannot be skipped');
-    if (node.kind === 'total_review' && status === SUCCEEDED && !hasRecordedReview(state, node)) throw new ControllerError('A successful total_review requires a recorded review for its active claim');
+    if (node.kind === 'total_review' && status === SUCCEEDED) {
+      const recordedReview = state.reviews.find(review => review.auditor_task === node.agent_task_path && review.claim_id === node.claim_id);
+      if (!recordedReview) throw new ControllerError('A successful total_review requires a recorded review for its active claim');
+      if (recordedReview.verdict !== 'pass') throw new ControllerError('A successful total_review requires a pass verdict for its active claim');
+    }
     let workflowOutcomeCompletion = null;
     if (node.kind === 'total_review') {
       result = addWorkflowOutcomeEnvelope(result, parameters);
@@ -1437,7 +1849,11 @@ async function retryNode(parameters) {
 
 const PRUNABLE_STATE_FIELDS = new Set(['version', 'routing_schema_version', 'task_id', 'workspace', 'goal', 'requirements', 'scope', 'non_goals', 'nodes', 'participants', 'reviews', 'events', 'workflow_revision', 'closed_revision', 'closed_at', 'created_at', 'updated_at', 'workspace_lease']);
 const PRUNABLE_NODE_FIELDS = new Set(['id', 'kind', 'agent_type', 'depends_on', 'execution_risk', 'routing_reason', 'execution_owner', 'integration_owner', 'quality_guard', 'routing_legacy', 'rescue_role', 'rescue_reason', 'rescued_at', 'rescue_count', 'status', 'agent_task_path', 'agent_thread_id', 'agent_role', 'claim_id', 'claimed_at', 'activation_at', 'activation_deadline_at', 'heartbeat_at', 'heartbeat_count', 'lease_duration_sec', 'attempt', 'result', 'checkpoint', 'checkpoint_at', 'workflow_completion_intent', 'recovery_history']);
-const PRUNABLE_LEASE_FIELDS = new Set(['version', 'workspace', 'active_task', 'updated_at']);
+const PRUNABLE_LEASE_FIELDS_V1 = new Set(['version', 'workspace', 'active_task', 'updated_at']);
+const PRUNABLE_LEASE_FIELDS = new Set(['version', 'workspace', 'status', 'active_task', 'updated_at']);
+const WORKSPACE_ACTIVE_TASK_FIELDS_V1 = new Set(['task_id', 'state_path', 'state_dir', 'acquired_at']);
+const WORKSPACE_ACTIVE_TASK_FIELDS = new Set([...WORKSPACE_ACTIVE_TASK_FIELDS_V1, 'phase']);
+const ACTIVE_TASK_LEASE_FIELDS = new Set(['registry_path', 'state_path', 'status', 'acquired_at']);
 const PRUNABLE_TASK_LEASE_FIELDS = new Set(['registry_path', 'state_path', 'status', 'acquired_at', 'released_at']);
 const PRUNE_SWEEP_FIELDS = new Set(['version', 'last_sweep_at', 'last_result']);
 const QUARANTINE_FIELDS_V1 = new Set(['version', 'status', 'task_id', 'original_state_path', 'error_path', 'reason', 'quarantined_at', 'delete_after', 'files', 'move_error']);
@@ -1450,7 +1866,27 @@ function hasExactFields(value, fields) {
   const keys = Object.keys(value);
   return keys.length === fields.size && keys.every(key => fields.has(key));
 }
-function validTimestamp(value) { return typeof value === 'string' && Number.isFinite(Date.parse(value)); }
+
+function hasSupportedWorkspaceLeaseShape(lease) {
+  return hasExactFields(lease, PRUNABLE_LEASE_FIELDS)
+    ? ['active', 'initializing', 'vacant'].includes(lease.status)
+    : hasExactFields(lease, PRUNABLE_LEASE_FIELDS_V1);
+}
+
+function workspaceLeaseIsVacant(lease) {
+  return hasSupportedWorkspaceLeaseShape(lease) && lease.active_task === null
+    && (lease.status === undefined || lease.status === 'vacant') && validTimestamp(lease.updated_at);
+}
+
+function validTimestamp(value) {
+  if (typeof value !== 'string') return false;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) && new Date(parsed).toISOString() === value;
+}
+
+function timestampAtOrAfter(later, earlier) {
+  return validTimestamp(later) && validTimestamp(earlier) && Date.parse(later) >= Date.parse(earlier);
+}
 
 function taskPruneEligibility(state, filePath, now) {
   if (!hasExactFields(state, PRUNABLE_STATE_FIELDS)) return { eligible: false, reason: 'incomplete or unknown state fields' };
@@ -1477,9 +1913,11 @@ function taskPruneEligibility(state, filePath, now) {
   if (!state.workspace_lease || state.workspace_lease.status !== 'released') return { eligible: false, reason: 'workspace lease is not released' };
   if (!hasExactFields(state.workspace_lease, PRUNABLE_TASK_LEASE_FIELDS)) return { eligible: false, reason: 'workspace lease is not a complete released state' };
   if (Object.values(state.nodes).some(node => node.status === RUNNING)) return { eligible: false, reason: 'has running nodes' };
-  if (typeof state.workspace_lease.registry_path !== 'string' || !path.isAbsolute(state.workspace_lease.registry_path) || path.resolve(state.workspace_lease.registry_path) !== workspaceLeasePath(state.workspace)) return { eligible: false, reason: 'invalid workspace lease path' };
-  if (state.workspace_lease.state_path !== filePath || !validTimestamp(state.workspace_lease.acquired_at) || !validTimestamp(state.workspace_lease.released_at)) return { eligible: false, reason: 'invalid released workspace lease state' };
-  if (path.resolve(state.workspace_lease.registry_path) === path.resolve(filePath)) return { eligible: false, reason: 'state path conflicts with workspace lease path' };
+  if (typeof state.workspace_lease.registry_path !== 'string' || !path.isAbsolute(state.workspace_lease.registry_path) || !samePath(path.resolve(state.workspace_lease.registry_path), workspaceLeasePath(state.workspace))) return { eligible: false, reason: 'invalid workspace lease path' };
+  if (!samePath(state.workspace_lease.state_path, filePath) || !validTimestamp(state.workspace_lease.acquired_at) || !validTimestamp(state.workspace_lease.released_at)) return { eligible: false, reason: 'invalid released workspace lease state' };
+  if (samePath(path.resolve(state.workspace_lease.registry_path), path.resolve(filePath))) return { eligible: false, reason: 'state path conflicts with workspace lease path' };
+  try { requireKnownContinuityStateShape(state, 'Prunable task state'); }
+  catch (error) { return { eligible: false, reason: `invalid nested task state: ${error.message}` }; }
   return { eligible: true };
 }
 
@@ -1487,7 +1925,7 @@ async function releasedLeaseEligibility(leasePath, state) {
   let lease;
   try { lease = await readJson(leasePath, { label: 'Workspace lease', maxBytes: MAX_MANIFEST_BYTES }); }
   catch (error) { return { eligible: false, reason: `workspace lease is unreadable: ${error.message}` }; }
-  if (!hasExactFields(lease, PRUNABLE_LEASE_FIELDS) || lease.version !== WORKSPACE_LEASE_VERSION || lease.workspace !== state.workspace || lease.active_task !== null || !validTimestamp(lease.updated_at)) return { eligible: false, reason: 'workspace lease is not a verified released registry' };
+  if (!workspaceLeaseIsVacant(lease) || lease.version !== WORKSPACE_LEASE_VERSION || !samePath(lease.workspace, state.workspace) || !validTimestamp(lease.updated_at)) return { eligible: false, reason: 'workspace lease is not a verified released registry' };
   return { eligible: true };
 }
 
@@ -1522,7 +1960,7 @@ async function quarantineEligibility(state, filePath, now) {
   let lease;
   try { lease = await readJson(lockableLeasePath, { label: 'Workspace lease', maxBytes: MAX_MANIFEST_BYTES }); }
   catch (error) { return { eligible: true, unverified: true, reason: `workspace lease is unreadable; direct quarantine is required: ${error.message}`, lease_path: lockableLeasePath }; }
-  if (!hasExactFields(lease, PRUNABLE_LEASE_FIELDS)
+  if (!hasSupportedWorkspaceLeaseShape(lease)
     || lease.version !== WORKSPACE_LEASE_VERSION
     || typeof state.workspace !== 'string'
     || !path.isAbsolute(state.workspace)
@@ -1533,6 +1971,7 @@ async function quarantineEligibility(state, filePath, now) {
     return { eligible: true, unverified: true, reason: 'workspace lease is not a complete matching registry; direct quarantine is required', lease_path: lockableLeasePath };
   }
   if (lease.active_task !== null) return { eligible: false, reason: 'workspace lease still has an active task' };
+  if (lease.status !== undefined && lease.status !== 'vacant') return { eligible: false, reason: 'workspace lease lifecycle is not vacant' };
   return { eligible: true, verified: true, lease_path: lockableLeasePath, reason: 'verified inactive workspace lease' };
 }
 
@@ -1541,6 +1980,12 @@ function errorQuarantinePath(errorPath) { return path.join(errorPath, ERROR_QUAR
 function quarantineExpiryPath(errorPath) { return path.join(errorPath, QUARANTINE_EXPIRY_FILENAME); }
 function reviewArtifactTaskPath(stateDir, taskId) { return path.join(path.resolve(stateDir), REVIEW_ARTIFACT_DIRECTORY, taskId); }
 function quarantineReviewArtifactPath(errorPath) { return path.join(errorPath, QUARANTINE_REVIEW_DIRECTORY); }
+function validQuarantineTaskId(taskId) { return typeof taskId === 'string' && /^[A-Za-z][A-Za-z0-9._-]{0,79}$/.test(taskId); }
+function quarantineLogicalTaskId(originalStatePath) {
+  if (typeof originalStatePath !== 'string' || !originalStatePath.endsWith('.json')) return null;
+  const taskId = path.basename(originalStatePath, '.json');
+  return validQuarantineTaskId(taskId) ? taskId : null;
+}
 
 async function reviewArtifactDirectoryIsSafe(directoryPath) {
   let entries;
@@ -1557,7 +2002,7 @@ async function reviewArtifactDirectoryIsSafe(directoryPath) {
 }
 
 function isDirectChild(parent, candidate) {
-  return path.dirname(path.resolve(candidate)) === path.resolve(parent);
+  return samePath(path.dirname(path.resolve(candidate)), path.resolve(parent));
 }
 
 async function stateFilesForQuarantine(filePath) {
@@ -1580,13 +2025,13 @@ function quarantineMetadataIsValid(metadata, stateDir, errorPath) {
   const legacyMetadata = hasExactFields(metadata, QUARANTINE_FIELDS_V1) && metadata.version === 1;
   if ((!currentMetadata && !legacyMetadata) || !['quarantining', 'quarantined'].includes(metadata.status)) return false;
   if (currentMetadata && metadata.review_artifacts !== null && metadata.review_artifacts !== QUARANTINE_REVIEW_DIRECTORY) return false;
-  if (metadata.task_id !== null && (typeof metadata.task_id !== 'string' || !metadata.task_id.trim())) return false;
   if (typeof metadata.original_state_path !== 'string' || typeof metadata.error_path !== 'string' || typeof metadata.reason !== 'string' || !metadata.reason.trim()) return false;
   if (!validTimestamp(metadata.quarantined_at) || !validTimestamp(metadata.delete_after) || (metadata.move_error !== null && (typeof metadata.move_error !== 'string' || !metadata.move_error.trim()))) return false;
   if (!Array.isArray(metadata.files) || !metadata.files.length || metadata.files.some(name => typeof name !== 'string' || !name || path.basename(name) !== name) || new Set(metadata.files).size !== metadata.files.length) return false;
   const root = errorStateRoot(stateDir);
-  if (!isDirectChild(root, errorPath) || path.resolve(metadata.error_path) !== path.resolve(errorPath)) return false;
-  if (path.dirname(path.resolve(metadata.original_state_path)) !== path.resolve(stateDir) || !metadata.original_state_path.endsWith('.json')) return false;
+  if (!isDirectChild(root, errorPath) || !samePath(path.resolve(metadata.error_path), path.resolve(errorPath))) return false;
+  if (!samePath(path.dirname(path.resolve(metadata.original_state_path)), path.resolve(stateDir)) || !metadata.original_state_path.endsWith('.json')) return false;
+  if (metadata.task_id !== quarantineLogicalTaskId(metadata.original_state_path)) return false;
   const logicalName = path.basename(metadata.original_state_path);
   const allowedNames = new Set([logicalName, databasePath(metadata.original_state_path), `${logicalName}.legacy`].map(candidate => path.basename(candidate)));
   if (metadata.files.some(name => !allowedNames.has(name))) return false;
@@ -1597,7 +2042,7 @@ function quarantineMetadataIsValid(metadata, stateDir, errorPath) {
 function quarantineExpiryFromMetadata(metadata) {
   return {
     version: 1,
-    task_id: metadata.task_id,
+    task_id: quarantineLogicalTaskId(metadata.original_state_path),
     original_state_path: metadata.original_state_path,
     quarantined_at: metadata.quarantined_at,
     delete_after: metadata.delete_after,
@@ -1608,11 +2053,11 @@ function quarantineExpiryFromMetadata(metadata) {
 
 function quarantineExpiryIsValid(expiry, stateDir, errorPath) {
   if (!hasExactFields(expiry, QUARANTINE_EXPIRY_FIELDS) || expiry.version !== 1) return false;
-  if (expiry.task_id !== null && (typeof expiry.task_id !== 'string' || !expiry.task_id.trim())) return false;
   if (typeof expiry.original_state_path !== 'string' || !validTimestamp(expiry.quarantined_at) || !validTimestamp(expiry.delete_after)) return false;
   if (!Array.isArray(expiry.files) || !expiry.files.length || expiry.files.some(name => typeof name !== 'string' || !name || path.basename(name) !== name) || new Set(expiry.files).size !== expiry.files.length) return false;
   if (expiry.review_artifacts !== null && expiry.review_artifacts !== QUARANTINE_REVIEW_DIRECTORY) return false;
-  if (path.dirname(path.resolve(expiry.original_state_path)) !== path.resolve(stateDir) || !expiry.original_state_path.endsWith('.json')) return false;
+  if (!samePath(path.dirname(path.resolve(expiry.original_state_path)), path.resolve(stateDir)) || !expiry.original_state_path.endsWith('.json')) return false;
+  if (expiry.task_id !== quarantineLogicalTaskId(expiry.original_state_path)) return false;
   const logicalName = path.basename(expiry.original_state_path);
   const allowedNames = new Set([logicalName, databasePath(expiry.original_state_path), `${logicalName}.legacy`].map(candidate => path.basename(candidate)));
   if (expiry.files.some(name => !allowedNames.has(name))) return false;
@@ -1656,11 +2101,9 @@ async function quarantineIfEligible(filePath, initialState, now) {
       if (!current.eligible) return { quarantined: false, reason: current.reason, task_id: state?.task_id ?? null };
       const components = await stateFilesForQuarantine(filePath);
       if (!components.files) return { quarantined: false, reason: components.reason, task_id: state?.task_id ?? null };
-      const taskId = typeof state?.task_id === 'string' && /^[A-Za-z][A-Za-z0-9._-]{0,79}$/.test(state.task_id)
-        ? state.task_id
-        : path.basename(filePath, '.json');
+      const taskId = quarantineLogicalTaskId(filePath);
       let artifactSource = null;
-      if (/^[A-Za-z][A-Za-z0-9._-]{0,79}$/.test(taskId)) {
+      if (taskId) {
         const candidate = reviewArtifactTaskPath(path.dirname(filePath), taskId);
         try {
           const artifactMetadata = await fs.lstat(candidate);
@@ -1677,7 +2120,7 @@ async function quarantineIfEligible(filePath, initialState, now) {
       const metadata = {
         version: 2,
         status: 'quarantining',
-        task_id: typeof state?.task_id === 'string' && state.task_id.trim() ? state.task_id : null,
+        task_id: taskId,
         original_state_path: filePath,
         error_path: errorPath,
         reason: current.verified ? 'legacy or incomplete task state passed the verified inactive-lease quarantine gate' : current.reason,
@@ -1708,10 +2151,6 @@ async function quarantineIfEligible(filePath, initialState, now) {
   }
 }
 
-function validQuarantineTaskId(taskId) {
-  return typeof taskId === 'string' && /^[A-Za-z][A-Za-z0-9._-]{0,79}$/.test(taskId);
-}
-
 async function quarantineContentsAreSafe(errorPath, record) {
   const contents = await fs.readdir(errorPath, { withFileTypes: true });
   const expectedFiles = new Set([...record.files, ERROR_QUARANTINE_FILENAME, QUARANTINE_EXPIRY_FILENAME]);
@@ -1723,9 +2162,11 @@ async function quarantineContentsAreSafe(errorPath, record) {
 
 async function upgradeLegacyQuarantine(stateDir, errorPath, metadata) {
   if (metadata.version !== 1 || metadata.status !== 'quarantined' || metadata.move_error !== null) return metadata;
+  const taskId = quarantineLogicalTaskId(metadata.original_state_path);
+  if (!taskId || metadata.task_id !== taskId) throw new ControllerError('Legacy quarantine task_id does not match its logical state path');
   let reviewArtifacts = null;
-  if (validQuarantineTaskId(metadata.task_id)) {
-    const artifactPath = reviewArtifactTaskPath(stateDir, metadata.task_id);
+  if (taskId) {
+    const artifactPath = reviewArtifactTaskPath(stateDir, taskId);
     try {
       const artifact = await fs.lstat(artifactPath);
       if (artifact.isSymbolicLink() || !artifact.isDirectory() || !await reviewArtifactDirectoryIsSafe(artifactPath)) {
@@ -1750,6 +2191,8 @@ async function upgradeLegacyQuarantine(stateDir, errorPath, metadata) {
 
 async function reconcileQuarantineEntry(stateDir, errorPath, metadata) {
   let current = await upgradeLegacyQuarantine(stateDir, errorPath, metadata);
+  const taskId = quarantineLogicalTaskId(current.original_state_path);
+  if (!taskId || current.task_id !== taskId) throw new ControllerError('Quarantine task_id does not match its logical state path');
   await ensureQuarantineExpiry(stateDir, errorPath, current);
   if (current.status === 'quarantined' && current.move_error === null) return { complete: true, metadata: current };
   const sourceDirectory = path.dirname(current.original_state_path);
@@ -1781,8 +2224,7 @@ async function reconcileQuarantineEntry(stateDir, errorPath, metadata) {
         if (target.isSymbolicLink() || !target.isDirectory() || !await reviewArtifactDirectoryIsSafe(destination)) throw new ControllerError(`Quarantine review artifact destination is unsafe: ${destination}`);
       } catch (error) {
         if (error.code !== 'ENOENT') throw error;
-        if (!validQuarantineTaskId(current.task_id)) throw new ControllerError('Quarantine review artifact has no valid task_id');
-        const source = reviewArtifactTaskPath(stateDir, current.task_id);
+        const source = reviewArtifactTaskPath(stateDir, taskId);
         try {
           const sourceMetadata = await fs.lstat(source);
           if (sourceMetadata.isSymbolicLink() || !sourceMetadata.isDirectory() || !await reviewArtifactDirectoryIsSafe(source)) throw new ControllerError(`Quarantine review artifact source is unsafe: ${source}`);
@@ -1911,7 +2353,7 @@ async function findQuarantinedState(stateDir, filePath) {
     const errorPath = path.join(root, entry.name);
     try {
       const metadata = await readQuarantineMetadata(stateDir, errorPath);
-      if (path.resolve(metadata.original_state_path) === path.resolve(filePath)) return metadata;
+      if (samePath(path.resolve(metadata.original_state_path), path.resolve(filePath))) return metadata;
     } catch {
       // Malformed entries are intentionally left in place and are not attributed to a task.
     }
@@ -2092,7 +2534,7 @@ async function pruneExpiredTasks(parameters) {
       const outcome = await withStateLock(leasePath, async () => withStateLock(filePath, async () => {
         let state;
         try { state = await loadState(filePath); }
-        catch (error) { if (error instanceof ControllerError && error.message.startsWith('JSON input does not exist:')) return { deleted: false, reason: 'state disappeared before cleanup' }; throw error; }
+        catch (error) { if (isMissingControllerState(error, filePath)) return { deleted: false, reason: 'state disappeared before cleanup' }; throw error; }
         const eligibility = taskPruneEligibility(state, filePath, now);
         if (!eligibility.eligible) return { deleted: false, reason: eligibility.reason, task_id: state.task_id };
         const leaseEligibility = await releasedLeaseEligibility(leasePath, state);
@@ -2146,9 +2588,15 @@ async function maybePruneExpiredTasks(parameters) {
 async function recoverTaskLock(parameters) {
   const [filePath, state] = await readTask(parameters);
   if (!state.workspace_lease) throw new ControllerError('Legacy task has no workspace lease and cannot recover its lock; create a new workflow task');
+  const workspaceRecovery = await recoverStaleLock(state.workspace_lease.registry_path, parameters.stale_after_sec);
   return withStateLock(state.workspace_lease.registry_path, async () => {
     await requireActiveWorkspaceLease(state, filePath);
-    return recoverStaleLock(filePath, parameters.stale_after_sec);
+    const taskRecovery = await recoverStaleLock(filePath, parameters.stale_after_sec);
+    return {
+      ...taskRecovery,
+      recovered: workspaceRecovery.recovered || taskRecovery.recovered,
+      workspace_lock: workspaceRecovery,
+    };
   });
 }
 
@@ -2213,14 +2661,26 @@ async function closeCheck(parameters) {
     const reasons = await closeReasons(initialState);
     return [{ task_id: initialState.task_id, close_allowed: !reasons.length, reasons, workspace_lease: { released: false, reason: 'legacy task has no workspace lease' } }, reasons.length ? 2 : 0];
   }
+  validateTaskWorkspaceLeaseMetadata(initialState, filePath);
   const leasePath = initialState.workspace_lease.registry_path;
   return withStateLock(leasePath, async () => withStateLock(filePath, async () => {
-    const state = normalizeState(await loadState(filePath));
+    const state = await loadState(filePath);
+    requireKnownContinuityStateShape(state, 'Task state');
+    normalizeState(state);
+    validateTaskWorkspaceLeaseMetadata(state, filePath);
     if (state.workspace_lease.status === 'released') {
+      if (!await pathEntryExists(leasePath)) throw new ControllerError(`Workspace lease registry is missing: ${leasePath}`);
       const lease = await loadWorkspaceLease(leasePath, state.workspace);
       let selfHealed = false;
-      if (lease.active_task?.task_id === state.task_id && lease.active_task?.state_path === filePath) {
-        lease.active_task = null; lease.updated_at = utcNow(); await atomicWrite(leasePath, lease); selfHealed = true;
+      if (releasedTaskMatchesVacantLease(lease, state, filePath, leasePath)) {
+        if (!hasOwn(lease, 'status')) {
+          lease.status = 'vacant'; lease.updated_at = utcNow(); await atomicWrite(leasePath, lease); selfHealed = true;
+        }
+      } else {
+        validateActiveWorkspaceLeaseMetadata(lease, leasePath);
+      }
+      if (!workspaceLeaseIsVacant(lease) && workspaceLeaseMatches(lease, state, filePath)) {
+        lease.status = 'vacant'; lease.active_task = null; lease.updated_at = utcNow(); await atomicWrite(leasePath, lease); selfHealed = true;
       }
       const reasons = await closeReasons(state);
       return [{ task_id: state.task_id, close_allowed: !reasons.length, reasons, workspace_lease: { released: true, already_released: true, self_healed: selfHealed, lease_path: leasePath } }, reasons.length ? 2 : 0];
@@ -2230,7 +2690,7 @@ async function closeCheck(parameters) {
     if (reasons.length) return [{ task_id: state.task_id, close_allowed: false, reasons }, 2];
     state.workspace_lease.status = 'released'; state.workspace_lease.released_at = utcNow(); state.closed_revision = state.workflow_revision; state.closed_at = utcNow();
     addEvent(state, 'workspace_lease_released', { close_allowed: true }); await writeState(filePath, state);
-    lease.active_task = null; lease.updated_at = utcNow(); await atomicWrite(leasePath, lease);
+    lease.status = 'vacant'; lease.active_task = null; lease.updated_at = utcNow(); await atomicWrite(leasePath, lease);
     return [{ task_id: state.task_id, close_allowed: true, reasons: [], workspace_lease: { released: true, lease_path: leasePath } }, 0];
   }));
 }
@@ -2238,10 +2698,10 @@ async function closeCheck(parameters) {
 export async function dispatch(command, parameters) {
   if (command === 'prune-expired') return [await pruneExpiredTasks(parameters), 0];
   if (command === 'reconcile-quarantine') return [await reconcileQuarantinedStates(parameters), 0];
-  // Diagnostic commands stay side-effect free; other operations lazily keep expired state bounded.
-  if (parameters && hasOwn(parameters, 'state_dir') && !READ_ONLY_COMMANDS.has(command)) await maybePruneExpiredTasks(parameters);
+  // These commands skip unrelated lazy cleanup; other operations keep expired state bounded.
+  if (parameters && hasOwn(parameters, 'state_dir') && !SKIP_AUTOMATIC_PRUNE_COMMANDS.has(command)) await maybePruneExpiredTasks(parameters);
   switch (command) {
-    case 'init': return [await initTask(parameters), 0]; case 'reconcile-workspace': return [await reconcileWorkspace(parameters), 0]; case 'add-node': return [await addNode(parameters), 0];
+    case 'init': return [await initTask(parameters), 0]; case 'reconcile-workspace': return [await reconcileWorkspace(parameters), 0]; case 'ensure-context': return [await ensureContext(parameters), 0]; case 'add-node': return [await addNode(parameters), 0];
     case 'ready': return [{ ready_nodes: readyNodes((await readTask(parameters))[1]) }, 0]; case 'claim': return [await claimNode(parameters), 0]; case 'start': return [await claimNode(parameters, true), 0];
     case 'complete': return [await completeNode(parameters), 0]; case 'heartbeat': return [await heartbeatNode(parameters), 0]; case 'checkpoint': return [await checkpointNode(parameters), 0];
     case 'abandon': return [await abandonNode(parameters), 0]; case 'retry': return [await retryNode(parameters), 0]; case 'requeue-stale': return [await requeueStaleNode(parameters), 0]; case 'rescue': return [await rescueNode(parameters), 0];

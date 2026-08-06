@@ -1,11 +1,13 @@
 ---
 name: workflow-controller
-description: "使用本地工作流控制器持久化 Codex 任务 DAG，并行派发所有就绪的原生子代理节点，并以绑定当前工作区指纹的独立 Sol 总审作为任务关闭关卡。"
+description: "使用本地工作流控制器持久化 Codex 任务 DAG、返回就绪节点建议，并以绑定当前工作区指纹的独立 Sol 总审作为任务关闭关卡。"
 ---
 
 # 工作流控制器
 
-需要持久化 DAG 调度或可强制执行的总体验收记录的状态变更任务，使用此 skill。控制器是状态和关卡服务；它不替代 Codex 原生 `spawn_agent`、`send_message`、`wait_agent` 或 `interrupt_agent`。控制器会为没有 `workflow` 字段的直接 `total_review` 结果写入与当前 task/node/claim/state_dir 匹配的 pending envelope；已有绑定缺失、`null`、假值或不匹配 completion 均不得完成或关闭。控制器仅回写自身生成的最终 completion；制品写入失败时节点保持运行中，原 claim 可重试。受控外部证据以流式目录遍历校验，普通文件最多 512（含 manifest），目录最多 512（不含根目录）。
+需要持久化 DAG 状态或可强制执行的总体验收记录的状态变更任务，使用此 skill。控制器是状态和关卡服务；它不替代 Codex 原生 `spawn_agent`、`send_message`、`wait_agent` 或 `interrupt_agent`。控制器会为没有 `workflow` 字段的直接 `total_review` 结果写入与当前 task/node/claim/state_dir 匹配的 pending envelope；已有绑定缺失、`null`、假值或不匹配 completion 均不得完成或关闭。控制器仅回写自身生成的最终 completion；制品写入失败时节点保持运行中，原 claim 可重试。受控外部证据以流式目录遍历校验，普通文件最多 512（含 manifest），目录最多 512（不含根目录）。
+
+`workflow_ensure_context` 幂等返回 `new`、`active` 或 `blocked`；调用时机和状态处理以 `$orchestrate-model-workflow` 为准。
 
 ## 必经流程
 
@@ -28,7 +30,7 @@ description: "使用本地工作流控制器持久化 Codex 任务 DAG，并行�
 - `total_review` 的 finalized outcome 只能在同一 claim 已持久化 completion intent 后恢复；intent 保存的结果摘要必须与制品除 `workflow_completion` 外的内容一致。没有 intent、摘要不匹配或只提交调用方伪造的 `completed=true` 制品都会被拒绝。已记录的 `fail` 只有在该 review claim 最终以节点状态 `failed` 完成时才参与 high -> xhigh -> max 升级；`unavailable`、超时、无效输出或其他完成状态不会计入。
 
 - 控制器记录由代理提供的任务路径和 claim；它不能验证真实 Codex 身份，也不能自行调用 Codex 协作 API。`workflow_start` 的 `native_agent_started=true` 与 `workflow_complete` 的 `completion_attestation` 是持久化审计声明，不是不可伪造的宿主认证；前者必须由已开始回合的原生实例提交，普通后者只能由 Root 在确认该实例为 `FINAL_ANSWER` 后以 `native_agent_finished` 提交。只有显式 Root 救援节点能使用 `root_rescue_self_completion`，并会记录为救援而非 Luna 完成；Sol CLI 在 `total_review` 以 `unavailable` 结束时，依据已确认的子进程退出或启动失败分别记录 `native_agent_exit_confirmed` 或 `native_agent_start_failed`，两者都不表示最终答复。`claim_id` 防止误完成和误接管，不构成认证或权限边界。对 `total_review`，控制器还要求该 claim 至少有一次 `workflow_heartbeat` 才能记录审核；这只能证明工作流实例执行过启动握手，不能替代原生身份认证。
-- `read_only` 节点只允许配置的只读 role（常规证据优先 Luna）；`avsp_luna_high_executor` 与 `avsp_luna_xhigh_executor` 以及只为旧任务保留的 `*_writer` role，只能认领完整、`delegable` 且 `execution_owner` 等于其真实任务路径的节点；新任务使用 executor。`protected` 节点或 legacy 路由必须交由 Terra 处理。Root 救援只能通过 `workflow_rescue` 显式进入 `main/root` 路由，并保留原 Luna attempt。控制器不证明写入目标是否真实互斥，协调者仍须在派发前核验。
+- `read_only` 节点只允许配置的只读 role；Luna 选择、并行和 fallback 以 `$orchestrate-model-workflow` 为准。`avsp_luna_high_executor`、`avsp_luna_xhigh_executor` 及旧任务的 `*_writer` 只能认领完整、`delegable` 且 `execution_owner` 等于其真实任务路径的节点；新任务使用 executor。`protected` 或 legacy 节点交由 Terra。Root 救援必须通过 `workflow_rescue` 进入 `main/root` 路由并保留原 Luna attempt；协调者仍须核验写入目标互斥。
 - `workflow_ready` 只是调度建议。main/root 仍是唯一能创建原生代理树的主体，且必须保持现有 role 拓扑。
 - 新节点默认有 600 秒激活窗口，运行租约默认 1,800 秒；`workflow_start` 会原子记录首个激活心跳，`workflow_checkpoint` 也会刷新租约。它们不是总运行时限，持续活动的长任务可以继续运行。
 - `state_dir` 是必填的绝对路径。推荐使用 `<workspace>/.codex/workflow-controller`，不要把它纳入源代码控制差异，也不要删除活动任务的状态文件。

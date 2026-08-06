@@ -7,6 +7,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 const mcpScript = fileURLToPath(new URL('../scripts/workflow_controller_mcp.mjs', import.meta.url));
+const pluginRoot = fileURLToPath(new URL('..', import.meta.url));
 
 function startMcp() {
   const child = spawn(process.execPath, [mcpScript], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
@@ -38,6 +39,14 @@ function startMcp() {
   };
 }
 
+test('plugin manifest and MCP cache target use the same cachebuster version', async () => {
+  const plugin = JSON.parse(await readFile(path.join(pluginRoot, '.codex-plugin', 'plugin.json'), 'utf8'));
+  const mcp = JSON.parse(await readFile(path.join(pluginRoot, '.mcp.json'), 'utf8'));
+  const launcher = mcp.mcpServers['workflow-controller'].args[1];
+  assert.match(launcher, new RegExp(`const version=['\"]${plugin.version.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}['\"]`));
+  assert.doesNotMatch(launcher, /candidates\.length/);
+});
+
 test('MCP server creates and reads a SQLite-backed workflow task over stdio', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-mcp-'));
   const workspace = path.join(root, 'workspace'); const stateDir = path.join(root, 'state'); const manifest = path.join(root, 'manifest.json');
@@ -49,6 +58,8 @@ test('MCP server creates and reads a SQLite-backed workflow task over stdio', as
     assert.equal(initialized.result.serverInfo.name, 'agnets-workflow');
     const init = await server.request({ method: 'tools/call', params: { name: 'workflow_init', arguments: { manifest, state_dir: stateDir } } });
     assert.equal(JSON.parse(init.result.content[0].text).task.task_id, 'mcp-task');
+    const ensured = await server.request({ method: 'tools/call', params: { name: 'workflow_ensure_context', arguments: { workspace, task_id: 'mcp-task', state_dir: stateDir } } });
+    assert.equal(JSON.parse(ensured.result.content[0].text).state, 'active');
     const status = await server.request({ method: 'tools/call', params: { name: 'workflow_status', arguments: { task_id: 'mcp-task', state_dir: stateDir } } });
     assert.equal(JSON.parse(status.result.content[0].text).task_id, 'mcp-task');
     const doctor = await server.request({ method: 'tools/call', params: { name: 'workflow_doctor', arguments: { task_id: 'mcp-task', state_dir: stateDir } } });

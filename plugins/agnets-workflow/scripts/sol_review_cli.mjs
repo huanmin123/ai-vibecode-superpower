@@ -44,6 +44,7 @@ const NATIVE_AGENT_START_FAILED = 'native_agent_start_failed';
 const MAX_EVIDENCE_FILES = 512;
 const MAX_EVIDENCE_FILE_BYTES = 64 * 1024 * 1024;
 const MAX_EVIDENCE_TOTAL_BYTES = 128 * 1024 * 1024;
+const sameInvocationPath = (left, right, platform) => platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right;
 const MAX_EVIDENCE_PATH_DEPTH = 32;
 const MAX_EVIDENCE_DIRECTORIES = 512;
 
@@ -200,7 +201,7 @@ function parseInvocation(argv, environment = process.env, platform = process.pla
     const resultRoot = path.resolve(workflow.state_dir, WORKFLOW_RESULT_DIRECTORY);
     const expectedResultPath = path.join(resultRoot, workflow.task_id, workflow.claim_id, 'outcome.json');
     if (!resultPath) resultPath = expectedResultPath;
-    if (path.resolve(resultPath) !== path.resolve(expectedResultPath)) throw new Error(`--result must be exactly ${expectedResultPath} when workflow binding is used`);
+    if (!sameInvocationPath(path.resolve(resultPath), path.resolve(expectedResultPath), platform)) throw new Error(`--result must be exactly ${expectedResultPath} when workflow binding is used`);
   }
   return { codexBin, timeoutSec, hardTimeoutSec, reviewProfile, evidenceDirectory, resultPath, reviewRole: reviewRole ?? DEFAULT_SOL_REVIEW_ROLE, reviewRoleExplicit: reviewRole !== null, workflow: workflowConfigured ? workflow : null, promptArgs: args.slice(index) };
 }

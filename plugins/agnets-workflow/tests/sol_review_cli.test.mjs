@@ -590,11 +590,15 @@ test('derives the CLI reasoning effort from the active workflow total-review rol
       queueMicrotask(() => { child.emit('exit', 2, null); child.stdout.emit('end'); child.stderr.emit('end'); });
       return child;
     };
+    const expectedResult = path.join(stateDir, '.workflow-review-results', 'review-task', claim.node.claim_id, 'outcome.json');
+    const alternateResult = `${expectedResult[0] === expectedResult[0].toLowerCase() ? expectedResult[0].toUpperCase() : expectedResult[0].toLowerCase()}${expectedResult.slice(1)}`;
     const result = await runSolReview([
+      '--result', alternateResult,
       '--workflow-state-dir', stateDir, '--workflow-task-id', 'review-task', '--workflow-node-id', 'total-review', '--workflow-claim-id', claim.node.claim_id,
       '--codex-bin', 'codex.cmd', '--', 'review this frozen evidence package',
     ], { CODEX_HOME: item.codexHome }, 'win32', spawnProcess);
     assert.equal(result.exit_code, 2);
+    assert.equal(result.result_path.toLowerCase(), expectedResult.toLowerCase());
     assert.equal(invocation.options.env.CODEX_REVIEW_REASONING_EFFORT, 'xhigh');
     assert.equal(invocation.options.env.CODEX_REVIEW_PROMPT, undefined);
   } finally { await rm(item.root, { recursive: true, force: true }); }
