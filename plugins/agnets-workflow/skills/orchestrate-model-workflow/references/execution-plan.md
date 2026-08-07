@@ -1,81 +1,59 @@
-# 复杂任务消息模板
+# 工作流消息模板
 
-路由、角色与恢复规则以 [SKILL.md](../SKILL.md) 为准。本文件只约定父子 agent 如何传递任务，不创建运行时对象或状态文件。
+本文件只提供计划、委派、完成和审核消息模板；路由、恢复和关闭策略以相应 skill 为准。
 
 ## 计划
 
 ```markdown
 # <任务名称>
-
 - 目标：<可观察结果>
 - 授权：<允许的状态变更；只读时写无>
 - 范围 / 非目标：<包含和排除项>
 - 已知事实：<已核验来源和当前状态>
 - 验收 / 验证：<完成条件和检查方式>
-- 停止条件：<何时补证、升级或报告阻塞>
-
-| task_name | 阶段 | agent_type | 输入/依赖 | 验收 | 状态 |
-| --- | --- | --- | --- | --- | --- |
-| <Codex task name> | 取证 / 定案 / 实施 / 预审 / 总验收 | <role> | <必要输入> | <条件> | pending |
+- 停止条件：<补证、重新分流或报告阻塞的条件>
 ```
 
-## 委派消息
+## 委派
 
 ```markdown
-task_name: <传给 spawn_agent 的名称>
+task_name: <Codex task name>
 agent_type: <实际 role>
 fork_turns: "none"
 goal: <可观察结果>
 scope: <允许目标和非目标>
-known_facts: <已核验的必要事实>
-authorization: <允许的操作>
+known_facts: <已核验事实>
+authorization: <允许操作>
 acceptance: <验收条件>
-verification: <要求执行的检查>
-stop_conditions: <停止并交回父级的条件>
-
-# 仅状态变更任务添加
-execution_contract: <已定步骤、不变量、领域边界/精度、失败语义和回滚/恢复方式>
+verification: <检查>
+stop_conditions: <停止条件>
+execution_contract: <步骤、不变量、边界、失败语义、回滚或恢复>
 execution_risk: <delegable | protected>
-execution_owner: <当前唯一执行 agent task path>
-integration_owner: <负责审核并集成的 main/root 或 Terra task path>
-quality_guard: <负责核验契约、diff、产物和验证的实例或检查>
-routing_reason: <为何该风险分流和 role 选择成立；xhigh executor 说明具体局部理解理由>
+execution_owner: <唯一 task path>
+integration_owner: <main/root 或 Terra task path>
+quality_guard: <核验实例或检查>
+routing_reason: <风险分流与 role 选择理由>
 ```
 
-默认使用自包含消息。只有确需有限最近上下文时，`fork_turns` 才能改为正整数；`all` 只能用于不传自定义 `agent_type` 的 full-history fork。
-
-## 完成消息
+## 完成
 
 ```markdown
 task_name: <原 task_name>
 actual_changes: <实际状态变化、diff 或无改动>
 evidence: <文件、产物和关键输出>
 verification_results: <实际检查及结果>
-remaining_work_or_blocker: <未完成工作；保留原始错误和缺失条件>
+remaining_work_or_blocker: <未完成工作、原始错误和缺失条件>
 ```
 
-子 agent 未返回时，父 agent 先核验 `list_agents`、实例状态/历史、diff、产物和验证输出。投递、触发、等待或中断的工具返回都不等于子任务完成或已经停止写入。
-
-## 任务级总验收
-
-每个有状态变更的任务在关闭前，由 main/root 新建此前未参与该任务的 `avsp_sol_high` 做总验收；第一次 high `fail` 修复后仍由 high 复审一次，第二次连续 high `fail` 后控制器把下一次总审升级为 `avsp_sol_xhigh`；xhigh 修复后再次 `fail` 时升级为 `avsp_sol_max`，进入更高等级后不得降级，max 持续到 `pass` 或显式状态上限阻塞。`unavailable`、超时、证据不足或普通失败不得作为能力升级依据。所选 Sol role 或模型被实际证明不可用时，使用此前未参与该任务的 `avsp_terra_xhigh_readonly` 兜底同一验收并披露独立性降级。输入必须包含原始目标、逐项验收条件、范围/非目标、执行契约、实际 diff/产物、验证输出和已知风险。验收返回 `pass`、`fail` 或 `unavailable`，并逐项说明需求覆盖、范围漂移、行为或回归风险、验证缺口与残余风险。缺少审核实例标识、逐项需求覆盖或证据时视为 `unavailable`。`fail` 或 `unavailable` 不得关闭任务；修复或补证后必须新建另一独立 Sol 实例重新验收。
+## 审核
 
 ```markdown
 auditor_task: <新建且此前未参与本任务的 task path>
-auditor_role: <avsp_sol_high | avsp_sol_xhigh | avsp_sol_max | avsp_terra_xhigh_readonly>
+auditor_role: <实际 role>
 verdict: <pass | fail | unavailable>
 requirement_coverage: <逐项验收条件 -> 证据或缺口>
 scope_and_regression: <范围漂移、行为或回归风险>
 verification_gaps: <未验证项及原因>
 residual_risk: <残余风险；无则写无>
-fallback_reason: <仅 Terra fallback；保留 Sol 不可用原始错误>
+fallback_reason: <仅 fallback；保留原始错误>
 ```
-
-## 协调检查
-
-- main/root 可为独立目标并行创建 `1..N` 个 Luna、Terra 或 Sol；完整、低风险且互斥的状态变更可由 main/root 或 `avsp_terra_high` 直接派 `1..N` 个 Luna executor。executor 为叶节点，Sol 与 executor 都不得派写入节点。
-- 同一 Terra 可并行管理 `1..N` 个 Luna executor；只读分支必须提供互补证据，executor 分支必须使用独立、完整且写入目标互斥的契约。main/root 直派时自身是 `integration_owner`；Terra 对 protected 执行与 executor 集成负责。
-- 状态变更任务的契约完整且五项路由字段齐全后才选择 executor；`protected` 不交 Luna；xhigh executor 有具体理由。旧清单或不完整字段按 `protected` 处理，不得静默委派。
-- 并行写入目标互斥；接管或替代前确认旧 executor 已终止或不再写入。
-- 只有证据满足验收时才关闭；保留实际验证、未覆盖行为和残余风险。
-- 仅在实际可读的运行时持久状态存在时使用它；缺失时只盘点当前状态、diff 和输出，保留原始错误与缺失条件并交回父级或用户，不声称自动恢复、已排队或自动重试。

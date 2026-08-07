@@ -1,4 +1,4 @@
 interface:
   display_name: "多模型开发工作流"
-  short_description: "按证据和执行风险调度 Luna、Terra 与 Sol"
-  default_prompt: "使用 $orchestrate-model-workflow 按证据与风险路由角色，并在状态变更前由 Terra 完成契约和执行风险分流。"
+  short_description: "为状态变更任务提供契约、执行分流与独立总验收闭环流程"
+  default_prompt: "使用 $orchestrate-model-workflow 为状态变更任务建立契约、分流执行并完成独立总验收。"

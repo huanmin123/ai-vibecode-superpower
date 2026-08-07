@@ -1,0 +1,4 @@
+interface:
+  display_name: "纯只读取证工作流"
+  short_description: "为复杂纯只读任务提供互补取证、有界定案和结果交接能力"
+  default_prompt: "使用 $orchestrate-read-workflow 处理复杂且可证明纯只读的任务。"

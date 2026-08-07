@@ -1,0 +1,8 @@
+interface:
+  display_name: "项目规划文档架构师"
+  short_description: "规划项目文档体系与任务级持久记录"
+  brand_color: "#2563EB"
+  default_prompt: "使用 $project-doc-planner 规划项目文档体系，并判断大型、长周期或跨模块开发任务需要哪些最小持久记录。"
+
+policy:
+  allow_implicit_invocation: true

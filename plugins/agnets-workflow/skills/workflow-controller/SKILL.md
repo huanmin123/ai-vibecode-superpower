@@ -1,39 +1,17 @@
 ---
 name: workflow-controller
-description: "使用本地工作流控制器持久化 Codex 任务 DAG、返回就绪节点建议，并以绑定当前工作区指纹的独立 Sol 总审作为任务关闭关卡。"
+description: "持久化状态变更任务的 DAG、恢复线索与绑定工作区指纹的总审关闭门禁。"
 ---
 
 # 工作流控制器
 
-需要持久化 DAG 状态或可强制执行的总体验收记录的状态变更任务，使用此 skill。控制器是状态和关卡服务；它不替代 Codex 原生 `spawn_agent`、`send_message`、`wait_agent` 或 `interrupt_agent`。控制器会为没有 `workflow` 字段的直接 `total_review` 结果写入与当前 task/node/claim/state_dir 匹配的 pending envelope；已有绑定缺失、`null`、假值或不匹配 completion 均不得完成或关闭。控制器仅回写自身生成的最终 completion；制品写入失败时节点保持运行中，原 claim 可重试。受控外部证据以流式目录遍历校验，普通文件最多 512（含 manifest），目录最多 512（不含根目录）。
+仅在状态变更任务需要持久 DAG、可恢复交接或可强制总审记录时使用。控制器是状态与关卡服务，不替代 Codex 原生 `spawn_agent`、`send_message`、`wait_agent` 或 `interrupt_agent`；它也不能验证真实 Codex 身份或自行停止、恢复代理。调用时机和写入任务分流以 `$orchestrate-model-workflow` 为准。
 
-`workflow_ensure_context` 幂等返回 `new`、`active` 或 `blocked`；调用时机和状态处理以 `$orchestrate-model-workflow` 为准。
+最短生命周期：在创建或恢复边界 `ensure-context`，以 manifest 初始化；读取 ready 节点，实际启动实例后记录进度和完成；遇到中断先诊断、确认旧实例停止后恢复或重派；冻结审查上下文，由独立 Sol 记录总审，通过关闭检查后才交付。工具返回、消息投递和退出码都不是任务终态。
 
-## 必经流程
+按需读取以下直接 reference；它们是控制器协议的唯一权威：
 
-1. 创建 JSON 任务清单，包含 `task_id`、绝对路径 `workspace`、`goal`、唯一的 `requirements` 和 DAG `nodes`。新清单应设 `routing_schema_version=1`；每个节点必须包含 `id`、`kind`、可选 `agent_type`、`depends_on`、`execution_risk`、`routing_reason`、`execution_owner`、`integration_owner` 与 `quality_guard`。`execution_risk=read_only` 只用于可证明不改变工作区或外部状态的取证；`delegable` 只用于完整、可恢复的 Luna executor 写入契约；其余写入为 `protected`。新任务必须在初始化时声明唯一的 `total_review` 节点，它直接依赖所有其他节点，且没有节点依赖它；初始化后 DAG 不可追加。旧清单没有版本标记时可读取，但会被明确标为 legacy/protected，不能授权 Luna executor。为任务固定一个绝对路径 `state_dir`，通常是 `<workspace>/.codex/workflow-controller`；同一任务的每一次 MCP/CLI 调用都必须携带完全相同的绝对路径。若初始化进程在返回前中断，先用 `workflow_reconcile_workspace` 检查该工作区：它只会激活可验证的已写状态，或清理确认不存在状态的初始化登记。每条需求包含唯一的 `id` 和非空 `text`。
-2. 调用 `workflow_init`，再调用 `workflow_ready`。对每个返回节点，main/root 必须先用 `spawn_agent` 创建新的原生实例，核对返回的真实任务路径和 role，并在任务包中要求该实例在自己实际开始首个回合后，以其真实路径、role 和 `native_agent_started=true` 调用 `workflow_start` 原子认领并激活节点；Root 不得替它调用 start。`workflow_claim` 仍保留给需要先登记、再由代理握手的兼容场景。不得先 claim 再用 `followup_task` 唤醒历史实例，也不得把 followup 提交成功当成实例已启动。运行中的代理仍须定期调用 `workflow_heartbeat`；`workflow_checkpoint` 也会刷新一次租约心跳。不得因为等待一个相互独立的就绪节点而延迟派发其他节点。
-3. 运行中的代理定期调用 `workflow_heartbeat`，并在开始、每个重要进展和阻塞前把不超过 32 KiB 的 JSON 进度写入临时文件后调用 `workflow_checkpoint`。checkpoint 应说明已完成步骤、下一步、改动/证据路径、验证和阻塞。心跳仅覆盖节点的最后活动时间和计数，不追加事件历史；每个原生子代理进入 `FINAL_ANSWER` 后，main/root 才能将结构化结果写入 JSON 文件，并携带匹配的 `claim_id` 与 `completion_attestation=native_agent_finished` 调用 `workflow_complete`（仅可用 `succeeded`、`failed`、`blocked`、`skipped` 或 `unavailable`）。唯一的常规例外是已由 `workflow_rescue` 显式转交、且当前 `agent_role=main/root` 的节点：Root 在完成自身验证后以 `completion_attestation=root_rescue_self_completion` 结束，控制器会留下该例外的审计记录，不能归为 Luna 结果。Sol CLI 的 `total_review` 若以 `unavailable` 结束，则仅在已确认子进程退出时记录 `completion_attestation=native_agent_exit_confirmed`，子进程未启动时记录 `native_agent_start_failed`；只有未收到 `spawn` 事件就报错才属于后者，启动后 error 必须等到实际 exit 才能算已确认退出。有效 Sol 结果文件会保持 `workflow_completion.state=pending`；main/root 必须把同一 `outcome.json` 作为 `workflow_complete` 的 `result`，控制器在持久化完成状态后原子回写最终状态，恢复时必须向控制器核对 claim 终态。两类异常 attestation 都明确不是 `FINAL_ANSWER`。消息、`wait_agent` 返回或 `send_message` 投递都不是最终状态。失败或阻塞节点必须保持可见；不得将其标为成功来解锁依赖节点。
-4. 使用 `workflow_stale` 查看启动期限或节点 `lease_duration_sec` 已过期的运行节点。结果会区分 `reason=never_activated`（从未产生首个心跳）和 `reason=heartbeat_expired`（曾启动后失联）。协调者先用原生 `list_agents` 等实际状态确认旧执行者停止：若当前 Codex 运行时实际提供 `resume_agent`、节点保存了 `agent_thread_id` 且旧实例可恢复，优先恢复原代理，由它用原 `claim_id` 继续心跳；控制器不能调用该内部能力。否则，协调者先创建替代原生实例并核对其真实任务路径，再以该路径作为 `replacement_agent_task_path`、`previous_agent_stopped=true` 调用 `workflow_requeue_stale`。此操作原子保存旧 attempt/checkpoint、将现代路由的 `execution_owner` 显式重绑定给该替代实例并返回恢复包；替代路径不得等于旧路径，且总审替代者不得是此前参与者。随后以新 claim 继续。这是新实例连续执行，不是旧会话恢复。若 Luna executor 或节点显式匹配的 legacy writer 已停止但 Root 必须接管实现，使用 `workflow_rescue`，它会记录原 claim、原因、替代路径和 `rescue_role=main/root`，随后 Root 必须用 `agent_role=main/root` 重新 `workflow_start`；不得把 Root 的改动伪装成 Luna 结果。没有实际停止证据时不得重排队或救援。若整个任务已中断且没有运行节点，只有确认全部旧代理已停止后才可调用 `workflow_release_workspace`。
-5. 锁阻塞时仅可用 `workflow_recover_lock` 恢复同一主机、超过阈值且写锁 PID 已不存在的锁；恢复操作以独占恢复保护串行化并归档旧锁，不会删除活动锁。写入、释放和恢复的崩溃遗留协调意图同样只会在元数据完整、同主机、超过阈值且 PID 不存在时归档恢复；未知、异机或仍活动的意图保持阻塞并报告。
-6. 总体验收前，调用 `workflow_audit_context`。把紧凑证据包交给一个从未参与任何先前任务节点的新建 Sol 总审代理。使用 Sol CLI 时，有效结果文件保持 `workflow_completion.state=pending`；在 `workflow_record_review` 后，main/root 必须将该同一文件传给 `workflow_complete`，控制器完成后才原子回写最终 completion。恢复时必须同时读取结果文件和控制器状态，不能只看退出码。
-7. 审核 JSON 必须包含 `auditor_task`、`auditor_role`、总审节点的 `claim_id`、`verdict`、`requirement_coverage`、`workflow_snapshot`、`workspace_fingerprint`、`scope_and_regression`、`verification_gaps` 和 `residual_risk`。`workflow_snapshot` 必须原样回填 `workflow_audit_context` 的结果；控制器会核验它仍对应当前非总审节点的状态与结果，并核验该 claim 仍属于同一路径、同一角色的运行中 `total_review` 节点。默认使用 `avsp_sol_high`；第一次 high `fail` 修复后仍使用 high，第二次连续 high `fail` 后由 `workflow_retry` 自动切换 `avsp_sol_xhigh`；xhigh 修复后再次 `fail` 时切换 `avsp_sol_max`，进入更高等级后不得降级。`unavailable`、超时、证据不足和无效输出不触发升级；仅在选定 Sol role 或模型确实不可用时使用 `avsp_terra_xhigh_readonly`。
-8. 总审代理调用 `workflow_record_review` 并进入 `FINAL_ANSWER` 后，main/root 以总审 claim 的 `completion_attestation=native_agent_finished` 调用 `workflow_complete`，再调用 `workflow_close_check`。只有 `close_allowed` 为 true 才能报告成功或触发发布；通过时控制器才释放该工作区租约。其后任何工作区变更都会使已记录的 `pass` 失效。
-
-9. 控制器状态主体保存在 `state_dir/<task_id>.sqlite` 中，使用插件内置的 SQLite/WASM 运行时，不依赖 Python、原生 Node 扩展或 Codex 的私有数据库。每个任务独占一个数据库，现有的 `<task_id>.json.lock` 仍负责跨 CLI 进程串行化同一任务。状态和协调 JSON 都以“同步临时文件、原子替换、同步目标文件”的顺序提交，POSIX 还会同步父目录；Windows 使用可写目标句柄刷新文件内容和替换结果。这不创建周期性备份，写入或同步失败会原样报错。旧版 `<task_id>.json` 会在首次成功写入 SQLite 后改名为 `.json.legacy`，作为一次恢复副本；SQLite 已提交前绝不删除旧文件。工作区租约和清理节流仍分别保存为 `workspace-lease.json` 与 `.workflow-prune-sweep.json`，因为它们是跨任务协调记录，不是任务主体。
-10. 普通的非只读控制器操作通过 `state_dir/.workflow-prune-sweep.json` 持久化节流，对同一目录最多每 6 小时执行一轮惰性清理，即使 CLI 每次调用都是新进程；只读诊断不会触发清理，也可显式调用 `workflow_prune_expired` 立即扫描。该标记还保留有界的最近清理计数。连续 7 天未更新时，只删除租约已释放、没有运行节点且版本与字段均完整可验证的任务，并删除对应的 Sol review 证据。连续 30 天未更新的未知、legacy 或无法验证租约的状态移入 `state_dir/.workflow-errors/<id>/`；其中 `quarantine.json` 与 `.quarantine-expiry.json` 分别记录传输与不可变到期信息。隔离完成后保留 365 天，届时才会在后续清理中删除；主隔离元数据损坏但到期凭证和目录内容可验证时仍可删除。隔离传输中断时，使用 `workflow_reconcile_quarantine` 幂等补齐已知文件和 review 证据，不删除未知文件。仍有运行节点、锁不可取得或隔离传输未完成的状态保留。`workflow_doctor` 指定任务时发现匹配隔离记录，省略 task id 时列出全部隔离项、孤立 legacy 副本与最近清理摘要。控制器不是常驻服务，所以没有任何 MCP 调用时不会在第 7、30 或 365 天整点自行启动。
-
-`workflow_doctor` 是只读诊断入口：指定 `task_id` 时返回状态库、工作区租约、协调文件和运行节点的机器可读检查结果；省略 `task_id` 时列出错误隔离项和孤立 legacy 副本。它还列出受控重派所需的事实动作。若 SQLite 或任务载荷无法读取，它仍返回 `health=blocked`、原始错误和不可关闭结论；不会删除、修复、释放租约或猜测旧代理已经停止。
-
-## 控制器边界
-
-- `total_review` 的 finalized outcome 只能在同一 claim 已持久化 completion intent 后恢复；intent 保存的结果摘要必须与制品除 `workflow_completion` 外的内容一致。没有 intent、摘要不匹配或只提交调用方伪造的 `completed=true` 制品都会被拒绝。已记录的 `fail` 只有在该 review claim 最终以节点状态 `failed` 完成时才参与 high -> xhigh -> max 升级；`unavailable`、超时、无效输出或其他完成状态不会计入。
-
-- 控制器记录由代理提供的任务路径和 claim；它不能验证真实 Codex 身份，也不能自行调用 Codex 协作 API。`workflow_start` 的 `native_agent_started=true` 与 `workflow_complete` 的 `completion_attestation` 是持久化审计声明，不是不可伪造的宿主认证；前者必须由已开始回合的原生实例提交，普通后者只能由 Root 在确认该实例为 `FINAL_ANSWER` 后以 `native_agent_finished` 提交。只有显式 Root 救援节点能使用 `root_rescue_self_completion`，并会记录为救援而非 Luna 完成；Sol CLI 在 `total_review` 以 `unavailable` 结束时，依据已确认的子进程退出或启动失败分别记录 `native_agent_exit_confirmed` 或 `native_agent_start_failed`，两者都不表示最终答复。`claim_id` 防止误完成和误接管，不构成认证或权限边界。对 `total_review`，控制器还要求该 claim 至少有一次 `workflow_heartbeat` 才能记录审核；这只能证明工作流实例执行过启动握手，不能替代原生身份认证。
-- `read_only` 节点只允许配置的只读 role；Luna 选择、并行和 fallback 以 `$orchestrate-model-workflow` 为准。`avsp_luna_high_executor`、`avsp_luna_xhigh_executor` 及旧任务的 `*_writer` 只能认领完整、`delegable` 且 `execution_owner` 等于其真实任务路径的节点；新任务使用 executor。`protected` 或 legacy 节点交由 Terra。Root 救援必须通过 `workflow_rescue` 进入 `main/root` 路由并保留原 Luna attempt；协调者仍须核验写入目标互斥。
-- `workflow_ready` 只是调度建议。main/root 仍是唯一能创建原生代理树的主体，且必须保持现有 role 拓扑。
-- 新节点默认有 600 秒激活窗口，运行租约默认 1,800 秒；`workflow_start` 会原子记录首个激活心跳，`workflow_checkpoint` 也会刷新租约。它们不是总运行时限，持续活动的长任务可以继续运行。
-- `state_dir` 是必填的绝对路径。推荐使用 `<workspace>/.codex/workflow-controller`，不要把它纳入源代码控制差异，也不要删除活动任务的状态文件。
-- 每个工作区在 `.codex/workflow-controller/workspace-lease.json` 中持有一个活动任务租约；即使两个会话使用不同 `state_dir`，也不能同时初始化同一个工作区的工作流。不同工作区可并行。租约释放后，旧任务只可读取，不能再认领、重试、追加节点、写心跳、完成或记录审核。控制器无法推断真实写入范围，因此这是保守的单工作区写任务边界。
-- `agent_thread_id` 是可选的原生 Codex thread UUID；仅当宿主实际提供时随 `workflow_claim` 记录。控制器不读取 `~/.codex/sessions`、rollout 或 SQLite，也没有调用 `resume_agent` 的公开权限。缺少该能力时，`workflow_requeue_stale` 返回的 checkpoint、依赖结果摘要、任务契约和工作区检查要求是新代理的连续性来源；恢复包会明确标记 `kind=new_agent_required`，不得声称恢复了原会话。
-- 控制器会从工作区指纹中排除 `.git`、`.codex`、`node_modules`、`.venv`、`.yarn` 与 `.yarn-cache*`；后两类是包管理器下载缓存，不能让验证期间的派生文件改变审核对象。构建输出仍属于审核范围。清单最多 64 个节点与 64 条需求，每个节点最多 8 次尝试；节点结果最多 64 KiB、审核 JSON 最多 128 KiB。完整日志应作为外部制品保留，状态中只写摘要和可核对路径。
+- [任务生命周期](references/task-lifecycle.md)：manifest、初始化、就绪节点、启动、心跳、checkpoint、完成与 attestation。
+- [恢复与诊断](references/recovery.md)：上下文连续性、过期、重派、救援、释放、锁和 doctor。
+- [总审与关闭](references/total-review.md)：审查上下文、证据、审核、升级、完成、关闭和 Sol CLI。
+- [存储与维护](references/storage-maintenance.md)：SQLite、原子写入、文件锁、清理、隔离和文件系统限制。

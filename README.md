@@ -10,8 +10,8 @@
 
 - 可供 Codex 使用的全局规则与跨平台文档。
 - 可按任务需要使用的 agent role profiles。
-- `agnets-workflow` 插件及其工作流工具。
-- 独立全局 skill：`project-doc-planner` 与 `gpt-image-2-cli`。
+- `agnets-workflow` 插件及其工作流工具与 `project-doc-planner` 项目文档规划能力。
+- 独立全局 skill：`gpt-image-2-cli`。
 
 ## 适合什么时候
 
@@ -25,42 +25,7 @@
 
 ## 工作流概览
 
-```mermaid
-flowchart TB
-    GOAL["用户目标与验收标准"] --> SPLIT["协调与任务拆分"]
-    SPLIT --> COST["成本与速度层：低成本模型处理取证、整理、范围明确且可验证的工作"]
-    COST --> EXEC["受控执行与验证"]
-    EXEC --> JUDGE["高级模型处理复杂判断与独立总审"]
-    JUDGE -->|通过| DELIVER["通过验收并交付"]
-    JUDGE -->|未通过| REPAIR["回到修复并重新验证"]
-    REPAIR --> EXEC
-
-    subgraph MCP["workflow-controller MCP：可查状态与关闭闭环"]
-        DAG["DAG 与依赖"] --> READY["按依赖识别就绪节点"]
-        READY --> CHECKPOINT["记录 checkpoint 与进度"]
-        CHECKPOINT --> DIAG["状态诊断与受控恢复"]
-        DIAG --> REVIEW["保存总审证据"]
-        REVIEW --> CLOSE["关闭检查"]
-    end
-    SPLIT -.-> DAG
-    COST -.-> READY
-    EXEC -.-> CHECKPOINT
-    JUDGE -.-> REVIEW
-    CLOSE -.-> DELIVER
-```
-
-MCP 不是替代 Codex agent 的调度器；它把任务进度、依赖、checkpoint、审核证据和关闭门禁持久化为可查、可恢复的状态。
-
-### workflow-controller MCP 如何支撑闭环
-
-| 机制 | 用户看到的结果 |
-| --- | --- |
-| DAG/依赖 | 可并行且按顺序交接 |
-| checkpoint/状态诊断 | 中断后有可核对的恢复线索 |
-| 工作区状态与关闭检查 | 未满足验收不得作为已完成交付 |
-| 总审证据 | 高级独立复查有据可查 |
-
-上述机制由 [`agnets-workflow` 使用说明](plugins/agnets-workflow/README.md) 和 [`workflow-controller` 工作流控制器](plugins/agnets-workflow/skills/workflow-controller/SKILL.md) 支持。
+工作流只有三路：单步、单域且无需判断或委派的纯读由 main/root 直接完成；复杂且可证明纯读使用 [`orchestrate-read-workflow`](plugins/agnets-workflow/skills/orchestrate-read-workflow/SKILL.md)；任何状态变更、无法证明纯读、可能产生持久产物，或需要持久控制、恢复或任务级总审时使用 [`orchestrate-model-workflow`](plugins/agnets-workflow/skills/orchestrate-model-workflow/SKILL.md)。控制器的协议权威是 [`workflow-controller`](plugins/agnets-workflow/skills/workflow-controller/SKILL.md)。
 
 ## 快速安装
 
@@ -97,8 +62,10 @@ sh ./install-codex.sh
 | 能力 | 适用场景 | 说明 |
 | --- | --- | --- |
 | [`agent-toolchain`](plugins/agnets-workflow/skills/agent-toolchain/SKILL.md) | 复杂重构、跨模块理解和大范围排障 | 为目标项目接入 CodeGraph 与 RTK；在跨模块理解、大型代码库或重复探索明显的场景下，可进一步减少重复探索与调用成本；一次性小改动通常不适合为了这一收益专门接入。 |
-| [`workflow-controller`](plugins/agnets-workflow/skills/workflow-controller/SKILL.md) | 需要持久化状态和可恢复交接的复杂任务 | 管理任务状态、就绪节点、checkpoint 与收口检查。 |
-| [`project-doc-planner`](skills/project-doc-planner/SKILL.md) | 新项目或大型改造的文档规划 | 生成和维护项目级文档结构。 |
+| [`orchestrate-read-workflow`](plugins/agnets-workflow/skills/orchestrate-read-workflow/SKILL.md) | 复杂且可证明纯只读的任务 | 组织互补取证与有界定案。 |
+| [`orchestrate-model-workflow`](plugins/agnets-workflow/skills/orchestrate-model-workflow/SKILL.md) | 状态变更或需要持久控制的任务 | 建立契约、执行分流和独立总验收。 |
+| [`workflow-controller`](plugins/agnets-workflow/skills/workflow-controller/SKILL.md) | model 工作流需要持久 DAG、恢复或总审记录时 | 协议以该 skill 及其 reference 为准。 |
+| [`project-doc-planner`](plugins/agnets-workflow/skills/project-doc-planner/SKILL.md) | 项目文档体系与任务记录判定 | 随 `agnets-workflow` 插件提供，规划文档结构，并为大型、长周期或跨模块开发保留最小持久记录。 |
 | [`gpt-image-2-cli`](skills/gpt-image-2-cli/SKILL.md) | 需要生成或编辑图片素材 | 通过命令行调用图像生成能力。 |
 
 例如，可以说：“使用 `$agent-toolchain` 给这个项目接入工具链”，或“使用 `$workflow-controller` 管理这个任务”。是否需要这些能力，应以任务范围为准。
@@ -106,6 +73,7 @@ sh ./install-codex.sh
 ## 进一步阅读
 
 - [`agnets-workflow` 使用说明](plugins/agnets-workflow/README.md)
+- [`orchestrate-read-workflow` 纯只读取证工作流](plugins/agnets-workflow/skills/orchestrate-read-workflow/SKILL.md)
 - [`orchestrate-model-workflow` 工作流规范](plugins/agnets-workflow/skills/orchestrate-model-workflow/SKILL.md)
 - [agent role profiles](codex-global-config/agents/ai-vibecode-superpower/)
 - [macOS/Linux 安装脚本](install-codex.sh)

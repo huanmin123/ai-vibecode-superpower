@@ -27,6 +27,6 @@
 
 ## 工作流
 
-复杂开发、实现、修复、架构、诊断、复审和验收必须使用 `$orchestrate-model-workflow`。
+单步、单域且无需判断或委派的纯读由 main/root 直接完成，不启用 workflow；复杂且可证明纯只读的任务使用 `$orchestrate-read-workflow`；任何状态变更、无法证明纯读、可能产生持久产物，或需要持久控制、恢复或任务级总审的任务使用 `$orchestrate-model-workflow`。两者互斥。
 
-root/native execution context 的连续性未知时，只在创建或恢复边界调用一次 `workflow_ensure_context`，不按每条消息轮询；其余规则以该 skill 为准。
+仅在 `$orchestrate-model-workflow` 的创建或恢复边界处理 root/native 连续性；其余规则以所选 skill 为准。

@@ -1,8 +1,0 @@
-interface:
-  display_name: "项目规划文档架构师"
-  short_description: "为软件项目设计文档架构、多环境资源和 AI 交付流水线"
-  brand_color: "#2563EB"
-  default_prompt: "使用 $project-doc-planner 为软件项目设计可维护的文档架构、私有环境资源布局、AI 交付流水线和开发规则基线。"
-
-policy:
-  allow_implicit_invocation: true

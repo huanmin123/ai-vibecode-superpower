@@ -14,8 +14,8 @@ source_plugin=$script_dir/plugins/$managed_plugin_name
 source_marketplace=$script_dir/.agents/plugins/marketplace.json
 source_plugin_skills=$source_plugin/skills
 source_standalone_skills=$script_dir/skills
-managed_plugin_skill_names='agent-toolchain orchestrate-model-workflow workflow-controller'
-managed_standalone_skill_names='gpt-image-2-cli project-doc-planner'
+managed_plugin_skill_names='agent-toolchain orchestrate-read-workflow orchestrate-model-workflow workflow-controller project-doc-planner'
+managed_standalone_skill_names='gpt-image-2-cli'
 managed_agent_role_files='ai-vibecode-superpower-avsp_luna_high.toml ai-vibecode-superpower-avsp_luna_xhigh.toml ai-vibecode-superpower-avsp_luna_high_writer.toml ai-vibecode-superpower-avsp_luna_xhigh_writer.toml ai-vibecode-superpower-avsp_luna_high_executor.toml ai-vibecode-superpower-avsp_luna_xhigh_executor.toml ai-vibecode-superpower-avsp_sol_high.toml ai-vibecode-superpower-avsp_sol_max.toml ai-vibecode-superpower-avsp_sol_xhigh.toml ai-vibecode-superpower-avsp_terra_high.toml ai-vibecode-superpower-avsp_terra_xhigh.toml ai-vibecode-superpower-avsp_terra_xhigh_readonly.toml ai-vibecode-superpower-avsp_terra_low_readonly.toml ai-vibecode-superpower-avsp_terra_medium_readonly.toml'
 
 for source_path in "$source_agents" "$source_config" "$source_agent_role_manifest" "$source_marketplace"; do

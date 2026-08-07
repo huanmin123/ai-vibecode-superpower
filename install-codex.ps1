@@ -635,12 +635,13 @@ $sourcePluginSkills = Join-Path $sourcePlugin 'skills'
 $sourceStandaloneSkills = Join-Path $scriptRoot 'skills'
 $managedPluginSkillNames = @(
     'agent-toolchain'
+    'orchestrate-read-workflow'
     'orchestrate-model-workflow'
     'workflow-controller'
+    'project-doc-planner'
 )
 $managedStandaloneSkillNames = @(
     'gpt-image-2-cli'
-    'project-doc-planner'
 )
 
 if (-not (Test-Path -LiteralPath $sourceAgents -PathType Leaf)) { throw "Missing source file: $sourceAgents" }
