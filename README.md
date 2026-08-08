@@ -69,6 +69,7 @@ MCP 不是替代 Codex agent 的调度器；它把任务进度、依赖、checkp
 - 已安装并可运行的 Codex CLI。
 - Node.js `>=20`。
 - macOS/Linux 还需要 `rg`（ripgrep）。
+- 关闭codex Desktop  必须否则配置会被覆盖回去
 
 安装目标优先使用非空的 `CODEX_HOME`；未设置时使用 `~/.codex`。
 
@@ -89,6 +90,31 @@ sh ./install-codex.sh
 ```
 
 安装成功后，必须完全重启 Codex Desktop 或 Codex CLI 进程，使新增配置与能力生效。
+
+
+如果本地使用了CC-switch  那么可能没有效果被覆盖回去
+
+配置检查： 必须有如下配置config.toml
+```toml
+
+model = "gpt-5.6-terra"
+model_reasoning_effort = "high"
+sandbox_mode = "danger-full-access"
+
+[plugins]
+[plugins."agnets-workflow@ai-vibecode-superpower-local"]
+enabled = true
+
+[agents]
+max_threads = 1000
+max_depth = 5
+
+
+[features]
+goals = true
+
+```
+
 
 ## 使用方式与可选能力
 
