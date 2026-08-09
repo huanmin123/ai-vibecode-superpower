@@ -95,6 +95,28 @@ sh ./install-codex.sh
 如果本地使用了 CC-Switch，需确认它没有覆盖安装脚本写入的 Codex 配置。
 
 
+> 检查配置 , 如果缺少自己补充  因为安装的时候可能因为你没有提前关闭软件导致配置被覆盖回去了
+
+```toml
+model = "gpt-5.6-terra"
+model_reasoning_effort = "xhigh"
+sandbox_mode = "danger-full-access"
+
+
+[plugins."agnets-workflow@ai-vibecode-superpower-local"]
+enabled = true
+
+[agents]
+max_threads = 1000
+max_depth = 5
+
+[features]
+goals = true
+
+
+```
+
+
 ## 使用方式与可选能力
 
 安装并重启后，在目标项目中直接描述任务即可。需要特定能力时，可以明确提及对应 skill：
