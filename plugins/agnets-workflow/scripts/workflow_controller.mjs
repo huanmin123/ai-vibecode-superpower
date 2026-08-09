@@ -33,6 +33,11 @@ const READ_ONLY_ROLES = new Set([
   'avsp_terra_xhigh',
   'avsp_terra_xhigh_readonly',
 ]);
+const READ_ONLY_FALLBACK_ROLES = new Map([
+  ['avsp_luna_high', 'avsp_terra_low_readonly'],
+  ['avsp_luna_xhigh', 'avsp_terra_medium_readonly'],
+]);
+const READ_ONLY_FALLBACK_ROLE_SET = new Set([...READ_ONLY_FALLBACK_ROLES.values(), FALLBACK_ROLE]);
 const PROTECTED_EXECUTOR_ROLE = 'avsp_terra_high';
 const ROUTING_FIELDS = ['execution_risk', 'routing_reason', 'execution_owner', 'integration_owner', 'quality_guard'];
 const IGNORED_DIRECTORIES = new Set(['.git', '.codex', 'node_modules', '.venv']);
@@ -665,13 +670,30 @@ function nodeRouting(raw, routingRequired) {
   };
 }
 
+function validateV1AgentType(kind, executionRisk, agentType) {
+  if (kind === 'total_review') {
+    if (!SOL_ROLES.has(agentType)) throw new ControllerError('A v1 total_review node requires a Sol agent_type; Terra is fallback-only');
+    return;
+  }
+  if (agentType == null) return;
+  if (executionRisk === 'protected' && agentType !== PROTECTED_EXECUTOR_ROLE) throw new ControllerError('A v1 protected node agent_type must be avsp_terra_high or omitted');
+  if (executionRisk === 'delegable' && !LUNA_EXECUTOR_ROLES.has(agentType) && agentType !== PROTECTED_EXECUTOR_ROLE) throw new ControllerError('A v1 delegable node agent_type must be a Luna executor, legacy writer, or avsp_terra_high');
+  if (executionRisk === 'read_only' && (!READ_ONLY_ROLES.has(agentType) || READ_ONLY_FALLBACK_ROLE_SET.has(agentType))) throw new ControllerError('A v1 read_only node agent_type cannot configure a Terra fallback role or other non-primary role');
+}
+
 function nodeRecord(raw, options = {}) {
   if (!raw || typeof raw !== 'object') throw new ControllerError('Each node must be an object');
   const id = requiredIdentifier(raw.id, 'node.id'); const kind = requiredString(raw.kind, 'node.kind');
   if (raw.agent_type !== undefined && raw.agent_type !== null) requiredString(raw.agent_type, 'node.agent_type');
   const dependencies = raw.depends_on ?? [];
   if (!Array.isArray(dependencies) || dependencies.some(dependency => typeof dependency !== 'string' || !dependency.trim())) throw new ControllerError('node.depends_on must contain non-empty string identifiers');
-  return { id, kind, agent_type: raw.agent_type ?? null, depends_on: dependencies, ...nodeRouting(raw, options.routingRequired === true), rescue_role: null, rescue_reason: null, rescued_at: null, rescue_count: 0, status: PENDING, agent_task_path: null, agent_thread_id: null, agent_role: null, claim_id: null, claimed_at: null, activation_at: null, activation_deadline_at: null, heartbeat_at: null, heartbeat_count: 0, lease_duration_sec: null, attempt: 0, result: null, checkpoint: null, checkpoint_at: null, workflow_completion_intent: null, recovery_history: [] };
+  const routing = nodeRouting(raw, options.routingRequired === true);
+  const defaultAgentType = options.routingSchemaVersion === 1 && !routing.routing_legacy && raw.agent_type == null
+    ? (kind === 'total_review' ? 'avsp_sol_high' : ({ read_only: 'avsp_luna_high', delegable: 'avsp_luna_high_executor' }[routing.execution_risk] ?? null))
+    : null;
+  const agentType = raw.agent_type ?? defaultAgentType;
+  if (options.routingSchemaVersion === 1) validateV1AgentType(kind, routing.execution_risk, agentType);
+  return { id, kind, agent_type: agentType, depends_on: dependencies, ...routing, rescue_role: null, rescue_reason: null, rescued_at: null, rescue_count: 0, status: PENDING, agent_task_path: null, agent_thread_id: null, agent_role: null, claim_id: null, claimed_at: null, activation_at: null, activation_deadline_at: null, heartbeat_at: null, heartbeat_count: 0, lease_duration_sec: null, attempt: 0, result: null, checkpoint: null, checkpoint_at: null, workflow_completion_intent: null, recovery_history: [] };
 }
 
 function normalizeState(state) {
@@ -713,7 +735,7 @@ async function makeState(manifest) {
   if (!Array.isArray(manifest.nodes) || !manifest.nodes.length || manifest.nodes.length > MAX_NODES) throw new ControllerError(`Manifest requires between 1 and ${MAX_NODES} nodes`);
   const nodes = Object.create(null);
   for (const rawNode of manifest.nodes ?? []) {
-    const node = nodeRecord(rawNode, { routingRequired: routingSchemaVersion === 1 });
+    const node = nodeRecord(rawNode, { routingRequired: routingSchemaVersion === 1, routingSchemaVersion });
     if (hasOwn(nodes, node.id)) throw new ControllerError(`Duplicate node id: ${node.id}`);
     nodes[node.id] = node;
   }
@@ -1030,7 +1052,15 @@ async function claimNode(parameters, activateImmediately = false) {
     if (runningParticipantPaths(state).has(taskPath)) throw new ControllerError('Agent already has a running node in this task');
     if (node.kind === 'total_review' && participantPaths(state).has(taskPath)) throw new ControllerError('A prior participant cannot claim the total review');
     const expectedAgentType = node.rescue_role ?? node.agent_type;
-    if (expectedAgentType && expectedAgentType !== role) throw new ControllerError(`Node agent_type must match claimed role: ${expectedAgentType}`);
+    const lunaFallback = node.kind !== 'total_review' && node.execution_risk === 'read_only' && READ_ONLY_FALLBACK_ROLES.get(node.agent_type) === role;
+    const solFallback = SOL_ROLES.has(node.agent_type) && role === FALLBACK_ROLE && node.rescue_role === null && (node.kind === 'total_review' || node.execution_risk === 'read_only');
+    const fallbackRole = lunaFallback || solFallback;
+    const fallbackReason = optionalString(parameters.fallback_reason, 'fallback_reason');
+    if (node.kind === 'total_review' && !SOL_ROLES.has(role) && role !== FALLBACK_ROLE) throw new ControllerError('A total_review node requires a Sol role or the configured Terra fallback');
+    if (node.kind === 'total_review' && role === FALLBACK_ROLE && !solFallback) throw new ControllerError('The total-review Terra role is fallback-only for a configured Sol reviewer');
+    if (node.kind !== 'total_review' && READ_ONLY_FALLBACK_ROLE_SET.has(role) && !fallbackRole) throw new ControllerError('The Terra read-only role is fallback-only for its configured Luna or Sol reviewer');
+    if (expectedAgentType && expectedAgentType !== role && !fallbackRole) throw new ControllerError(`Node agent_type must match claimed role: ${expectedAgentType}`);
+    if (fallbackRole && !fallbackReason) throw new ControllerError('Terra fallback requires fallback_reason');
     // Total reviews are read-only guards, not protected execution work.
     if (node.execution_risk === 'protected' && node.kind !== 'total_review' && role !== PROTECTED_EXECUTOR_ROLE) throw new ControllerError('Only avsp_terra_high can claim protected work');
     if (node.execution_risk === 'read_only' && node.kind !== 'total_review' && !READ_ONLY_ROLES.has(role)) throw new ControllerError('A read_only node requires a configured read-only role');
@@ -1043,8 +1073,8 @@ async function claimNode(parameters, activateImmediately = false) {
     if (!node.routing_legacy && node.execution_owner !== taskPath) throw new ControllerError('Node claim must match execution_owner');
     if (node.attempt >= MAX_NODE_ATTEMPTS) throw new ControllerError(`Node exceeded the ${MAX_NODE_ATTEMPTS}-attempt limit: ${nodeId}`);
     const now = utcNow(); node.status = RUNNING; node.agent_task_path = taskPath; node.agent_thread_id = threadId; node.agent_role = role; node.claim_id = randomUUID(); node.claimed_at = now; node.activation_at = activateImmediately ? now : null; node.activation_deadline_at = activateImmediately ? null : new Date(Date.now() + activationTimeoutSec * 1000).toISOString(); node.heartbeat_at = now; node.heartbeat_count = activateImmediately ? 1 : 0; node.lease_duration_sec = leaseDurationSec; node.attempt += 1;
-    state.participants.push({ agent_task_path: taskPath, agent_thread_id: threadId, agent_role: role, node_id: nodeId, claim_id: node.claim_id, attempt: node.attempt });
-    addEvent(state, 'node_claimed', { node_id: nodeId, agent_task_path: taskPath, agent_thread_id: threadId, agent_role: role, claim_id: node.claim_id, attempt: node.attempt });
+    state.participants.push({ agent_task_path: taskPath, agent_thread_id: threadId, agent_role: role, node_id: nodeId, claim_id: node.claim_id, attempt: node.attempt, fallback_reason: fallbackReason });
+    addEvent(state, 'node_claimed', { node_id: nodeId, agent_task_path: taskPath, agent_thread_id: threadId, agent_role: role, claim_id: node.claim_id, attempt: node.attempt, fallback_reason: fallbackReason });
     if (activateImmediately) addEvent(state, 'node_started', { node_id: nodeId, agent_task_path: taskPath, agent_thread_id: threadId, agent_role: role, claim_id: node.claim_id, native_agent_started: true });
     await writeState(filePath, state);
     return { task_id: state.task_id, node };

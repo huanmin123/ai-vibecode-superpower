@@ -58,7 +58,7 @@ remaining_work_or_blocker: <未完成工作；保留原始错误和缺失条件>
 
 ## 任务级总验收
 
-每个有状态变更的任务在关闭前，由 main/root 新建此前未参与该任务的 `avsp_sol_high` 做总验收；第一次 high `fail` 修复后仍由 high 复审一次，第二次连续 high `fail` 后控制器把下一次总审升级为 `avsp_sol_xhigh`；xhigh 修复后再次 `fail` 时升级为 `avsp_sol_max`，进入更高等级后不得降级，max 持续到 `pass` 或显式状态上限阻塞。`unavailable`、超时、证据不足或普通失败不得作为能力升级依据。所选 Sol role 或模型被实际证明不可用时，使用此前未参与该任务的 `avsp_terra_xhigh_readonly` 兜底同一验收并披露独立性降级。输入必须包含原始目标、逐项验收条件、范围/非目标、执行契约、实际 diff/产物、验证输出和已知风险。验收返回 `pass`、`fail` 或 `unavailable`，并逐项说明需求覆盖、范围漂移、行为或回归风险、验证缺口与残余风险。缺少审核实例标识、逐项需求覆盖或证据时视为 `unavailable`。`fail` 或 `unavailable` 不得关闭任务；修复或补证后必须新建另一独立 Sol 实例重新验收。
+总审路由、升级链和关闭条件以 [SKILL.md](../SKILL.md) 为准。总审结果必须能回填下列字段；`fail`/`unavailable` 不得关闭任务。
 
 ```markdown
 auditor_task: <新建且此前未参与本任务的 task path>
@@ -73,9 +73,4 @@ fallback_reason: <仅 Terra fallback；保留 Sol 不可用原始错误>
 
 ## 协调检查
 
-- main/root 可为独立目标并行创建 `1..N` 个 Luna、Terra 或 Sol；完整、低风险且互斥的状态变更可由 main/root 或 `avsp_terra_high` 直接派 `1..N` 个 Luna executor。executor 为叶节点，Sol 与 executor 都不得派写入节点。
-- 同一 Terra 可并行管理 `1..N` 个 Luna executor；只读分支必须提供互补证据，executor 分支必须使用独立、完整且写入目标互斥的契约。main/root 直派时自身是 `integration_owner`；Terra 对 protected 执行与 executor 集成负责。
-- 状态变更任务的契约完整且五项路由字段齐全后才选择 executor；`protected` 不交 Luna；xhigh executor 有具体理由。旧清单或不完整字段按 `protected` 处理，不得静默委派。
-- 并行写入目标互斥；接管或替代前确认旧 executor 已终止或不再写入。
-- 只有证据满足验收时才关闭；保留实际验证、未覆盖行为和残余风险。
-- 仅在实际可读的运行时持久状态存在时使用它；缺失时只盘点当前状态、diff 和输出，保留原始错误与缺失条件并交回父级或用户，不声称自动恢复、已排队或自动重试。
+交接、并发、恢复和关闭检查以 [SKILL.md](../SKILL.md) 为准；本模板只提醒父 agent 填完整任务包，并核对实际状态、diff、产物和验证结果。

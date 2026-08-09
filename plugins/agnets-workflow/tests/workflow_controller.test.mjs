@@ -1070,7 +1070,7 @@ test('refuses to turn a non-Luna delegable attempt into a Root rescue', async ()
   try {
     const routing = { execution_risk: 'delegable', routing_reason: 'isolated reversible edit', execution_owner: '/root/terra', integration_owner: '/root', quality_guard: 'targeted test' };
     const reviewRouting = { execution_risk: 'protected', routing_reason: 'independent total review', execution_owner: '/root/reviewer', integration_owner: '/root', quality_guard: 'close gate' };
-    await writeFile(fixture.manifest, JSON.stringify({ task_id: 'feature-1', workspace: fixture.workspace, goal: 'Reject invalid rescue source', routing_schema_version: 1, requirements: [{ id: 'R1', text: 'rescue source is Luna' }], nodes: [{ id: 'implement', kind: 'implementation', ...routing }, { id: 'total-review', kind: 'total_review', agent_type: 'avsp_sol_high', depends_on: ['implement'], ...reviewRouting }] }));
+    await writeFile(fixture.manifest, JSON.stringify({ task_id: 'feature-1', workspace: fixture.workspace, goal: 'Reject invalid rescue source', routing_schema_version: 1, requirements: [{ id: 'R1', text: 'rescue source is Luna' }], nodes: [{ id: 'implement', kind: 'implementation', agent_type: 'avsp_terra_high', ...routing }, { id: 'total-review', kind: 'total_review', agent_type: 'avsp_sol_high', depends_on: ['implement'], ...reviewRouting }] }));
     await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
     const [claim] = await dispatch('claim', { state_dir: fixture.stateDir, task_id: 'feature-1', node_id: 'implement', agent_task_path: '/root/terra', agent_role: 'avsp_terra_high' });
     await assert.rejects(
@@ -1169,8 +1169,10 @@ test('routes read-only evidence to Luna without misclassifying it as delegable a
     const evidenceRouting = { execution_risk: 'read_only', routing_reason: 'independent evidence collection without state changes', execution_owner: '/root/evidence', integration_owner: '/root', quality_guard: 'evidence is cited and bounded' };
     const writeRouting = { execution_risk: 'delegable', routing_reason: 'isolated reversible edit', execution_owner: '/root/reader', integration_owner: '/root', quality_guard: 'targeted test' };
     const reviewRouting = { execution_risk: 'protected', routing_reason: 'independent total review', execution_owner: '/root/reviewer', integration_owner: '/root', quality_guard: 'close gate' };
-    await writeFile(fixture.manifest, JSON.stringify({ task_id: 'feature-1', workspace: fixture.workspace, goal: 'Separate evidence from execution', routing_schema_version: 1, requirements: [{ id: 'R1', text: 'Luna evidence is auditable' }], nodes: [{ id: 'evidence', kind: 'verification', agent_type: 'avsp_luna_high', ...evidenceRouting }, { id: 'write', kind: 'implementation', agent_type: 'avsp_luna_high_writer', ...writeRouting }, { id: 'untyped-write', kind: 'implementation', execution_risk: 'delegable', routing_reason: 'isolated reversible edit', execution_owner: '/root/untyped-reader', integration_owner: '/root', quality_guard: 'targeted test' }, { id: 'total-review', kind: 'total_review', agent_type: 'avsp_sol_high', depends_on: ['evidence', 'write', 'untyped-write'], ...reviewRouting }] }));
-    await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+    await writeFile(fixture.manifest, JSON.stringify({ task_id: 'feature-1', workspace: fixture.workspace, goal: 'Separate evidence from execution', routing_schema_version: 1, requirements: [{ id: 'R1', text: 'Luna evidence is auditable' }], nodes: [{ id: 'evidence', kind: 'verification', ...evidenceRouting }, { id: 'write', kind: 'implementation', agent_type: 'avsp_luna_high_writer', ...writeRouting }, { id: 'untyped-write', kind: 'implementation', execution_risk: 'delegable', routing_reason: 'isolated reversible edit', execution_owner: '/root/untyped-reader', integration_owner: '/root', quality_guard: 'targeted test' }, { id: 'total-review', kind: 'total_review', agent_type: 'avsp_sol_high', depends_on: ['evidence', 'write', 'untyped-write'], ...reviewRouting }] }));
+    const [initialized] = await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+    assert.equal(initialized.task.nodes.find(node => node.id === 'evidence').agent_type, 'avsp_luna_high');
+    assert.equal(initialized.task.nodes.find(node => node.id === 'untyped-write').agent_type, 'avsp_luna_high_executor');
     await assert.rejects(
       () => dispatch('start', { state_dir: fixture.stateDir, task_id: 'feature-1', node_id: 'evidence', agent_task_path: '/root/evidence', agent_role: 'avsp_luna_high' }),
       /native_agent_started must be true/
@@ -1188,10 +1190,91 @@ test('routes read-only evidence to Luna without misclassifying it as delegable a
     assert.ok(stateAfterComplete.events.some(event => event.type === 'node_completed' && event.node_id === 'evidence' && event.completion_attestation === 'native_agent_finished'));
     await assert.rejects(
       () => dispatch('claim', { state_dir: fixture.stateDir, task_id: 'feature-1', node_id: 'untyped-write', agent_task_path: '/root/untyped-reader', agent_role: 'avsp_luna_high' }),
-      /delegable node requires/
+      /Node agent_type must match claimed role/
     );
     const [writer] = await dispatch('claim', { state_dir: fixture.stateDir, task_id: 'feature-1', node_id: 'write', agent_task_path: '/root/reader', agent_role: 'avsp_luna_high_writer' });
     assert.equal(writer.node.agent_role, 'avsp_luna_high_writer');
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test('requires and records an explicit Terra fallback for default read-only routing', async () => {
+  const fixture = await setup();
+  try {
+    const evidenceRouting = { execution_risk: 'read_only', routing_reason: 'independent evidence collection without state changes', execution_owner: '/root/evidence', integration_owner: '/root', quality_guard: 'evidence is cited and bounded' };
+    const reviewRouting = { execution_risk: 'protected', routing_reason: 'independent total review', execution_owner: '/root/reviewer', integration_owner: '/root', quality_guard: 'close gate' };
+    await writeFile(fixture.manifest, JSON.stringify({ task_id: 'feature-1', workspace: fixture.workspace, goal: 'Record explicit fallback', routing_schema_version: 1, requirements: [{ id: 'R1', text: 'fallback is auditable' }], nodes: [{ id: 'evidence', kind: 'verification', ...evidenceRouting }, { id: 'total-review', kind: 'total_review', agent_type: 'avsp_sol_high', depends_on: ['evidence'], ...reviewRouting }] }));
+    const [initialized] = await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+    assert.equal(initialized.task.nodes[0].agent_type, 'avsp_luna_high');
+    await assert.rejects(
+      () => dispatch('claim', { state_dir: fixture.stateDir, task_id: 'feature-1', node_id: 'evidence', agent_task_path: '/root/evidence', agent_role: 'avsp_terra_low_readonly' }),
+      /fallback_reason/
+    );
+    const fallbackReason = 'avsp_luna_high unavailable';
+    const [claimed] = await dispatch('claim', { state_dir: fixture.stateDir, task_id: 'feature-1', node_id: 'evidence', agent_task_path: '/root/evidence', agent_role: 'avsp_terra_low_readonly', fallback_reason: fallbackReason });
+    assert.equal(claimed.node.agent_role, 'avsp_terra_low_readonly');
+    const state = await readControllerState(fixture.stateDir);
+    const event = state.events.find(item => item.type === 'node_claimed' && item.node_id === 'evidence');
+    assert.equal(event.fallback_reason, fallbackReason);
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test('requires and records an explicit Terra fallback for a non-total Sol read-only node', async () => {
+  const fixture = await setup();
+  try {
+    const evidenceRouting = { execution_risk: 'read_only', routing_reason: 'complex independent evidence judgment', execution_owner: '/root/evidence', integration_owner: '/root', quality_guard: 'evidence is cited and bounded' };
+    const reviewRouting = { execution_risk: 'protected', routing_reason: 'independent total review', execution_owner: '/root/reviewer', integration_owner: '/root', quality_guard: 'close gate' };
+    await writeFile(fixture.manifest, JSON.stringify({ task_id: 'feature-1', workspace: fixture.workspace, goal: 'Record Sol-stage fallback', routing_schema_version: 1, requirements: [{ id: 'R1', text: 'fallback is auditable' }], nodes: [{ id: 'evidence', kind: 'verification', agent_type: 'avsp_sol_high', ...evidenceRouting }, { id: 'total-review', kind: 'total_review', depends_on: ['evidence'], ...reviewRouting }] }));
+    await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+    await assert.rejects(
+      () => dispatch('claim', { state_dir: fixture.stateDir, task_id: 'feature-1', node_id: 'evidence', agent_task_path: '/root/evidence', agent_role: 'avsp_terra_xhigh_readonly' }),
+      /fallback_reason/
+    );
+    const fallbackReason = 'avsp_sol_high unavailable';
+    const [claimed] = await dispatch('claim', { state_dir: fixture.stateDir, task_id: 'feature-1', node_id: 'evidence', agent_task_path: '/root/evidence', agent_role: 'avsp_terra_xhigh_readonly', fallback_reason: fallbackReason });
+    assert.equal(claimed.node.agent_role, 'avsp_terra_xhigh_readonly');
+    const state = await readControllerState(fixture.stateDir);
+    assert.equal(state.events.find(item => item.type === 'node_claimed').fallback_reason, fallbackReason);
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test('defaults modern total review to Sol high and records an explicit Terra fallback', async () => {
+  const fixture = await setup();
+  try {
+    const reviewRouting = { execution_risk: 'protected', routing_reason: 'independent total review', execution_owner: '/root/reviewer', integration_owner: '/root', quality_guard: 'close gate' };
+    await writeFile(fixture.manifest, JSON.stringify({ task_id: 'feature-1', workspace: fixture.workspace, goal: 'Record total-review fallback', routing_schema_version: 1, requirements: [{ id: 'R1', text: 'fallback is auditable' }], nodes: [{ id: 'total-review', kind: 'total_review', ...reviewRouting }] }));
+    const [initialized] = await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+    assert.equal(initialized.task.nodes[0].agent_type, 'avsp_sol_high');
+    await assert.rejects(
+      () => dispatch('claim', { state_dir: fixture.stateDir, task_id: 'feature-1', node_id: 'total-review', agent_task_path: '/root/reviewer', agent_role: 'avsp_terra_xhigh' }),
+      /total_review node requires a Sol role/
+    );
+    await assert.rejects(
+      () => dispatch('claim', { state_dir: fixture.stateDir, task_id: 'feature-1', node_id: 'total-review', agent_task_path: '/root/reviewer', agent_role: 'avsp_terra_xhigh_readonly' }),
+      /fallback_reason/
+    );
+    const fallbackReason = 'avsp_sol_high unavailable';
+    const [claimed] = await dispatch('start', { state_dir: fixture.stateDir, task_id: 'feature-1', node_id: 'total-review', agent_task_path: '/root/reviewer', agent_role: 'avsp_terra_xhigh_readonly', native_agent_started: true, fallback_reason: fallbackReason });
+    const [context] = await dispatch('audit-context', { state_dir: fixture.stateDir, task_id: 'feature-1' });
+    const review = path.join(fixture.root, 'fallback-review.json');
+    await writeFile(review, JSON.stringify({ auditor_task: '/root/reviewer', auditor_role: 'avsp_terra_xhigh_readonly', claim_id: claimed.node.claim_id, verdict: 'unavailable', fallback_reason: fallbackReason, requirement_coverage: { R1: 'Sol high unavailable; Terra fallback recorded' }, workflow_snapshot: context.workflow_snapshot, workspace_fingerprint: context.workspace_fingerprint, scope_and_regression: 'not executed because the Sol reviewer was unavailable', verification_gaps: 'independent Sol review unavailable', residual_risk: 'independence is reduced by Terra fallback' }));
+    const [recorded] = await dispatch('record-review', { state_dir: fixture.stateDir, task_id: 'feature-1', review });
+    assert.equal(recorded.review.auditor_role, 'avsp_terra_xhigh_readonly');
+    assert.equal(recorded.review.fallback_reason, fallbackReason);
+    const state = await readControllerState(fixture.stateDir);
+    assert.equal(state.events.find(item => item.type === 'node_claimed').fallback_reason, fallbackReason);
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test('does not apply v1 default agent types to complete legacy routing manifests', async () => {
+  const fixture = await setup();
+  try {
+    const workRouting = { execution_risk: 'delegable', routing_reason: 'isolated reversible edit', execution_owner: '/root/terra', integration_owner: '/root', quality_guard: 'targeted test' };
+    const reviewRouting = { execution_risk: 'protected', routing_reason: 'independent total review', execution_owner: '/root/reviewer', integration_owner: '/root', quality_guard: 'close gate' };
+    await writeFile(fixture.manifest, JSON.stringify({ task_id: 'feature-1', workspace: fixture.workspace, goal: 'Preserve legacy routing', requirements: [{ id: 'R1', text: 'legacy routing remains claimable' }], nodes: [{ id: 'work', kind: 'implementation', ...workRouting }, { id: 'total-review', kind: 'total_review', agent_type: 'avsp_sol_high', depends_on: ['work'], ...reviewRouting }] }));
+    const [initialized] = await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+    assert.equal(initialized.task.nodes.find(node => node.id === 'work').agent_type, null);
+    const [claimed] = await dispatch('claim', { state_dir: fixture.stateDir, task_id: 'feature-1', node_id: 'work', agent_task_path: '/root/terra', agent_role: 'avsp_terra_high' });
+    assert.equal(claimed.node.agent_role, 'avsp_terra_high');
   } finally { await rm(fixture.root, { recursive: true, force: true }); }
 });
 
@@ -1201,19 +1284,63 @@ test('routing schema rejects incomplete fields and duplicate delegable execution
     const base = { task_id: 'feature-1', workspace: fixture.workspace, goal: 'Change app safely', routing_schema_version: 1, requirements: [{ id: 'R1', text: 'app changes' }] };
     await writeFile(fixture.manifest, JSON.stringify({ ...base, nodes: [{ id: 'partial', kind: 'implementation', execution_risk: 'delegable' }] }));
     await assert.rejects(() => dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest }), /routing fields/);
+    const reviewRoute = { execution_risk: 'protected', routing_reason: 'independent close gate', execution_owner: '/root/reviewer', integration_owner: '/root', quality_guard: 'review all requirements' };
+    for (const agentType of ['avsp_terra_xhigh', 'avsp_terra_xhigh_readonly']) {
+      await writeFile(fixture.manifest, JSON.stringify({ ...base, nodes: [{ id: 'total-review', kind: 'total_review', agent_type: agentType, ...reviewRoute }] }));
+      await assert.rejects(() => dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest }), /requires a Sol agent_type/);
+    }
+    const evidenceRoute = { execution_risk: 'read_only', routing_reason: 'independent evidence', execution_owner: '/root/evidence', integration_owner: '/root', quality_guard: 'cite evidence' };
+    for (const agentType of ['avsp_terra_low_readonly', 'avsp_terra_medium_readonly', 'avsp_terra_xhigh_readonly']) {
+      await writeFile(fixture.manifest, JSON.stringify({ ...base, nodes: [{ id: 'evidence', kind: 'verification', agent_type: agentType, ...evidenceRoute }, { id: 'total-review', kind: 'total_review', depends_on: ['evidence'], ...reviewRoute }] }));
+      await assert.rejects(() => dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest }), /cannot configure a Terra fallback role/);
+    }
+    const incompatibleRoutes = [
+      { risk: 'protected', agent_type: 'avsp_luna_high', error: /protected node agent_type/ },
+      { risk: 'protected', agent_type: 'avsp_luna_high_executor', error: /protected node agent_type/ },
+      { risk: 'delegable', agent_type: 'avsp_luna_high', error: /delegable node agent_type/ },
+      { risk: 'delegable', agent_type: 'avsp_sol_high', error: /delegable node agent_type/ },
+      { risk: 'read_only', agent_type: 'avsp_luna_high_executor', error: /read_only node agent_type/ },
+      { risk: 'read_only', agent_type: 'avsp_terra_high', error: /read_only node agent_type/ },
+      { risk: 'read_only', agent_type: 'avsp_unknown', error: /read_only node agent_type/ },
+    ];
+    for (const route of incompatibleRoutes) {
+      const node = { id: 'work', kind: 'implementation', agent_type: route.agent_type, ...evidenceRoute, execution_risk: route.risk };
+      await writeFile(fixture.manifest, JSON.stringify({ ...base, nodes: [node, { id: 'total-review', kind: 'total_review', depends_on: ['work'], ...reviewRoute }] }));
+      await assert.rejects(() => dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest }), route.error);
+    }
     const route = { execution_risk: 'delegable', routing_reason: 'reversible', execution_owner: '/root/executor', integration_owner: '/root', quality_guard: 'test' };
     await writeFile(fixture.manifest, JSON.stringify({ ...base, nodes: [{ id: 'one', kind: 'implementation', ...route }, { id: 'two', kind: 'implementation', ...route }] }));
     await assert.rejects(() => dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest }), /distinct execution_owner/);
   } finally { await rm(fixture.root, { recursive: true, force: true }); }
 });
 
+test('legacy routing cannot treat a Terra fallback role as the primary reviewer', async () => {
+  const fixture = await setup();
+  try {
+    const evidenceRoute = { execution_risk: 'read_only', routing_reason: 'independent evidence', execution_owner: '/root/evidence', integration_owner: '/root', quality_guard: 'cite evidence' };
+    const reviewRoute = { execution_risk: 'protected', routing_reason: 'independent close gate', execution_owner: '/root/reviewer', integration_owner: '/root', quality_guard: 'review all requirements' };
+    await writeFile(fixture.manifest, JSON.stringify({ task_id: 'feature-1', workspace: fixture.workspace, goal: 'Reject direct fallback routing', requirements: [{ id: 'R1', text: 'fallback is explicit' }], nodes: [{ id: 'evidence', kind: 'verification', agent_type: 'avsp_terra_low_readonly', ...evidenceRoute }, { id: 'total-review', kind: 'total_review', agent_type: 'avsp_sol_high', depends_on: ['evidence'], ...reviewRoute }] }));
+    await dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest });
+    await assert.rejects(
+      () => dispatch('claim', { state_dir: fixture.stateDir, task_id: 'feature-1', node_id: 'evidence', agent_task_path: '/root/evidence', agent_role: 'avsp_terra_low_readonly', fallback_reason: 'configured directly' }),
+      /fallback-only for its configured Luna or Sol reviewer/
+    );
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
 test('MCP schema forwards the workspace-release confirmation parameter used by the controller', () => {
   const claim = TOOLS.find(tool => tool.name === 'workflow_claim');
   assert.equal(claim.inputSchema.properties.activation_timeout_sec.minimum, 1);
+  assert.equal(claim.inputSchema.properties.fallback_reason.type, 'string');
   const start = TOOLS.find(tool => tool.name === 'workflow_start');
   assert.deepEqual(start.inputSchema.required, ['task_id', 'node_id', 'agent_task_path', 'agent_role', 'native_agent_started', 'state_dir']);
   assert.equal(start.inputSchema.properties.native_agent_started.const, true);
+  assert.equal(start.inputSchema.properties.fallback_reason.type, 'string');
   assert.equal(TOOL_COMMANDS.workflow_start, 'start');
+  const wait = TOOLS.find(tool => tool.name === 'workflow_wait');
+  assert.deepEqual(wait.inputSchema.required, ['task_id', 'state_dir', 'after_cursor']);
+  assert.equal(wait.inputSchema.properties.timeout_sec.maximum, 600);
+  assert.equal(TOOL_COMMANDS.workflow_wait, 'wait');
   const complete = TOOLS.find(tool => tool.name === 'workflow_complete');
   assert.deepEqual(complete.inputSchema.required, ['task_id', 'node_id', 'claim_id', 'status', 'result', 'completion_attestation', 'state_dir']);
   assert.deepEqual(complete.inputSchema.properties.completion_attestation.enum, ['native_agent_finished', 'root_rescue_self_completion', 'native_agent_exit_confirmed', 'native_agent_start_failed']);
