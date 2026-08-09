@@ -1289,6 +1289,8 @@ test('routing schema rejects incomplete fields and duplicate delegable execution
       await writeFile(fixture.manifest, JSON.stringify({ ...base, nodes: [{ id: 'total-review', kind: 'total_review', agent_type: agentType, ...reviewRoute }] }));
       await assert.rejects(() => dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest }), /requires a Sol agent_type/);
     }
+    await writeFile(fixture.manifest, JSON.stringify({ ...base, nodes: [{ id: 'total-review', kind: 'total_review', ...reviewRoute, execution_risk: 'delegable' }] }));
+    await assert.rejects(() => dispatch('init', { state_dir: fixture.stateDir, manifest: fixture.manifest }), /total_review node cannot be delegable/);
     const evidenceRoute = { execution_risk: 'read_only', routing_reason: 'independent evidence', execution_owner: '/root/evidence', integration_owner: '/root', quality_guard: 'cite evidence' };
     for (const agentType of ['avsp_terra_low_readonly', 'avsp_terra_medium_readonly', 'avsp_terra_xhigh_readonly']) {
       await writeFile(fixture.manifest, JSON.stringify({ ...base, nodes: [{ id: 'evidence', kind: 'verification', agent_type: agentType, ...evidenceRoute }, { id: 'total-review', kind: 'total_review', depends_on: ['evidence'], ...reviewRoute }] }));

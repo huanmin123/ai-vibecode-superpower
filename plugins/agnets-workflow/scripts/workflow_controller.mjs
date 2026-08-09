@@ -672,6 +672,7 @@ function nodeRouting(raw, routingRequired) {
 
 function validateV1AgentType(kind, executionRisk, agentType) {
   if (kind === 'total_review') {
+    if (executionRisk === 'delegable') throw new ControllerError('A v1 total_review node cannot be delegable');
     if (!SOL_ROLES.has(agentType)) throw new ControllerError('A v1 total_review node requires a Sol agent_type; Terra is fallback-only');
     return;
   }

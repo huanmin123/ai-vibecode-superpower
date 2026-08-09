@@ -175,7 +175,10 @@ function compactNodeEnvelope(result, fallbackReason = null) {
 
 export function compactMcpResult(toolName, result, argumentsValue = {}) {
   if (!result || typeof result !== 'object' || Array.isArray(result)) return result;
-  if (toolName === 'workflow_status') return argumentsValue.detail === 'full' ? result : compactStatus(result);
+  if (toolName === 'workflow_status') {
+    if (argumentsValue.detail !== undefined && !['summary', 'full'].includes(argumentsValue.detail)) throw new ControllerError('workflow_status.detail must be summary or full');
+    return argumentsValue.detail === 'full' ? result : compactStatus(result);
+  }
   if (toolName === 'workflow_init') return { state_path: result.state_path, task: compactStatus(result.task) };
   if (toolName === 'workflow_ready') return { ready_nodes: (result.ready_nodes ?? []).map(compactReadyNode) };
   if (['workflow_claim', 'workflow_start', 'workflow_heartbeat', 'workflow_abandon', 'workflow_retry', 'workflow_requeue_stale', 'workflow_rescue', 'workflow_complete'].includes(toolName)) {

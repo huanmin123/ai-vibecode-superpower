@@ -208,4 +208,5 @@ test('MCP result compaction keeps scheduling facts and drops repeated heavy stat
   assert.equal(summary.latest_review.verdict, 'pass');
   assert.ok(JSON.stringify(summary).length < JSON.stringify(full).length / 4);
   assert.equal(compactMcpResult('workflow_status', full, { detail: 'full' }), full);
+  assert.throws(() => compactMcpResult('workflow_status', full, { detail: 'verbose' }), /workflow_status\.detail must be summary or full/);
 });
