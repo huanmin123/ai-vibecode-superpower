@@ -32,6 +32,7 @@ authorization: <允许的操作>
 acceptance: <验收条件>
 verification: <要求执行的检查>
 stop_conditions: <停止并交回父级的条件>
+efficiency_context: <agent-toolchain exact 抽象事实 JSON；控制器生成 efficiency_policy，不向用户暴露，不是 ACL>
 
 # 仅状态变更任务添加
 execution_contract: <已定步骤、不变量、领域边界/精度、失败语义和回滚/恢复方式>

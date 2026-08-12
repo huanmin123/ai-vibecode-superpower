@@ -374,7 +374,7 @@ test('retains the pending artifact when automatic unavailable completion cannot 
     await dispatch('init', { state_dir: stateDir, manifest });
     const [claim] = await dispatch('claim', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', agent_task_path: '/root/retryable-unavailable', agent_role: 'avsp_sol_high' });
     await dispatch('heartbeat', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', claim_id: claim.node.claim_id });
-    const outcome = path.join(stateDir, '.workflow-review-results', 'review-task', claim.node.claim_id, 'outcome.json');
+    const outcome = path.join(await fsPromises.realpath(stateDir), '.workflow-review-results', 'review-task', claim.node.claim_id, 'outcome.json');
     let outcomeRenames = 0;
     fsPromises.rename = async (source, destination) => {
       if (path.resolve(destination) === path.resolve(outcome) && ++outcomeRenames === 2) {
@@ -529,6 +529,74 @@ test('rejects a workflow-bound result path outside the review artifact directory
       ], { CODEX_HOME: item.codexHome }, 'win32', () => { throw new Error('spawn must not be called'); }),
       /--result must be exactly/,
     );
+  } finally { await rm(item.root, { recursive: true, force: true }); }
+});
+
+test('uses bigint evidence identities and distinguishes adjacent values above Number precision', async () => {
+  const item = await fixture();
+  const originalLstat = fsPromises.lstat;
+  const manifestPath = path.join(item.evidence, 'evidence-manifest.json');
+  let manifestReads = 0;
+  try {
+    fsPromises.lstat = async (target, options) => {
+      assert.deepEqual(options, { bigint: true });
+      const metadata = await originalLstat(target, options);
+      if (path.resolve(target) !== path.resolve(manifestPath)) return metadata;
+      manifestReads += 1;
+      const inode = manifestReads === 1 ? 9007199254740993n : 9007199254740994n;
+      return Object.assign(Object.create(metadata), { dev: 1n, ino: inode });
+    };
+    await assert.rejects(
+      runSolReview(['--review-profile', 'bounded-external', '--evidence-dir', item.evidence, '--', 'review prompt'], { CODEX_HOME: item.codexHome }, 'linux', () => {
+        throw new Error('spawn must not be called');
+      }),
+      /evidence-manifest\.json changed during validation/,
+    );
+    assert.ok(manifestReads >= 2);
+  } finally {
+    fsPromises.lstat = originalLstat;
+    await rm(item.root, { recursive: true, force: true });
+  }
+});
+
+test('rejects a workflow review result directory containing a Windows junction before spawning Sol', { skip: process.platform !== 'win32' }, async t => {
+  const item = await fixture();
+  try {
+    const stateDir = path.join(item.root, 'state'); const outside = path.join(item.root, 'outside-results');
+    await mkdir(path.join(stateDir, '.workflow-review-results'), { recursive: true }); await mkdir(outside);
+    try { await symlink(outside, path.join(stateDir, '.workflow-review-results', 'review-task'), 'junction'); }
+    catch (error) {
+      if (['EPERM', 'EACCES', 'UNKNOWN'].includes(error.code)) return t.skip(`junction unavailable: ${error.code}`);
+      throw error;
+    }
+    await assert.rejects(
+      runSolReview([
+        '--workflow-state-dir', stateDir,
+        '--workflow-task-id', 'review-task',
+        '--workflow-node-id', 'total-review',
+        '--workflow-claim-id', 'claim-1',
+        '--', 'review prompt',
+      ], { CODEX_HOME: item.codexHome }, 'win32', () => { throw new Error('spawn must not be called'); }),
+      /must not contain a symlink or junction/,
+    );
+    assert.deepEqual(await readdir(outside), []);
+  } finally { await rm(item.root, { recursive: true, force: true }); }
+});
+
+test('rejects a relative workflow state directory and completes through a Windows case alias', { skip: process.platform !== 'win32' }, async t => {
+  const item = await fixture();
+  const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(item.root, 'state'); const manifest = path.join(item.root, 'manifest.json');
+  try {
+    await assert.rejects(runSolReview(['--workflow-state-dir', 'relative', '--workflow-task-id', 'review-task', '--workflow-node-id', 'total-review', '--workflow-claim-id', 'claim-1', '--', 'review'], { CODEX_HOME: item.codexHome }, 'win32'), /--workflow-state-dir must be an absolute path/);
+    await mkdir(workspace); await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
+    await writeFile(manifest, JSON.stringify({ task_id: 'review-task', workspace, goal: 'canonical workflow state', requirements: [{ id: 'R1', text: 'canonical state binding' }], nodes: [{ id: 'total-review', kind: 'total_review', agent_type: 'avsp_sol_high', depends_on: [] }] }));
+    await dispatch('init', { state_dir: stateDir, manifest });
+    const alias = stateDir.toUpperCase(); const physical = await fsPromises.realpath(stateDir);
+    if ((await fsPromises.realpath(alias)).toLocaleLowerCase('und') !== physical.toLocaleLowerCase('und')) return t.skip('the test volume is case-sensitive');
+    const [claim] = await dispatch('start', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', agent_task_path: '/root/canonical-sol', agent_role: 'avsp_sol_high', native_agent_started: true });
+    const result = await runSolReview(['--review-profile', 'bounded-external', '--evidence-dir', path.join(item.root, 'missing'), '--workflow-state-dir', alias, '--workflow-task-id', 'review-task', '--workflow-node-id', 'total-review', '--workflow-claim-id', claim.node.claim_id, '--codex-bin', 'fake-codex', '--', 'review'], { CODEX_HOME: item.codexHome }, 'win32', () => { throw new Error('spawn must not be called'); });
+    assert.equal(result.workflow.state_dir, physical); assert.ok(result.result_path.startsWith(physical)); assert.equal(result.workflow_completion.completed, true);
+    assert.equal((await readTaskState(path.join(stateDir, 'review-task.sqlite'))).nodes['total-review'].status, 'unavailable');
   } finally { await rm(item.root, { recursive: true, force: true }); }
 });
 
@@ -775,6 +843,71 @@ test('rejects empty review fields and coverage values that contradict the final 
       assert.equal(result.exit_code, 1);
       assert.match(result.review_verdict.reason, /non-empty/);
     }
+  } finally { await rm(item.root, { recursive: true, force: true }); }
+});
+
+test('rejects a fail review that does not identify a blocking finding', async () => {
+  const item = await fixture();
+  try {
+    const review = {
+      auditor_task: '/root/review', auditor_role: 'avsp_sol_high', claim_id: 'review-claim', verdict: 'fail',
+      requirement_coverage: { R1: 'failed' }, workflow_snapshot: { revision: 1 }, workspace_fingerprint: { value: 'fingerprint' }, scope_and_regression: 'reviewed', verification_gaps: 'blocking gap', residual_risk: 'not accepted',
+    };
+    const spawnProcess = () => {
+      const child = new EventEmitter(); child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
+      queueMicrotask(() => {
+        child.stdout.emit('data', Buffer.from(`${JSON.stringify(review)}\n`));
+        child.emit('exit', 0, null); child.stdout.emit('end'); child.stderr.emit('end');
+      });
+      return child;
+    };
+    const result = await runSolReview(['--codex-bin', 'fake-codex', '--', 'review prompt'], { CODEX_HOME: item.codexHome }, 'win32', spawnProcess);
+    assert.equal(result.exit_code, 1);
+    assert.deepEqual(result.review_verdict, { valid: false, reason: 'a fail review requires at least one blocking finding' });
+  } finally { await rm(item.root, { recursive: true, force: true }); }
+});
+
+test('accepts a fail review with a structured blocking finding', async () => {
+  const item = await fixture();
+  try {
+    const review = {
+      auditor_task: '/root/review', auditor_role: 'avsp_sol_high', claim_id: 'review-claim', verdict: 'fail',
+      findings: [{ id: 'R1-blocking', severity: 'blocking', requirement_id: 'R1', summary: 'Required behavior is not satisfied.', evidence: 'Observed mismatch in the supplied evidence.' }],
+      requirement_coverage: { R1: 'failed' }, workflow_snapshot: { revision: 1 }, workspace_fingerprint: { value: 'fingerprint' }, scope_and_regression: 'reviewed', verification_gaps: 'blocking gap', residual_risk: 'not accepted',
+    };
+    const spawnProcess = () => {
+      const child = new EventEmitter(); child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
+      queueMicrotask(() => {
+        child.stdout.emit('data', Buffer.from(`${JSON.stringify(review)}\n`));
+        child.emit('exit', 0, null); child.stdout.emit('end'); child.stderr.emit('end');
+      });
+      return child;
+    };
+    const result = await runSolReview(['--codex-bin', 'fake-codex', '--', 'review prompt'], { CODEX_HOME: item.codexHome }, 'win32', spawnProcess);
+    assert.equal(result.exit_code, 0);
+    assert.deepEqual(result.review_verdict, { valid: true, verdict: 'fail' });
+  } finally { await rm(item.root, { recursive: true, force: true }); }
+});
+
+test('rejects a finding identifier longer than the controller limit', async () => {
+  const item = await fixture();
+  try {
+    const review = {
+      auditor_task: '/root/review', auditor_role: 'avsp_sol_high', claim_id: 'review-claim', verdict: 'fail',
+      findings: [{ id: `F${'a'.repeat(80)}`, severity: 'blocking', requirement_id: 'R1', summary: 'Required behavior is not satisfied.', evidence: 'Observed mismatch in the supplied evidence.' }],
+      requirement_coverage: { R1: 'failed' }, workflow_snapshot: { revision: 1 }, workspace_fingerprint: { value: 'fingerprint' }, scope_and_regression: 'reviewed', verification_gaps: 'blocking gap', residual_risk: 'not accepted',
+    };
+    const spawnProcess = () => {
+      const child = new EventEmitter(); child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
+      queueMicrotask(() => {
+        child.stdout.emit('data', Buffer.from(`${JSON.stringify(review)}\n`));
+        child.emit('exit', 0, null); child.stdout.emit('end'); child.stderr.emit('end');
+      });
+      return child;
+    };
+    const result = await runSolReview(['--codex-bin', 'fake-codex', '--', 'review prompt'], { CODEX_HOME: item.codexHome }, 'win32', spawnProcess);
+    assert.equal(result.exit_code, 1);
+    assert.match(result.review_verdict.reason, /identifier of at most 80 characters/);
   } finally { await rm(item.root, { recursive: true, force: true }); }
 });
 

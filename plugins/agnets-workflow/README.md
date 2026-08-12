@@ -1,65 +1,25 @@
 # Agnets 工作流
 
-`agnets-workflow` 为 Codex 提供统一的多代理工作流、项目工具链和持久化任务状态。它适合需要并行执行、可恢复交接和独立总审的复杂开发任务。
+`agnets-workflow` 为 Codex 提供统一的多代理工作流、项目工具链和持久化任务状态。它适合需要并行执行、可恢复交接和按证据升级的质量门的复杂开发任务。简单问答、只读查询或边界清晰的单文件低风险修改不进入持久化 DAG，由 main/root 直接完成并做与风险相称的最终验证。
 
 ## 能力
 
-- 用任务 DAG 管理实现、验证和总审节点。
-- 持久化任务状态、节点产物、参与者、审核记录和工作区租约。
-- 在控制器被再次调用时惰性清理过期状态；完整已关闭任务按 7 天处理，未知或无法验证的状态先隔离 30 天，隔离后再保留 365 天。
+- 用任务 DAG 管理取证、设计、实现、集成、验证与任务末端质量门。
+- 持久化任务状态、节点产物、参与者、审核记录和按声明范围协调的工作区租约。
+- 在控制器被再次调用时惰性清理过期状态；完整已关闭任务按 7 天处理，可证明已失活的损坏状态在 30 天后隔离，无法验证 registry 或运行状态的任务保留给人工恢复，隔离完成后再保留 365 天。
 - 通过 MCP 或本地 CLI 提供初始化、派发、心跳、checkpoint、恢复、总审和关闭检查。
 
 工作流路由、角色边界、交接、恢复和总审升级规则以 [`orchestrate-model-workflow`](skills/orchestrate-model-workflow/SKILL.md) 为准；控制器命令和持久化约束以 [`workflow-controller`](skills/workflow-controller/SKILL.md) 为准。
 
+任务准入和委派会通过 [`agent-toolchain`](skills/agent-toolchain/SKILL.md) 的内部 router 静默选择保守效率路径：只有已定契约的可逆实施使用最小实现纪律，只读载荷按抽象属性选择 CodeGraph、RTK 或受证明的本地 adapter；审核、错误、最终交付和持久化制品保持原样。用户不需要选择模式。
+
+## 完整流程
+
+先做工作流准入判断。只有需要持久化、多节点协作、恢复交接或独立末端质量门的完整任务才建立 DAG。进入后，一次用户输入对应一份完整任务清单；取证、设计、实现、集成和验证都在任务内部完成，各节点保留必要证据，但不单独启动审核。全部工作完成并冻结工作区后，才运行唯一的任务级末端质量门；失败后的修复仍回到同一任务，完成后重新进入该质量门。最高 `max` 总审会先冻结 blocking charter，再进行受保护批量修复和一次受控 closure；closure 发现未经证明属于本次修复回归的新 blocker 时，任务明确进入范围决策阻塞，不会无限重审或静默关闭。只有质量门通过且证据仍与当前任务和工作区匹配时才能关闭。门级选择、审核升级和失败恢复规则见 [`orchestrate-model-workflow`](skills/orchestrate-model-workflow/SKILL.md)。
+
 ## 快速开始
 
-在目标工作区准备一个 manifest：
-
-```json
-{
-  "task_id": "payments-refactor",
-  "workspace": "F:\\work\\payments",
-  "goal": "完成支付重构并保持现有行为",
-  "routing_schema_version": 1,
-  "requirements": [
-    { "id": "R1", "text": "迁移支付路由" },
-    { "id": "R2", "text": "现有测试通过" }
-  ],
-  "nodes": [
-    {
-      "id": "evidence",
-      "kind": "verification",
-      "execution_risk": "read_only",
-      "routing_reason": "独立只读取证",
-      "execution_owner": "/root/payments_evidence",
-      "integration_owner": "/root",
-      "quality_guard": "核对证据"
-    },
-    {
-      "id": "implementation",
-      "kind": "implementation",
-      "depends_on": ["evidence"],
-      "execution_risk": "delegable",
-      "routing_reason": "范围互斥且可回滚",
-      "execution_owner": "/root/payments_implementation",
-      "integration_owner": "/root",
-      "quality_guard": "核对 diff 和测试"
-    },
-    {
-      "id": "total-review",
-      "kind": "total_review",
-      "depends_on": ["evidence", "implementation"],
-      "execution_risk": "protected",
-      "routing_reason": "任务级独立总验收",
-      "execution_owner": "/root/payments_review",
-      "integration_owner": "/root",
-      "quality_guard": "核对需求和回归"
-    }
-  ]
-}
-```
-
-`routing_schema_version=1` 清单可省略 `agent_type`，由控制器按节点风险应用默认路由。`execution_owner` 必须对应实际原生任务路径；例如 `task_name=payments_evidence` 对应 `/root/payments_evidence`。
+先按 [`workflow-controller`](skills/workflow-controller/SKILL.md) 准备完整任务 manifest，并为任务固定一个 `state_dir`。新任务的清单结构、质量门评估和节点字段以该文档为准。
 
 在插件目录运行：
 
@@ -68,10 +28,10 @@ node .\scripts\workflow_controller.mjs --state-dir "$pwd\.codex\workflow-control
 node .\scripts\workflow_controller.mjs --state-dir "$pwd\.codex\workflow-controller" ready --task-id payments-refactor
 ```
 
-独立 Sol 复核可用以下入口启动：
+需要独立复核时可使用插件入口：
 
 ```powershell
-node .\scripts\sol_review_cli.mjs --review-role avsp_sol_high -- <prompt>
+node .\scripts\sol_review_cli.mjs -- <prompt>
 ```
 
 CLI 会保存审查结果和受控日志；绑定工作流时使用控制器要求的同一结果制品完成收口。完整参数、总审绑定和验证流程见 [`orchestrate-model-workflow`](skills/orchestrate-model-workflow/SKILL.md)。
@@ -80,7 +40,9 @@ CLI 会保存审查结果和受控日志；绑定工作流时使用控制器要�
 
 建议将 `state_dir` 设为目标工作区的 `.codex/workflow-controller/`。状态库、租约、checkpoint 和审查制品属于控制数据，不应纳入业务改动或工作区指纹。
 
-控制器不是常驻服务，清理只会在后续控制器调用时触发。`workflow_doctor` 可检查状态和恢复前提；它不会替用户接管运行中的代理。未知或损坏状态不会静默删除，隔离和到期删除都必须经过控制器的保留周期。
+控制器不是常驻服务，清理只会在后续控制器调用时触发。`workflow_doctor` 可检查状态和恢复前提；它不会替用户接管运行中的代理。未知或损坏状态不会静默删除，隔离和到期删除都必须经过控制器的保留周期。恢复、换绑和关卡失效处理见 [`workflow-controller`](skills/workflow-controller/SKILL.md)。
+
+同一工作区可运行声明范围互不冲突的任务。清单可选 `workspace_claims` 为非空的 `{mode:"read"|"write",prefix:"..."}` 数组；缺失时按根目录 `write` 兼容。它是协调声明而非文件系统 ACL：末端审核仍须确认实际 diff 和产物仅落在 `write` claims。扩大范围时，先确认旧执行者停止并释放其 entry，再用 claims 超集和新的 `task_id` 初始化替代任务；共享或全局副作用使用根目录 `write` 独占。
 
 ## MCP
 

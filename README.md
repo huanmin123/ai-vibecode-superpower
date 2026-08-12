@@ -11,6 +11,7 @@
 - 可供 Codex 使用的全局规则与跨平台文档。
 - 可按任务需要使用的 agent role profiles。
 - `agnets-workflow` 插件及其工作流工具。
+- `agent-toolchain` 内置无感的最小实施与只读载荷路由。
 - 独立全局 skill：`project-doc-planner` 与 `gpt-image-2-cli`。
 
 ## 适合什么时候
@@ -123,7 +124,7 @@ goals = true
 
 | 能力 | 适用场景 | 说明 |
 | --- | --- | --- |
-| [`agent-toolchain`](plugins/agnets-workflow/skills/agent-toolchain/SKILL.md) | 复杂重构、跨模块理解和大范围排障 | 为目标项目接入 CodeGraph 与 RTK；在跨模块理解、大型代码库或重复探索明显的场景下，可进一步减少重复探索与调用成本；一次性小改动通常不适合为了这一收益专门接入。 |
+| [`agent-toolchain`](plugins/agnets-workflow/skills/agent-toolchain/SKILL.md) | 复杂重构、跨模块理解和大范围排障 | 为目标项目接入 CodeGraph 与 RTK，并在复杂任务内部自动选择最小实施、上下文选择和只读载荷路径；用户无需选择模式。 |
 | [`workflow-controller`](plugins/agnets-workflow/skills/workflow-controller/SKILL.md) | 需要持久化状态和可恢复交接的复杂任务 | 管理任务状态、就绪节点、checkpoint 与收口检查。 |
 | [`project-doc-planner`](skills/project-doc-planner/SKILL.md) | 新项目或大型改造的文档规划 | 生成和维护项目级文档结构。 |
 | [`gpt-image-2-cli`](skills/gpt-image-2-cli/SKILL.md) | 需要生成或编辑图片素材 | 通过命令行调用图像生成能力。 |

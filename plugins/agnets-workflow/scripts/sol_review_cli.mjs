@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
-import { dispatch, sameJson } from './workflow_controller.mjs';
+import { canonicalStateDirectory, dispatch, sameJson } from './workflow_controller.mjs';
 
 const STATE_FILE = 'deny_read_acl_state.json';
 const REPAIR_LOCK_WAIT_MS = 5_000;
@@ -39,6 +39,9 @@ const SOL_REVIEW_ROLE_EFFORTS = new Map([
 ]);
 const DEFAULT_SOL_REVIEW_ROLE = 'avsp_sol_high';
 const REVIEW_REQUIRED_FIELDS = ['auditor_task', 'auditor_role', 'claim_id', 'verdict', 'requirement_coverage', 'workflow_snapshot', 'workspace_fingerprint', 'scope_and_regression', 'verification_gaps', 'residual_risk'];
+const REVIEW_FINDING_FIELDS = ['id', 'severity', 'requirement_id', 'summary', 'evidence'];
+const REVIEW_FINDING_SEVERITIES = new Set(['blocking', 'advisory']);
+const MAX_REVIEW_FINDINGS = 64;
 const NATIVE_AGENT_EXIT_CONFIRMED = 'native_agent_exit_confirmed';
 const NATIVE_AGENT_START_FAILED = 'native_agent_start_failed';
 const MAX_EVIDENCE_FILES = 512;
@@ -66,24 +69,89 @@ async function readAclState(statePath) {
   }
 }
 
-async function writeJsonAtomically(filePath, value) {
+async function writeJsonAtomically(filePath, value, parentAuthority) {
+  if (!parentAuthority || !sameFilesystemPath(parentAuthority.path, path.dirname(filePath))) throw new Error(`Artifact write requires a caller-verified parent authority: ${filePath}`);
+  const parent = parentAuthority;
   const temporary = `${filePath}.${randomUUID()}.tmp`;
+  let temporaryIdentity = null;
   try {
-    await fs.writeFile(temporary, `${JSON.stringify(value)}\n`, { encoding: 'utf8', flag: 'wx' });
+    const handle = await fs.open(temporary, 'wx');
+    try {
+      temporaryIdentity = filesystemIdentity(await handle.stat({ bigint: true }));
+      await verifyRegularDirectory(parent);
+      await handle.writeFile(`${JSON.stringify(value)}\n`, 'utf8');
+      await handle.sync();
+    } finally { await handle.close(); }
+    await verifyRegularDirectory(parent);
+    await verifyOwnedFile(temporary, temporaryIdentity, 'artifact temporary');
     await fs.rename(temporary, filePath);
+    await verifyRegularDirectory(parent);
+    await verifyOwnedFile(filePath, temporaryIdentity, 'artifact');
   } catch (error) {
-    await fs.unlink(temporary).catch(cleanupError => { if (cleanupError.code !== 'ENOENT') throw cleanupError; });
+    await unlinkOwnedFile(temporary, temporaryIdentity);
     throw error;
   }
 }
 
-async function acquireRepairLock(lockPath, statePath) {
+function filesystemIdentity(metadata) { return { dev: metadata.dev.toString(), ino: metadata.ino.toString() }; }
+async function snapshotRegularDirectory(directory) {
+  const metadata = await fs.lstat(directory, { bigint: true });
+  if (metadata.isSymbolicLink() || !metadata.isDirectory()) throw new Error(`Artifact parent is not a regular directory: ${directory}`);
+  return { path: directory, realPath: await fs.realpath(directory), identity: filesystemIdentity(metadata) };
+}
+async function verifyRegularDirectory(snapshot) {
+  const current = await snapshotRegularDirectory(snapshot.path);
+  const expectedRealPath = snapshot.realPath ?? snapshot.real_path;
+  if (!sameFilesystemPath(current.realPath, expectedRealPath) || current.identity.dev !== snapshot.identity.dev || current.identity.ino !== snapshot.identity.ino) {
+    throw new Error(`Artifact parent directory changed: ${snapshot.path}`);
+  }
+}
+async function unlinkOwnedFile(filePath, identity) {
+  if (!identity) return false;
+  try {
+    const metadata = await fs.lstat(filePath, { bigint: true });
+    const current = filesystemIdentity(metadata);
+    if (metadata.isSymbolicLink() || !metadata.isFile() || current.dev !== identity.dev || current.ino !== identity.ino) return false;
+    await fs.unlink(filePath); return true;
+  } catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+}
+async function verifyOwnedFile(filePath, identity, label) {
+  const metadata = await fs.lstat(filePath, { bigint: true });
+  const current = filesystemIdentity(metadata);
+  if (metadata.isSymbolicLink() || !metadata.isFile() || current.dev !== identity?.dev || current.ino !== identity?.ino) {
+    throw new Error(`${label} changed: ${filePath}`);
+  }
+}
+
+async function openHandleOwnsPath(handle, filePath) {
+  try {
+    const [handleMetadata, pathMetadata] = await Promise.all([handle.stat({ bigint: true }), fs.lstat(filePath, { bigint: true })]);
+    const handleIdentity = filesystemIdentity(handleMetadata); const pathIdentity = filesystemIdentity(pathMetadata);
+    return !pathMetadata.isSymbolicLink() && pathMetadata.isFile() && handleIdentity.dev === pathIdentity.dev && handleIdentity.ino === pathIdentity.ino;
+  } catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+}
+
+async function closeAndUnlinkOwnedPath(handle, filePath) {
+  const identity = filesystemIdentity(await handle.stat({ bigint: true }));
+  const ownsPath = await openHandleOwnsPath(handle, filePath);
+  await handle.close();
+  if (!ownsPath) return false;
+  return unlinkOwnedFile(filePath, identity);
+}
+
+async function acquireRepairLock(lockPath, statePath, parentAuthority) {
   const deadline = Date.now() + REPAIR_LOCK_WAIT_MS;
   while (true) {
     try {
       const handle = await fs.open(lockPath, 'wx');
-      await handle.writeFile(`pid=${process.pid} hostname=${os.hostname()} created=${new Date().toISOString()}\n`);
-      return handle;
+      try {
+        await verifyRegularDirectory(parentAuthority);
+        await handle.writeFile(`pid=${process.pid} hostname=${os.hostname()} created=${new Date().toISOString()}\n`);
+        return handle;
+      } catch (cause) {
+        await closeAndUnlinkOwnedPath(handle, lockPath);
+        throw cause;
+      }
     } catch (error) {
       if (error.code !== 'EEXIST') throw error;
       const current = await readAclState(statePath);
@@ -107,19 +175,21 @@ export async function repairInvalidDenyReadAclState(codexHome, platform = proces
   const initial = await readAclState(statePath);
   if (initial.kind !== 'invalid') return { repaired: false, reason: initial.kind, state_path: statePath };
 
+  const parentAuthority = await snapshotRegularDirectory(sandboxDirectory);
   const lockPath = `${statePath}.repair`;
-  const lock = await acquireRepairLock(lockPath, statePath);
+  const lock = await acquireRepairLock(lockPath, statePath, parentAuthority);
   if (!lock) return { repaired: false, reason: 'repaired_by_another_process', state_path: statePath };
   try {
+    await verifyRegularDirectory(parentAuthority);
     const current = await readAclState(statePath);
     if (current.kind !== 'invalid') return { repaired: false, reason: current.kind, state_path: statePath };
     const backupPath = `${statePath}.corrupt-${new Date().toISOString().replace(/[:.]/g, '-')}-${randomUUID()}`;
+    await verifyRegularDirectory(parentAuthority);
     await fs.rename(statePath, backupPath);
-    await writeJsonAtomically(statePath, { principals: {} });
+    await writeJsonAtomically(statePath, { principals: {} }, parentAuthority);
     return { repaired: true, state_path: statePath, backup_path: backupPath };
   } finally {
-    await lock.close();
-    await fs.unlink(lockPath).catch(error => { if (error.code !== 'ENOENT') throw error; });
+    await closeAndUnlinkOwnedPath(lock, lockPath);
   }
 }
 
@@ -184,7 +254,13 @@ function parseInvocation(argv, environment = process.env, platform = process.pla
     }
     if (option === '--result') { resultPath = path.resolve(requiredOption(args, index, option)); index += 2; continue; }
     if (option === '--review-role') { reviewRole = solReviewRole(requiredOption(args, index, option), option); index += 2; continue; }
-    if (option === '--workflow-state-dir') { workflow.state_dir = path.resolve(requiredOption(args, index, option)); index += 2; continue; }
+    if (option === '--workflow-state-dir') {
+      const value = requiredOption(args, index, option);
+      if (!path.isAbsolute(value)) throw new Error('--workflow-state-dir must be an absolute path');
+      workflow.state_dir = path.resolve(value);
+      index += 2;
+      continue;
+    }
     if (option === '--workflow-task-id') { workflow.task_id = safeWorkflowIdentifier(requiredOption(args, index, option), option); index += 2; continue; }
     if (option === '--workflow-node-id') { workflow.node_id = safeWorkflowIdentifier(requiredOption(args, index, option), option); index += 2; continue; }
     if (option === '--workflow-claim-id') { workflow.claim_id = safeWorkflowToken(requiredOption(args, index, option), option); index += 2; continue; }
@@ -196,12 +272,6 @@ function parseInvocation(argv, environment = process.env, platform = process.pla
   const workflowValues = Object.values(workflow);
   const workflowConfigured = workflowValues.some(value => value !== null);
   if (workflowConfigured && workflowValues.some(value => value === null)) throw new Error('workflow result recording requires --workflow-state-dir, --workflow-task-id, --workflow-node-id, and --workflow-claim-id');
-  if (workflowConfigured) {
-    const resultRoot = path.resolve(workflow.state_dir, WORKFLOW_RESULT_DIRECTORY);
-    const expectedResultPath = path.join(resultRoot, workflow.task_id, workflow.claim_id, 'outcome.json');
-    if (!resultPath) resultPath = expectedResultPath;
-    if (path.resolve(resultPath) !== path.resolve(expectedResultPath)) throw new Error(`--result must be exactly ${expectedResultPath} when workflow binding is used`);
-  }
   return { codexBin, timeoutSec, hardTimeoutSec, reviewProfile, evidenceDirectory, resultPath, reviewRole: reviewRole ?? DEFAULT_SOL_REVIEW_ROLE, reviewRoleExplicit: reviewRole !== null, workflow: workflowConfigured ? workflow : null, promptArgs: args.slice(index) };
 }
 
@@ -212,7 +282,7 @@ function reviewOutputContract(workflow, reviewRole) {
   const role = `Set auditor_role to exactly "${reviewRole}".`;
   return [
     'Final response contract: return exactly one final JSON object, with no Markdown or prose after it.',
-    `auditor_task, auditor_role, and claim_id must be non-empty strings. requirement_coverage, workflow_snapshot, and workspace_fingerprint must be non-empty objects. scope_and_regression, verification_gaps, and residual_risk must be non-empty strings, arrays, or objects. verdict must be pass, fail, or unavailable. ${claim} ${role}`,
+    `auditor_task, auditor_role, and claim_id must be non-empty strings. requirement_coverage, workflow_snapshot, and workspace_fingerprint must be non-empty objects. scope_and_regression, verification_gaps, and residual_risk must be non-empty strings, arrays, or objects. verdict must be pass, fail, or unavailable. When verdict is fail, findings must be a non-empty array containing at least one blocking finding. Every finding must contain exactly id, severity, requirement_id, summary, and evidence; id must be unique, start with a letter, contain only letters, digits, dot, underscore, or hyphen, and be at most 80 characters, severity must be blocking or advisory, requirement_id must be a covered requirement id or null, and summary and evidence must be non-empty. A pass may contain advisory findings but cannot contain blocking findings. An unavailable result cannot contain findings. ${claim} ${role}`,
   ].join(' ');
 }
 
@@ -234,20 +304,38 @@ async function resolveEvidenceDirectory(reviewProfile, evidenceDirectory, platfo
     return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
   };
   const samePath = (left, right) => platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right;
-  const identityOf = details => ({ dev: details.dev ?? null, ino: details.ino ?? null, size: details.size, mtimeMs: details.mtimeMs, ctimeMs: details.ctimeMs });
+  const decimalMetadata = (value, label) => {
+    if (typeof value !== 'bigint') throw new Error(`${label} filesystem metadata must use bigint values`);
+    return value.toString();
+  };
+  const identityOf = details => ({
+    dev: decimalMetadata(details?.dev, 'Evidence'),
+    ino: decimalMetadata(details?.ino, 'Evidence'),
+    size: decimalMetadata(details?.size, 'Evidence'),
+    mtimeMs: decimalMetadata(details?.mtimeMs, 'Evidence'),
+    ctimeMs: decimalMetadata(details?.ctimeMs, 'Evidence'),
+  });
+  const boundedSize = (details, label) => {
+    const size = decimalMetadata(details?.size, label);
+    const value = BigInt(size);
+    if (value > BigInt(MAX_EVIDENCE_FILE_BYTES)) throw new Error(`${label} exceeds the ${MAX_EVIDENCE_FILE_BYTES}-byte limit`);
+    const number = Number(value);
+    if (!Number.isSafeInteger(number)) throw new Error(`${label} size is outside the supported safe range`);
+    return number;
+  };
   const sameIdentity = (left, right) => left.dev === right.dev && left.ino === right.ino && left.size === right.size && left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs;
   const digestFile = async filePath => createHash('sha256').update(await fs.readFile(filePath)).digest('hex');
   try {
-    const details = await fs.lstat(absoluteDirectory);
+    const details = await fs.lstat(absoluteDirectory, { bigint: true });
     if (details.isSymbolicLink()) throw new Error('--evidence-dir must not be a symlink or junction');
     if (!details.isDirectory()) throw new Error('--evidence-dir must name an existing directory');
     const realDirectory = await fs.realpath(absoluteDirectory);
     const directoryIdentity = identityOf(details);
 
     const manifestPath = path.join(absoluteDirectory, EVIDENCE_MANIFEST);
-    const manifestDetails = await fs.lstat(manifestPath).catch(error => { if (error?.code === 'ENOENT') throw new Error(`--evidence-dir must contain ${EVIDENCE_MANIFEST}`); throw error; });
+    const manifestDetails = await fs.lstat(manifestPath, { bigint: true }).catch(error => { if (error?.code === 'ENOENT') throw new Error(`--evidence-dir must contain ${EVIDENCE_MANIFEST}`); throw error; });
     if (!manifestDetails.isFile() || manifestDetails.isSymbolicLink()) throw new Error(`${EVIDENCE_MANIFEST} must be a regular file inside the evidence directory`);
-    if (manifestDetails.size > MAX_EVIDENCE_FILE_BYTES) throw new Error(`${EVIDENCE_MANIFEST} exceeds the ${MAX_EVIDENCE_FILE_BYTES}-byte limit`);
+    const manifestSize = boundedSize(manifestDetails, EVIDENCE_MANIFEST);
     const realManifest = await fs.realpath(manifestPath);
     if (!isWithin(realDirectory, realManifest)) throw new Error(`${EVIDENCE_MANIFEST} escapes the evidence directory`);
     let manifest;
@@ -261,13 +349,13 @@ async function resolveEvidenceDirectory(reviewProfile, evidenceDirectory, platfo
       throw new Error(`${EVIDENCE_MANIFEST} must contain version 1 and an allowed_files array`);
     }
     const manifestIdentity = identityOf(manifestDetails);
-    const manifestDetailsAfterRead = await fs.lstat(manifestPath);
+    const manifestDetailsAfterRead = await fs.lstat(manifestPath, { bigint: true });
     const realManifestAfterRead = await fs.realpath(manifestPath);
     if (!sameIdentity(identityOf(manifestDetailsAfterRead), manifestIdentity) || !samePath(realManifestAfterRead, realManifest)) throw new Error(`${EVIDENCE_MANIFEST} changed during validation`);
     const manifestDigest = createHash('sha256').update(manifestContents).digest('hex');
     const allowed = new Set();
     const validatedEntries = new Map();
-    let totalBytes = manifestDetails.size;
+    let totalBytes = manifestSize;
     for (const entry of manifest.allowed_files) {
       if (allowed.size >= MAX_EVIDENCE_FILES - 1) throw new Error(`${EVIDENCE_MANIFEST} exceeds the ${MAX_EVIDENCE_FILES}-file limit including ${EVIDENCE_MANIFEST}`);
       if (typeof entry !== 'string' || !entry.trim() || path.isAbsolute(entry)) throw new Error(`${EVIDENCE_MANIFEST} allowed_files entries must be relative paths`);
@@ -278,16 +366,16 @@ async function resolveEvidenceDirectory(reviewProfile, evidenceDirectory, platfo
       if (sameManifestName(relative)) throw new Error(`${EVIDENCE_MANIFEST} cannot list itself`);
       if (allowed.has(relative)) throw new Error(`${EVIDENCE_MANIFEST} contains a duplicate file: ${entry}`);
       allowed.add(relative);
-      const fileDetails = await fs.lstat(resolved).catch(error => { if (error?.code === 'ENOENT') throw new Error(`evidence file is missing: ${entry}`); throw error; });
+      const fileDetails = await fs.lstat(resolved, { bigint: true }).catch(error => { if (error?.code === 'ENOENT') throw new Error(`evidence file is missing: ${entry}`); throw error; });
       if (!fileDetails.isFile() || fileDetails.isSymbolicLink()) throw new Error(`evidence file must be a regular file: ${entry}`);
       const realFile = await fs.realpath(resolved);
       if (!isWithin(realDirectory, realFile)) throw new Error(`evidence file escapes the package: ${entry}`);
-      if (fileDetails.size > MAX_EVIDENCE_FILE_BYTES) throw new Error(`evidence file exceeds the ${MAX_EVIDENCE_FILE_BYTES}-byte limit: ${entry}`);
-      totalBytes += fileDetails.size;
+      const fileSize = boundedSize(fileDetails, `evidence file ${entry}`);
+      totalBytes += fileSize;
       if (totalBytes > MAX_EVIDENCE_TOTAL_BYTES) throw new Error(`evidence package exceeds the ${MAX_EVIDENCE_TOTAL_BYTES}-byte limit`);
       const identity = identityOf(fileDetails);
       const digest = await digestFile(resolved);
-      const fileDetailsAfterRead = await fs.lstat(resolved);
+      const fileDetailsAfterRead = await fs.lstat(resolved, { bigint: true });
       const realFileAfterRead = await fs.realpath(resolved);
       if (!sameIdentity(identityOf(fileDetailsAfterRead), identity) || !samePath(realFileAfterRead, realFile)) throw new Error(`evidence file changed during validation: ${entry}`);
       validatedEntries.set(relative, { realPath: realFile, identity, digest });
@@ -302,7 +390,7 @@ async function resolveEvidenceDirectory(reviewProfile, evidenceDirectory, platfo
         for await (const entry of handle) {
         const current = path.join(directory, entry.name);
         const relative = path.relative(absoluteDirectory, current);
-        const details = await fs.lstat(current);
+        const details = await fs.lstat(current, { bigint: true });
         if (details.isSymbolicLink()) throw new Error(`evidence package cannot contain symlinks: ${relative}`);
         const realCurrent = await fs.realpath(current);
         if (!isWithin(realDirectory, realCurrent)) throw new Error(`evidence package path escapes the package: ${relative}`);
@@ -339,19 +427,19 @@ async function resolveEvidenceDirectory(reviewProfile, evidenceDirectory, platfo
       const verifyDirectories = async () => {
         for (const [relative, expected] of validatedDirectories) {
           const current = path.join(absoluteDirectory, relative);
-          const currentDetails = await fs.lstat(current);
+          const currentDetails = await fs.lstat(current, { bigint: true });
           if (!currentDetails.isDirectory() || currentDetails.isSymbolicLink()) throw new Error(`evidence package changed during snapshot: ${relative}`);
           const currentRealPath = await fs.realpath(current);
           if (!samePath(currentRealPath, expected.realPath) || !sameIdentity(identityOf(currentDetails), expected.identity)) throw new Error(`evidence package changed during snapshot: ${relative}`);
         }
       };
-      const currentRoot = await fs.lstat(absoluteDirectory);
+      const currentRoot = await fs.lstat(absoluteDirectory, { bigint: true });
       const currentRealDirectory = await fs.realpath(absoluteDirectory);
       if (!sameIdentity(identityOf(currentRoot), directoryIdentity) || !samePath(currentRealDirectory, realDirectory)) throw new Error('evidence directory changed during snapshot');
       await verifyDirectories();
       for (const relative of sourceEntries) {
         const source = path.join(absoluteDirectory, relative);
-        const sourceDetails = await fs.lstat(source);
+        const sourceDetails = await fs.lstat(source, { bigint: true });
         if (!sourceDetails.isFile() || sourceDetails.isSymbolicLink()) throw new Error(`evidence package changed during snapshot: ${relative}`);
         const sourceRealPath = await fs.realpath(source);
         const expected = signatures.get(relative);
@@ -363,11 +451,11 @@ async function resolveEvidenceDirectory(reviewProfile, evidenceDirectory, platfo
       }
       for (const relative of sourceEntries) {
         const source = path.join(absoluteDirectory, relative);
-        const sourceDetails = await fs.lstat(source);
+        const sourceDetails = await fs.lstat(source, { bigint: true });
         const sourceRealPath = await fs.realpath(source);
         const sourceDigest = await digestFile(source);
         const before = signatures.get(relative);
-        const currentRootAfterCopy = await fs.lstat(absoluteDirectory);
+        const currentRootAfterCopy = await fs.lstat(absoluteDirectory, { bigint: true });
         const currentRealDirectoryAfterCopy = await fs.realpath(absoluteDirectory);
         if (!sameIdentity(identityOf(currentRootAfterCopy), directoryIdentity) || !samePath(currentRealDirectoryAfterCopy, realDirectory) || sourceDetails.isSymbolicLink() || !samePath(sourceRealPath, before.realPath) || !sameIdentity(identityOf(sourceDetails), before.identity) || sourceDigest !== before.digest) {
           throw new Error(`evidence package changed during snapshot: ${relative}`);
@@ -385,16 +473,86 @@ async function resolveEvidenceDirectory(reviewProfile, evidenceDirectory, platfo
   }
 }
 
-async function writeAtomically(filePath, value) {
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
+function pathIsWithin(root, candidate) {
+  const relative = path.relative(root, candidate);
+  return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+function sameFilesystemPath(left, right, platform = process.platform) {
+  const normalizedLeft = path.normalize(left).normalize('NFC');
+  const normalizedRight = path.normalize(right).normalize('NFC');
+  return platform === 'win32' ? normalizedLeft.toLocaleLowerCase('und') === normalizedRight.toLocaleLowerCase('und') : normalizedLeft === normalizedRight;
+}
+
+function directoryIdentity(metadata) {
+  return { dev: BigInt(metadata.dev).toString(), ino: BigInt(metadata.ino).toString() };
+}
+function sameDirectoryIdentity(left, right) { return left.dev === right.dev && left.ino === right.ino; }
+
+async function prepareWorkflowArtifactAuthority(workflow, resultPath, platform = process.platform) {
+  const root = workflow.state_dir;
+  const targetDirectory = path.dirname(resultPath);
+  const relative = path.relative(root, targetDirectory);
+  if (!pathIsWithin(root, targetDirectory) || relative === '') throw new Error('workflow result directory must be a child of the canonical state directory');
+  const rootMetadata = await fs.lstat(root, { bigint: true });
+  if (rootMetadata.isSymbolicLink() || !rootMetadata.isDirectory()) throw new Error('--workflow-state-dir must resolve to a regular directory');
+  const rootRealPath = await fs.realpath(root);
+  const directories = [{ path: root, real_path: rootRealPath, identity: directoryIdentity(rootMetadata) }];
+  let current = root;
+  for (const segment of relative.split(path.sep)) {
+    if (!segment || segment === '.' || segment === '..') throw new Error('workflow result directory contains an invalid path segment');
+    current = path.join(current, segment);
+    try { await fs.mkdir(current); }
+    catch (error) { if (error.code !== 'EEXIST') throw error; }
+    const metadata = await fs.lstat(current, { bigint: true });
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) throw new Error(`workflow result directory must not contain a symlink or junction: ${current}`);
+    const realPath = await fs.realpath(current);
+    if (!pathIsWithin(rootRealPath, realPath)) throw new Error(`workflow result directory escapes the canonical state directory: ${current}`);
+    directories.push({ path: current, real_path: realPath, identity: directoryIdentity(metadata) });
+  }
+  return { version: 1, platform, root_real_path: rootRealPath, target_directory: targetDirectory, target_real_path: directories.at(-1).real_path, directories };
+}
+
+async function verifyWorkflowArtifactAuthority(authority) {
+  for (const expected of authority.directories) {
+    const metadata = await fs.lstat(expected.path, { bigint: true });
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) throw new Error(`workflow result directory identity changed: ${expected.path}`);
+    const realPath = await fs.realpath(expected.path);
+    if (!sameFilesystemPath(realPath, expected.real_path, authority.platform) || !sameDirectoryIdentity(directoryIdentity(metadata), expected.identity)) throw new Error(`workflow result directory identity changed: ${expected.path}`);
+  }
+}
+
+async function writeAtomically(filePath, value, authority = null) {
+  if (authority?.directories) {
+    if (!sameFilesystemPath(path.dirname(filePath), authority.target_directory, authority.platform)) throw new Error(`workflow artifact path is outside its verified result directory: ${filePath}`);
+    await verifyWorkflowArtifactAuthority(authority);
+  } else if (!authority) throw new Error(`Workflow artifact write requires a caller-verified authority: ${filePath}`);
+  const parent = authority.directories?.at(-1) ?? authority;
   const temporary = `${filePath}.${randomUUID()}.tmp`;
-  let handle;
+  let handle; let temporaryIdentity = null;
   try {
     handle = await fs.open(temporary, 'wx');
+    temporaryIdentity = filesystemIdentity(await handle.stat({ bigint: true }));
+    await verifyRegularDirectory(parent);
+    if (authority?.directories) {
+      await verifyWorkflowArtifactAuthority(authority);
+      const temporaryRealPath = await fs.realpath(temporary);
+      if (!pathIsWithin(authority.target_real_path, temporaryRealPath)) throw new Error(`workflow artifact temporary file escaped its verified result directory: ${temporary}`);
+    }
     await handle.writeFile(value);
     await handle.sync();
     await handle.close(); handle = null;
+    await verifyRegularDirectory(parent);
+    await verifyOwnedFile(temporary, temporaryIdentity, 'workflow artifact temporary');
+    if (authority?.directories) await verifyWorkflowArtifactAuthority(authority);
     await fs.rename(temporary, filePath);
+    await verifyRegularDirectory(parent);
+    await verifyOwnedFile(filePath, temporaryIdentity, 'workflow artifact');
+    if (authority?.directories) {
+      await verifyWorkflowArtifactAuthority(authority);
+      const resultRealPath = await fs.realpath(filePath);
+      if (!pathIsWithin(authority.target_real_path, resultRealPath)) throw new Error(`workflow artifact escaped its verified result directory: ${filePath}`);
+    }
     handle = await fs.open(filePath, 'r+');
     await handle.sync();
     if (process.platform !== 'win32') {
@@ -403,7 +561,7 @@ async function writeAtomically(filePath, value) {
     }
   } catch (error) {
     await handle?.close(); handle = null;
-    await fs.unlink(temporary).catch(cleanupError => { if (cleanupError.code !== 'ENOENT') throw cleanupError; });
+    await unlinkOwnedFile(temporary, temporaryIdentity);
     throw error;
   } finally {
     await handle?.close();
@@ -494,6 +652,32 @@ function nonEmptyReviewValue(value) {
   return Boolean(value) && typeof value === 'object' && Object.keys(value).length > 0;
 }
 
+function validateReviewFindings(value, workflowContract) {
+  const findings = value.findings ?? [];
+  if (!Array.isArray(findings)) return 'review output findings must be an array';
+  if (findings.length > MAX_REVIEW_FINDINGS) return `review output findings exceed the ${MAX_REVIEW_FINDINGS}-finding limit`;
+  const requirementIds = new Set(workflowContract?.requirement_ids ?? Object.keys(value.requirement_coverage));
+  const findingIds = new Set();
+  let blockingFindings = 0;
+  for (const [index, finding] of findings.entries()) {
+    if (!finding || typeof finding !== 'object' || Array.isArray(finding)) return `review output findings[${index}] must be an object`;
+    const keys = Object.keys(finding).sort();
+    const expectedFields = [...REVIEW_FINDING_FIELDS].sort();
+    if (keys.length !== expectedFields.length || keys.some((key, keyIndex) => key !== expectedFields[keyIndex])) return `review output findings[${index}] must contain exactly: ${REVIEW_FINDING_FIELDS.join(', ')}`;
+    if (!nonEmptyString(finding.id) || !/^[A-Za-z][A-Za-z0-9._-]{0,79}$/.test(finding.id)) return `review output findings[${index}].id must be a valid identifier of at most 80 characters`;
+    if (findingIds.has(finding.id)) return 'review output finding ids must be unique';
+    findingIds.add(finding.id);
+    if (!REVIEW_FINDING_SEVERITIES.has(finding.severity)) return `review output findings[${index}].severity must be blocking or advisory`;
+    if (finding.severity === 'blocking') blockingFindings += 1;
+    if (finding.requirement_id !== null && (!nonEmptyString(finding.requirement_id) || !requirementIds.has(finding.requirement_id))) return `review output findings[${index}].requirement_id must name a covered requirement or be null`;
+    if (!nonEmptyString(finding.summary) || !nonEmptyReviewValue(finding.evidence)) return `review output findings[${index}].summary and evidence must be non-empty`;
+  }
+  if (value.verdict === 'fail' && blockingFindings === 0) return 'a fail review requires at least one blocking finding';
+  if (value.verdict === 'pass' && blockingFindings > 0) return 'a pass review cannot contain a blocking finding';
+  if (value.verdict === 'unavailable' && findings.length > 0) return 'an unavailable review cannot contain findings';
+  return null;
+}
+
 async function readWorkflowReviewContract(workflow) {
   if (!workflow) return null;
   try {
@@ -532,6 +716,8 @@ function validateReviewOutput(stdout, workflowContract) {
   if (Object.values(value.requirement_coverage).some(item => !nonEmptyReviewValue(item))) return { valid: false, reason: 'review output requirement_coverage values must be non-empty strings, arrays, or objects' };
   if (!nonEmptyReviewValue(value.scope_and_regression) || !nonEmptyReviewValue(value.verification_gaps) || !nonEmptyReviewValue(value.residual_risk)) return { valid: false, reason: 'review output scope_and_regression, verification_gaps, and residual_risk must be non-empty strings, arrays, or objects' };
   if (workflowContract?.error) return { valid: false, reason: workflowContract.error };
+  const findingError = validateReviewFindings(value, workflowContract);
+  if (findingError) return { valid: false, reason: findingError };
   if (workflowContract) {
     if (value.auditor_task !== workflowContract.auditor_task || value.auditor_role !== workflowContract.auditor_role || value.claim_id !== workflowContract.claim_id) return { valid: false, reason: 'review output auditor identity or claim_id does not match the active workflow review' };
     const expectedIds = new Set(workflowContract.requirement_ids);
@@ -677,24 +863,24 @@ function artifactPaths(resultPath) {
   };
 }
 
-async function persistOutcome(resultPath, outcome, stdout, stderr) {
+async function persistOutcome(resultPath, outcome, stdout, stderr, authority = null) {
   const paths = artifactPaths(resultPath);
-  await writeAtomically(paths.stdout, Buffer.concat(stdout.chunks));
-  await writeAtomically(paths.stderr, Buffer.concat(stderr.chunks));
+  await writeAtomically(paths.stdout, Buffer.concat(stdout.chunks), authority);
+  await writeAtomically(paths.stderr, Buffer.concat(stderr.chunks), authority);
   const result = {
     version: 1,
     ...outcome,
     stdout: { path: paths.stdout, captured_bytes: stdout.bytes, truncated: stdout.truncated || stdout.drain_timed_out, drain_timed_out: stdout.drain_timed_out },
     stderr: { path: paths.stderr, captured_bytes: stderr.bytes, truncated: stderr.truncated || stderr.drain_timed_out, drain_timed_out: stderr.drain_timed_out },
   };
-  await writeAtomically(paths.result, `${JSON.stringify(result, null, 2)}\n`);
+  await writeAtomically(paths.result, `${JSON.stringify(result, null, 2)}\n`, authority);
   return { result, paths };
 }
 
-async function persistWorkflowCompletion(stored, workflowCompletion) {
+async function persistWorkflowCompletion(stored, workflowCompletion, authority = null) {
   if (!stored || workflowCompletion?.completed !== true) return;
   stored.result.workflow_completion = workflowCompletion;
-  await writeAtomically(stored.paths.result, `${JSON.stringify(stored.result, null, 2)}\n`);
+  await writeAtomically(stored.paths.result, `${JSON.stringify(stored.result, null, 2)}\n`, authority);
 }
 
 async function completeUnavailableWorkflowReview(workflow, resultPath, outcome) {
@@ -719,7 +905,22 @@ async function completeUnavailableWorkflowReview(workflow, resultPath, outcome) 
 }
 
 export async function runSolReview(argv = process.argv.slice(2), environment = process.env, platform = process.platform, spawnProcess = spawn, terminateProcess = terminateSolReviewProcess) {
-  const { codexBin, timeoutSec, hardTimeoutSec, reviewProfile, evidenceDirectory, resultPath, reviewRole: requestedReviewRole, reviewRoleExplicit, workflow, promptArgs } = parseInvocation(argv, environment, platform);
+  const invocation = parseInvocation(argv, environment, platform);
+  const { codexBin, timeoutSec, hardTimeoutSec, reviewProfile, evidenceDirectory, reviewRole: requestedReviewRole, reviewRoleExplicit, promptArgs } = invocation;
+  let workflow = invocation.workflow;
+  let resultPath = invocation.resultPath;
+  let workflowArtifactAuthority = null;
+  let resultParentAuthority = null;
+  if (workflow) {
+    workflow = { ...workflow, state_dir: await canonicalStateDirectory(workflow.state_dir, '--workflow-state-dir') };
+    const expectedResultPath = path.join(workflow.state_dir, WORKFLOW_RESULT_DIRECTORY, workflow.task_id, workflow.claim_id, 'outcome.json');
+    if (!resultPath) resultPath = expectedResultPath;
+    if (path.resolve(resultPath) !== expectedResultPath) throw new Error(`--result must be exactly ${expectedResultPath} when workflow binding is used`);
+    workflowArtifactAuthority = await prepareWorkflowArtifactAuthority(workflow, resultPath, platform);
+  } else if (resultPath) {
+    resultParentAuthority = await snapshotRegularDirectory(path.dirname(resultPath));
+  }
+  const artifactAuthority = workflowArtifactAuthority ?? resultParentAuthority;
   const startedAt = new Date().toISOString(); const started = Date.now();
   const softDeadline = started + timeoutSec * 1000;
   const hardDeadline = hardTimeoutSec === null ? null : started + hardTimeoutSec * 1000;
@@ -740,12 +941,13 @@ export async function runSolReview(argv = process.argv.slice(2), environment = p
       review_role: requestedReviewRole, evidence_directory: evidenceDirectory, review_workspace: null, started_at: startedAt, finished_at: new Date().toISOString(), duration_ms: Date.now() - started,
       exit_code: 1, child_exit_code: null, spawn_error: workflowPreflightError, spawn_started: false, signal: null, timed_out: false, deadline_reached: false, hard_timeout_reached: false,
       termination: null, review_verdict: { valid: false, reason: workflowPreflightError }, repair, workflow,
+      workflow_artifact_authority: workflowArtifactAuthority,
       workflow_completion: { state: 'pending' },
     };
     const emptyCapture = { chunks: [], bytes: 0, truncated: false, drain_timed_out: false };
-    const stored = await persistOutcome(resultPath, outcome, emptyCapture, emptyCapture);
+    const stored = await persistOutcome(resultPath, outcome, emptyCapture, emptyCapture, workflowArtifactAuthority);
     const workflowCompletion = await completeUnavailableWorkflowReview(workflow, stored.paths.result, outcome);
-    await persistWorkflowCompletion(stored, workflowCompletion);
+    await persistWorkflowCompletion(stored, workflowCompletion, workflowArtifactAuthority);
     return { ...outcome, result_path: stored.paths.result, workflow_completion: workflowCompletion?.completed === true ? workflowCompletion : outcome.workflow_completion, workflow_completion_error: workflowCompletion?.completed === false ? workflowCompletion.reason : null };
   }
   if (reviewRoleExplicit && initialWorkflowContract && !initialWorkflowContract.error && requestedReviewRole !== initialWorkflowContract.auditor_role) {
@@ -765,12 +967,13 @@ export async function runSolReview(argv = process.argv.slice(2), environment = p
       evidence_directory: evidenceDirectory, review_workspace: null, started_at: startedAt, finished_at: new Date().toISOString(), duration_ms: Date.now() - started,
        exit_code: 1, child_exit_code: null, spawn_error: reason, spawn_started: false, signal: null, timed_out: false, deadline_reached: false, hard_timeout_reached: false,
        termination: null, review_verdict: { valid: false, reason }, repair, workflow,
+       workflow_artifact_authority: workflowArtifactAuthority,
        workflow_completion: workflow ? { state: 'pending' } : null,
     };
     const emptyCapture = { chunks: [], bytes: 0, truncated: false, drain_timed_out: false };
-    const stored = await persistOutcome(resultPath, outcome, emptyCapture, emptyCapture);
+    const stored = await persistOutcome(resultPath, outcome, emptyCapture, emptyCapture, workflowArtifactAuthority);
     const workflowCompletion = await completeUnavailableWorkflowReview(workflow, stored.paths.result, outcome);
-    await persistWorkflowCompletion(stored, workflowCompletion);
+    await persistWorkflowCompletion(stored, workflowCompletion, workflowArtifactAuthority);
     return { ...outcome, result_path: stored.paths.result, workflow_completion: workflowCompletion?.completed === true ? workflowCompletion : outcome.workflow_completion, workflow_completion_error: workflowCompletion?.completed === false ? workflowCompletion.reason : null };
   }
   const reviewWorkspace = evidencePackage?.workspace ?? null;
@@ -804,11 +1007,12 @@ export async function runSolReview(argv = process.argv.slice(2), environment = p
         evidence_directory: evidencePackage?.source ?? null, review_workspace: reviewWorkspace, started_at: startedAt, finished_at: new Date().toISOString(), duration_ms: Date.now() - started,
         exit_code: 1, child_exit_code: null, spawn_error: reason, spawn_started: false, signal: null, timed_out: false, deadline_reached: false, hard_timeout_reached: false,
         termination: null, review_verdict: { valid: false, reason }, repair, workflow, workflow_completion: workflow ? { state: 'pending' } : null,
+        workflow_artifact_authority: workflowArtifactAuthority,
       };
       const emptyCapture = { chunks: [], bytes: 0, truncated: false, drain_timed_out: false };
-      const stored = resultPath ? await persistOutcome(resultPath, outcome, emptyCapture, emptyCapture) : null;
+      const stored = resultPath ? await persistOutcome(resultPath, outcome, emptyCapture, emptyCapture, artifactAuthority) : null;
       const workflowCompletion = stored ? await completeUnavailableWorkflowReview(workflow, stored.paths.result, outcome) : null;
-      await persistWorkflowCompletion(stored, workflowCompletion);
+      await persistWorkflowCompletion(stored, workflowCompletion, workflowArtifactAuthority);
       return { ...outcome, result_path: stored?.paths.result ?? null, workflow_completion: workflowCompletion?.completed === true ? workflowCompletion : outcome.workflow_completion, workflow_completion_error: workflowCompletion?.completed === false ? workflowCompletion.reason : null };
     }
     const stdinWrite = usesWindowsCommandScript ? startWindowsPromptWrite(child.stdin, prompt) : null;
@@ -851,13 +1055,14 @@ export async function runSolReview(argv = process.argv.slice(2), environment = p
     review_verdict: reviewVerdict,
     repair,
     workflow,
+    workflow_artifact_authority: workflowArtifactAuthority,
     spawn_started: childOutcome.spawn_started === true,
     workflow_completion: workflow ? { state: 'pending' } : null,
     };
     let stored = null;
-    if (resultPath) stored = await persistOutcome(resultPath, outcome, stdout, stderr);
+    if (resultPath) stored = await persistOutcome(resultPath, outcome, stdout, stderr, artifactAuthority);
     const workflowCompletion = stored ? await completeUnavailableWorkflowReview(workflow, stored.paths.result, outcome) : null;
-    await persistWorkflowCompletion(stored, workflowCompletion);
+    await persistWorkflowCompletion(stored, workflowCompletion, workflowArtifactAuthority);
     return { ...outcome, result_path: stored?.paths.result ?? null, workflow_completion: workflowCompletion?.completed === true ? workflowCompletion : outcome.workflow_completion, workflow_completion_error: workflowCompletion?.completed === false ? workflowCompletion.reason : null };
   } finally {
     await evidencePackage?.cleanup?.();

@@ -16,6 +16,10 @@
 
 外层命令超时不证明审查进程已停止。`--timeout-sec` 是软截止，只记录 `deadline_reached` 并继续等待；只有 `--hard-timeout-sec` 才请求终止。硬截止或外层超时后，必须从操作系统进程列表和命令行精确定位该 task/claim 的 CLI 子进程，只终止明确匹配的进程并复核其已退出，之后才可 `abandon` 和 `retry`。无法归属或确认退出时保留节点运行或阻塞，不得并行重试。
 
-软截止不是失败，部分日志不是 verdict，退出码 0 也不等于通过。有效 stdout 必须完整并以最终 JSON 结束；工作流绑定时还须匹配审查者、claim、需求覆盖、`workflow_snapshot` 和工作区指纹，否则记为 `unavailable`。
+软截止不是失败，部分日志不是 verdict，退出码 0 也不等于通过。有效 stdout 必须完整并以最终 JSON 结束；工作流绑定时还须匹配审查者、claim、需求覆盖、`workflow_snapshot` 和工作区指纹，否则记为 `unavailable`。`fail` 必须返回非空 `findings`，每项精确包含唯一、以字母开头、仅含字母数字、点、下划线或连字符且最长 80 字符的 `id`、`severity`、可空 `requirement_id`、`summary` 和 `evidence`，且至少一项为 `blocking`；`pass` 不得带 blocking finding，`unavailable` 不得带 findings。该结构直接用于后续修复的逐项绑定，不能只在自由文本里描述问题。
 
-有效结果保留 `workflow_completion.state=pending`。main/root 把同一 `outcome.json` 作为 `workflow_complete.result`；控制器持久化节点完成后才原子回写最终 completion。恢复时同时检查该字段和控制器中的 claim 终态。子进程异常退出只可记录 `native_agent_exit_confirmed` 或 `native_agent_start_failed`：只有未收到 `spawn` 事件即报错属于后者，启动后的 error 必须等到实际 exit 才属于前者，均不得伪称 `native_agent_finished`。
+有效结果保留 `workflow_completion.state=pending`，并持久化 `workflow_artifact_authority`。工作流绑定的 CLI 只向 canonical `state_dir/.workflow-review-results/<task>/<claim>/` 写入，并在启动前及每次日志、outcome、completion 写入前后逐级核对目录物理身份；任何 symlink/junction、越界或目录替换都会拒绝写入。main/root 把同一 `outcome.json` 作为 `workflow_complete.result`；控制器用拒绝 link 的稳定文件句柄读取 outcome，把读取对象的文件身份传入 authority 校验，并在持久 intent、原子回写和回写后复核之间保持内容摘要与物理身份一致。它拒绝复制到其他路径、读取窗口内替换或目录替换后的 outcome，持久化节点完成后才原子回写最终 completion。恢复时同时检查该字段和控制器中的 claim 终态。子进程异常退出只可记录 `native_agent_exit_confirmed` 或 `native_agent_start_failed`：只有未收到 `spawn` 事件即报错属于后者，启动后的 error 必须等到实际 exit 才属于前者，均不得伪称 `native_agent_finished`。
+
+## Max Closure
+
+当 `audit-context.max_review_charter` 存在时，CLI 审查是 closure，不再开放式重新发现。只核验 charter 的固定 blockers、受保护 repair 的差异与回归，以及原始 requirements。`pass` 仅在这些项目全部通过时可用。若发现新的 blocking finding，只有它明确关联原 requirement，且输出 `repair_regressions:[{ "finding_id": "...", "evidence": "..." }]` 逐项证明它由本次 repair 引入，才可作为当前 closure blocker；否则仍输出该 finding，但不得把它描述为通过或建议自动重试，控制器会记录 `out_of_charter` 并阻塞等待范围决策。

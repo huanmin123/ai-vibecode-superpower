@@ -15,6 +15,7 @@ source_marketplace=$script_dir/.agents/plugins/marketplace.json
 source_plugin_skills=$source_plugin/skills
 source_standalone_skills=$script_dir/skills
 managed_plugin_skill_names='agent-toolchain orchestrate-model-workflow workflow-controller'
+legacy_plugin_skill_names_to_remove='adaptive-efficiency'
 managed_standalone_skill_names='gpt-image-2-cli project-doc-planner'
 managed_agent_role_files='ai-vibecode-superpower-avsp_luna_high.toml ai-vibecode-superpower-avsp_luna_xhigh.toml ai-vibecode-superpower-avsp_luna_high_writer.toml ai-vibecode-superpower-avsp_luna_xhigh_writer.toml ai-vibecode-superpower-avsp_luna_high_executor.toml ai-vibecode-superpower-avsp_luna_xhigh_executor.toml ai-vibecode-superpower-avsp_sol_high.toml ai-vibecode-superpower-avsp_sol_max.toml ai-vibecode-superpower-avsp_sol_xhigh.toml ai-vibecode-superpower-avsp_terra_high.toml ai-vibecode-superpower-avsp_terra_xhigh.toml ai-vibecode-superpower-avsp_terra_xhigh_readonly.toml ai-vibecode-superpower-avsp_terra_low_readonly.toml ai-vibecode-superpower-avsp_terra_medium_readonly.toml'
 
@@ -955,6 +956,9 @@ for skill_name in $managed_standalone_skill_names; do
     printf '%s\t%s\t%s\t%s\t%s\n' "skills/$skill_name" "$codex_home/skills/$skill_name" "$stage_dir/skills/$skill_name" directory replace >> "$manifest"
 done
 for skill_name in $managed_plugin_skill_names; do
+    printf '%s\t%s\t%s\t%s\t%s\n' "skills/$skill_name" "$codex_home/skills/$skill_name" - directory remove >> "$manifest"
+done
+for skill_name in $legacy_plugin_skill_names_to_remove; do
     printf '%s\t%s\t%s\t%s\t%s\n' "skills/$skill_name" "$codex_home/skills/$skill_name" - directory remove >> "$manifest"
 done
 

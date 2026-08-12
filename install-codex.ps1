@@ -638,6 +638,7 @@ $managedPluginSkillNames = @(
     'orchestrate-model-workflow'
     'workflow-controller'
 )
+$legacyPluginSkillNamesToRemove = @('adaptive-efficiency')
 $managedStandaloneSkillNames = @(
     'gpt-image-2-cli'
     'project-doc-planner'
@@ -745,6 +746,9 @@ try {
     }
     foreach ($skillName in $managedPluginSkillNames) {
         $transactionTargets.Add([pscustomobject]@{ Name = (Join-Path 'skills' $skillName); Target = (Join-Path $skillsTarget $skillName); Candidate = $null; Kind = 'Directory'; Operation = 'Remove'; WasPresent = $false; BackedUp = $false; InstallStarted = $false })
+    }
+    foreach ($legacySkillName in $legacyPluginSkillNamesToRemove) {
+        $transactionTargets.Add([pscustomobject]@{ Name = (Join-Path 'skills' $legacySkillName); Target = (Join-Path $skillsTarget $legacySkillName); Candidate = $null; Kind = 'Directory'; Operation = 'Remove'; WasPresent = $false; BackedUp = $false; InstallStarted = $false })
     }
 
     # Validate every destination and the backup root before any managed target is replaced or removed.

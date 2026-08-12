@@ -82,16 +82,23 @@ function validateControllerSchema(database, databasePath) {
   }
 }
 
-async function atomicWriteBinary(filePath, bytes) {
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
+async function atomicWriteBinary(filePath, bytes, parentAuthority) {
+  if (!parentAuthority || path.resolve(parentAuthority.path) !== path.resolve(path.dirname(filePath))) throw error(`SQLite task state requires a caller-verified parent authority: ${filePath}`);
+  const parent = parentAuthority;
   const temporary = `${filePath}.${randomUUID()}.tmp`;
-  let handle;
+  let handle; let temporaryIdentity = null;
   try {
     handle = await fs.open(temporary, 'wx');
+    temporaryIdentity = objectIdentity(await handle.stat({ bigint: true }));
+    await verifyRegularDirectory(parent);
     await handle.writeFile(bytes);
     await handle.sync();
     await handle.close(); handle = null;
+    await verifyRegularDirectory(parent);
+    await verifyOwnedFile(temporary, temporaryIdentity, 'SQLite task temporary');
     await fs.rename(temporary, filePath);
+    await verifyRegularDirectory(parent);
+    await verifyOwnedFile(filePath, temporaryIdentity, 'SQLite task state');
     handle = await fs.open(filePath, 'r+');
     await handle.sync();
     if (process.platform !== 'win32') {
@@ -100,12 +107,47 @@ async function atomicWriteBinary(filePath, bytes) {
     }
   } catch (cause) {
     await handle?.close(); handle = null;
-    await fs.unlink(temporary).catch(cleanupError => {
-      if (cleanupError.code !== 'ENOENT') throw cleanupError;
-    });
+    await unlinkOwnedFile(temporary, temporaryIdentity);
     throw cause;
   } finally {
     await handle?.close();
+  }
+}
+
+function objectIdentity(metadata) { return { dev: metadata.dev.toString(), ino: metadata.ino.toString() }; }
+
+async function snapshotRegularDirectory(directory) {
+  const metadata = await fs.lstat(directory, { bigint: true });
+  if (metadata.isSymbolicLink() || !metadata.isDirectory()) throw error(`SQLite task state parent is not a regular directory: ${directory}`);
+  return { path: directory, realPath: await fs.realpath(directory), identity: objectIdentity(metadata) };
+}
+
+async function verifyRegularDirectory(snapshot) {
+  const current = await snapshotRegularDirectory(snapshot.path);
+  const expectedRealPath = snapshot.realPath ?? snapshot.real_path;
+  if (current.realPath !== expectedRealPath || current.identity.dev !== snapshot.identity.dev || current.identity.ino !== snapshot.identity.ino) {
+    throw error(`SQLite task state parent changed: ${snapshot.path}`);
+  }
+}
+
+async function unlinkOwnedFile(filePath, identity) {
+  if (!identity) return false;
+  try {
+    const metadata = await fs.lstat(filePath, { bigint: true });
+    if (metadata.isSymbolicLink() || !metadata.isFile() || objectIdentity(metadata).dev !== identity.dev || objectIdentity(metadata).ino !== identity.ino) return false;
+    await fs.unlink(filePath);
+    return true;
+  } catch (cause) {
+    if (cause.code === 'ENOENT') return false;
+    throw cause;
+  }
+}
+
+async function verifyOwnedFile(filePath, identity, label) {
+  const metadata = await fs.lstat(filePath, { bigint: true });
+  const current = objectIdentity(metadata);
+  if (metadata.isSymbolicLink() || !metadata.isFile() || current.dev !== identity?.dev || current.ino !== identity?.ino) {
+    throw error(`${label} changed: ${filePath}`);
   }
 }
 
@@ -145,7 +187,7 @@ export async function readTaskState(databasePath) {
   }
 }
 
-export async function writeTaskState(databasePath, state) {
+export async function writeTaskState(databasePath, state, { parentAuthority } = {}) {
   const payload = JSON.stringify(state);
   if (Buffer.byteLength(payload, 'utf8') > MAX_PAYLOAD_BYTES) {
     throw error(`SQLite task payload exceeds the ${MAX_PAYLOAD_BYTES}-byte limit: ${databasePath}`);
@@ -158,16 +200,19 @@ export async function writeTaskState(databasePath, state) {
     );
     const exported = database.export();
     if (exported.byteLength > MAX_DATABASE_BYTES) throw error(`SQLite task state exceeds the ${MAX_DATABASE_BYTES}-byte limit: ${databasePath}`);
-    await atomicWriteBinary(databasePath, exported);
+    await atomicWriteBinary(databasePath, exported, parentAuthority);
   } finally {
     database.close();
   }
 }
 
-export async function deleteTaskState(databasePath) {
+export async function deleteTaskState(databasePath, { parentAuthority } = {}) {
+  if (!parentAuthority || path.resolve(parentAuthority.path) !== path.resolve(path.dirname(databasePath))) throw error(`SQLite task state deletion requires a caller-verified parent authority: ${databasePath}`);
+  await verifyRegularDirectory(parentAuthority);
   await fs.unlink(databasePath).catch(cause => {
     if (cause.code !== 'ENOENT') throw cause;
   });
+  await verifyRegularDirectory(parentAuthority);
 }
 
 export const SQLITE_LIMITS = Object.freeze({ MAX_DATABASE_BYTES, MAX_PAYLOAD_BYTES });
