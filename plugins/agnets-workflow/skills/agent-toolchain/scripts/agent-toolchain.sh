@@ -142,6 +142,85 @@ toml_table_body() {
   ' "$file"
 }
 
+agents_heading_candidate() {
+  file=$1
+  title=$2
+  awk -v title="$title" '
+    function normalize_title(value) {
+      gsub(/[ \t]+/, " ", value)
+      sub(/^ /, "", value)
+      sub(/ $/, "", value)
+      return tolower(value)
+    }
+    function is_atx_h2(value) { return value ~ "^[ ]?[ ]?[ ]?##[ \t]+" }
+    function atx_title(value) {
+      sub(/^[ ]?[ ]?[ ]?##[ \t]+/, "", value)
+      sub(/[ \t]+#+[ \t]*$/, "", value)
+      return normalize_title(value)
+    }
+    function is_setext_underline(value) { return value ~ "^[ ]?[ ]?[ ]?-+[ \t]*$" }
+    { if (NR == 1) sub(/^\xef\xbb\xbf/, ""); sub(/\r$/, ""); lines[NR] = $0 }
+    END {
+      candidate = normalize_title(title)
+      for (line_no = 1; line_no <= NR; line_no += 1) {
+        if (is_atx_h2(lines[line_no]) && atx_title(lines[line_no]) == candidate) { found = 1; break }
+        if (line_no < NR && normalize_title(lines[line_no]) == candidate && is_setext_underline(lines[line_no + 1])) { found = 1; break }
+      }
+      exit (found ? 0 : 1)
+    }
+  ' "$file"
+}
+
+managed_agents_section() {
+  file=$1
+  heading=$2
+  awk -v heading="$heading" '
+    function normalize_title(value) {
+      gsub(/[ \t]+/, " ", value)
+      sub(/^ /, "", value)
+      sub(/ $/, "", value)
+      return tolower(value)
+    }
+    function is_atx_h2(value) { return value ~ "^[ ]?[ ]?[ ]?##[ \t]+" }
+    function atx_title(value) {
+      sub(/^[ ]?[ ]?[ ]?##[ \t]+/, "", value)
+      sub(/[ \t]+#+[ \t]*$/, "", value)
+      return normalize_title(value)
+    }
+    function is_setext_underline(value) { return value ~ "^[ ]?[ ]?[ ]?-+[ \t]*$" }
+    function is_h2(line_no) {
+      return is_atx_h2(lines[line_no]) || (line_no < NR && lines[line_no] ~ "^[ ]?[ ]?[ ]?[^[:space:]].*$" && is_setext_underline(lines[line_no + 1]))
+    }
+    { if (NR == 1) sub(/^\xef\xbb\xbf/, ""); sub(/\r$/, ""); lines[NR] = $0 }
+    END {
+      title = normalize_title(substr(heading, 4))
+      for (line_no = 1; line_no <= NR; line_no += 1) {
+        if (is_atx_h2(lines[line_no]) && atx_title(lines[line_no]) == title) {
+          count += 1
+          if (lines[line_no] != heading) invalid = 1
+          if (count == 1) start = line_no
+        }
+        if (line_no < NR && normalize_title(lines[line_no]) == title && is_setext_underline(lines[line_no + 1])) {
+          count += 1
+          invalid = 1
+          if (count == 1) start = line_no
+        }
+      }
+      if (count != 1 || invalid) exit 2
+      end_line = start
+      for (line_no = start + 1; line_no <= NR; line_no += 1) {
+        if (is_h2(line_no)) break
+        end_line = line_no
+      }
+      while (end_line > start && lines[end_line] == "") end_line -= 1
+      for (line_no = start; line_no <= end_line; line_no += 1) {
+        print lines[line_no]
+      }
+      printf "__agent_toolchain_section_end__"
+    }
+  ' "$file"
+}
+
 configure_project() {
   codex_dir="$PROJECT/.codex"
   config="$codex_dir/config.toml"
@@ -157,9 +236,14 @@ configure_project() {
 
   config_needs_write=0
   agents_needs_write=0
-  tool_error_rule_needs_write=0
   ignore_needs_write=0
-  tool_error_rule='- 工具调用报错时，只有工具注册表或 `--help` 未列出目标命令，才可判定其不存在；否则不得归因于能力缺失。'
+  agents_heading='## CodeGraph 与 RTK'
+  agents_block='## CodeGraph 与 RTK
+
+- CodeGraph MCP 可用于查询跨模块依赖、调用链和影响范围；其结果必须以当前源码、`rg`、未跟踪文件和刚修改文件复核。
+- 对只读且输出量大的命令，优先使用匹配的 `rtk` 子命令：`git`、`rg`、`log`、`diff`、`test`、`mvn`、`npm`、`pnpm`、`read`、`find`、`ls`、`tree`。未列出的只读命令先用 `rtk rewrite "<command>"` 或 `rtk --help` 核实；写操作和精确排障使用原生命令。
+- 只有工具注册表或 `--help` 未列出目标命令时，才能判定该命令不存在；其他工具错误保留原始输出，不得归因于能力缺失。
+- 安装、配置修复、初始化或修复索引、健康检查、升级审查和回滚使用全局 `$agent-toolchain`；不得在日常开发中自行安装、升级、重配或维护工具链。'
   if [ -f "$config" ] && rg -q '^\[mcp_servers\.codegraph\][[:space:]]*$' "$config"; then
     main_body=$(toml_table_body "$config" '[mcp_servers.codegraph]') || die ".codex/config.toml 的 CodeGraph 主表重复或无效"
     env_body=$(toml_table_body "$config" '[mcp_servers.codegraph.env]') || die ".codex/config.toml 的 CodeGraph env 表缺失、重复或无效"
@@ -175,10 +259,18 @@ configure_project() {
     config_needs_write=1
   fi
 
-  if [ -f "$agents" ] && rg -q '^## AI 工具[[:space:]]*$' "$agents"; then
-    rg -Fq '$agent-toolchain' "$agents" || die 'AGENTS.md 的 AI 工具规则缺少 $agent-toolchain'
-    rg -Fq 'rtk rewrite' "$agents" || die "AGENTS.md 的 AI 工具规则缺少 RTK 路由"
-    rg -Fxq "$tool_error_rule" "$agents" || tool_error_rule_needs_write=1
+  if [ -f "$agents" ] && agents_heading_candidate "$agents" 'AI 工具'; then
+    die 'AGENTS.md 包含旧版 AI 工具注入标题；请人工迁移为当前 CodeGraph 与 RTK 受管标题'
+  fi
+  if [ -f "$agents" ] && agents_heading_candidate "$agents" 'CodeGraph 与 RTK'; then
+    managed_section=$(managed_agents_section "$agents" "$agents_heading") || die 'AGENTS.md 的 CodeGraph 与 RTK 受管标题冲突或重复'
+    case "$managed_section" in
+      *__agent_toolchain_section_end__) managed_section=${managed_section%__agent_toolchain_section_end__} ;;
+      *) die 'AGENTS.md 的 CodeGraph 与 RTK 受管标题冲突' ;;
+    esac
+    expected_section=$(printf '%s\n__agent_toolchain_section_end__' "$agents_block")
+    expected_section=${expected_section%__agent_toolchain_section_end__}
+    [ "$managed_section" = "$expected_section" ] || die 'AGENTS.md 的 CodeGraph 与 RTK 受管标题冲突'
   else
     agents_needs_write=1
   fi
@@ -198,15 +290,9 @@ args = [
 CODEGRAPH_TELEMETRY = "0"
 CODEGRAPH_NO_UPDATE_CHECK = "1"
 DO_NOT_TRACK = "1"'
-  [ "$agents_needs_write" -eq 0 ] || append_project_text "$agents" '## AI 工具
-
-- CodeGraph/RTK 的安装、初始化、维护和验证使用全局 `$agent-toolchain`。
-- CodeGraph MCP 用于查询跨模块依赖、调用链和影响范围；处理跨模块任务时使用它。
-- 对只读高输出命令，优先使用匹配的 `rtk` 子命令：`git`、`rg`、`log`、`diff`、`test`、`mvn`、`npm`、`pnpm`、`read`、`find`、`ls`、`tree`。未列出的只读命令先用 `rtk rewrite "<command>"` 或 `rtk --help` 判断；写操作和精确排障使用原生命令。
-- 工具调用报错时，只有工具注册表或 `--help` 未列出目标命令，才可判定其不存在；否则不得归因于能力缺失。'
-  [ "$tool_error_rule_needs_write" -eq 0 ] || append_project_text "$agents" "$tool_error_rule"
+  [ "$agents_needs_write" -eq 0 ] || append_project_text "$agents" "$agents_block"
   [ "$ignore_needs_write" -eq 0 ] || append_project_text "$ignore" '/.codegraph/'
-  note "项目 CodeGraph/RTK 路由已就绪"
+  note "项目 CodeGraph 与 RTK 受管配置已就绪"
 }
 
 load_trusted_manifest() {

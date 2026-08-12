@@ -1,4 +1,4 @@
 interface:
-  display_name: "Agent Toolchain"
-  short_description: "Use CodeGraph and RTK for development tasks"
-  default_prompt: "Use $agent-toolchain to analyze this repository with its configured CodeGraph and RTK tools."
+  display_name: "项目工具链接入与维护"
+  short_description: "Configure, repair, or maintain this project's CodeGraph and RTK toolchain"
+  default_prompt: "Use $agent-toolchain to configure, repair, or maintain this project's CodeGraph and RTK toolchain."

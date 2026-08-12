@@ -370,7 +370,7 @@ async function handle(request) {
     cancellableRequests.get(requestKey(requestId))?.abort();
     return;
   }
-  if (method === 'initialize') return write({ jsonrpc: '2.0', id, result: { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'agnets-workflow', version: '0.2.0' } } });
+  if (method === 'initialize') return write({ jsonrpc: '2.0', id, result: { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'agnets-workflow', version: '0.2.1' } } });
   if (method === 'tools/list') return write({ jsonrpc: '2.0', id, result: { tools: TOOLS } });
   if (method !== 'tools/call') return write({ jsonrpc: '2.0', id, error: { code: -32601, message: `Unknown method: ${method}` } });
   const command = TOOL_COMMANDS[request.params?.name];

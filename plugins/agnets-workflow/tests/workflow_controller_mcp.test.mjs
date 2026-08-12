@@ -63,6 +63,7 @@ test('MCP server creates and reads a SQLite-backed workflow task over stdio', as
     await writeFile(manifest, JSON.stringify({ task_id: 'mcp-task', workspace, goal: 'verify MCP persistence', requirements: [{ id: 'R1', text: 'store state' }], nodes: [{ id: 'total-review', kind: 'total_review', agent_type: 'avsp_sol_high' }] }));
     const initialized = await server.request({ method: 'initialize', params: {} });
     assert.equal(initialized.result.serverInfo.name, 'agnets-workflow');
+    assert.equal(initialized.result.serverInfo.version, '0.2.1');
     const init = await server.request({ method: 'tools/call', params: { name: 'workflow_init', arguments: { manifest, state_dir: stateDir } } });
     assert.equal(JSON.parse(init.result.content[0].text).task.task_id, 'mcp-task');
     const status = await server.request({ method: 'tools/call', params: { name: 'workflow_status', arguments: { task_id: 'mcp-task', state_dir: stateDir } } });

@@ -1,6 +1,6 @@
 # Agnets 工作流
 
-`agnets-workflow` 为 Codex 提供统一的多代理工作流、项目工具链和持久化任务状态。它适合需要并行执行、可恢复交接和按证据升级的质量门的复杂开发任务。简单问答、只读查询或边界清晰的单文件低风险修改不进入持久化 DAG，由 main/root 直接完成并做与风险相称的最终验证。
+`agnets-workflow` 为 Codex 提供统一的多代理工作流、项目工具链的受控接入与维护，以及持久化任务状态。它适合需要并行执行、可恢复交接和按证据升级的质量门的复杂开发任务。简单问答、只读查询或边界清晰的单文件低风险修改不进入持久化 DAG，由 main/root 直接完成并做与风险相称的最终验证。
 
 ## 能力
 
@@ -8,6 +8,7 @@
 - 持久化任务状态、节点产物、参与者、审核记录和按声明范围协调的工作区租约。
 - 在控制器被再次调用时惰性清理过期状态；完整已关闭任务按 7 天处理，可证明已失活的损坏状态在 30 天后隔离，无法验证 registry 或运行状态的任务保留给人工恢复，隔离完成后再保留 365 天。
 - 通过 MCP 或本地 CLI 提供初始化、派发、心跳、checkpoint、恢复、总审和关闭检查。
+- 用 `$agent-toolchain` 为目标项目接入或维护 CodeGraph/RTK；接入时在项目 `AGENTS.md` 中写入一个统一的 `## CodeGraph 与 RTK` 受管标题，日常开发直接遵守其中的规则。
 
 工作流路由、角色边界、交接、恢复和总审升级规则以 [`orchestrate-model-workflow`](skills/orchestrate-model-workflow/SKILL.md) 为准；控制器命令和持久化约束以 [`workflow-controller`](skills/workflow-controller/SKILL.md) 为准。
 

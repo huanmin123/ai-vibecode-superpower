@@ -1,6 +1,6 @@
-# 接入与安装
+# 项目接入与安装
 
-仅在用户要求为项目接入 CodeGraph/RTK、首次安装、修复缺失安装或审查升级时读取本文件。日常使用工具时不要读取。
+仅在用户要求为项目接入 CodeGraph/RTK、首次安装、修复缺失安装或审查升级时读取本文件。接入完成后的日常使用规则由目标项目根 `AGENTS.md` 的 `## CodeGraph 与 RTK` 标题提供，不要为普通开发读取本文件或触发 `$agent-toolchain`。
 
 ## 先决条件与边界
 
@@ -11,7 +11,7 @@
 
 ## 接入顺序
 
-1. 运行 `configure`：仅在不存在冲突时写入 CodeGraph MCP 配置、`/.codegraph/` 忽略规则及项目根 `AGENTS.md` 的 AI 工具路由。
+1. 运行 `configure`：仅在不存在冲突时写入 CodeGraph MCP 配置、`/.codegraph/` 忽略规则及项目根 `AGENTS.md` 的唯一 `## CodeGraph 与 RTK` 受管标题。该标题内同时包含运行时工具规则和 `$agent-toolchain` 管理路由；旧版 `## AI 工具` 标题不会被覆盖。
 2. 运行 `bootstrap --dry-run`，核对将安装的受管工具。
 3. 运行 `bootstrap --apply`：CodeGraph 使用官方固定 npm 包且禁用安装脚本；RTK 使用固定官方 release，并校验归档与摘要。
 4. 运行 `init-codegraph`：新建索引，或对已有索引执行一次增量同步。

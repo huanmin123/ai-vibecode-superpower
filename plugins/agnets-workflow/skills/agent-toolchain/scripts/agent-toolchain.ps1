@@ -121,6 +121,54 @@ function Get-TomlTableBody([string]$Path, [string]$Header) {
   return ($lines -join "`n")
 }
 
+function Normalize-AgentsHeadingTitle([string]$Text) {
+  return (($Text -replace '[ \t]+', ' ').Trim()).ToUpperInvariant()
+}
+
+function Get-AgentsHeadingCandidates([string[]]$Lines, [string]$Heading) {
+  $headingTitle = Normalize-AgentsHeadingTitle $Heading.Substring(3)
+  $atxPattern = '^[ ]{0,3}##[ \t]+(?<content>.*)$'
+  $setextUnderlinePattern = '^[ ]{0,3}-+[ \t]*$'
+  $candidates = [System.Collections.Generic.List[object]]::new()
+  for ($index = 0; $index -lt $Lines.Count; $index += 1) {
+    $atxMatch = [regex]::Match($Lines[$index], $atxPattern)
+    if ($atxMatch.Success) {
+      $atxTitle = $atxMatch.Groups['content'].Value -replace '[ \t]+#+[ \t]*$', ''
+      if ((Normalize-AgentsHeadingTitle $atxTitle) -eq $headingTitle) {
+        [void]$candidates.Add([pscustomobject]@{ Index = $index; Kind = 'atx' })
+      }
+    }
+    if ($index + 1 -lt $Lines.Count -and (Normalize-AgentsHeadingTitle $Lines[$index]) -eq $headingTitle -and $Lines[$index + 1] -match $setextUnderlinePattern) {
+      [void]$candidates.Add([pscustomobject]@{ Index = $index; Kind = 'setext' })
+    }
+  }
+  return $candidates
+}
+
+function Test-AgentsH2At([string[]]$Lines, [int]$Index) {
+  if ($Lines[$Index] -match '^[ ]{0,3}##[ \t]+') { return $true }
+  return $Index + 1 -lt $Lines.Count -and $Lines[$Index] -match '^[ ]{0,3}\S.*$' -and $Lines[$Index + 1] -match '^[ ]{0,3}-+[ \t]*$'
+}
+
+function Get-ManagedAgentsSection([string[]]$Lines, [string]$Heading) {
+  $headingCandidates = @(Get-AgentsHeadingCandidates $Lines $Heading)
+  if ($headingCandidates.Count -ne 1) {
+    if ($headingCandidates.Count -eq 0) { return $null }
+    Fail 'AGENTS.md 的 CodeGraph 与 RTK 受管标题重复'
+  }
+  $candidate = $headingCandidates[0]
+  if ($candidate.Kind -ne 'atx' -or $Lines[$candidate.Index] -cne $Heading) { Fail 'AGENTS.md 的 CodeGraph 与 RTK 受管标题冲突' }
+  $sectionLines = [System.Collections.Generic.List[string]]::new()
+  for ($index = $candidate.Index; $index -lt $Lines.Count; $index += 1) {
+    if ($index -gt $candidate.Index -and (Test-AgentsH2At $Lines $index)) { break }
+    [void]$sectionLines.Add($Lines[$index])
+  }
+  while ($sectionLines.Count -gt 0 -and [string]::IsNullOrEmpty($sectionLines[$sectionLines.Count - 1])) {
+    $sectionLines.RemoveAt($sectionLines.Count - 1)
+  }
+  return (($sectionLines -join "`n") + "`n")
+}
+
 function Configure-Project {
   $codexDirectory = Join-Path $script:Project '.codex'
   $configPath = Join-Path $codexDirectory 'config.toml'
@@ -134,8 +182,16 @@ function Configure-Project {
   Assert-PlainFileOrAbsent $agentsPath
   Assert-PlainFileOrAbsent $ignorePath
 
-  $needsConfig = $false; $needsAgents = $false; $needsToolErrorRule = $false; $needsIgnore = $false
-  $toolErrorRule = '- 工具调用报错时，只有工具注册表或 `--help` 未列出目标命令，才可判定其不存在；否则不得归因于能力缺失。'
+  $needsConfig = $false; $needsAgents = $false; $needsIgnore = $false
+  $agentsHeading = '## CodeGraph 与 RTK'
+  $agentsBlock = @(
+    '## CodeGraph 与 RTK'
+    ''
+    '- CodeGraph MCP 可用于查询跨模块依赖、调用链和影响范围；其结果必须以当前源码、`rg`、未跟踪文件和刚修改文件复核。'
+    '- 对只读且输出量大的命令，优先使用匹配的 `rtk` 子命令：`git`、`rg`、`log`、`diff`、`test`、`mvn`、`npm`、`pnpm`、`read`、`find`、`ls`、`tree`。未列出的只读命令先用 `rtk rewrite "<command>"` 或 `rtk --help` 核实；写操作和精确排障使用原生命令。'
+    '- 只有工具注册表或 `--help` 未列出目标命令时，才能判定该命令不存在；其他工具错误保留原始输出，不得归因于能力缺失。'
+    '- 安装、配置修复、初始化或修复索引、健康检查、升级审查和回滚使用全局 `$agent-toolchain`；不得在日常开发中自行安装、升级、重配或维护工具链。'
+  ) -join "`n"
   $configText = if (Test-Path -LiteralPath $configPath) { Get-Content -LiteralPath $configPath -Raw } else { '' }
   if ($configText -match '(?m)^\[mcp_servers\.codegraph\]\s*$') {
     $mainBody = Get-TomlTableBody $configPath '[mcp_servers.codegraph]'
@@ -148,9 +204,14 @@ function Configure-Project {
   }
 
   $agentsText = if (Test-Path -LiteralPath $agentsPath) { Get-Content -LiteralPath $agentsPath -Raw } else { '' }
-  if ($agentsText -match '(?m)^## AI 工具\s*$') {
-    if (-not $agentsText.Contains('$agent-toolchain') -or -not $agentsText.Contains('rtk rewrite')) { Fail 'AGENTS.md 的 AI 工具路由冲突' }
-    if (-not $agentsText.Contains($toolErrorRule)) { $needsToolErrorRule = $true }
+  $agentsLines = @($agentsText -replace "`r`n", "`n" -split "`n")
+  if ($agentsLines.Count -gt 0) { $agentsLines[0] = $agentsLines[0].TrimStart([char]0xFEFF) }
+  if (@(Get-AgentsHeadingCandidates $agentsLines '## AI 工具').Count -gt 0) {
+    Fail 'AGENTS.md 包含旧版 AI 工具注入标题；请人工迁移为当前 CodeGraph 与 RTK 受管标题'
+  }
+  $managedAgentsSection = Get-ManagedAgentsSection $agentsLines $agentsHeading
+  if ($null -ne $managedAgentsSection) {
+    if ($managedAgentsSection -cne "$agentsBlock`n") { Fail 'AGENTS.md 的 CodeGraph 与 RTK 受管标题冲突' }
   } else {
     $needsAgents = $true
   }
@@ -175,18 +236,10 @@ DO_NOT_TRACK = "1"
 '@
   }
   if ($needsAgents) {
-    Append-ProjectText $agentsPath @'
-## AI 工具
-
-- CodeGraph/RTK 的安装、初始化、维护和验证使用全局 `$agent-toolchain`。
-- CodeGraph MCP 用于查询跨模块依赖、调用链和影响范围；处理跨模块任务时使用它。
-- 对只读高输出命令，优先使用匹配的 `rtk` 子命令：`git`、`rg`、`log`、`diff`、`test`、`mvn`、`npm`、`pnpm`、`read`、`find`、`ls`、`tree`。未列出的只读命令先用 `rtk rewrite "<command>"` 或 `rtk --help` 判断；写操作和精确排障使用原生命令。
-- 工具调用报错时，只有工具注册表或 `--help` 未列出目标命令，才可判定其不存在；否则不得归因于能力缺失。
-'@
+    Append-ProjectText $agentsPath $agentsBlock
   }
-  if ($needsToolErrorRule) { Append-ProjectText $agentsPath $toolErrorRule }
   if ($needsIgnore) { Append-ProjectText $ignorePath '/.codegraph/' }
-  Note '项目 CodeGraph/RTK 路由已就绪'
+  Note '项目 CodeGraph 与 RTK 受管配置已就绪'
 }
 
 function Load-TrustedManifest {
