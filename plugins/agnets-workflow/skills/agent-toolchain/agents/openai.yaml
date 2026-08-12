@@ -1,4 +1,4 @@
 interface:
   display_name: "Agent Toolchain"
-  short_description: "Manage verified CodeGraph and RTK project toolchains"
-  default_prompt: "Use $agent-toolchain to inspect, bootstrap, initialize, and maintain the configured CodeGraph and RTK toolchain for this repository."
+  short_description: "Use CodeGraph and RTK for development tasks"
+  default_prompt: "Use $agent-toolchain to analyze this repository with its configured CodeGraph and RTK tools."

@@ -11,7 +11,7 @@
 - 可供 Codex 使用的全局规则与跨平台文档。
 - 可按任务需要使用的 agent role profiles。
 - `agnets-workflow` 插件及其工作流工具。
-- `agent-toolchain` 内置无感的最小实施与只读载荷路由。
+- `agent-toolchain` 提供 CodeGraph 与 RTK 的项目工具使用和受控接入。
 - 独立全局 skill：`project-doc-planner` 与 `gpt-image-2-cli`。
 
 ## 适合什么时候
@@ -20,7 +20,7 @@
 
 ## 成本预期
 
-对于可拆分的复杂任务，工作流可减少高成本推理和重复探索；实际收益取决于任务规模、上下文和重试。对于跨模块理解、大型代码库或重复探索明显的场景，叠加 `agent-toolchain` 可进一步减少重复读取与无效调用；一次性小改动通常不适合为此专门接入。
+对于可拆分的复杂任务，工作流可减少高成本推理和重复探索；实际收益取决于任务规模、上下文和重试。对于跨模块理解、大型代码库或重复探索明显的场景，已接入的 CodeGraph 与 RTK 可辅助查询和筛选；一次性小改动通常不适合为此专门接入。
 
 成本优化不会省略验证；无法安全拆分或证明可恢复时，工作流保持保守执行。
 
@@ -124,7 +124,7 @@ goals = true
 
 | 能力 | 适用场景 | 说明 |
 | --- | --- | --- |
-| [`agent-toolchain`](plugins/agnets-workflow/skills/agent-toolchain/SKILL.md) | 复杂重构、跨模块理解和大范围排障 | 为目标项目接入 CodeGraph 与 RTK，并在复杂任务内部自动选择最小实施、上下文选择和只读载荷路径；用户无需选择模式。 |
+| [`agent-toolchain`](plugins/agnets-workflow/skills/agent-toolchain/SKILL.md) | 复杂重构、跨模块理解和大范围排障 | 使用已接入的 CodeGraph 与 RTK 查询代码关系、压缩只读高输出命令；需要时再受控接入工具链。 |
 | [`workflow-controller`](plugins/agnets-workflow/skills/workflow-controller/SKILL.md) | 需要持久化状态和可恢复交接的复杂任务 | 管理任务状态、就绪节点、checkpoint 与收口检查。 |
 | [`project-doc-planner`](skills/project-doc-planner/SKILL.md) | 新项目或大型改造的文档规划 | 生成和维护项目级文档结构。 |
 | [`gpt-image-2-cli`](skills/gpt-image-2-cli/SKILL.md) | 需要生成或编辑图片素材 | 通过命令行调用图像生成能力。 |

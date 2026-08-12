@@ -1,0 +1,55 @@
+# 接入与安装
+
+仅在用户要求为项目接入 CodeGraph/RTK、首次安装、修复缺失安装或审查升级时读取本文件。日常使用工具时不要读取。
+
+## 先决条件与边界
+
+- 先读取目标项目根 `AGENTS.md`，并确认项目允许写入 `.codex/`、`.gitignore` 和 `AGENTS.md`。
+- 只有本 skill 的 `scripts/agent-toolchain.ps1` 或 `scripts/agent-toolchain.sh` 可以执行接入与安装；不得运行供应商 installer、`codegraph install`、`rtk init`、项目内同名脚本，或 npm 上同名 `rtk` 包。
+- 先运行 `bootstrap --dry-run`，确认预期写入、下载和平台支持，再运行 `--apply`。冲突、摘要校验失败、网络失败或权限不足时保留原始错误并停止；不得覆盖已有配置或猜测替代来源。
+- CodeGraph 和 RTK 的固定版本、官方来源、RTK 平台资产与 SHA-256 都以驱动内置 manifest 为唯一来源。升级只能修改并审查 skill 与两个驱动，不能在目标项目中临时替换版本。
+
+## 接入顺序
+
+1. 运行 `configure`：仅在不存在冲突时写入 CodeGraph MCP 配置、`/.codegraph/` 忽略规则及项目根 `AGENTS.md` 的 AI 工具路由。
+2. 运行 `bootstrap --dry-run`，核对将安装的受管工具。
+3. 运行 `bootstrap --apply`：CodeGraph 使用官方固定 npm 包且禁用安装脚本；RTK 使用固定官方 release，并校验归档与摘要。
+4. 运行 `init-codegraph`：新建索引，或对已有索引执行一次增量同步。
+5. 运行完整 `doctor`，再执行一次与当前任务相关的 CodeGraph 查询或 `codegraph status`。
+
+## 调用驱动
+
+在已安装插件缓存中定位驱动；不要假设开发仓库路径就是运行中的 skill。
+
+macOS/Linux：
+
+```sh
+codex_home="${CODEX_HOME:-$HOME/.codex}"
+driver=$(find "$codex_home/plugins/cache" -type f -path '*/agnets-workflow/*/skills/agent-toolchain/scripts/agent-toolchain.sh' -print 2>/dev/null | sort | tail -n 1)
+[ -n "$driver" ] || { printf '%s\n' '未找到已安装的 agnets-workflow 插件。' >&2; exit 1; }
+"$driver" configure --project "$PWD"
+"$driver" bootstrap --project "$PWD" --dry-run
+"$driver" bootstrap --project "$PWD" --apply
+"$driver" init-codegraph --project "$PWD"
+"$driver" doctor --project "$PWD"
+```
+
+Windows PowerShell 7：
+
+```powershell
+$codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
+$driver = @(Get-ChildItem -Path (Join-Path $codexHome 'plugins/cache/*/agnets-workflow/*/skills/agent-toolchain/scripts/agent-toolchain.ps1') -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime | Select-Object -Last 1 -ExpandProperty FullName)
+if ($driver.Count -ne 1) { throw '未找到已安装的 agnets-workflow 插件。' }
+$driver = $driver[0]
+& $driver configure --project $PWD
+& $driver bootstrap --project $PWD --dry-run
+& $driver bootstrap --project $PWD --apply
+& $driver init-codegraph --project $PWD
+& $driver doctor --project $PWD
+```
+
+## 安装结果
+
+- 项目配置与索引分开：`.codegraph/` 是本地缓存，不提交。
+- CodeGraph MCP 配置生效通常需要新建 Codex task 或重启客户端。
+- `doctor` 通过只证明当前受管工具和索引可用；后续每次实际使用仍须以当前源文件、`rg`、未跟踪文件和刚修改文件复核结果。

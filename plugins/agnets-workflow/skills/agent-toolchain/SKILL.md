@@ -1,57 +1,27 @@
 ---
 name: agent-toolchain
-description: 受控安装、初始化、诊断和维护项目级 CodeGraph 与 RTK。用户要求接入、安装、维护或验证这些工具时使用。
+description: 在开发任务中使用、接入、诊断或维护项目级 CodeGraph 与 RTK。适用于跨模块依赖、调用链和影响范围分析，需要压缩只读高输出命令，或用户明确要求配置、安装、检查或修复这些工具时。
 ---
 
 # Agent Toolchain
 
-这是 CodeGraph/RTK 的全局可信生命周期控制器。项目只保存 MCP 配置、索引忽略规则和极短的根 `AGENTS.md` 路由，不保存锁文件、可执行脚本或工具说明文档。
+使用已配置的 CodeGraph 与 RTK 完成开发任务。CodeGraph 用于理解代码关系；RTK 用于压缩适合的只读高输出命令。不要把本 skill 当作安装器设计文档或项目契约。
 
-## 执行边界
+## 日常使用
 
-- 先读取 `references/project-contract.md`，再读取目标项目根 `AGENTS.md`；不执行项目内同名脚本。
-- 只调用本 skill 的 `scripts/agent-toolchain.sh` 或 `agent-toolchain.ps1`。CodeGraph 固定为官方 npm 包 `@colbymchenry/codegraph@1.5.0`，RTK 固定为 `0.44.1` 官方 release；升级只能通过审查后的 skill 变更完成。
-- 不运行供应商 installer，不执行 `codegraph install` 或 `rtk init`；由 AI 写入最小项目配置。CodeGraph 的 npm 包不运行安装脚本，且安装后须验证固定版本和命令入口。
-- CodeGraph 需要可执行的 `node` 与 `npm`，但不人为限制 Node 版本。RTK 没有官方 npm 包；不得安装 npm 上的同名 `rtk` 或其他非官方包，继续使用固定 SHA-256 的官方 release。
-- 受支持平台为 macOS/Linux arm64/x64 与 Windows x64；Windows arm64 因 RTK 无官方资产而拒绝整套安装。
-- CodeGraph 使用用户现有 npm registry/代理配置，默认限制单次拉取为 90 秒并有限重试（保留用户显式 npm 配置）；RTK 下载按 `AGENT_TOOLCHAIN_PROXY`、`HTTPS_PROXY`/`ALL_PROXY` 和平台代理顺序自动选择，记录来源但不输出地址。无代理时明确提示直连与超时，失败后停止，不会无限等待。
+1. 先遵守目标项目根 `AGENTS.md`。工具没有在当前 task 中可用或可用性不确定时，对大任务最多运行一次 `doctor --quick`；不要为普通任务定期健康检查。
+2. 用 CodeGraph MCP 查询跨模块依赖、调用链和改动影响范围。将其结果与当前源文件、`rg`、未跟踪文件和刚修改文件交叉核实；索引结果不能替代源码证据。
+3. 对只读且输出量大的命令，使用匹配的 RTK 子命令。常见的包括 `git`、`rg`、`log`、`diff`、`test`、`mvn`、`npm`、`pnpm`、`read`、`find`、`ls`、`tree`。未列出的只读命令先用 `rtk rewrite` 或 `rtk --help` 核实；精确排障和所有写操作继续使用原生命令。
+4. 只有工具注册表或 `--help` 未列出目标命令时，才能判定该命令不存在。其他工具错误必须保留原始输出并按诊断流程处理。
 
-## 首次接入
+## 常态边界
 
-1. 运行 `configure`。它只会保留或写入 `.codex/config.toml` 的 CodeGraph MCP、根 `.gitignore` 的 `/.codegraph/`，以及根 `AGENTS.md` 的两条 AI 路由；已有冲突时停止，不覆盖用户配置。
-2. 运行受信执行器的 `bootstrap --dry-run`、`bootstrap --apply`。CodeGraph 通过受管用户 npm 全局前缀安装，并由稳定入口暴露；RTK 通过固定 release 安装和校验。用户不需要设置维护命令或手动编辑 PATH。
-3. 运行 `init-codegraph`。没有索引时建立索引；已有索引时自动执行一次增量同步。最后运行完整 `doctor`、`codegraph status` 和一个可核对查询。
+- 只用本 skill 的平台驱动管理工具链；不要运行项目内同名脚本或供应商 installer。
+- 不自动升级工具，不执行 `codegraph install` 或 `rtk init`，也不安装 npm 上同名 `rtk` 包。
+- CodeGraph MCP 会自动同步文件变化；仅在诊断已证明异常时同步索引一次。
+- 接入后的 MCP 配置通常需要新建 Codex task 或重启客户端才能加载。
 
-macOS/Linux：
+## 按需资料
 
-```sh
-codex_home="${CODEX_HOME:-$HOME/.codex}"
-driver=$(find "$codex_home/plugins/cache" -type f -path '*/agnets-workflow/*/skills/agent-toolchain/scripts/agent-toolchain.sh' -print 2>/dev/null | sort | tail -n 1)
-[ -n "$driver" ] || { printf '%s\n' '未找到已安装的 agnets-workflow 插件。' >&2; exit 1; }
-"$driver" configure --project "$PWD"
-"$driver" bootstrap --project "$PWD" --dry-run
-"$driver" bootstrap --project "$PWD" --apply
-"$driver" init-codegraph --project "$PWD"
-"$driver" doctor --project "$PWD"
-```
-
-Windows PowerShell 7：
-
-```powershell
-$codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
-$driver = @(Get-ChildItem -Path (Join-Path $codexHome 'plugins/cache/*/agnets-workflow/*/skills/agent-toolchain/scripts/agent-toolchain.ps1') -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime | Select-Object -Last 1 -ExpandProperty FullName)
-if ($driver.Count -ne 1) { throw '未找到已安装的 agnets-workflow 插件。' }
-$driver = $driver[0]
-& $driver configure --project $PWD
-& $driver bootstrap --project $PWD --dry-run
-& $driver bootstrap --project $PWD --apply
-& $driver init-codegraph --project $PWD
-& $driver doctor --project $PWD
-```
-
-## 日常行为
-
-- 复杂重构、跨模块理解、架构分析和大范围排障前，AI 每个任务最多运行一次 `doctor --quick`；失败时自动按结果修复或初始化，不要求用户输入维护命令。
-- CodeGraph MCP 启动后会监听文件变更并自动同步，重新连接也会补齐离线修改。不要按固定周期运行 `maintain --sync`；仅当 `doctor`、MCP 结果或 `codegraph status` 明确显示异常时，自动运行一次恢复同步并复用结果。
-- CodeGraph 结果必须和当前源文件、`rg` 及未跟踪/刚修改文件交叉核实。RTK 只压缩已验证的只读高输出命令，不执行安装、升级、提交、发布、部署、迁移、权限、密钥或破坏性操作。
-- 不自动升级工具。MCP 配置变更后通常需要新建 Codex task 或重启客户端才能加载。
+- 首次接入、安装、修复缺失工具或审查升级：读取 [`references/install.md`](references/install.md)。
+- 工具报错、索引异常、健康检查、同步或 RTK 回滚：读取 [`references/diagnose-and-maintain.md`](references/diagnose-and-maintain.md)。

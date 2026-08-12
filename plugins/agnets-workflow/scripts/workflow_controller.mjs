@@ -4,9 +4,6 @@ import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { deleteTaskState, readTaskState, taskStateExists, writeTaskState } from './sqlite_task_store.mjs';
-import { decideEfficiency, EFFICIENCY_CONTEXT_FIELDS, POLICY_VERSION, PolicyError, resolveEfficiencyContext } from '../skills/agent-toolchain/scripts/efficiency-router.mjs';
-import { transformCavemanPayload } from '../skills/agent-toolchain/scripts/caveman-manager.mjs';
-import { verifiedPonytailMinimalLadderReference } from '../skills/agent-toolchain/scripts/ponytail-policy.mjs';
 
 export const VERSION = 1;
 const PENDING = 'pending';
@@ -53,20 +50,6 @@ const READ_ONLY_FALLBACK_ROLES = new Map([
 const READ_ONLY_FALLBACK_ROLE_SET = new Set([...READ_ONLY_FALLBACK_ROLES.values(), FALLBACK_ROLE]);
 const PROTECTED_EXECUTOR_ROLE = 'avsp_terra_high';
 const ROUTING_FIELDS = ['execution_risk', 'routing_reason', 'execution_owner', 'integration_owner', 'quality_guard'];
-const EFFICIENCY_POLICY_FIELDS = new Set([
-  'schema_version', 'policy_version', 'decision_id', 'task_id', 'node_id', 'workflow_snapshot',
-  'input_digest', 'implementation_scope', 'implementation_reference', 'presentation', 'context_selection',
-  'payload_delivery', 'reason_codes', 'preserve_fields', 'lineage',
-]);
-const EFFICIENCY_LINEAGE_FIELDS = new Set(['source_ref', 'source_digest', 'state', 'transform_count']);
-const EFFICIENCY_IMPLEMENTATION_SCOPES = new Set(['standard', 'minimal_ladder']);
-const PONYTAIL_IMPLEMENTATION_REFERENCE_FIELDS = new Set(['id', 'upstream_commit', 'upstream_skill_sha256', 'rules_sha256', 'license']);
-const EFFICIENCY_PRESENTATIONS = new Set(['normal', 'tight_lite']);
-const EFFICIENCY_CONTEXT_SELECTIONS = new Set(['raw', 'codegraph']);
-const EFFICIENCY_PAYLOAD_DELIVERIES = new Set(['raw', 'rtk', 'caveman_local']);
-const EFFICIENCY_LINEAGE_STATES = new Set(['raw', 'selected', 'compressed']);
-const EFFICIENCY_CONTEXT_DERIVED_FIELDS = new Set(['task_id', 'node_id', 'workflow_snapshot']);
-const EFFICIENCY_MANIFEST_CONTEXT_FIELDS = new Set(EFFICIENCY_CONTEXT_FIELDS.filter(field => !EFFICIENCY_CONTEXT_DERIVED_FIELDS.has(field)));
 const IGNORED_DIRECTORIES = new Set(['.git', '.codex', 'node_modules', '.venv']);
 const WORKSPACE_LEASE_AUTHORITY_FILENAME = '.codex-workflow-controller-authority.json';
 const WORKSPACE_LEASE_PUBLICATION_SUFFIX = '.publication.json';
@@ -1592,144 +1575,6 @@ function workflowSnapshot(state) {
   return workflowSnapshotFor(state, { digestAlgorithm: 'sha256-stable-json-v2', includeAssurance: true, excludeAllReviews: true });
 }
 
-function efficiencyPolicySnapshot(state, node) {
-  const material = {
-    task_id: state.task_id,
-    goal: state.goal,
-    requirements: [...state.requirements].sort((left, right) => left.id.localeCompare(right.id)),
-    scope: state.scope,
-    non_goals: state.non_goals,
-    assurance_level: state.assurance_level,
-    assurance_assessment: state.assurance_assessment,
-    workspace_claims: state.workspace_claims,
-    node: {
-      id: node.id,
-      kind: node.kind,
-      agent_type: node.agent_type,
-      depends_on: [...node.depends_on].sort(),
-      execution_risk: node.execution_risk,
-      routing_reason: node.routing_reason,
-      execution_owner: node.execution_owner,
-      integration_owner: node.integration_owner,
-      quality_guard: node.quality_guard,
-    },
-  };
-  return {
-    digest_algorithm: 'sha256-stable-json-policy-v1',
-    digest: createHash('sha256').update(stableJson(material)).digest('hex'),
-  };
-}
-
-function efficiencyPolicyMatchesState(state, node) {
-  if (node.efficiency_policy === null) return true;
-  if (!sameJson(node.efficiency_policy.workflow_snapshot, efficiencyPolicySnapshot(state, node))) return false;
-  const generated = normalizeEfficiencyContext(node.efficiency_context, state.task_id, node.id).policy;
-  const recorded = { ...node.efficiency_policy, workflow_snapshot: null };
-  return sameJson(recorded, generated);
-}
-
-function recomputeEfficiencyPolicy(state, node) {
-  if (node.efficiency_context === null) {
-    node.efficiency_policy = null;
-    return;
-  }
-  const generated = normalizeEfficiencyContext(node.efficiency_context, state.task_id, node.id).policy;
-  generated.workflow_snapshot = efficiencyPolicySnapshot(state, node);
-  node.efficiency_policy = generated;
-}
-
-function transformedEfficiencyContext(context, receipt) {
-  return {
-    ...context,
-    lineage_state: 'compressed',
-    source_ref: receipt.source_ref,
-    source_digest: receipt.source_digest,
-    payload_ref: receipt.transformed_ref,
-    payload_digest: receipt.transformed_digest,
-  };
-}
-
-async function prepareEfficiencyArtifactDirectory(stateDir, taskId) {
-  const root = await canonicalStateDirectory(stateDir, 'efficiency artifact state_dir');
-  const rootMetadata = await fs.lstat(root, { bigint: true });
-  if (rootMetadata.isSymbolicLink() || !rootMetadata.isDirectory()) throw new ControllerError(`Efficiency artifact state directory is unsafe: ${root}`);
-  const rootRealPath = await fs.realpath(root);
-  let current = root;
-  for (const segment of [REVIEW_ARTIFACT_DIRECTORY, taskId]) {
-    current = path.join(current, segment);
-    try { await fs.mkdir(current); } catch (error) { if (error.code !== 'EEXIST') throw error; }
-    const metadata = await fs.lstat(current, { bigint: true });
-    if (metadata.isSymbolicLink() || !metadata.isDirectory()) throw new ControllerError(`Efficiency artifact directory is unsafe: ${current}`);
-    if (!pathIsWithinPhysicalRoot(rootRealPath, await fs.realpath(current))) throw new ControllerError(`Efficiency artifact directory escapes the state directory: ${current}`);
-  }
-  return current;
-}
-
-function disableCavemanForNode(state, node, reason) {
-  node.efficiency_context = {
-    ...node.efficiency_context,
-    adapter_state: 'unavailable',
-    adapter_attestation_id: null,
-    adapter_version: null,
-    adapter_digest: null,
-    adapter_license: null,
-    adapter_endpoint_identity: null,
-  };
-  recomputeEfficiencyPolicy(state, node);
-  if (node.efficiency_policy.payload_delivery !== 'raw') throw new ControllerError('Unable to disable an unavailable Caveman optimization');
-  addEvent(state, 'efficiency_transform_unavailable', { node_id: node.id, adapter: 'caveman-engine', reason });
-}
-
-async function applyAutomaticCavemanTransform(state, node, stateDir) {
-  const policy = node.efficiency_policy;
-  const context = node.efficiency_context;
-  if (!policy || policy.payload_delivery !== 'caveman_local' || policy.lineage.state !== 'raw') return null;
-  if (!context?.payload_ref || !context.payload_digest) throw new ControllerError('Caveman policy is missing a source payload reference');
-  const outputDirectory = await prepareEfficiencyArtifactDirectory(stateDir, state.task_id);
-  const outputPath = path.join(outputDirectory, `${node.id}-${policy.decision_id.slice('sha256:'.length, 'sha256:'.length + 16)}.caveman`);
-  let transformed;
-  try {
-    transformed = await transformCavemanPayload({
-      sourcePath: context.payload_ref,
-      outputPath,
-      expectedSourceDigest: context.payload_digest,
-    });
-  } catch (error) {
-    disableCavemanForNode(state, node, error.message);
-    return { status: 'raw', reason: error.message };
-  }
-  if (transformed.status !== 'transformed') {
-    disableCavemanForNode(state, node, transformed.reason ?? 'not_net_positive');
-    addEvent(state, 'efficiency_transform_not_selected', { node_id: node.id, adapter: 'caveman-engine', reason: transformed.reason ?? 'not_net_positive', source_digest: transformed.source_digest });
-    return { status: 'raw', reason: transformed.reason ?? 'not_net_positive' };
-  }
-  if (transformed.adapter_attestation_id !== context.adapter_attestation_id || transformed.source_ref !== context.payload_ref || transformed.source_digest !== context.payload_digest) {
-    throw new ControllerError('Automatic Caveman transform does not bind the node policy payload');
-  }
-  node.efficiency_context = transformedEfficiencyContext(context, transformed);
-  recomputeEfficiencyPolicy(state, node);
-  if (node.efficiency_policy.payload_delivery !== 'raw' || node.efficiency_policy.lineage.state !== 'compressed') {
-    throw new ControllerError('Automatic Caveman transform did not close the payload lineage');
-  }
-  addEvent(state, 'efficiency_transform_recorded', {
-    node_id: node.id, adapter: transformed.adapter,
-    source_digest: transformed.source_digest, transformed_digest: transformed.transformed_digest,
-    recovery_handle: transformed.recovery_handle,
-  });
-  return { status: 'transformed', payload_ref: transformed.transformed_ref, payload_digest: transformed.transformed_digest };
-}
-
-function nodeInputArtifact(node) {
-  const context = node?.efficiency_context;
-  if (!context?.payload_ref || !context?.payload_digest) return null;
-  return {
-    ref: context.payload_ref,
-    digest: context.payload_digest,
-    recoverable: context.recoverable === true,
-    replayable: context.replayable === true,
-  };
-}
-
 function workflowSnapshotMatchesState(recorded, state) {
   if (!recorded || typeof recorded !== 'object' || Array.isArray(recorded)) return false;
   if (recorded.digest_algorithm === 'sha256-stable-json-v2') return sameJson(recorded, workflowSnapshot(state));
@@ -1800,74 +1645,6 @@ function validateV2AgentType(kind, executionRisk, agentType) {
   validateV1AgentType(kind, executionRisk, agentType);
 }
 
-function normalizeEfficiencyPolicy(raw, expectedTaskId, expectedNodeId) {
-  if (raw === undefined || raw === null) return null;
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new ControllerError('efficiency_policy must be an object or null');
-  const keys = Object.keys(raw);
-  if (keys.length !== EFFICIENCY_POLICY_FIELDS.size || keys.some(key => !EFFICIENCY_POLICY_FIELDS.has(key))) {
-    throw new ControllerError('efficiency_policy must contain the exact policy envelope fields');
-  }
-  if (raw.schema_version !== 1) throw new ControllerError('efficiency_policy.schema_version must be 1');
-  requiredString(raw.policy_version, 'efficiency_policy.policy_version');
-  if (!/^sha256:[0-9a-f]{64}$/.test(requiredString(raw.decision_id, 'efficiency_policy.decision_id'))) throw new ControllerError('efficiency_policy.decision_id must be a sha256 digest');
-  if (!/^sha256:[0-9a-f]{64}$/.test(requiredString(raw.input_digest, 'efficiency_policy.input_digest'))) throw new ControllerError('efficiency_policy.input_digest must be a sha256 digest');
-  if (raw.task_id !== expectedTaskId) throw new ControllerError('efficiency_policy.task_id must match the manifest task_id');
-  if (raw.node_id !== expectedNodeId) throw new ControllerError('efficiency_policy.node_id must match the node id');
-  if (raw.workflow_snapshot !== null) throw new ControllerError('A manifest efficiency_policy.workflow_snapshot must be null until controller initialization');
-  if (!EFFICIENCY_IMPLEMENTATION_SCOPES.has(raw.implementation_scope)) throw new ControllerError('efficiency_policy.implementation_scope is invalid');
-  if (raw.implementation_scope === 'minimal_ladder') {
-    if (!raw.implementation_reference || typeof raw.implementation_reference !== 'object' || Array.isArray(raw.implementation_reference)) throw new ControllerError('minimal_ladder requires a managed implementation_reference');
-    const referenceKeys = Object.keys(raw.implementation_reference);
-    if (referenceKeys.length !== PONYTAIL_IMPLEMENTATION_REFERENCE_FIELDS.size || referenceKeys.some(key => !PONYTAIL_IMPLEMENTATION_REFERENCE_FIELDS.has(key))) throw new ControllerError('implementation_reference must contain exact managed Ponytail reference fields');
-    if (!sameJson(raw.implementation_reference, verifiedPonytailMinimalLadderReference())) throw new ControllerError('implementation_reference does not match the managed Ponytail reference');
-  } else if (raw.implementation_reference !== null) {
-    throw new ControllerError('standard implementation_scope must not carry implementation_reference');
-  }
-  if (!EFFICIENCY_PRESENTATIONS.has(raw.presentation)) throw new ControllerError('efficiency_policy.presentation is invalid');
-  if (!EFFICIENCY_CONTEXT_SELECTIONS.has(raw.context_selection)) throw new ControllerError('efficiency_policy.context_selection is invalid');
-  if (!EFFICIENCY_PAYLOAD_DELIVERIES.has(raw.payload_delivery)) throw new ControllerError('efficiency_policy.payload_delivery is invalid');
-  if (!Array.isArray(raw.reason_codes) || raw.reason_codes.some(value => typeof value !== 'string' || !value.trim())) throw new ControllerError('efficiency_policy.reason_codes must contain non-empty strings');
-  if (!Array.isArray(raw.preserve_fields) || raw.preserve_fields.some(value => typeof value !== 'string' || !value.trim())) throw new ControllerError('efficiency_policy.preserve_fields must contain non-empty strings');
-  if (!raw.lineage || typeof raw.lineage !== 'object' || Array.isArray(raw.lineage)) throw new ControllerError('efficiency_policy.lineage must be an object');
-  const lineageKeys = Object.keys(raw.lineage);
-  if (lineageKeys.length !== EFFICIENCY_LINEAGE_FIELDS.size || lineageKeys.some(key => !EFFICIENCY_LINEAGE_FIELDS.has(key))) throw new ControllerError('efficiency_policy.lineage must contain exact fields');
-  if (!EFFICIENCY_LINEAGE_STATES.has(raw.lineage.state)) throw new ControllerError('efficiency_policy.lineage.state is invalid');
-  const expectedTransformCount = raw.lineage.state === 'raw' ? 0 : 1;
-  if (raw.lineage.transform_count !== expectedTransformCount) throw new ControllerError('efficiency_policy.lineage.transform_count does not match lineage state');
-  for (const field of ['source_ref', 'source_digest']) {
-    if (raw.lineage[field] !== null && (typeof raw.lineage[field] !== 'string' || !raw.lineage[field].trim())) throw new ControllerError(`efficiency_policy.lineage.${field} must be null or a non-empty string`);
-  }
-  if (raw.lineage.source_digest !== null && !/^sha256:[0-9a-f]{64}$/.test(raw.lineage.source_digest)) throw new ControllerError('efficiency_policy.lineage.source_digest must be a sha256 digest');
-  if (raw.lineage.state !== 'raw' && (!raw.lineage.source_ref || !raw.lineage.source_digest)) throw new ControllerError('A transformed efficiency_policy lineage requires source_ref and source_digest');
-  if (raw.implementation_scope === 'minimal_ladder' && raw.presentation !== 'normal') throw new ControllerError('minimal_ladder cannot be combined with presentation compaction in a node policy');
-  if (raw.context_selection !== 'raw' && raw.payload_delivery !== 'raw') throw new ControllerError('A policy cannot select context and transform the same payload twice');
-  return structuredClone(raw);
-}
-
-function normalizeEfficiencyContext(raw, expectedTaskId, expectedNodeId, { requireAutomaticDiscovery = false } = {}) {
-  if (raw === undefined || raw === null) return { context: null, policy: null };
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new ControllerError('efficiency_context must be an object or null');
-  const keys = Object.keys(raw);
-  if (keys.length !== EFFICIENCY_MANIFEST_CONTEXT_FIELDS.size || keys.some(key => !EFFICIENCY_MANIFEST_CONTEXT_FIELDS.has(key))) {
-    throw new ControllerError('efficiency_context must contain the exact abstract context fields; task_id, node_id, and workflow_snapshot are controller-owned');
-  }
-  if (requireAutomaticDiscovery && (raw.provider_path !== 'auto' || raw.endpoint_scope !== 'auto' || raw.adapter_state !== 'auto')) {
-    throw new ControllerError('New efficiency_context must delegate provider, endpoint, and adapter discovery to the managed controller');
-  }
-  let resolved;
-  try {
-    resolved = resolveEfficiencyContext({ ...raw, task_id: expectedTaskId, node_id: expectedNodeId, workflow_snapshot: null });
-    const { task_id, node_id, workflow_snapshot, ...context } = resolved;
-    return {
-      context,
-      policy: decideEfficiency(resolved),
-    };
-  } catch (error) {
-    if (error instanceof PolicyError) throw new ControllerError(`Invalid efficiency_context (${error.code}): ${error.message}`);
-    throw error;
-  }
-}
-
 function nodeRecord(raw, options = {}) {
   if (!raw || typeof raw !== 'object') throw new ControllerError('Each node must be an object');
   const id = requiredIdentifier(raw.id, 'node.id'); const kind = requiredString(raw.kind, 'node.kind');
@@ -1882,9 +1659,7 @@ function nodeRecord(raw, options = {}) {
   const agentType = raw.agent_type ?? defaultAgentType;
   if (options.routingSchemaVersion === 1) validateV1AgentType(kind, routing.execution_risk, agentType);
   if (options.routingSchemaVersion === 2) validateV2AgentType(kind, routing.execution_risk, agentType);
-  if (hasOwn(raw, 'efficiency_policy')) throw new ControllerError('efficiency_policy is controller-generated; provide only efficiency_context');
-  const efficiency = options.expectedTaskId ? normalizeEfficiencyContext(raw.efficiency_context, options.expectedTaskId, id, { requireAutomaticDiscovery: true }) : { context: null, policy: null };
-  return { id, kind, review_stage: isV2QualityReview ? 'terra' : kind === 'total_review' ? 'sol' : null, agent_type: agentType, depends_on: dependencies, ...routing, efficiency_context: efficiency.context, efficiency_policy: efficiency.policy, rescue_role: null, rescue_reason: null, rescued_at: null, rescue_count: 0, status: PENDING, agent_task_path: null, agent_thread_id: null, agent_role: null, claim_id: null, claimed_at: null, activation_at: null, activation_deadline_at: null, heartbeat_at: null, heartbeat_count: 0, lease_duration_sec: null, attempt: 0, attempt_budget_used: 0, unavailable_attempts: 0, result: null, checkpoint: null, checkpoint_at: null, workflow_completion_intent: null, recovery_history: [] };
+  return { id, kind, review_stage: isV2QualityReview ? 'terra' : kind === 'total_review' ? 'sol' : null, agent_type: agentType, depends_on: dependencies, ...routing, rescue_role: null, rescue_reason: null, rescued_at: null, rescue_count: 0, status: PENDING, agent_task_path: null, agent_thread_id: null, agent_role: null, claim_id: null, claimed_at: null, activation_at: null, activation_deadline_at: null, heartbeat_at: null, heartbeat_count: 0, lease_duration_sec: null, attempt: 0, attempt_budget_used: 0, unavailable_attempts: 0, result: null, checkpoint: null, checkpoint_at: null, workflow_completion_intent: null, recovery_history: [] };
 }
 
 function normalizeState(state) {
@@ -1918,27 +1693,6 @@ function normalizeState(state) {
       throw new ControllerError(`Task node has invalid attempt accounting: ${nodeId}`);
     }
     node.checkpoint ??= null; node.checkpoint_at ??= null; node.recovery_history ??= []; node.workflow_completion_intent ??= null;
-    node.efficiency_context ??= null;
-    node.efficiency_policy ??= null;
-    if (node.efficiency_context !== null) {
-      const generated = normalizeEfficiencyContext(node.efficiency_context, state.task_id, nodeId);
-      if (node.efficiency_policy === null) throw new ControllerError(`Task node with efficiency_context is missing controller-generated efficiency_policy: ${nodeId}`);
-      const recordedSnapshot = node.efficiency_policy.workflow_snapshot ?? null;
-      const priorPolicy = node.efficiency_policy;
-      // Older policies did not carry the bundled Ponytail reference. Preserve
-      // readability only until the claim boundary recomputes this old version.
-      const legacyReference = !hasOwn(priorPolicy, 'implementation_reference') && priorPolicy.policy_version !== POLICY_VERSION
-        ? generated.policy.implementation_reference
-        : undefined;
-      const normalizedStored = normalizeEfficiencyPolicy({ ...priorPolicy, ...(legacyReference === undefined ? {} : { implementation_reference: legacyReference }), workflow_snapshot: null }, state.task_id, nodeId);
-      // Keep an older policy readable. The claim/rebind boundary compares it
-      // with the current router output and records a deterministic recompute.
-      normalizedStored.workflow_snapshot = recordedSnapshot;
-      node.efficiency_policy = normalizedStored;
-    } else if (node.efficiency_policy !== null) {
-      throw new ControllerError(`Task node efficiency_policy requires efficiency_context: ${nodeId}`);
-    }
-    if (node.efficiency_policy !== null && node.efficiency_policy.workflow_snapshot !== null && (typeof node.efficiency_policy.workflow_snapshot !== 'object' || Array.isArray(node.efficiency_policy.workflow_snapshot))) throw new ControllerError(`Task node has invalid efficiency_policy.workflow_snapshot: ${nodeId}`);
     node.rescue_role ??= null; node.rescue_reason ??= null; node.rescued_at ??= null; node.rescue_count ??= 0;
     node.review_stage ??= state.routing_schema_version === 2 && node.kind === QUALITY_REVIEW_KIND ? 'terra' : node.kind === 'total_review' ? 'sol' : null;
     if (!hasOwn(node, 'execution_risk')) Object.assign(node, nodeRouting(node, false));
@@ -1978,16 +1732,11 @@ async function makeState(manifest) {
   }
   validateNodes(nodes);
   validateReviewTopology(nodes, assuranceLevel);
-  for (const node of Object.values(nodes)) {
-    if (isReviewNode(node, routingSchemaVersion) && (node.efficiency_context !== null || node.efficiency_policy !== null)) throw new ControllerError('Review nodes must not carry efficiency_context or efficiency_policy');
-    if (node.efficiency_policy?.implementation_scope === 'minimal_ladder' && node.execution_risk !== 'delegable') throw new ControllerError('minimal_ladder requires a delegable executor node');
-  }
   if (hasOwn(manifest, 'workspace_claims') && Object.values(nodes).some(node => !isReviewNode(node, routingSchemaVersion) && node.execution_risk !== 'read_only') && !workspaceClaims.some(claim => claim.mode === 'write')) {
     throw new ControllerError('workspace_claims requires at least one write claim for non-read-only work');
   }
   const created = utcNow();
   const state = { version: VERSION, routing_schema_version: routingSchemaVersion || null, assurance_level: assuranceLevel, assurance_assessment: assuranceAssessmentValue, task_id: taskId, workspace, workspace_claims: workspaceClaims, goal, requirements, scope: manifest.scope ?? [], non_goals: manifest.non_goals ?? [], nodes, participants: [], reviews: [], repair_records: [], max_review_charter: null, verification_record: null, verification_history: [], events: [{ at: created, type: 'task_initialized', workflow_revision: 0 }], workflow_revision: 0, closed_revision: null, closed_at: null, created_at: created, updated_at: created };
-  for (const node of Object.values(nodes)) recomputeEfficiencyPolicy(state, node);
   return state;
 }
 
@@ -2577,10 +2326,6 @@ async function rebindPendingOwner(parameters) {
     const replacement = replacementExecutionOwner(state, node, parameters);
     if (replacement === node.execution_owner) throw new ControllerError('replacement_agent_task_path must differ from the current execution_owner');
     const priorExecutionOwner = rebindExecutionOwner(node, replacement);
-    if (node.efficiency_policy) {
-      recomputeEfficiencyPolicy(state, node);
-      addEvent(state, 'efficiency_policy_recomputed', { node_id: nodeId, reason: 'execution_owner_changed', decision_id: node.efficiency_policy.decision_id });
-    }
     bumpWorkflowRevision(state, 'pending_owner_rebound', { node_id: nodeId, prior_execution_owner: priorExecutionOwner, replacement_execution_owner: replacement, reason, previous_agent_stopped: true });
     await writeState(filePath, state);
     return { task_id: state.task_id, node, ready_nodes: readyNodes(state) };
@@ -2633,11 +2378,6 @@ async function claimNode(parameters, activateImmediately = false) {
   return withActiveWorkspaceStateLock(filePath, async state => {
     const node = state.nodes[nodeId];
     if (!node || !readyNodes(state).some(candidate => candidate.id === nodeId)) throw new ControllerError(`Node is not ready: ${nodeId}`);
-    if (!efficiencyPolicyMatchesState(state, node)) {
-      const policyVersionChanged = node.efficiency_policy?.policy_version !== POLICY_VERSION;
-      recomputeEfficiencyPolicy(state, node);
-      addEvent(state, 'efficiency_policy_recomputed', { node_id: nodeId, reason: policyVersionChanged ? 'efficiency_policy_version_changed' : 'workflow_snapshot_changed', decision_id: node.efficiency_policy?.decision_id ?? null });
-    }
     if (runningParticipantPaths(state).has(taskPath)) throw new ControllerError('Agent already has a running node in this task');
     const reviewNode = isReviewNode(node, state.routing_schema_version);
     if (reviewNode && participantPaths(state).has(taskPath)) {
@@ -2673,14 +2413,13 @@ async function claimNode(parameters, activateImmediately = false) {
       charter.active_closure_claim_id = null;
     }
     nodeAttemptAvailability(node, nodeId);
-    await applyAutomaticCavemanTransform(state, node, parameters.state_dir);
     const now = utcNow(); node.status = RUNNING; node.agent_task_path = taskPath; node.agent_thread_id = threadId; node.agent_role = role; node.claim_id = randomUUID(); node.claimed_at = now; node.activation_at = activateImmediately ? now : null; node.activation_deadline_at = activateImmediately ? null : new Date(Date.now() + activationTimeoutSec * 1000).toISOString(); node.heartbeat_at = now; node.heartbeat_count = activateImmediately ? 1 : 0; node.lease_duration_sec = leaseDurationSec; node.attempt += 1; node.attempt_budget_used += 1;
     if (isMaxReviewNode(node)) state.max_review_charter.active_closure_claim_id = node.claim_id;
     state.participants.push({ agent_task_path: taskPath, agent_thread_id: threadId, agent_role: role, node_id: nodeId, claim_id: node.claim_id, attempt: node.attempt, fallback_reason: fallbackReason });
     addEvent(state, 'node_claimed', { node_id: nodeId, agent_task_path: taskPath, agent_thread_id: threadId, agent_role: role, claim_id: node.claim_id, attempt: node.attempt, fallback_reason: fallbackReason });
     if (activateImmediately) addEvent(state, 'node_started', { node_id: nodeId, agent_task_path: taskPath, agent_thread_id: threadId, agent_role: role, claim_id: node.claim_id, native_agent_started: true });
     await writeState(filePath, state);
-    return { task_id: state.task_id, node, input_artifact: nodeInputArtifact(node) };
+    return { task_id: state.task_id, node };
   });
 }
 
@@ -3132,7 +2871,6 @@ async function requeueStaleNode(parameters) {
     if (!stale) throw new ControllerError(`Node is not stale for its active claim: ${nodeId}`);
     nodeAttemptAvailability(node, nodeId);
     const replacement = replacementExecutionOwner(state, node, parameters); const priorExecutionOwner = rebindExecutionOwner(node, replacement);
-    recomputeEfficiencyPolicy(state, node);
     const packet = recoveryPacket(state, node, stale, reason, priorExecutionOwner);
     node.recovery_history.push({ at: utcNow(), ...packet.previous_attempt });
     if (node.recovery_history.length > MAX_TOTAL_NODE_ATTEMPTS) node.recovery_history.splice(0, node.recovery_history.length - MAX_TOTAL_NODE_ATTEMPTS);
@@ -3155,7 +2893,6 @@ async function rescueNode(parameters) {
     nodeAttemptAvailability(node, nodeId);
     const replacement = replacementExecutionOwner(state, node, parameters);
     const priorExecutionOwner = rebindExecutionOwner(node, replacement);
-    recomputeEfficiencyPolicy(state, node);
     const now = utcNow();
     const stale = staleNodes(state).find(candidate => candidate.id === nodeId && candidate.claim_id === claimId) ?? { reason: 'explicit_root_rescue' };
     const packet = recoveryPacket(state, node, stale, reason, priorExecutionOwner);
@@ -3195,7 +2932,6 @@ async function retryNode(parameters) {
     nodeAttemptAvailability(node, nodeId);
     if (state.routing_schema_version === 2 && reviewNode && !hasOwn(parameters, 'replacement_agent_task_path')) throw new ControllerError('A retried review node requires replacement_agent_task_path for an independent reviewer');
     const replacement = node.routing_legacy ? null : replacementExecutionOwner(state, node, parameters); const priorExecutionOwner = replacement ? rebindExecutionOwner(node, replacement) : node.execution_owner;
-    if (replacement) recomputeEfficiencyPolicy(state, node);
     const priorClaimId = node.claim_id; const wasTotalReview = node.kind === 'total_review'; const priorReviewRole = reviewNode ? node.agent_type : null; const nextReview = reviewNode ? nextReviewRoute(state, node) : null;
     if (isMaxReviewNode(node)) {
       const charter = requireMaxReviewCharter(state, node);
@@ -3245,15 +2981,15 @@ async function retryNode(parameters) {
 }
 
 const PRUNABLE_STATE_FIELDS = new Set(['version', 'routing_schema_version', 'assurance_level', 'assurance_assessment', 'task_id', 'workspace', 'workspace_claims', 'goal', 'requirements', 'scope', 'non_goals', 'nodes', 'participants', 'reviews', 'repair_records', 'max_review_charter', 'verification_record', 'verification_history', 'events', 'workflow_revision', 'closed_revision', 'closed_at', 'created_at', 'updated_at', 'workspace_lease']);
-const PRUNABLE_NODE_FIELDS = new Set(['id', 'kind', 'review_stage', 'agent_type', 'depends_on', 'execution_risk', 'routing_reason', 'execution_owner', 'integration_owner', 'quality_guard', 'routing_legacy', 'efficiency_context', 'efficiency_policy', 'rescue_role', 'rescue_reason', 'rescued_at', 'rescue_count', 'status', 'agent_task_path', 'agent_thread_id', 'agent_role', 'claim_id', 'claimed_at', 'activation_at', 'activation_deadline_at', 'heartbeat_at', 'heartbeat_count', 'lease_duration_sec', 'attempt', 'attempt_budget_used', 'unavailable_attempts', 'result', 'checkpoint', 'checkpoint_at', 'workflow_completion_intent', 'recovery_history']);
+const PRUNABLE_NODE_FIELDS = new Set(['id', 'kind', 'review_stage', 'agent_type', 'depends_on', 'execution_risk', 'routing_reason', 'execution_owner', 'integration_owner', 'quality_guard', 'routing_legacy', 'rescue_role', 'rescue_reason', 'rescued_at', 'rescue_count', 'status', 'agent_task_path', 'agent_thread_id', 'agent_role', 'claim_id', 'claimed_at', 'activation_at', 'activation_deadline_at', 'heartbeat_at', 'heartbeat_count', 'lease_duration_sec', 'attempt', 'attempt_budget_used', 'unavailable_attempts', 'result', 'checkpoint', 'checkpoint_at', 'workflow_completion_intent', 'recovery_history']);
 const LEGACY_V1_PRUNABLE_STATE_FIELDS = new Set([...PRUNABLE_STATE_FIELDS].filter(field => !['assurance_level', 'assurance_assessment', 'repair_records', 'max_review_charter', 'verification_record', 'verification_history'].includes(field)));
 const LEGACY_V1_NULL_MAX_CHARTER_PRUNABLE_STATE_FIELDS = new Set([...LEGACY_V1_PRUNABLE_STATE_FIELDS, 'max_review_charter']);
 const LEGACY_V2_PRUNABLE_STATE_FIELDS = new Set([...PRUNABLE_STATE_FIELDS].filter(field => !['assurance_assessment', 'repair_records', 'max_review_charter', 'verification_history'].includes(field)));
 const LEGACY_PRE_VERIFICATION_HISTORY_PRUNABLE_STATE_FIELDS = new Set([...PRUNABLE_STATE_FIELDS].filter(field => !['max_review_charter', 'verification_history'].includes(field)));
 const LEGACY_PRE_MAX_CHARTER_PRUNABLE_STATE_FIELDS = new Set([...PRUNABLE_STATE_FIELDS].filter(field => field !== 'max_review_charter'));
 const LEGACY_CLAIMLESS_PRUNABLE_STATE_FIELDS = new Set([...PRUNABLE_STATE_FIELDS].filter(field => field !== 'workspace_claims'));
-const LEGACY_V1_PRUNABLE_NODE_FIELDS = new Set([...PRUNABLE_NODE_FIELDS].filter(field => !['review_stage', 'attempt_budget_used', 'unavailable_attempts', 'efficiency_context', 'efficiency_policy'].includes(field)));
-const LEGACY_V2_PRUNABLE_NODE_FIELDS = new Set([...PRUNABLE_NODE_FIELDS].filter(field => !['attempt_budget_used', 'unavailable_attempts', 'efficiency_context', 'efficiency_policy'].includes(field)));
+const LEGACY_V1_PRUNABLE_NODE_FIELDS = new Set([...PRUNABLE_NODE_FIELDS].filter(field => !['review_stage', 'attempt_budget_used', 'unavailable_attempts'].includes(field)));
+const LEGACY_V2_PRUNABLE_NODE_FIELDS = new Set([...PRUNABLE_NODE_FIELDS].filter(field => !['attempt_budget_used', 'unavailable_attempts'].includes(field)));
 const PRUNABLE_LEASE_FIELDS = new Set(['version', 'workspace', 'active_tasks', 'updated_at']);
 const PRUNABLE_TASK_LEASE_FIELDS = new Set(['registry_path', 'state_path', 'status', 'acquired_at', 'released_at', 'workspace_claims']);
 const LEGACY_CLAIMLESS_PRUNABLE_TASK_LEASE_FIELDS = new Set([...PRUNABLE_TASK_LEASE_FIELDS].filter(field => field !== 'workspace_claims'));
@@ -3285,11 +3021,7 @@ function taskPruneEligibility(state, filePath, now) {
     : isPreRepairV2State ? LEGACY_V2_PRUNABLE_STATE_FIELDS : !hasOwn(state, 'verification_history') ? LEGACY_PRE_VERIFICATION_HISTORY_PRUNABLE_STATE_FIELDS : !hasOwn(state, 'max_review_charter') ? LEGACY_PRE_MAX_CHARTER_PRUNABLE_STATE_FIELDS : PRUNABLE_STATE_FIELDS;
   const stateFields = claimless ? new Set([...baseStateFields].filter(field => field !== 'workspace_claims')) : baseStateFields;
   const legacyNodeFields = isPreV2V1State ? LEGACY_V1_PRUNABLE_NODE_FIELDS : isPreRepairV2State ? LEGACY_V2_PRUNABLE_NODE_FIELDS : null;
-  const legacyNodesCarryNullEfficiencyFields = legacyNodeFields !== null && Object.values(state.nodes ?? {}).every(node =>
-    hasOwn(node, 'efficiency_context') && node.efficiency_context === null && hasOwn(node, 'efficiency_policy') && node.efficiency_policy === null);
-  const nodeFields = legacyNodesCarryNullEfficiencyFields
-    ? new Set([...legacyNodeFields, 'efficiency_context', 'efficiency_policy'])
-    : legacyNodeFields ?? PRUNABLE_NODE_FIELDS;
+  const nodeFields = legacyNodeFields ?? PRUNABLE_NODE_FIELDS;
   if (!hasExactFields(state, stateFields)) return { eligible: false, reason: 'incomplete or unknown state fields' };
   if (state.version !== VERSION || ![1, 2].includes(state.routing_schema_version)) return { eligible: false, reason: 'legacy or unsupported state schema' };
   if (state.routing_schema_version === 1 && state.assurance_level !== undefined && state.assurance_level !== null) return { eligible: false, reason: 'invalid v1 assurance state' };

@@ -69,7 +69,6 @@ function compactReadyNode(node) {
     ['execution_owner', node.execution_owner],
     ['integration_owner', node.integration_owner],
     ['quality_guard', node.quality_guard],
-    ['efficiency_policy', node.efficiency_policy],
     ['rescue_role', node.rescue_role],
     ['attempt', node.attempt],
   ]);
@@ -83,7 +82,6 @@ function compactNode(node, fallbackReason = null) {
     ['agent_type', node.agent_type],
     ['execution_risk', node.execution_risk],
     ['execution_owner', node.execution_owner],
-    ['efficiency_policy', node.efficiency_policy],
     ['agent_task_path', node.agent_task_path],
     ['agent_thread_id', node.agent_thread_id],
     ['agent_role', node.agent_role],

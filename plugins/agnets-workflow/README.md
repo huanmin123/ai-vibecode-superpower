@@ -11,8 +11,6 @@
 
 工作流路由、角色边界、交接、恢复和总审升级规则以 [`orchestrate-model-workflow`](skills/orchestrate-model-workflow/SKILL.md) 为准；控制器命令和持久化约束以 [`workflow-controller`](skills/workflow-controller/SKILL.md) 为准。
 
-任务准入和委派会通过 [`agent-toolchain`](skills/agent-toolchain/SKILL.md) 的内部 router 静默选择保守效率路径：只有已定契约的可逆实施使用最小实现纪律，只读载荷按抽象属性选择 CodeGraph、RTK 或受证明的本地 adapter；审核、错误、最终交付和持久化制品保持原样。用户不需要选择模式。
-
 ## 完整流程
 
 先做工作流准入判断。只有需要持久化、多节点协作、恢复交接或独立末端质量门的完整任务才建立 DAG。进入后，一次用户输入对应一份完整任务清单；取证、设计、实现、集成和验证都在任务内部完成，各节点保留必要证据，但不单独启动审核。全部工作完成并冻结工作区后，才运行唯一的任务级末端质量门；失败后的修复仍回到同一任务，完成后重新进入该质量门。最高 `max` 总审会先冻结 blocking charter，再进行受保护批量修复和一次受控 closure；closure 发现未经证明属于本次修复回归的新 blocker 时，任务明确进入范围决策阻塞，不会无限重审或静默关闭。只有质量门通过且证据仍与当前任务和工作区匹配时才能关闭。门级选择、审核升级和失败恢复规则见 [`orchestrate-model-workflow`](skills/orchestrate-model-workflow/SKILL.md)。

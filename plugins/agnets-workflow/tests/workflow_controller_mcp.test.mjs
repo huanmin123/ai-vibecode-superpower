@@ -256,8 +256,6 @@ test('MCP result compaction keeps scheduling facts and drops repeated heavy stat
     agent_task_path: '/root/evidence', agent_thread_id: 'thread-1', agent_role: 'avsp_terra_low_readonly', claim_id: 'claim-1', attempt: 1,
     claimed_at: '2026-08-09T00:00:00.000Z', activation_at: '2026-08-09T00:00:01.000Z', activation_deadline_at: null,
     heartbeat_at: '2026-08-09T00:00:02.000Z', heartbeat_count: 2, lease_duration_sec: 1800, checkpoint: { detail: 'x'.repeat(4096) }, checkpoint_at: '2026-08-09T00:00:02.000Z',
-    efficiency_context: { exact_abstract_context: 'x'.repeat(4096) },
-    efficiency_policy: { implementation_scope: 'standard', presentation: 'normal', context_selection: 'codegraph', payload_delivery: 'raw', decision_id: `sha256:${'a'.repeat(64)}` },
     result: largeResult, recovery_history: [{ result: largeResult }], rescue_role: null, workflow_completion_intent: null,
   };
   const full = {
@@ -275,8 +273,6 @@ test('MCP result compaction keeps scheduling facts and drops repeated heavy stat
   assert.equal(summary.nodes[0].claim_id, 'claim-1');
   assert.equal(summary.nodes[0].lease_duration_sec, 1800);
   assert.equal(summary.nodes[0].fallback_reason, 'avsp_luna_high unavailable');
-  assert.equal(summary.nodes[0].efficiency_policy.context_selection, 'codegraph');
-  assert.equal('efficiency_context' in summary.nodes[0], false);
   assert.equal(summary.nodes[0].result_present, true);
   assert.equal('result' in summary.nodes[0], false);
   assert.equal('checkpoint' in summary.nodes[0], false);

@@ -40,10 +40,6 @@ role 会先应用，但 child 随后继承父 turn 的 approval policy 和 permi
 
 先判断是否需要多代理持久化工作流。简单问答、只读查询、边界清晰且可由 main/root 独立完成的单文件低风险整理，不创建控制器 DAG，也不派独立审核代理；main/root 直接完成，并在结束前执行与风险相称的验证。只有任务需要跨文件或复杂取证、多节点协作、持久恢复、受保护写入、独立末端质量门或用户明确要求该工作流时，才进入下述完整生命周期。准入只决定是否启用持久化编排，不得用来跳过本来就需要的验证或高风险独立审核。
 
-### 自动效率路由
-
-main/root 在任务准入及每次委派前静默收集 [`agent-toolchain`](../agent-toolchain/SKILL.md) router 要求的阶段、参与者职责、持久性、精确性、可恢复性、风险、工具证明和 payload lineage 等抽象事实，并将 exact `efficiency_context` 放入对应非 review 节点。不得要求用户选择或理解模式，也不得按业务、框架或文件名硬编码场景。控制器独占调用 `scripts/efficiency-router.mjs`、生成并持久化 `efficiency_policy`；协调者和 executor 不得自行指定决策结果。它不是 ACL，也不替代执行契约、风险判断或质量门。只把 `minimal_ladder` 交给已定契约的可逆 implementation executor；临时进度可使用 `tight_lite`；Terra、Sol、review、audit、error、contract、final 和持久化制品保持原样。同一 payload 最多经历一次 CodeGraph、RTK 或受证明本地 adapter 的语义选择/压缩。router、transform、retrieve、authorization、attestation 或 digest 失败时保留原始错误、记录效率不可用并显式使用权威 raw 路径，不得静默回退或报告成功。
-
 ### 完整任务生命周期
 
 一次用户输入建立一份完整任务清单。main/root 先明确目标、范围、非目标、验收和授权；随后完成必要的取证、设计与执行契约，派发全部就绪的取证、实现、集成和验证节点，并在每次状态变更后核验结果与工作区。节点的 `quality_guard` 只定义该节点必须留下的测试或证据，不创建审核代理，也不得把审核插入每个小步骤。
