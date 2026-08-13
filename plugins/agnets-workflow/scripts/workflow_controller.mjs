@@ -499,12 +499,15 @@ function currentCohortReviews(state, node, phase) {
   return state.reviews.filter(review => review.node_id === node.id && review.review_phase === phase && claimIds.has(review.claim_id));
 }
 
-function protocolReviewHistoryDigest(state, { excludeActiveCohortPhase = false } = {}) {
-  const cohortNode = excludeActiveCohortPhase ? protocolReviewNode(state) : null;
+function externallyVisibleReviews(state) {
+  const cohortNode = protocolReviewNode(state);
   const activePhase = cohortNode?.review_gate?.cohort?.phase;
-  const reviews = activePhase === 'blind' || activePhase === 'cross_questioning'
-    ? state.reviews.filter(review => !(review.node_id === cohortNode.id && review.review_phase === activePhase))
-    : state.reviews;
+  if (activePhase !== 'blind' && activePhase !== 'cross_questioning') return state.reviews;
+  return state.reviews.filter(review => !(review.node_id === cohortNode.id && review.review_phase === activePhase));
+}
+
+function protocolReviewHistoryDigest(state, { excludeActiveCohortPhase = false } = {}) {
+  const reviews = excludeActiveCohortPhase ? externallyVisibleReviews(state) : state.reviews;
   return createHash('sha256').update(stableJson({
     goal: state.goal,
     requirements: state.requirements,
@@ -2065,7 +2068,7 @@ function staleNodes(state, now = Date.now()) {
 }
 
 function compactState(state) {
-  return { task_id: state.task_id, workspace: state.workspace, workspace_claims: state.workspace_claims, workspace_lease: state.workspace_lease ?? null, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), assurance_assessment: state.assurance_assessment, review_protocol_version: state.review_protocol_version, review_entry_stage: state.review_entry_stage, review_context: state.review_context, goal: state.goal, nodes: Object.values(state.nodes), ready_nodes: readyNodes(state), stale_nodes: staleNodes(state), participants: state.participants, reviews: state.reviews, repair_records: state.repair_records, verification_record: state.verification_record, verification_history: state.verification_history, workflow_revision: state.workflow_revision, updated_at: state.updated_at };
+  return { task_id: state.task_id, workspace: state.workspace, workspace_claims: state.workspace_claims, workspace_lease: state.workspace_lease ?? null, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), assurance_assessment: state.assurance_assessment, review_protocol_version: state.review_protocol_version, review_entry_stage: state.review_entry_stage, review_context: state.review_context, goal: state.goal, nodes: Object.values(state.nodes), ready_nodes: readyNodes(state), stale_nodes: staleNodes(state), participants: state.participants, reviews: externallyVisibleReviews(state), repair_records: state.repair_records, verification_record: state.verification_record, verification_history: state.verification_history, workflow_revision: state.workflow_revision, updated_at: state.updated_at };
 }
 
 async function coordinationStatus(lockPath) {
@@ -2542,7 +2545,7 @@ async function raiseAssurance(parameters) {
   const replacement = requiredString(parameters.replacement_agent_task_path, 'replacement_agent_task_path');
   const integrationOwner = requiredString(parameters.integration_owner, 'integration_owner');
   return withActiveWorkspaceStateLock(filePath, async state => {
-    if (state.routing_schema_version !== 2) throw new ControllerError('Only a v2 task can raise assurance_level');
+    if (![2, REVIEW_PROTOCOL_VERSION].includes(state.routing_schema_version)) throw new ControllerError('Only a v2 or v3 task can raise assurance_level');
     const rank = { verification: 0, terra: 1, sol: 2 };
     if (!hasOwn(rank, targetLevel) || rank[targetLevel] <= rank[state.assurance_level]) {
       throw new ControllerError('target_assurance_level must be higher than the current assurance_level');
@@ -2560,6 +2563,7 @@ async function raiseAssurance(parameters) {
     const priorAssessment = state.assurance_assessment;
     let reviewNode;
     if (priorLevel === 'verification') {
+      if (isReviewProtocolState(state)) throw new ControllerError('A v3 task cannot start from verification assurance');
       if (Object.keys(state.nodes).length >= MAX_NODES) throw new ControllerError(`Task already has the ${MAX_NODES}-node limit`);
       const reviewNodeId = requiredIdentifier(parameters.review_node_id, 'review_node_id');
       if (hasOwn(state.nodes, reviewNodeId)) throw new ControllerError(`Duplicate node id: ${reviewNodeId}`);
@@ -2581,9 +2585,14 @@ async function raiseAssurance(parameters) {
       if (!reviewNode || reviewNode.kind !== QUALITY_REVIEW_KIND || reviewNode.status !== PENDING || reviewNode.claim_id || reviewNode.attempt !== 0) {
         throw new ControllerError('Terra assurance can only be raised before its terminal review gate is claimed');
       }
-      reviewNode.kind = 'total_review';
-      reviewNode.review_stage = 'sol';
-      reviewNode.agent_type = 'avsp_sol_high';
+      if (isReviewProtocolState(state)) {
+        applyProtocolStage(reviewNode, 'sol_high');
+        state.review_entry_stage = 'sol_high';
+      } else {
+        reviewNode.kind = 'total_review';
+        reviewNode.review_stage = 'sol';
+        reviewNode.agent_type = 'avsp_sol_high';
+      }
       reviewNode.execution_owner = replacement;
       reviewNode.integration_owner = integrationOwner;
       reviewNode.routing_reason = reason;
@@ -2592,7 +2601,7 @@ async function raiseAssurance(parameters) {
     state.assurance_level = targetLevel;
     state.assurance_assessment = nextAssessment;
     validateNodes(state.nodes);
-    validateReviewTopology(state.nodes, state.assurance_level);
+    validateReviewTopology(state.nodes, state.assurance_level, state.routing_schema_version, state.review_entry_stage);
     bumpWorkflowRevision(state, 'assurance_level_raised', {
       from: priorLevel,
       to: targetLevel,
@@ -4564,7 +4573,7 @@ async function recoverTaskLock(parameters) {
 
 async function auditContext(parameters) {
   const [, state] = await readTask(parameters);
-  return { task_id: state.task_id, workspace_claims: state.workspace_claims, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), assurance_assessment: state.assurance_assessment, review_protocol_version: state.review_protocol_version, review_entry_stage: state.review_entry_stage, review_context: state.review_context, review_history_digest: protocolReviewHistoryDigest(state, { excludeActiveCohortPhase: true }), goal: state.goal, requirements: state.requirements, scope: state.scope, non_goals: state.non_goals, nodes: Object.values(state.nodes), participants: state.participants, reviews: state.reviews, repair_records: state.repair_records, max_review_charter: state.max_review_charter ?? null, verification_record: state.verification_record, verification_history: state.verification_history, workflow_snapshot: workflowSnapshot(state), workspace_fingerprint: await workspaceFingerprint(state.workspace, state.workspace_claims) };
+  return { task_id: state.task_id, workspace_claims: state.workspace_claims, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), assurance_assessment: state.assurance_assessment, review_protocol_version: state.review_protocol_version, review_entry_stage: state.review_entry_stage, review_context: state.review_context, review_history_digest: protocolReviewHistoryDigest(state, { excludeActiveCohortPhase: true }), goal: state.goal, requirements: state.requirements, scope: state.scope, non_goals: state.non_goals, nodes: Object.values(state.nodes), participants: state.participants, reviews: externallyVisibleReviews(state), repair_records: state.repair_records, max_review_charter: state.max_review_charter ?? null, verification_record: state.verification_record, verification_history: state.verification_history, workflow_snapshot: workflowSnapshot(state), workspace_fingerprint: await workspaceFingerprint(state.workspace, state.workspace_claims) };
 }
 
 function requireRequirementCoverage(state, coverage, label) {
