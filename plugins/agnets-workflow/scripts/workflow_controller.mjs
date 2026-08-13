@@ -6,6 +6,7 @@ import { pathToFileURL } from 'node:url';
 import { deleteTaskState, readTaskState, taskStateExists, writeTaskState } from './sqlite_task_store.mjs';
 
 export const VERSION = 1;
+const REVIEW_PROTOCOL_VERSION = 3;
 const PENDING = 'pending';
 const RUNNING = 'running';
 const SUCCEEDED = 'succeeded';
@@ -73,6 +74,11 @@ const MAX_REPAIR_RECORDS = MAX_REVIEWS;
 const MAX_VERIFICATION_HISTORY = MAX_REVIEWS;
 const MAX_REVIEW_FINDINGS = 64;
 const MAX_MAX_CLOSURE_ATTEMPTS = 2;
+const PROTOCOL_MAX_CLOSURE_ATTEMPTS = 1;
+const REVIEW_ENTRY_STAGES = new Set(['terra_single', 'terra_cohort', 'sol_high', 'sol_xhigh']);
+const REVIEW_PROTOCOL_STAGES = new Set([...REVIEW_ENTRY_STAGES, 'sol_max_initial', 'sol_max_closure']);
+const COHORT_SLOTS = ['coverage', 'adversarial'];
+const COHORT_PHASES = new Set(['blind', 'cross_questioning', 'passed', 'failed']);
 const MAX_CHECKPOINT_BYTES = 32 * 1024;
 const MAX_RECOVERY_RESULT_BYTES = 8 * 1024;
 const DEFAULT_TASK_RETENTION_DAYS = 7;
@@ -263,6 +269,17 @@ function requireAssuranceLevelMatches(level, assessment, label = 'assurance_leve
   if (expectedLevel && level !== expectedLevel) throw new ControllerError(`${label} must be ${expectedLevel} for the supplied assurance_assessment`);
 }
 
+function reviewContextValue(value, label = 'review_context') {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new ControllerError(`${label} must be an object`);
+  const expected = ['boundaries', 'environment', 'scenarios'];
+  const keys = Object.keys(value).sort();
+  if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) throw new ControllerError(`${label} must contain exactly: ${expected.join(', ')}`);
+  if (!nonEmptyReviewValue(value.environment)) throw new ControllerError(`${label}.environment must be non-empty`);
+  if (!Array.isArray(value.scenarios) || !value.scenarios.length || value.scenarios.some(item => !nonEmptyReviewValue(item))) throw new ControllerError(`${label}.scenarios must be a non-empty array of non-empty values`);
+  if (!nonEmptyReviewValue(value.boundaries)) throw new ControllerError(`${label}.boundaries must be non-empty`);
+  return structuredClone(value);
+}
+
 function reviewFindings(state, value, verdict) {
   const rawFindings = value ?? [];
   if (!Array.isArray(rawFindings)) throw new ControllerError('Review findings must be an array');
@@ -315,7 +332,7 @@ function addressedReviewFindings(sourceReview, value) {
     if (keys.length !== expectedFields.length || keys.some((key, keyIndex) => key !== expectedFields[keyIndex])) {
       throw new ControllerError(`addressed_findings[${index}] must contain exactly: ${REPAIR_FINDING_FIELDS.join(', ')}`);
     }
-    const findingId = requiredIdentifier(item.finding_id, `addressed_findings[${index}].finding_id`);
+    const findingId = requiredString(item.finding_id, `addressed_findings[${index}].finding_id`);
     if (!sourceById.has(findingId)) throw new ControllerError(`addressed_findings references an unknown finding: ${findingId}`);
     return { finding_id: findingId, resolution: requiredReviewValue(item.resolution, `addressed_findings[${index}].resolution`), verification_evidence: requiredReviewValue(item.verification_evidence, `addressed_findings[${index}].verification_evidence`) };
   });
@@ -330,21 +347,196 @@ function isMaxReviewNode(node) {
   return node?.kind === 'total_review' && node.agent_type === 'avsp_sol_max';
 }
 
+function isReviewProtocolState(state) {
+  return state?.routing_schema_version === REVIEW_PROTOCOL_VERSION && state?.review_protocol_version === REVIEW_PROTOCOL_VERSION;
+}
+
+function protocolReviewNode(state) {
+  return isReviewProtocolState(state) ? reviewNodesForState(state)[0] ?? null : null;
+}
+
+function isCohortReviewNode(state, node) {
+  return isReviewProtocolState(state) && node?.review_gate?.stage === 'terra_cohort' && node.review_gate.cohort !== null;
+}
+
+function createCohortLane(slot) {
+  return {
+    slot,
+    status: PENDING,
+    reserved_agent_task_path: null,
+    agent_task_path: null,
+    agent_thread_id: null,
+    agent_role: null,
+    claim_id: null,
+    claimed_at: null,
+    activation_at: null,
+    activation_deadline_at: null,
+    heartbeat_at: null,
+    heartbeat_count: 0,
+    lease_duration_sec: null,
+    checkpoint: null,
+    checkpoint_at: null,
+    attempt: 0,
+    attempt_budget_used: 0,
+    unavailable_attempts: 0,
+    review_claim_id: null,
+    blind_review_claim_id: null,
+    cross_review_claim_id: null,
+    result: null,
+  };
+}
+
+function createTerraCohort(roundId = randomUUID()) {
+  return {
+    round_id: roundId,
+    phase: 'blind',
+    exchange: null,
+    aggregate: null,
+    lanes: Object.fromEntries(COHORT_SLOTS.map(slot => [slot, createCohortLane(slot)])),
+  };
+}
+
+function createReviewGate(stage) {
+  if (!REVIEW_PROTOCOL_STAGES.has(stage)) throw new ControllerError(`Unsupported review protocol stage: ${stage}`);
+  return {
+    stage,
+    phase: 'ready',
+    round_id: randomUUID(),
+    pending_source_review_claim_id: null,
+    scope_decision_required: false,
+    cohort: stage === 'terra_cohort' ? createTerraCohort() : null,
+  };
+}
+
+function protocolStageForNode(node) {
+  return node?.review_gate?.stage ?? null;
+}
+
+function protocolNodeRole(stage) {
+  if (stage === 'terra_single' || stage === 'terra_cohort') return TERRA_REVIEW_ROLE;
+  if (stage === 'sol_high') return 'avsp_sol_high';
+  if (stage === 'sol_xhigh') return 'avsp_sol_xhigh';
+  if (stage === 'sol_max_initial' || stage === 'sol_max_closure') return 'avsp_sol_max';
+  throw new ControllerError(`Unsupported review protocol stage: ${stage}`);
+}
+
+function protocolNodeKind(stage) {
+  return stage === 'terra_single' || stage === 'terra_cohort' ? QUALITY_REVIEW_KIND : 'total_review';
+}
+
+function protocolNextStage(stage) {
+  if (stage === 'terra_single') return 'terra_cohort';
+  if (stage === 'terra_cohort') return 'sol_high';
+  if (stage === 'sol_high') return 'sol_xhigh';
+  if (stage === 'sol_xhigh') return 'sol_max_initial';
+  if (stage === 'sol_max_initial') return 'sol_max_closure';
+  return null;
+}
+
+function applyProtocolStage(node, stage) {
+  node.kind = protocolNodeKind(stage);
+  node.review_stage = stage.startsWith('terra') ? 'terra' : 'sol';
+  node.agent_type = protocolNodeRole(stage);
+  node.review_gate = createReviewGate(stage);
+}
+
+function cohortLaneForClaim(node, claimId) {
+  if (!node?.review_gate?.cohort || typeof claimId !== 'string') return null;
+  return Object.values(node.review_gate.cohort.lanes).find(lane => lane.claim_id === claimId) ?? null;
+}
+
+function activeCohortLaneForTask(node, taskPath) {
+  if (!node?.review_gate?.cohort || typeof taskPath !== 'string') return null;
+  return Object.values(node.review_gate.cohort.lanes).find(lane => lane.status === RUNNING && lane.agent_task_path === taskPath) ?? null;
+}
+
+function cohortLanes(node) {
+  return Object.values(node?.review_gate?.cohort?.lanes ?? {});
+}
+
+function isCohortRoundComplete(node) {
+  return cohortLanes(node).length === COHORT_SLOTS.length && cohortLanes(node).every(lane => ['succeeded', 'failed', 'unavailable'].includes(lane.status));
+}
+
+function resetCohortLanes(node) {
+  for (const slot of COHORT_SLOTS) {
+    const prior = node.review_gate.cohort.lanes[slot] ?? {};
+    const lane = createCohortLane(slot);
+    lane.attempt = prior.attempt ?? 0;
+    lane.attempt_budget_used = prior.attempt_budget_used ?? 0;
+    lane.unavailable_attempts = prior.unavailable_attempts ?? 0;
+    lane.blind_review_claim_id = prior.blind_review_claim_id ?? null;
+    node.review_gate.cohort.lanes[slot] = lane;
+  }
+}
+
+function resetCohortLaneForRetry(lane, reservedAgentTaskPath, preserveBlindClaim) {
+  const next = createCohortLane(lane.slot);
+  next.attempt = lane.attempt;
+  next.attempt_budget_used = lane.attempt_budget_used;
+  next.unavailable_attempts = lane.unavailable_attempts;
+  next.blind_review_claim_id = preserveBlindClaim ? lane.blind_review_claim_id ?? null : null;
+  next.reserved_agent_task_path = reservedAgentTaskPath;
+  return next;
+}
+
+function resetCohortRound(node, reservedSlot, reservedAgentTaskPath) {
+  const prior = node.review_gate.cohort;
+  const next = createTerraCohort();
+  for (const slot of COHORT_SLOTS) {
+    const priorLane = prior.lanes[slot] ?? {};
+    const lane = next.lanes[slot];
+    lane.attempt = priorLane.attempt ?? 0;
+    lane.attempt_budget_used = priorLane.attempt_budget_used ?? 0;
+    lane.unavailable_attempts = priorLane.unavailable_attempts ?? 0;
+  }
+  next.lanes[reservedSlot].reserved_agent_task_path = reservedAgentTaskPath;
+  node.review_gate.cohort = next;
+}
+
+function currentCohortReviews(state, node, phase) {
+  const claimIds = new Set(cohortLanes(node).map(lane => phase === 'blind' ? lane.blind_review_claim_id : lane.cross_review_claim_id).filter(Boolean));
+  return state.reviews.filter(review => review.node_id === node.id && review.review_phase === phase && claimIds.has(review.claim_id));
+}
+
+function protocolReviewHistoryDigest(state, { excludeActiveCohortPhase = false } = {}) {
+  const cohortNode = excludeActiveCohortPhase ? protocolReviewNode(state) : null;
+  const activePhase = cohortNode?.review_gate?.cohort?.phase;
+  const reviews = activePhase === 'blind' || activePhase === 'cross_questioning'
+    ? state.reviews.filter(review => !(review.node_id === cohortNode.id && review.review_phase === activePhase))
+    : state.reviews;
+  return createHash('sha256').update(stableJson({
+    goal: state.goal,
+    requirements: state.requirements,
+    scope: state.scope,
+    non_goals: state.non_goals,
+    reviews,
+    repair_records: state.repair_records,
+  })).digest('hex');
+}
+
 function validMaxReviewCharter(state, charter) {
   if (!charter || typeof charter !== 'object' || Array.isArray(charter)) return false;
-  if (charter.schema_version !== 1 || !['initial_repair_required', 'closure_ready', 'closure_reviewing', 'repair_required', 'scope_decision_required', 'closure_passed'].includes(charter.status)) return false;
+  const protocolCharter = charter.schema_version === 2;
+  if (![1, 2].includes(charter.schema_version) || !['initial_repair_required', 'closure_ready', 'closure_reviewing', 'repair_required', 'scope_decision_required', 'closure_passed'].includes(charter.status)) return false;
   if (typeof charter.created_at !== 'string' || !Number.isFinite(Date.parse(charter.created_at)) || typeof charter.source_review_claim_id !== 'string') return false;
   if (!charter.workflow_snapshot || typeof charter.workflow_snapshot !== 'object' || !charter.workspace_fingerprint || typeof charter.workspace_fingerprint !== 'object') return false;
   if (!sameJson(charter.requirements, state.requirements) || !sameJson(charter.workspace_claims, state.workspace_claims)) return false;
   if (!Array.isArray(charter.blocking_finding_ids) || !charter.blocking_finding_ids.length || !Array.isArray(charter.blocking_findings) || !Array.isArray(charter.out_of_charter_findings)) return false;
   if (new Set(charter.blocking_finding_ids).size !== charter.blocking_finding_ids.length || charter.blocking_findings.some(finding => !finding || typeof finding.id !== 'string') || !sameJson([...charter.blocking_finding_ids].sort(), charter.blocking_findings.map(finding => finding.id).sort())) return false;
-  if (!Number.isSafeInteger(charter.repair_count) || charter.repair_count < 0 || !Number.isSafeInteger(charter.closure_attempt_count) || charter.closure_attempt_count < 0 || charter.closure_attempt_limit !== MAX_MAX_CLOSURE_ATTEMPTS || charter.closure_attempt_count > charter.closure_attempt_limit || typeof charter.scope_decision_required !== 'boolean') return false;
+  const closureLimit = protocolCharter ? PROTOCOL_MAX_CLOSURE_ATTEMPTS : MAX_MAX_CLOSURE_ATTEMPTS;
+  if (!Number.isSafeInteger(charter.repair_count) || charter.repair_count < 0 || !Number.isSafeInteger(charter.closure_attempt_count) || charter.closure_attempt_count < 0 || charter.closure_attempt_limit !== closureLimit || charter.closure_attempt_count > charter.closure_attempt_limit || typeof charter.scope_decision_required !== 'boolean') return false;
+  if (protocolCharter && (charter.source_max_initial !== true || !isReviewProtocolState(state))) return false;
   return (charter.pending_repair_source_claim_id === null || typeof charter.pending_repair_source_claim_id === 'string')
     && (charter.active_closure_claim_id === undefined || charter.active_closure_claim_id === null || typeof charter.active_closure_claim_id === 'string');
 }
 
+function isMaxClosureNode(state, node) {
+  return isMaxReviewNode(node) && (!isReviewProtocolState(state) || protocolStageForNode(node) === 'sol_max_closure');
+}
+
 function maxReviewCharterMissing(state, node) {
-  return isMaxReviewNode(node) && !validMaxReviewCharter(state, state.max_review_charter);
+  return isMaxClosureNode(state, node) && !validMaxReviewCharter(state, state.max_review_charter);
 }
 
 function requireMaxReviewCharter(state, node) {
@@ -384,7 +576,34 @@ async function freezeMaxReviewCharter(state, node, sourceReview) {
   return state.max_review_charter;
 }
 
+async function freezeProtocolMaxReviewCharter(state, node, sourceReview) {
+  const blockingFindings = sourceReview.findings.filter(finding => finding.severity === 'blocking');
+  if (!blockingFindings.length) throw new ControllerError('A max closure charter requires blocking findings from the finalized max initial review');
+  state.max_review_charter = {
+    schema_version: 2,
+    status: 'initial_repair_required',
+    created_at: utcNow(),
+    source_review_claim_id: sourceReview.claim_id,
+    pending_repair_source_claim_id: sourceReview.claim_id,
+    workflow_snapshot: workflowSnapshot(state),
+    workspace_fingerprint: await workspaceFingerprint(state.workspace, state.workspace_claims),
+    requirements: structuredClone(state.requirements),
+    workspace_claims: structuredClone(state.workspace_claims),
+    blocking_finding_ids: blockingFindings.map(finding => finding.id),
+    blocking_findings: structuredClone(blockingFindings),
+    repair_count: 0,
+    closure_attempt_count: 0,
+    closure_attempt_limit: PROTOCOL_MAX_CLOSURE_ATTEMPTS,
+    out_of_charter_findings: [],
+    scope_decision_required: false,
+    source_max_initial: true,
+  };
+  addEvent(state, 'max_initial_review_charter_frozen', { node_id: node.id, source_review_claim_id: sourceReview.claim_id, blocking_finding_ids: state.max_review_charter.blocking_finding_ids, closure_attempt_limit: PROTOCOL_MAX_CLOSURE_ATTEMPTS });
+  return state.max_review_charter;
+}
+
 function maxClosureReview(state, node) {
+  if (!isMaxClosureNode(state, node)) return false;
   const charter = requireMaxReviewCharter(state, node);
   return charter.status === 'closure_reviewing';
 }
@@ -1473,7 +1692,7 @@ function validateNodes(nodes) {
 }
 
 function isReviewNode(node, routingSchemaVersion = null) {
-  return node?.kind === 'total_review' || (routingSchemaVersion === 2 && node?.kind === QUALITY_REVIEW_KIND);
+  return node?.kind === 'total_review' || (routingSchemaVersion >= 2 && node?.kind === QUALITY_REVIEW_KIND);
 }
 
 function reviewNodes(nodes, routingSchemaVersion = null) {
@@ -1485,15 +1704,15 @@ function reviewNodesForState(state) {
 }
 
 function effectiveAssuranceLevel(state) {
-  if (state.routing_schema_version !== 2) return null;
+  if (state.routing_schema_version < 2) return null;
   const reviewNode = reviewNodesForState(state)[0];
   return state.assurance_level === 'terra' && reviewNode?.review_stage === 'sol' ? 'sol' : state.assurance_level;
 }
 
-function validateReviewTopology(nodes, assuranceLevel = null) {
+function validateReviewTopology(nodes, assuranceLevel = null, routingSchemaVersion = null, reviewEntryStage = null) {
   const allNodes = Object.values(nodes);
-  const routingSchemaVersion = assuranceLevel === null ? 1 : 2;
-  const reviews = reviewNodes(nodes, routingSchemaVersion);
+  const schemaVersion = routingSchemaVersion ?? (assuranceLevel === null ? 1 : 2);
+  const reviews = reviewNodes(nodes, schemaVersion);
   if (!assuranceLevel) {
     if (reviews.length !== 1 || reviews[0].kind !== 'total_review') throw new ControllerError('A new task manifest must contain exactly one total_review node');
   } else if (assuranceLevel === 'verification') {
@@ -1514,12 +1733,24 @@ function validateReviewTopology(nodes, assuranceLevel = null) {
     throw new ControllerError(`Unsupported assurance_level: ${assuranceLevel}`);
   }
   const review = reviews[0];
-  const expectedDependencies = allNodes.filter(node => !isReviewNode(node, routingSchemaVersion)).map(node => node.id).sort();
+  if (schemaVersion === REVIEW_PROTOCOL_VERSION) {
+    if (!REVIEW_ENTRY_STAGES.has(reviewEntryStage)) throw new ControllerError('A v3 task requires a supported review_entry_stage');
+    const expectedStage = reviewEntryStage;
+    if (assuranceLevel === 'terra' && !expectedStage.startsWith('terra')) throw new ControllerError('A terra v3 task must start at a Terra review stage');
+    if (assuranceLevel === 'sol' && !expectedStage.startsWith('sol_')) throw new ControllerError('A sol v3 task must start at a Sol review stage');
+    if (!review || !review.review_gate || !REVIEW_PROTOCOL_STAGES.has(review.review_gate.stage)) throw new ControllerError('A v3 review node requires an explicit review_gate');
+    if (review.kind !== protocolNodeKind(review.review_gate.stage) || review.agent_type !== protocolNodeRole(review.review_gate.stage)) throw new ControllerError('A v3 review node does not match its review_gate stage');
+    if (review.review_gate.stage === 'terra_cohort') {
+      const cohort = review.review_gate.cohort;
+      if (!cohort || !COHORT_PHASES.has(cohort.phase) || !cohort.lanes || COHORT_SLOTS.some(slot => !cohort.lanes[slot])) throw new ControllerError('A v3 Terra cohort requires two explicit lanes');
+    }
+  }
+  const expectedDependencies = allNodes.filter(node => !isReviewNode(node, schemaVersion)).map(node => node.id).sort();
   const actualDependencies = [...new Set(review.depends_on)].sort();
   if (expectedDependencies.length !== actualDependencies.length || expectedDependencies.some((id, index) => id !== actualDependencies[index])) {
     throw new ControllerError('The review node must directly depend on every non-review node');
   }
-  if (allNodes.some(node => !isReviewNode(node, routingSchemaVersion) && node.depends_on.includes(review.id))) {
+  if (allNodes.some(node => !isReviewNode(node, schemaVersion) && node.depends_on.includes(review.id))) {
     throw new ControllerError('No node may depend on a review node');
   }
 }
@@ -1559,6 +1790,11 @@ function workflowSnapshotMaterial(state, { includeAssurance = true, excludeAllRe
   if (includeAssurance) {
     material.assurance_level = state.assurance_level;
     material.assurance_assessment = state.assurance_assessment;
+    if (isReviewProtocolState(state)) {
+      material.review_protocol_version = state.review_protocol_version;
+      material.review_entry_stage = state.review_entry_stage;
+      material.review_context = state.review_context;
+    }
   }
   return material;
 }
@@ -1652,14 +1888,14 @@ function nodeRecord(raw, options = {}) {
   const dependencies = raw.depends_on ?? [];
   if (!Array.isArray(dependencies) || dependencies.some(dependency => typeof dependency !== 'string' || !dependency.trim())) throw new ControllerError('node.depends_on must contain non-empty string identifiers');
   const routing = nodeRouting(raw, options.routingRequired === true);
-  const isV2QualityReview = options.routingSchemaVersion === 2 && kind === QUALITY_REVIEW_KIND;
+  const isV2QualityReview = options.routingSchemaVersion >= 2 && kind === QUALITY_REVIEW_KIND;
   const defaultAgentType = options.routingSchemaVersion >= 1 && !routing.routing_legacy && raw.agent_type == null
     ? (kind === 'total_review' ? 'avsp_sol_high' : (isV2QualityReview ? TERRA_REVIEW_ROLE : ({ read_only: 'avsp_luna_high', delegable: 'avsp_luna_high_executor' }[routing.execution_risk] ?? null)))
     : null;
   const agentType = raw.agent_type ?? defaultAgentType;
   if (options.routingSchemaVersion === 1) validateV1AgentType(kind, routing.execution_risk, agentType);
-  if (options.routingSchemaVersion === 2) validateV2AgentType(kind, routing.execution_risk, agentType);
-  return { id, kind, review_stage: isV2QualityReview ? 'terra' : kind === 'total_review' ? 'sol' : null, agent_type: agentType, depends_on: dependencies, ...routing, rescue_role: null, rescue_reason: null, rescued_at: null, rescue_count: 0, status: PENDING, agent_task_path: null, agent_thread_id: null, agent_role: null, claim_id: null, claimed_at: null, activation_at: null, activation_deadline_at: null, heartbeat_at: null, heartbeat_count: 0, lease_duration_sec: null, attempt: 0, attempt_budget_used: 0, unavailable_attempts: 0, result: null, checkpoint: null, checkpoint_at: null, workflow_completion_intent: null, recovery_history: [] };
+  if (options.routingSchemaVersion >= 2) validateV2AgentType(kind, routing.execution_risk, agentType);
+  return { id, kind, review_stage: isV2QualityReview ? 'terra' : kind === 'total_review' ? 'sol' : null, agent_type: agentType, depends_on: dependencies, ...routing, rescue_role: null, rescue_reason: null, rescued_at: null, rescue_count: 0, status: PENDING, agent_task_path: null, agent_thread_id: null, agent_role: null, claim_id: null, claimed_at: null, activation_at: null, activation_deadline_at: null, heartbeat_at: null, heartbeat_count: 0, lease_duration_sec: null, attempt: 0, attempt_budget_used: 0, unavailable_attempts: 0, result: null, checkpoint: null, checkpoint_at: null, workflow_completion_intent: null, recovery_history: [], review_gate: null };
 }
 
 function normalizeState(state) {
@@ -1676,12 +1912,23 @@ function normalizeState(state) {
   state.assurance_assessment ??= null;
   state.repair_records ??= [];
   if (!Array.isArray(state.repair_records)) throw new ControllerError('Task repair_records must be an array');
-  if (state.routing_schema_version === 2) {
+  if (state.routing_schema_version === 2 || state.routing_schema_version === REVIEW_PROTOCOL_VERSION) {
     if (!ASSURANCE_LEVELS.has(state.assurance_level)) throw new ControllerError('A v2 task state requires assurance_level verification, terra, or sol');
     if (state.assurance_assessment !== null) state.assurance_assessment = assuranceAssessment(state.assurance_assessment, 'assurance_assessment', { allowLegacy: true });
   } else {
     state.assurance_level ??= null;
     state.assurance_assessment = null;
+  }
+  if (state.routing_schema_version === REVIEW_PROTOCOL_VERSION) {
+    if (state.assurance_level === 'verification') throw new ControllerError('A v3 review protocol task must select terra or sol assurance');
+    if (state.review_protocol_version !== REVIEW_PROTOCOL_VERSION || !REVIEW_ENTRY_STAGES.has(state.review_entry_stage)) {
+      throw new ControllerError('A v3 task state requires complete review protocol metadata; explicit migration is required');
+    }
+    state.review_context = reviewContextValue(state.review_context);
+  } else {
+    state.review_protocol_version ??= null;
+    state.review_entry_stage ??= null;
+    state.review_context ??= null;
   }
   for (const [nodeId, node] of Object.entries(state.nodes)) {
     if (!node || typeof node !== 'object' || Array.isArray(node)) throw new ControllerError(`Task node must be an object: ${nodeId}`);
@@ -1694,11 +1941,20 @@ function normalizeState(state) {
     }
     node.checkpoint ??= null; node.checkpoint_at ??= null; node.recovery_history ??= []; node.workflow_completion_intent ??= null;
     node.rescue_role ??= null; node.rescue_reason ??= null; node.rescued_at ??= null; node.rescue_count ??= 0;
-    node.review_stage ??= state.routing_schema_version === 2 && node.kind === QUALITY_REVIEW_KIND ? 'terra' : node.kind === 'total_review' ? 'sol' : null;
+    node.review_stage ??= state.routing_schema_version >= 2 && node.kind === QUALITY_REVIEW_KIND ? 'terra' : node.kind === 'total_review' ? 'sol' : null;
+    node.review_gate ??= null;
+    if (state.routing_schema_version === REVIEW_PROTOCOL_VERSION && isReviewNode(node, state.routing_schema_version)) {
+      if (!node.review_gate || typeof node.review_gate !== 'object' || !REVIEW_PROTOCOL_STAGES.has(node.review_gate.stage)) throw new ControllerError('A v3 review node requires an explicit review_gate; explicit migration is required');
+      if (node.kind !== protocolNodeKind(node.review_gate.stage) || node.agent_type !== protocolNodeRole(node.review_gate.stage)) throw new ControllerError('A v3 review node does not match its review_gate stage');
+      if (node.review_gate.stage === 'terra_cohort') {
+        const cohort = node.review_gate.cohort;
+        if (!cohort || typeof cohort !== 'object' || !COHORT_PHASES.has(cohort.phase) || !cohort.lanes || typeof cohort.lanes !== 'object' || COHORT_SLOTS.some(slot => !cohort.lanes[slot])) throw new ControllerError('A v3 Terra cohort requires two explicit lanes');
+      }
+    }
     if (!hasOwn(node, 'execution_risk')) Object.assign(node, nodeRouting(node, false));
   }
   validateNodes(state.nodes);
-  validateReviewTopology(state.nodes, state.assurance_level);
+  validateReviewTopology(state.nodes, state.assurance_level, state.routing_schema_version, state.review_entry_stage);
   return state;
 }
 
@@ -1707,10 +1963,10 @@ async function makeState(manifest) {
   if (!manifest || typeof manifest !== 'object' || required.some(key => !hasOwn(manifest, key))) throw new ControllerError('Manifest requires task_id, workspace, goal, and requirements');
   const taskId = requiredIdentifier(manifest.task_id, 'task_id');
   const routingSchemaVersion = manifest.routing_schema_version ?? 0;
-  if (![0, 1, 2].includes(routingSchemaVersion)) throw new ControllerError('routing_schema_version must be 1 or 2 when provided');
-  const assuranceLevel = routingSchemaVersion === 2 ? requiredString(manifest.assurance_level, 'assurance_level') : null;
+  if (![0, 1, 2, REVIEW_PROTOCOL_VERSION].includes(routingSchemaVersion)) throw new ControllerError('routing_schema_version must be 1, 2, or 3 when provided');
+  const assuranceLevel = routingSchemaVersion >= 2 ? requiredString(manifest.assurance_level, 'assurance_level') : null;
   if (assuranceLevel !== null && !ASSURANCE_LEVELS.has(assuranceLevel)) throw new ControllerError('assurance_level must be verification, terra, or sol');
-  const assuranceAssessmentValue = routingSchemaVersion === 2 ? assuranceAssessment(manifest.assurance_assessment) : null;
+  const assuranceAssessmentValue = routingSchemaVersion >= 2 ? assuranceAssessment(manifest.assurance_assessment) : null;
   if (assuranceAssessmentValue !== null) requireAssuranceLevelMatches(assuranceLevel, assuranceAssessmentValue);
   const workspace = await canonicalWorkspace(manifest.workspace);
   const workspaceClaims = await normalizeWorkspaceClaims(manifest.workspace_claims, workspace, { legacy: !hasOwn(manifest, 'workspace_claims') });
@@ -1730,22 +1986,46 @@ async function makeState(manifest) {
     if (hasOwn(nodes, node.id)) throw new ControllerError(`Duplicate node id: ${node.id}`);
     nodes[node.id] = node;
   }
+  const reviewEntryStage = routingSchemaVersion === REVIEW_PROTOCOL_VERSION
+    ? requiredString(manifest.review_entry_stage ?? (assuranceLevel === 'terra' ? 'terra_single' : 'sol_high'), 'review_entry_stage')
+    : null;
+  if (routingSchemaVersion === REVIEW_PROTOCOL_VERSION && !REVIEW_ENTRY_STAGES.has(reviewEntryStage)) {
+    throw new ControllerError('review_entry_stage must be terra_single, terra_cohort, sol_high, or sol_xhigh');
+  }
+  const reviewContext = routingSchemaVersion === REVIEW_PROTOCOL_VERSION ? reviewContextValue(manifest.review_context) : null;
+  if (routingSchemaVersion === REVIEW_PROTOCOL_VERSION && assuranceLevel === 'verification') throw new ControllerError('A v3 review protocol task must select terra or sol assurance');
+  if (routingSchemaVersion === REVIEW_PROTOCOL_VERSION) {
+    const review = reviewNodes(nodes, routingSchemaVersion)[0];
+    if (review) applyProtocolStage(review, reviewEntryStage);
+  }
+  if (routingSchemaVersion === 2 && assuranceLevel === 'sol' && reviewNodes(nodes, routingSchemaVersion)[0]?.agent_type === 'avsp_sol_max') {
+    throw new ControllerError('A v2 task cannot start at avsp_sol_max; begin at high or xhigh, or use the v3 review protocol');
+  }
   validateNodes(nodes);
-  validateReviewTopology(nodes, assuranceLevel);
+  validateReviewTopology(nodes, assuranceLevel, routingSchemaVersion, reviewEntryStage);
   if (hasOwn(manifest, 'workspace_claims') && Object.values(nodes).some(node => !isReviewNode(node, routingSchemaVersion) && node.execution_risk !== 'read_only') && !workspaceClaims.some(claim => claim.mode === 'write')) {
     throw new ControllerError('workspace_claims requires at least one write claim for non-read-only work');
   }
   const created = utcNow();
-  const state = { version: VERSION, routing_schema_version: routingSchemaVersion || null, assurance_level: assuranceLevel, assurance_assessment: assuranceAssessmentValue, task_id: taskId, workspace, workspace_claims: workspaceClaims, goal, requirements, scope: manifest.scope ?? [], non_goals: manifest.non_goals ?? [], nodes, participants: [], reviews: [], repair_records: [], max_review_charter: null, verification_record: null, verification_history: [], events: [{ at: created, type: 'task_initialized', workflow_revision: 0 }], workflow_revision: 0, closed_revision: null, closed_at: null, created_at: created, updated_at: created };
+  const state = { version: VERSION, routing_schema_version: routingSchemaVersion || null, assurance_level: assuranceLevel, assurance_assessment: assuranceAssessmentValue, review_protocol_version: routingSchemaVersion === REVIEW_PROTOCOL_VERSION ? REVIEW_PROTOCOL_VERSION : null, review_entry_stage: reviewEntryStage, review_context: reviewContext, task_id: taskId, workspace, workspace_claims: workspaceClaims, goal, requirements, scope: manifest.scope ?? [], non_goals: manifest.non_goals ?? [], nodes, participants: [], reviews: [], repair_records: [], max_review_charter: null, verification_record: null, verification_history: [], events: [{ at: created, type: 'task_initialized', workflow_revision: 0 }], workflow_revision: 0, closed_revision: null, closed_at: null, created_at: created, updated_at: created };
   return state;
 }
 
 function readyNodes(state) {
-  return Object.values(state.nodes).filter(node => node.status === PENDING && node.depends_on.every(dependency => [SUCCEEDED, 'skipped'].includes(state.nodes[dependency].status)));
+  return Object.values(state.nodes).filter(node => {
+    const dependenciesReady = node.depends_on.every(dependency => [SUCCEEDED, 'skipped'].includes(state.nodes[dependency].status));
+    if (!dependenciesReady) return false;
+    if (node.status === PENDING) return true;
+    return isCohortReviewNode(state, node) && node.status === RUNNING && cohortLanes(node).some(lane => lane.status === PENDING);
+  });
 }
 
 function participantPaths(state) { return new Set(state.participants.map(item => item.agent_task_path)); }
-function runningParticipantPaths(state) { return new Set(Object.values(state.nodes).filter(node => node.status === RUNNING && node.agent_task_path).map(node => node.agent_task_path)); }
+function runningParticipantPaths(state) {
+  const paths = new Set(Object.values(state.nodes).filter(node => node.status === RUNNING && node.agent_task_path).map(node => node.agent_task_path));
+  for (const node of Object.values(state.nodes)) for (const lane of cohortLanes(node)) if (lane.status === RUNNING && lane.agent_task_path) paths.add(lane.agent_task_path);
+  return paths;
+}
 async function configuredStatePath(parameters, taskId) { return statePath(await canonicalStateDirectory(parameters.state_dir), taskId); }
 async function readTask(parameters) { const filePath = await configuredStatePath(parameters, requiredString(parameters.task_id, 'task_id')); return [filePath, normalizeState(await loadState(filePath))]; }
 
@@ -1759,6 +2039,19 @@ function activationDeadline(node) {
 
 function staleNodes(state, now = Date.now()) {
   return Object.values(state.nodes).flatMap(node => {
+    if (isCohortReviewNode(state, node)) {
+      return cohortLanes(node).flatMap(lane => {
+        if (lane.status !== RUNNING || !lane.lease_duration_sec) return [];
+        const deadline = Date.parse(lane.activation_deadline_at);
+        if (!lane.activation_at || lane.heartbeat_count === 0) {
+          if (!Number.isFinite(deadline) || deadline >= now) return [];
+          return [{ id: node.id, reviewer_slot: lane.slot, agent_task_path: lane.agent_task_path, agent_thread_id: lane.agent_thread_id, claim_id: lane.claim_id, reason: 'never_activated', claimed_at: lane.claimed_at, activation_deadline_at: lane.activation_deadline_at, lease_duration_sec: lane.lease_duration_sec }];
+        }
+        const heartbeat = Date.parse(lane.heartbeat_at);
+        if (!Number.isFinite(heartbeat) || heartbeat + lane.lease_duration_sec * 1000 >= now) return [];
+        return [{ id: node.id, reviewer_slot: lane.slot, agent_task_path: lane.agent_task_path, agent_thread_id: lane.agent_thread_id, claim_id: lane.claim_id, reason: 'heartbeat_expired', heartbeat_at: lane.heartbeat_at, lease_duration_sec: lane.lease_duration_sec }];
+      });
+    }
     if (node.status !== RUNNING || !node.lease_duration_sec) return [];
     if (!node.activation_at || node.heartbeat_count === 0) {
       const deadline = activationDeadline(node);
@@ -1772,7 +2065,7 @@ function staleNodes(state, now = Date.now()) {
 }
 
 function compactState(state) {
-  return { task_id: state.task_id, workspace: state.workspace, workspace_claims: state.workspace_claims, workspace_lease: state.workspace_lease ?? null, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), assurance_assessment: state.assurance_assessment, goal: state.goal, nodes: Object.values(state.nodes), ready_nodes: readyNodes(state), stale_nodes: staleNodes(state), participants: state.participants, reviews: state.reviews, repair_records: state.repair_records, verification_record: state.verification_record, verification_history: state.verification_history, workflow_revision: state.workflow_revision, updated_at: state.updated_at };
+  return { task_id: state.task_id, workspace: state.workspace, workspace_claims: state.workspace_claims, workspace_lease: state.workspace_lease ?? null, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), assurance_assessment: state.assurance_assessment, review_protocol_version: state.review_protocol_version, review_entry_stage: state.review_entry_stage, review_context: state.review_context, goal: state.goal, nodes: Object.values(state.nodes), ready_nodes: readyNodes(state), stale_nodes: staleNodes(state), participants: state.participants, reviews: state.reviews, repair_records: state.repair_records, verification_record: state.verification_record, verification_history: state.verification_history, workflow_revision: state.workflow_revision, updated_at: state.updated_at };
 }
 
 async function coordinationStatus(lockPath) {
@@ -2356,17 +2649,46 @@ async function invalidateGate(parameters) {
       return { task_id: state.task_id, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), gate_kind: 'verification', invalidation_reasons: invalidationReasons, node: null, ready_nodes: readyNodes(state) };
     }
     const node = reviewNodesForState(state)[0];
-    const latestReview = state.reviews.at(-1);
-    if (!node || node.status !== SUCCEEDED || !latestReview || latestReview.verdict !== 'pass' || latestReview.node_id !== node.id || latestReview.claim_id !== node.claim_id) {
+    if (!node || node.status !== SUCCEEDED) {
       throw new ControllerError('Only a succeeded terminal review with a recorded pass can be invalidated');
     }
-    nodeAttemptAvailability(node, node.id);
+    const cohortNode = isCohortReviewNode(state, node);
+    const closureNode = isMaxClosureNode(state, node);
+    const latestReview = state.reviews.at(-1);
+    if (cohortNode) {
+      const cohort = node.review_gate.cohort;
+      const finalReviews = currentCohortReviews(state, node, 'cross_questioning').filter(review => review.verdict === 'pass' && reviewCompletion(state, review).status === SUCCEEDED);
+      if (cohort.phase !== 'passed' || cohort.aggregate?.verdict !== 'pass' || finalReviews.length !== COHORT_SLOTS.length) throw new ControllerError('Only a passed Terra cohort can be invalidated');
+    } else if (!latestReview || latestReview.verdict !== 'pass' || latestReview.node_id !== node.id || latestReview.claim_id !== node.claim_id) {
+      throw new ControllerError('Only a succeeded terminal review with a recorded pass can be invalidated');
+    }
+    if (closureNode) {
+      const charter = requireMaxReviewCharter(state, node);
+      if (charter.status !== 'closure_passed' || charter.scope_decision_required) throw new ControllerError('Only a passed max closure can be invalidated');
+    }
+    const reviewerSlot = cohortNode ? optionalString(parameters.reviewer_slot, 'reviewer_slot') ?? 'coverage' : null;
+    if (reviewerSlot && !COHORT_SLOTS.includes(reviewerSlot)) throw new ControllerError(`reviewer_slot must be one of: ${COHORT_SLOTS.join(', ')}`);
+    if (cohortNode) nodeAttemptAvailability(node.review_gate.cohort.lanes[reviewerSlot], node.id);
+    else nodeAttemptAvailability(node, node.id);
     const replacement = replacementExecutionOwner(state, node, parameters);
     const priorExecutionOwner = rebindExecutionOwner(node, replacement);
-    const priorClaimId = node.claim_id;
+    const priorClaimId = cohortNode ? `cohort:${node.review_gate.cohort.round_id}` : node.claim_id;
     clearRescueRouting(node);
-    clearAttemptForRetry(node);
-    bumpWorkflowRevision(state, 'review_gate_invalidated', { node_id: node.id, prior_claim_id: priorClaimId, prior_execution_owner: priorExecutionOwner, replacement_execution_owner: replacement, reason, invalidation_reasons: invalidationReasons });
+    if (cohortNode) {
+      resetCohortRound(node, reviewerSlot, replacement);
+      clearAttemptForRetry(node);
+    } else {
+      if (closureNode) {
+        const charter = requireMaxReviewCharter(state, node);
+        charter.status = 'closure_ready';
+        charter.scope_decision_required = false;
+        charter.pending_repair_source_claim_id = null;
+        charter.active_closure_claim_id = null;
+        charter.closure_attempt_count = Math.max(0, charter.closure_attempt_count - 1);
+      }
+      clearAttemptForRetry(node);
+    }
+    bumpWorkflowRevision(state, 'review_gate_invalidated', { node_id: node.id, reviewer_slot: reviewerSlot, prior_claim_id: priorClaimId, prior_execution_owner: priorExecutionOwner, replacement_execution_owner: replacement, reason, invalidation_reasons: invalidationReasons });
     await writeState(filePath, state);
     return { task_id: state.task_id, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), gate_kind: node.kind, invalidation_reasons: invalidationReasons, node, ready_nodes: readyNodes(state) };
   });
@@ -2377,7 +2699,19 @@ async function claimNode(parameters, activateImmediately = false) {
   if (activateImmediately) trueValue(parameters.native_agent_started, 'native_agent_started');
   return withActiveWorkspaceStateLock(filePath, async state => {
     const node = state.nodes[nodeId];
-    if (!node || !readyNodes(state).some(candidate => candidate.id === nodeId)) throw new ControllerError(`Node is not ready: ${nodeId}`);
+    const cohortNode = isCohortReviewNode(state, node);
+    if (!node || (!cohortNode && !readyNodes(state).some(candidate => candidate.id === nodeId))) throw new ControllerError(`Node is not ready: ${nodeId}`);
+    let cohortLane = null;
+    if (cohortNode) {
+      const slot = requiredString(parameters.reviewer_slot, 'reviewer_slot');
+      if (!COHORT_SLOTS.includes(slot)) throw new ControllerError(`reviewer_slot must be one of: ${COHORT_SLOTS.join(', ')}`);
+      const cohort = node.review_gate.cohort;
+      if (!['blind', 'cross_questioning'].includes(cohort.phase)) throw new ControllerError(`The Terra cohort cannot accept claims in phase: ${cohort.phase}`);
+      cohortLane = cohort.lanes[slot];
+      if (!cohortLane || cohortLane.status !== PENDING) throw new ControllerError(`The Terra cohort lane is not ready: ${slot}`);
+      if (cohortLane.reserved_agent_task_path && cohortLane.reserved_agent_task_path !== taskPath) throw new ControllerError(`The Terra cohort lane is reserved for a replacement reviewer: ${slot}`);
+      if (!node.depends_on.every(dependency => [SUCCEEDED, 'skipped'].includes(state.nodes[dependency].status))) throw new ControllerError(`Node is not ready: ${nodeId}`);
+    }
     if (runningParticipantPaths(state).has(taskPath)) throw new ControllerError('Agent already has a running node in this task');
     const reviewNode = isReviewNode(node, state.routing_schema_version);
     if (reviewNode && participantPaths(state).has(taskPath)) {
@@ -2403,8 +2737,8 @@ async function claimNode(parameters, activateImmediately = false) {
       if (node.routing_legacy || node.execution_risk !== 'delegable') throw new ControllerError('A Luna executor requires complete delegable routing metadata');
       if (node.execution_owner !== taskPath) throw new ControllerError('Luna executor claim must match node execution_owner');
     }
-    if (!node.routing_legacy && node.execution_owner !== taskPath) throw new ControllerError('Node claim must match execution_owner');
-    if (isMaxReviewNode(node)) {
+    if (!cohortNode && !node.routing_legacy && node.execution_owner !== taskPath) throw new ControllerError('Node claim must match execution_owner');
+    if (isMaxClosureNode(state, node)) {
       const charter = requireMaxReviewCharter(state, node);
       if (charter.status !== 'closure_ready' || charter.scope_decision_required) throw new ControllerError(`The max review charter cannot be claimed for closure: ${charter.status}`);
       if (charter.closure_attempt_count >= charter.closure_attempt_limit) throw new ControllerError('The max review charter exhausted its controlled closure attempts');
@@ -2412,14 +2746,21 @@ async function claimNode(parameters, activateImmediately = false) {
       charter.closure_attempt_count += 1;
       charter.active_closure_claim_id = null;
     }
-    nodeAttemptAvailability(node, nodeId);
-    const now = utcNow(); node.status = RUNNING; node.agent_task_path = taskPath; node.agent_thread_id = threadId; node.agent_role = role; node.claim_id = randomUUID(); node.claimed_at = now; node.activation_at = activateImmediately ? now : null; node.activation_deadline_at = activateImmediately ? null : new Date(Date.now() + activationTimeoutSec * 1000).toISOString(); node.heartbeat_at = now; node.heartbeat_count = activateImmediately ? 1 : 0; node.lease_duration_sec = leaseDurationSec; node.attempt += 1; node.attempt_budget_used += 1;
-    if (isMaxReviewNode(node)) state.max_review_charter.active_closure_claim_id = node.claim_id;
-    state.participants.push({ agent_task_path: taskPath, agent_thread_id: threadId, agent_role: role, node_id: nodeId, claim_id: node.claim_id, attempt: node.attempt, fallback_reason: fallbackReason });
-    addEvent(state, 'node_claimed', { node_id: nodeId, agent_task_path: taskPath, agent_thread_id: threadId, agent_role: role, claim_id: node.claim_id, attempt: node.attempt, fallback_reason: fallbackReason });
-    if (activateImmediately) addEvent(state, 'node_started', { node_id: nodeId, agent_task_path: taskPath, agent_thread_id: threadId, agent_role: role, claim_id: node.claim_id, native_agent_started: true });
+    nodeAttemptAvailability(cohortLane ?? node, nodeId);
+    const now = utcNow();
+    if (cohortLane) {
+      cohortLane.status = RUNNING; cohortLane.reserved_agent_task_path = null; cohortLane.agent_task_path = taskPath; cohortLane.agent_thread_id = threadId; cohortLane.agent_role = role; cohortLane.claim_id = randomUUID(); if (node.review_gate.cohort.phase === 'blind') cohortLane.blind_review_claim_id = cohortLane.claim_id; else cohortLane.cross_review_claim_id = cohortLane.claim_id; cohortLane.claimed_at = now; cohortLane.activation_at = activateImmediately ? now : null; cohortLane.activation_deadline_at = activateImmediately ? null : new Date(Date.now() + activationTimeoutSec * 1000).toISOString(); cohortLane.heartbeat_at = now; cohortLane.heartbeat_count = activateImmediately ? 1 : 0; cohortLane.lease_duration_sec = leaseDurationSec; cohortLane.attempt += 1; cohortLane.attempt_budget_used += 1;
+      node.status = RUNNING;
+    } else {
+      node.status = RUNNING; node.agent_task_path = taskPath; node.agent_thread_id = threadId; node.agent_role = role; node.claim_id = randomUUID(); node.claimed_at = now; node.activation_at = activateImmediately ? now : null; node.activation_deadline_at = activateImmediately ? null : new Date(Date.now() + activationTimeoutSec * 1000).toISOString(); node.heartbeat_at = now; node.heartbeat_count = activateImmediately ? 1 : 0; node.lease_duration_sec = leaseDurationSec; node.attempt += 1; node.attempt_budget_used += 1;
+    }
+    if (isMaxClosureNode(state, node)) state.max_review_charter.active_closure_claim_id = node.claim_id;
+    const activeClaim = cohortLane ?? node;
+    state.participants.push({ agent_task_path: taskPath, agent_thread_id: threadId, agent_role: role, node_id: nodeId, claim_id: activeClaim.claim_id, attempt: activeClaim.attempt, reviewer_slot: cohortLane?.slot ?? null, fallback_reason: fallbackReason });
+    addEvent(state, 'node_claimed', { node_id: nodeId, agent_task_path: taskPath, agent_thread_id: threadId, agent_role: role, claim_id: activeClaim.claim_id, reviewer_slot: cohortLane?.slot ?? null, attempt: activeClaim.attempt, fallback_reason: fallbackReason });
+    if (activateImmediately) addEvent(state, 'node_started', { node_id: nodeId, agent_task_path: taskPath, agent_thread_id: threadId, agent_role: role, claim_id: activeClaim.claim_id, reviewer_slot: cohortLane?.slot ?? null, native_agent_started: true });
     await writeState(filePath, state);
-    return { task_id: state.task_id, node };
+    return { task_id: state.task_id, node, reviewer_slot: cohortLane?.slot ?? null, claim_id: activeClaim.claim_id };
   });
 }
 
@@ -2430,16 +2771,28 @@ function requireActiveClaim(node, parameters) {
   return claimId;
 }
 
+function activeClaimForOperation(state, node, parameters) {
+  if (isCohortReviewNode(state, node)) {
+    const claimId = requiredString(parameters.claim_id, 'claim_id');
+    const lane = cohortLaneForClaim(node, claimId);
+    if (!lane || lane.status !== RUNNING) throw new ControllerError(`Claim does not own an active Terra cohort lane: ${parameters.node_id}`);
+    return lane;
+  }
+  requireActiveClaim(node, parameters);
+  return node;
+}
+
 function hasRecordedReview(state, node) {
   return state.reviews.some(review => review.auditor_task === node.agent_task_path && review.claim_id === node.claim_id);
 }
 
 function hasRecordedPassingReview(state, node) {
+  if (isCohortReviewNode(state, node)) return node.review_gate.cohort?.aggregate?.verdict === 'pass';
   return state.reviews.some(review => review.auditor_task === node.agent_task_path && review.claim_id === node.claim_id && review.verdict === 'pass');
 }
 
 function reviewCompletion(state, review) {
-  const completionEvent = [...state.events].reverse().find(event => event.type === 'node_completed' && event.node_id === review.node_id && event.claim_id === review.claim_id) ?? (() => {
+  const completionEvent = [...state.events].reverse().find(event => (event.type === 'node_completed' || event.type === 'terra_cohort_lane_completed') && event.node_id === review.node_id && event.claim_id === review.claim_id) ?? (() => {
     const reviews = state.reviews.filter(candidate => candidate.node_id === review.node_id && !state.events.some(event => event.type === 'node_completed' && event.node_id === candidate.node_id && event.claim_id === candidate.claim_id)).sort((left, right) => Date.parse(left.recorded_at) - Date.parse(right.recorded_at));
     const legacyEvents = state.events.filter(event => event.type === 'node_completed' && event.node_id === review.node_id && !hasOwn(event, 'claim_id')).sort((left, right) => Date.parse(left.at) - Date.parse(right.at));
     const used = new Set();
@@ -2496,6 +2849,17 @@ function nextTotalReviewRole(state, node) {
     return 'avsp_sol_max';
   }
   return SOL_ESCALATION_ORDER[Math.min(latestIndex, SOL_ESCALATION_ORDER.length - 1)];
+}
+
+function requireRecordedProtocolRepair(state, sourceReview) {
+  if (!sourceReview || !isFinalFailedReview(state, sourceReview)) throw new ControllerError('A protocol stage can advance only from a finalized failed review');
+  const repair = [...state.repair_records].reverse().find(record => record.source_review_claim_id === sourceReview.claim_id);
+  if (!repair) throw new ControllerError(`The failed ${sourceReview.auditor_role} review requires a recorded repair before the next review stage`);
+  return repair;
+}
+
+function protocolLatestFailedReview(state, node) {
+  return [...state.reviews].reverse().find(review => review.node_id === node.id && isFinalFailedReview(state, review)) ?? null;
 }
 
 function finalizedLatestReview(state, node) {
@@ -2692,16 +3056,63 @@ async function completeNode(parameters) {
   let activeResultSnapshot = resultSnapshot;
   let result = resultSnapshot.value; const [filePath] = await readTask(parameters); const nodeId = requiredIdentifier(parameters.node_id, 'node_id');
   return withActiveWorkspaceStateLock(filePath, async state => {
-    const node = state.nodes[nodeId]; requireActiveClaim(node, parameters);
+    const node = state.nodes[nodeId]; const activeClaim = activeClaimForOperation(state, node, parameters); const cohortNode = isCohortReviewNode(state, node);
     await verifyJsonSnapshot(parameters.result, resultSnapshot, 'Node result');
-    if (!node.activation_at || node.heartbeat_count < 1) throw new ControllerError('An unactivated node cannot be completed; the claiming agent must first call workflow_heartbeat or workflow_start');
-    const expectedAttestation = node.rescue_role === ROOT_RESCUE_ROLE && node.agent_role === ROOT_RESCUE_ROLE
+    if (!activeClaim.activation_at || activeClaim.heartbeat_count < 1) throw new ControllerError('An unactivated node cannot be completed; the claiming agent must first call workflow_heartbeat or workflow_start');
+    const expectedAttestation = node.rescue_role === ROOT_RESCUE_ROLE && activeClaim.agent_role === ROOT_RESCUE_ROLE
       ? ROOT_RESCUE_SELF_COMPLETION
       : node.kind === 'total_review' && status === 'unavailable' && [NATIVE_AGENT_EXIT_CONFIRMED, NATIVE_AGENT_START_FAILED].includes(parameters.completion_attestation)
         ? parameters.completion_attestation
         : NATIVE_AGENT_FINISHED;
     if (parameters.completion_attestation !== expectedAttestation) throw new ControllerError(`workflow_complete requires completion_attestation=${expectedAttestation}`);
     const reviewNode = isReviewNode(node, state.routing_schema_version);
+    if (cohortNode) {
+      if (status === 'skipped' || status === 'blocked') throw new ControllerError('A Terra cohort lane can only succeed, fail, or be unavailable');
+      const recordedReview = state.reviews.find(review => review.node_id === node.id && review.claim_id === activeClaim.claim_id);
+      if (!recordedReview) throw new ControllerError('A Terra cohort lane requires a recorded review for its active claim');
+      if ((status === SUCCEEDED && recordedReview.verdict !== 'pass') || (status === 'failed' && recordedReview.verdict !== 'fail') || (status === 'unavailable' && recordedReview.verdict !== 'unavailable')) {
+        throw new ControllerError('Terra cohort completion status must match the recorded review verdict');
+      }
+      recordedReview.completion_status = status;
+      recordedReview.completion_attestation = expectedAttestation;
+      recordedReview.completed_at = utcNow();
+      activeClaim.status = status;
+      activeClaim.result = result;
+      if (status === 'unavailable') {
+        activeClaim.attempt_budget_used = Math.max(0, activeClaim.attempt_budget_used - 1);
+        activeClaim.unavailable_attempts += 1;
+      }
+      addEvent(state, 'terra_cohort_lane_completed', { node_id: node.id, reviewer_slot: activeClaim.slot, claim_id: activeClaim.claim_id, status, completion_attestation: expectedAttestation });
+      if (isCohortRoundComplete(node)) {
+        const cohort = node.review_gate.cohort;
+        if (cohortLanes(node).some(lane => lane.status === 'unavailable')) {
+          node.status = 'unavailable';
+          cohort.phase = cohort.phase;
+        } else if (cohort.phase === 'blind') {
+          cohort.phase = 'cross_questioning';
+          resetCohortLanes(node);
+          node.status = PENDING;
+          addEvent(state, 'terra_cohort_blind_round_completed', { node_id: node.id, round_id: cohort.round_id });
+        } else {
+        const finalReviews = currentCohortReviews(state, node, 'cross_questioning').filter(review => reviewCompletion(state, review).status === (review.verdict === 'pass' ? SUCCEEDED : 'failed'));
+          if (finalReviews.length !== COHORT_SLOTS.length || new Set(finalReviews.map(review => review.reviewer_slot)).size !== COHORT_SLOTS.length) throw new ControllerError('A Terra cohort requires one completed cross-questioning review from each lane');
+          const failed = finalReviews.filter(review => review.verdict === 'fail');
+          const nonconverged = new Set(finalReviews.map(review => review.verdict)).size > 1;
+          const verdict = failed.length || nonconverged ? 'fail' : 'pass';
+          const findings = failed.flatMap(review => review.findings.filter(finding => finding.severity === 'blocking').map(finding => ({ ...finding, source_finding_id: finding.id, finding_ref: `C${createHash('sha256').update(`${review.claim_id}:${finding.id}`).digest('hex').slice(0, 24)}` })));
+          if (nonconverged) {
+            findings.push({ id: 'cohort_nonconvergence', source_finding_id: 'cohort_nonconvergence', finding_ref: `C${createHash('sha256').update(`${cohort.round_id}:nonconvergence`).digest('hex').slice(0, 24)}`, severity: 'blocking', requirement_id: null, summary: 'The two Terra cross-review lanes reached different final verdicts.', evidence: 'The bounded cross-questioning round did not converge on a shared final position.' });
+          }
+          cohort.aggregate = { source_review_claim_id: `cohort:${cohort.round_id}`, verdict, findings, review_claim_ids: finalReviews.map(review => review.claim_id), workspace_fingerprint: await workspaceFingerprint(state.workspace, state.workspace_claims), completed_at: utcNow(), history_digest: protocolReviewHistoryDigest(state) };
+          cohort.phase = verdict === 'pass' ? 'passed' : 'failed';
+          node.status = verdict === 'pass' ? SUCCEEDED : 'failed';
+          node.result = { summary: 'Terra cross-review cohort completed.', verdict, findings };
+          addEvent(state, verdict === 'pass' ? 'terra_cohort_passed' : 'terra_cohort_failed', { node_id: node.id, round_id: cohort.round_id, finding_refs: findings.map(finding => finding.finding_ref) });
+        }
+      }
+      await writeState(filePath, state);
+      return { task_id: state.task_id, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), node, ready_nodes: readyNodes(state) };
+    }
     if (reviewNode && status === 'skipped') throw new ControllerError('A review node cannot be skipped');
     if (reviewNode && status === SUCCEEDED && !hasRecordedPassingReview(state, node)) throw new ControllerError('A successful review node requires a recorded review with verdict pass for its active claim');
     let workflowOutcomeCompletion = null;
@@ -2765,7 +3176,7 @@ async function completeNode(parameters) {
     if (status === 'unavailable') {
       node.attempt_budget_used = Math.max(0, node.attempt_budget_used - 1);
       node.unavailable_attempts += 1;
-      if (reviewNode && isMaxReviewNode(node) && state.max_review_charter?.active_closure_claim_id === node.claim_id) {
+      if (reviewNode && isMaxClosureNode(state, node) && state.max_review_charter?.active_closure_claim_id === node.claim_id) {
         state.max_review_charter.status = 'closure_ready';
         state.max_review_charter.active_closure_claim_id = null;
         state.max_review_charter.closure_attempt_count = Math.max(0, state.max_review_charter.closure_attempt_count - 1);
@@ -2774,8 +3185,8 @@ async function completeNode(parameters) {
     }
     // A max closure failure is terminal for its reviewer but deliberately
     // blocked for the task until the chartered protected repair is recorded.
-    const maxClosureFailure = reviewNode && isMaxReviewNode(node) && status === 'failed' && state.max_review_charter?.status === 'repair_required';
-    const maxScopeDecision = reviewNode && isMaxReviewNode(node) && status === 'failed' && state.max_review_charter?.status === 'scope_decision_required';
+    const maxClosureFailure = reviewNode && isMaxClosureNode(state, node) && status === 'failed' && state.max_review_charter?.status === 'repair_required';
+    const maxScopeDecision = reviewNode && isMaxClosureNode(state, node) && status === 'failed' && state.max_review_charter?.status === 'scope_decision_required';
     node.status = maxClosureFailure || maxScopeDecision ? 'blocked' : status; node.result = result;
     if (reviewNode) addEvent(state, 'node_completed', { node_id: nodeId, claim_id: node.claim_id, status, completion_attestation: expectedAttestation });
     else bumpWorkflowRevision(state, 'node_completed', { node_id: nodeId, status, completion_attestation: expectedAttestation });
@@ -2787,8 +3198,8 @@ async function completeNode(parameters) {
 async function heartbeatNode(parameters) {
   const [filePath] = await readTask(parameters); const nodeId = requiredIdentifier(parameters.node_id, 'node_id');
   return withActiveWorkspaceStateLock(filePath, async state => {
-    const node = state.nodes[nodeId]; requireActiveClaim(node, parameters);
-    const now = utcNow(); node.activation_at ??= now; node.activation_deadline_at = null; node.heartbeat_at = now; node.heartbeat_count += 1; state.updated_at = now; await writeState(filePath, state);
+    const node = state.nodes[nodeId]; const active = activeClaimForOperation(state, node, parameters);
+    const now = utcNow(); active.activation_at ??= now; active.activation_deadline_at = null; active.heartbeat_at = now; active.heartbeat_count += 1; state.updated_at = now; await writeState(filePath, state);
     return { task_id: state.task_id, node };
   });
 }
@@ -2799,9 +3210,9 @@ async function checkpointNode(parameters) {
   if (!checkpoint || typeof checkpoint !== 'object' || Array.isArray(checkpoint)) throw new ControllerError('Node checkpoint must be a JSON object');
   const [filePath] = await readTask(parameters); const nodeId = requiredIdentifier(parameters.node_id, 'node_id');
   return withActiveWorkspaceStateLock(filePath, async state => {
-    const node = state.nodes[nodeId]; requireActiveClaim(node, parameters);
-    node.checkpoint = checkpoint; node.checkpoint_at = utcNow(); node.activation_at ??= node.checkpoint_at; node.activation_deadline_at = null; node.heartbeat_at = node.checkpoint_at; node.heartbeat_count += 1; state.updated_at = node.checkpoint_at; await writeState(filePath, state);
-    return { task_id: state.task_id, node_id: nodeId, checkpoint_at: node.checkpoint_at };
+    const node = state.nodes[nodeId]; const active = activeClaimForOperation(state, node, parameters);
+    active.checkpoint = checkpoint; active.checkpoint_at = utcNow(); active.activation_at ??= active.checkpoint_at; active.activation_deadline_at = null; active.heartbeat_at = active.checkpoint_at; active.heartbeat_count += 1; state.updated_at = active.checkpoint_at; await writeState(filePath, state);
+    return { task_id: state.task_id, node_id: nodeId, checkpoint_at: active.checkpoint_at };
   });
 }
 
@@ -2866,7 +3277,27 @@ function clearRescueRouting(node) {
 async function requeueStaleNode(parameters) {
   const [filePath] = await readTask(parameters); const nodeId = requiredIdentifier(parameters.node_id, 'node_id'); const reason = requiredString(parameters.reason, 'reason'); retryConfirmation(parameters); const claimId = requiredString(parameters.claim_id, 'claim_id');
   return withActiveWorkspaceStateLock(filePath, async state => {
-    const node = state.nodes[nodeId]; requireActiveClaim(node, parameters);
+    const node = state.nodes[nodeId];
+    if (isCohortReviewNode(state, node)) {
+      const slot = requiredString(parameters.reviewer_slot, 'reviewer_slot');
+      const lane = node.review_gate.cohort.lanes[slot];
+      if (!lane || lane.status !== RUNNING || lane.claim_id !== claimId) throw new ControllerError(`Claim does not own an active Terra cohort lane: ${nodeId}`);
+      const stale = staleNodes(state).find(candidate => candidate.id === nodeId && candidate.reviewer_slot === slot && candidate.claim_id === claimId);
+      if (!stale) throw new ControllerError(`Terra cohort lane is not stale for its active claim: ${nodeId}/${slot}`);
+      nodeAttemptAvailability(lane, nodeId);
+      const replacement = requiredString(parameters.replacement_agent_task_path, 'replacement_agent_task_path');
+      if (participantPaths(state).has(replacement)) throw new ControllerError('A replacement Terra cohort reviewer must not be a prior participant');
+      const packet = recoveryPacket(state, { ...node, ...lane, execution_owner: replacement }, stale, reason, lane.agent_task_path);
+      node.recovery_history.push({ at: utcNow(), reviewer_slot: slot, ...packet.previous_attempt });
+      if (node.recovery_history.length > MAX_TOTAL_NODE_ATTEMPTS) node.recovery_history.splice(0, node.recovery_history.length - MAX_TOTAL_NODE_ATTEMPTS);
+      const preserveBlindClaim = node.review_gate.cohort.phase === 'cross_questioning';
+      node.review_gate.cohort.lanes[slot] = resetCohortLaneForRetry(lane, replacement, preserveBlindClaim);
+      node.status = RUNNING;
+      addEvent(state, 'stale_node_requeued', { node_id: nodeId, reviewer_slot: slot, prior_claim_id: claimId, replacement_execution_owner: replacement, reason, stale_reason: stale.reason, previous_agent_stopped: true, auto_requeue: true });
+      await writeState(filePath, state);
+      return { task_id: state.task_id, node, recovery_package: packet, ready_nodes: readyNodes(state) };
+    }
+    requireActiveClaim(node, parameters);
     const stale = staleNodes(state).find(candidate => candidate.id === nodeId && candidate.claim_id === claimId);
     if (!stale) throw new ControllerError(`Node is not stale for its active claim: ${nodeId}`);
     nodeAttemptAvailability(node, nodeId);
@@ -2909,7 +3340,20 @@ async function rescueNode(parameters) {
 async function abandonNode(parameters) {
   const [filePath] = await readTask(parameters); const nodeId = requiredIdentifier(parameters.node_id, 'node_id'); const reason = requiredString(parameters.reason, 'reason'); trueValue(parameters.previous_agent_stopped, 'previous_agent_stopped');
   return withActiveWorkspaceStateLock(filePath, async state => {
-    const node = state.nodes[nodeId]; requireActiveClaim(node, parameters);
+    const node = state.nodes[nodeId];
+    if (isCohortReviewNode(state, node)) {
+      const slot = requiredString(parameters.reviewer_slot, 'reviewer_slot');
+      const lane = node.review_gate.cohort.lanes[slot];
+      const claimId = requiredString(parameters.claim_id, 'claim_id');
+      if (!lane || lane.status !== RUNNING || lane.claim_id !== claimId) throw new ControllerError(`Claim does not own an active Terra cohort lane: ${nodeId}`);
+      lane.status = 'abandoned';
+      lane.result = { summary: 'Terra cohort lane abandoned after explicit reconciliation.', reason, abandoned_at: utcNow(), claim_id: lane.claim_id };
+      node.status = 'abandoned';
+      addEvent(state, 'node_abandoned', { node_id: nodeId, reviewer_slot: slot, claim_id, reason, previous_agent_stopped: true });
+      await writeState(filePath, state);
+      return { task_id: state.task_id, node };
+    }
+    requireActiveClaim(node, parameters);
     node.status = 'abandoned'; node.workflow_completion_intent = null; node.result = { summary: 'Node abandoned after explicit reconciliation.', reason, abandoned_at: utcNow(), claim_id: node.claim_id };
     if (node.kind === 'total_review') addEvent(state, 'node_abandoned', { node_id: nodeId, claim_id: node.claim_id, reason, previous_agent_stopped: true });
     else bumpWorkflowRevision(state, 'node_abandoned', { node_id: nodeId, claim_id: node.claim_id, reason, previous_agent_stopped: true });
@@ -2922,7 +3366,22 @@ async function retryNode(parameters) {
   const [filePath] = await readTask(parameters); const nodeId = requiredIdentifier(parameters.node_id, 'node_id'); const reason = requiredString(parameters.reason, 'reason'); retryConfirmation(parameters);
   return withActiveWorkspaceStateLock(filePath, async state => {
     const node = state.nodes[nodeId];
+    const protocolNode = isReviewProtocolState(state) && protocolReviewNode(state) === node;
     const reviewNode = isReviewNode(node, state.routing_schema_version);
+    if (protocolNode && isCohortReviewNode(state, node) && ['unavailable', 'abandoned'].includes(node.status)) {
+      const slot = requiredString(parameters.reviewer_slot, 'reviewer_slot');
+      const lane = node.review_gate.cohort.lanes[slot];
+      if (!lane || lane.status !== node.status) throw new ControllerError('Only the matching unavailable or abandoned Terra cohort lane can be retried');
+      retryConfirmation(parameters); nodeAttemptAvailability(lane, nodeId);
+      const replacement = requiredString(parameters.replacement_agent_task_path, 'replacement_agent_task_path');
+      if (participantPaths(state).has(replacement)) throw new ControllerError('A replacement Terra cohort reviewer must not be a prior participant');
+      const preserveBlindClaim = node.review_gate.cohort.phase === 'cross_questioning';
+      node.review_gate.cohort.lanes[slot] = resetCohortLaneForRetry(lane, replacement, preserveBlindClaim);
+      node.status = RUNNING;
+      addEvent(state, 'terra_cohort_lane_retried', { node_id: nodeId, reviewer_slot: slot, replacement_agent_task_path: replacement, prior_status: lane.status, reason, previous_agent_stopped: true });
+      await writeState(filePath, state);
+      return { task_id: state.task_id, node, ready_nodes: readyNodes(state) };
+    }
     const orphanedReview = reviewNode && node.status === SUCCEEDED && !hasRecordedPassingReview(state, node);
     if (!node || (!['failed', 'blocked', 'unavailable', 'abandoned'].includes(node.status) && !orphanedReview)) {
       throw new ControllerError(`Only failed, blocked, unavailable, abandoned, or an unrecorded successful total_review can be retried: ${nodeId}`);
@@ -2930,10 +3389,57 @@ async function retryNode(parameters) {
     const downstreamStarted = Object.values(state.nodes).some(candidate => candidate.depends_on.includes(nodeId) && candidate.status !== PENDING);
     if (downstreamStarted) throw new ControllerError(`Cannot retry after a dependent node changed state: ${nodeId}`);
     nodeAttemptAvailability(node, nodeId);
-    if (state.routing_schema_version === 2 && reviewNode && !hasOwn(parameters, 'replacement_agent_task_path')) throw new ControllerError('A retried review node requires replacement_agent_task_path for an independent reviewer');
+    if (state.routing_schema_version >= 2 && reviewNode && !hasOwn(parameters, 'replacement_agent_task_path')) throw new ControllerError('A retried review node requires replacement_agent_task_path for an independent reviewer');
     const replacement = node.routing_legacy ? null : replacementExecutionOwner(state, node, parameters); const priorExecutionOwner = replacement ? rebindExecutionOwner(node, replacement) : node.execution_owner;
-    const priorClaimId = node.claim_id; const wasTotalReview = node.kind === 'total_review'; const priorReviewRole = reviewNode ? node.agent_type : null; const nextReview = reviewNode ? nextReviewRoute(state, node) : null;
-    if (isMaxReviewNode(node)) {
+    const priorClaimId = node.claim_id; const wasTotalReview = node.kind === 'total_review'; const priorReviewRole = reviewNode ? node.agent_type : null;
+    if (protocolNode) {
+      const stage = protocolStageForNode(node);
+      if (node.review_gate.scope_decision_required) throw new ControllerError('The final Sol/max closure requires a user scope decision; automatic retry is forbidden');
+      if (node.status === 'unavailable') {
+        clearRescueRouting(node); clearAttemptForRetry(node);
+        addEvent(state, 'review_protocol_unavailable_retried', { node_id: nodeId, stage, reason, previous_agent_stopped: true });
+        await writeState(filePath, state);
+        return { task_id: state.task_id, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), node, ready_nodes: readyNodes(state) };
+      }
+      if (stage === 'sol_max_closure') {
+        const charter = requireMaxReviewCharter(state, node);
+        if (charter.scope_decision_required || charter.status === 'scope_decision_required') throw new ControllerError('The final Sol/max closure requires a user scope decision; automatic retry is forbidden');
+        if (charter.status !== 'closure_ready') throw new ControllerError(`The max review charter is not ready for its only closure review: ${charter.status}`);
+        clearRescueRouting(node); clearAttemptForRetry(node);
+        addEvent(state, 'max_closure_review_ready', { node_id: nodeId, reason, previous_agent_stopped: true });
+        await writeState(filePath, state);
+        return { task_id: state.task_id, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), node, max_review_charter: state.max_review_charter, ready_nodes: readyNodes(state) };
+      }
+      if (stage === 'terra_cohort') {
+        const aggregate = node.review_gate.cohort.aggregate;
+        const sourceClaimId = aggregate?.source_review_claim_id ?? `cohort:${node.review_gate.cohort.round_id}`;
+        if (!state.repair_records.some(record => record.source_review_claim_id === sourceClaimId)) throw new ControllerError('The failed Terra cohort requires a recorded repair before Sol escalation');
+        clearRescueRouting(node); clearAttemptForRetry(node); applyProtocolStage(node, 'sol_high');
+        addEvent(state, 'terra_cohort_escalated', { node_id: nodeId, role: node.agent_type, source_review_claim_id: sourceClaimId, reason, previous_agent_stopped: true });
+        await writeState(filePath, state);
+        return { task_id: state.task_id, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), node, ready_nodes: readyNodes(state) };
+      }
+      if (stage === 'sol_max_initial') {
+        const sourceReview = protocolLatestFailedReview(state, node);
+        if (!sourceReview) throw new ControllerError('Sol/max closure requires a finalized failed max initial review');
+        await freezeProtocolMaxReviewCharter(state, node, sourceReview);
+        clearRescueRouting(node); clearAttemptForRetry(node); applyProtocolStage(node, 'sol_max_closure');
+        node.status = 'blocked';
+        addEvent(state, 'max_initial_repair_required', { node_id: nodeId, source_review_claim_id: sourceReview.claim_id, reason, previous_agent_stopped: true });
+        await writeState(filePath, state);
+        return { task_id: state.task_id, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), node, max_review_charter: state.max_review_charter, ready_nodes: [] };
+      }
+      const sourceReview = protocolLatestFailedReview(state, node);
+      requireRecordedProtocolRepair(state, sourceReview);
+      const nextStage = protocolNextStage(stage);
+      if (!nextStage) throw new ControllerError('The review protocol has no automatic stage after this failure');
+      clearRescueRouting(node); clearAttemptForRetry(node); applyProtocolStage(node, nextStage);
+      addEvent(state, 'review_protocol_stage_escalated', { node_id: nodeId, from_stage: stage, to_stage: nextStage, source_review_claim_id: sourceReview.claim_id, reason, previous_agent_stopped: true });
+      await writeState(filePath, state);
+      return { task_id: state.task_id, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), node, ready_nodes: readyNodes(state) };
+    }
+    const nextReview = reviewNode ? nextReviewRoute(state, node) : null;
+    if (isMaxClosureNode(state, node)) {
       const charter = requireMaxReviewCharter(state, node);
       if (charter.scope_decision_required || charter.status === 'scope_decision_required') {
         throw new ControllerError('The max review charter requires a scope decision; create a replacement task or explicitly expand the charter before retrying');
@@ -2980,8 +3486,8 @@ async function retryNode(parameters) {
   });
 }
 
-const PRUNABLE_STATE_FIELDS = new Set(['version', 'routing_schema_version', 'assurance_level', 'assurance_assessment', 'task_id', 'workspace', 'workspace_claims', 'goal', 'requirements', 'scope', 'non_goals', 'nodes', 'participants', 'reviews', 'repair_records', 'max_review_charter', 'verification_record', 'verification_history', 'events', 'workflow_revision', 'closed_revision', 'closed_at', 'created_at', 'updated_at', 'workspace_lease']);
-const PRUNABLE_NODE_FIELDS = new Set(['id', 'kind', 'review_stage', 'agent_type', 'depends_on', 'execution_risk', 'routing_reason', 'execution_owner', 'integration_owner', 'quality_guard', 'routing_legacy', 'rescue_role', 'rescue_reason', 'rescued_at', 'rescue_count', 'status', 'agent_task_path', 'agent_thread_id', 'agent_role', 'claim_id', 'claimed_at', 'activation_at', 'activation_deadline_at', 'heartbeat_at', 'heartbeat_count', 'lease_duration_sec', 'attempt', 'attempt_budget_used', 'unavailable_attempts', 'result', 'checkpoint', 'checkpoint_at', 'workflow_completion_intent', 'recovery_history']);
+const PRUNABLE_STATE_FIELDS = new Set(['version', 'routing_schema_version', 'assurance_level', 'assurance_assessment', 'review_protocol_version', 'review_entry_stage', 'review_context', 'task_id', 'workspace', 'workspace_claims', 'goal', 'requirements', 'scope', 'non_goals', 'nodes', 'participants', 'reviews', 'repair_records', 'max_review_charter', 'verification_record', 'verification_history', 'events', 'workflow_revision', 'closed_revision', 'closed_at', 'created_at', 'updated_at', 'workspace_lease']);
+const PRUNABLE_NODE_FIELDS = new Set(['id', 'kind', 'review_stage', 'agent_type', 'depends_on', 'execution_risk', 'routing_reason', 'execution_owner', 'integration_owner', 'quality_guard', 'routing_legacy', 'rescue_role', 'rescue_reason', 'rescued_at', 'rescue_count', 'status', 'agent_task_path', 'agent_thread_id', 'agent_role', 'claim_id', 'claimed_at', 'activation_at', 'activation_deadline_at', 'heartbeat_at', 'heartbeat_count', 'lease_duration_sec', 'attempt', 'attempt_budget_used', 'unavailable_attempts', 'result', 'checkpoint', 'checkpoint_at', 'workflow_completion_intent', 'recovery_history', 'review_gate']);
 const LEGACY_V1_PRUNABLE_STATE_FIELDS = new Set([...PRUNABLE_STATE_FIELDS].filter(field => !['assurance_level', 'assurance_assessment', 'repair_records', 'max_review_charter', 'verification_record', 'verification_history'].includes(field)));
 const LEGACY_V1_NULL_MAX_CHARTER_PRUNABLE_STATE_FIELDS = new Set([...LEGACY_V1_PRUNABLE_STATE_FIELDS, 'max_review_charter']);
 const LEGACY_V2_PRUNABLE_STATE_FIELDS = new Set([...PRUNABLE_STATE_FIELDS].filter(field => !['assurance_assessment', 'repair_records', 'max_review_charter', 'verification_history'].includes(field)));
@@ -3023,9 +3529,9 @@ function taskPruneEligibility(state, filePath, now) {
   const legacyNodeFields = isPreV2V1State ? LEGACY_V1_PRUNABLE_NODE_FIELDS : isPreRepairV2State ? LEGACY_V2_PRUNABLE_NODE_FIELDS : null;
   const nodeFields = legacyNodeFields ?? PRUNABLE_NODE_FIELDS;
   if (!hasExactFields(state, stateFields)) return { eligible: false, reason: 'incomplete or unknown state fields' };
-  if (state.version !== VERSION || ![1, 2].includes(state.routing_schema_version)) return { eligible: false, reason: 'legacy or unsupported state schema' };
+  if (state.version !== VERSION || ![1, 2, REVIEW_PROTOCOL_VERSION].includes(state.routing_schema_version)) return { eligible: false, reason: 'legacy or unsupported state schema' };
   if (state.routing_schema_version === 1 && state.assurance_level !== undefined && state.assurance_level !== null) return { eligible: false, reason: 'invalid v1 assurance state' };
-  if (state.routing_schema_version === 2 && !ASSURANCE_LEVELS.has(state.assurance_level)) return { eligible: false, reason: 'invalid v2 assurance state' };
+  if (state.routing_schema_version >= 2 && !ASSURANCE_LEVELS.has(state.assurance_level)) return { eligible: false, reason: 'invalid assurance state' };
   try { requiredIdentifier(state.task_id, 'task_id'); requiredString(state.workspace, 'workspace'); requiredString(state.goal, 'goal'); }
   catch (error) { return { eligible: false, reason: `invalid task identity: ${error.message}` }; }
   if (state.task_id !== path.basename(filePath, '.json')) return { eligible: false, reason: 'task_id does not match state path' };
@@ -3044,7 +3550,7 @@ function taskPruneEligibility(state, filePath, now) {
         && node.attempt_budget_used + node.unavailable_attempts <= node.attempt;
     if (!['read_only', 'delegable', 'protected'].includes(node.execution_risk) || !Array.isArray(node.depends_on) || node.depends_on.some(dependency => typeof dependency !== 'string') || node.routing_legacy !== false || !Number.isSafeInteger(node.attempt) || node.attempt < 0 || node.attempt > MAX_TOTAL_NODE_ATTEMPTS || !hasValidAttemptAccounting || !Number.isSafeInteger(node.heartbeat_count) || node.heartbeat_count < 0 || !Array.isArray(node.recovery_history)) return { eligible: false, reason: 'legacy or invalid node routing' };
   }
-  try { validateNodes(state.nodes); validateReviewTopology(state.nodes, state.assurance_level); }
+  try { validateNodes(state.nodes); validateReviewTopology(state.nodes, state.assurance_level, state.routing_schema_version, state.review_entry_stage); }
   catch (error) { return { eligible: false, reason: `invalid task topology: ${error.message}` }; }
   if (!Number.isSafeInteger(state.workflow_revision) || state.workflow_revision < 0 || !validTimestamp(state.created_at) || !validTimestamp(state.updated_at)) return { eligible: false, reason: 'invalid task timestamps or revision' };
   const updatedAt = Date.parse(state.updated_at);
@@ -4058,7 +4564,7 @@ async function recoverTaskLock(parameters) {
 
 async function auditContext(parameters) {
   const [, state] = await readTask(parameters);
-  return { task_id: state.task_id, workspace_claims: state.workspace_claims, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), assurance_assessment: state.assurance_assessment, goal: state.goal, requirements: state.requirements, scope: state.scope, non_goals: state.non_goals, nodes: Object.values(state.nodes), participants: state.participants, reviews: state.reviews, repair_records: state.repair_records, max_review_charter: state.max_review_charter ?? null, verification_record: state.verification_record, verification_history: state.verification_history, workflow_snapshot: workflowSnapshot(state), workspace_fingerprint: await workspaceFingerprint(state.workspace, state.workspace_claims) };
+  return { task_id: state.task_id, workspace_claims: state.workspace_claims, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), assurance_assessment: state.assurance_assessment, review_protocol_version: state.review_protocol_version, review_entry_stage: state.review_entry_stage, review_context: state.review_context, review_history_digest: protocolReviewHistoryDigest(state, { excludeActiveCohortPhase: true }), goal: state.goal, requirements: state.requirements, scope: state.scope, non_goals: state.non_goals, nodes: Object.values(state.nodes), participants: state.participants, reviews: state.reviews, repair_records: state.repair_records, max_review_charter: state.max_review_charter ?? null, verification_record: state.verification_record, verification_history: state.verification_history, workflow_snapshot: workflowSnapshot(state), workspace_fingerprint: await workspaceFingerprint(state.workspace, state.workspace_claims) };
 }
 
 function requireRequirementCoverage(state, coverage, label) {
@@ -4108,7 +4614,59 @@ async function recordRepair(parameters) {
   const [filePath] = await readTask(parameters);
   return withActiveWorkspaceStateLock(filePath, async state => {
     const reviewNode = reviewNodesForState(state)[0];
-    if (reviewNode && isMaxReviewNode(reviewNode)) {
+    if (isReviewProtocolState(state) && reviewNode && isCohortReviewNode(state, reviewNode) && reviewNode.status === 'failed') {
+      const aggregate = reviewNode.review_gate.cohort.aggregate;
+      const sourceClaimId = requiredString(repair.source_review_claim_id, 'source_review_claim_id');
+      const syntheticSource = { claim_id: `cohort:${reviewNode.review_gate.cohort.round_id}`, findings: (aggregate?.findings ?? []).map(finding => ({ ...finding, id: finding.finding_ref })) };
+      if (!aggregate || aggregate.verdict !== 'fail' || sourceClaimId !== syntheticSource.claim_id) throw new ControllerError('A Terra cohort repair must reference the failed cohort round');
+      if (state.repair_records.some(record => record.source_review_claim_id === sourceClaimId)) throw new ControllerError('The failed Terra cohort already has a repair record');
+      const repairedBy = requiredString(repair.repaired_by, 'repaired_by');
+      const addressedFindings = addressedReviewFindings(syntheticSource, repair.addressed_findings);
+      const verificationEvidence = requiredReviewValue(repair.verification_evidence, 'verification_evidence');
+      const fingerprint = await workspaceFingerprint(state.workspace, state.workspace_claims);
+      if (!sameJson(repair.workspace_fingerprint, fingerprint)) throw new ControllerError('Terra cohort repair fingerprint does not match the current workspace');
+      const stored = { source_review_claim_id: sourceClaimId, source_review_auditor_task: 'terra_cohort', source_workspace_fingerprint: aggregate.workspace_fingerprint ?? fingerprint, repaired_by: repairedBy, addressed_findings: addressedFindings, verification_evidence: verificationEvidence, workflow_snapshot: workflowSnapshot(state), workspace_fingerprint: fingerprint, workspace_changed: true, recorded_at: utcNow(), terra_cohort: true };
+      state.repair_records.push(stored);
+      addEvent(state, 'terra_cohort_repair_recorded', { node_id: reviewNode.id, source_review_claim_id: sourceClaimId, repaired_by: repairedBy });
+      await writeState(filePath, state);
+      return { task_id: state.task_id, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), repair_record: stored };
+    }
+    if (isReviewProtocolState(state) && reviewNode && protocolStageForNode(reviewNode) === 'terra_single' && reviewNode.status === 'failed') {
+      const sourceReview = protocolLatestFailedReview(state, reviewNode);
+      const sourceClaimId = requiredString(repair.source_review_claim_id, 'source_review_claim_id');
+      if (!sourceReview || sourceClaimId !== sourceReview.claim_id) throw new ControllerError('A Terra single-stage repair must reference the latest failed review claim');
+      if (state.repair_records.some(record => record.source_review_claim_id === sourceClaimId)) throw new ControllerError('The failed Terra review already has a repair record');
+      const repairedBy = requiredString(repair.repaired_by, 'repaired_by');
+      const addressedFindings = addressedReviewFindings(sourceReview, repair.addressed_findings);
+      const verificationEvidence = requiredReviewValue(repair.verification_evidence, 'verification_evidence');
+      const fingerprint = await workspaceFingerprint(state.workspace, state.workspace_claims);
+      if (!sameJson(repair.workspace_fingerprint, fingerprint)) throw new ControllerError('Terra repair fingerprint does not match the current workspace');
+      const stored = { source_review_claim_id: sourceClaimId, source_review_auditor_task: sourceReview.auditor_task, source_workspace_fingerprint: sourceReview.workspace_fingerprint, repaired_by: repairedBy, addressed_findings: addressedFindings, verification_evidence: verificationEvidence, workflow_snapshot: workflowSnapshot(state), workspace_fingerprint: fingerprint, workspace_changed: !sameJson(fingerprint, sourceReview.workspace_fingerprint), recorded_at: utcNow(), terra_stage: 'terra_single' };
+      state.repair_records.push(stored);
+      addEvent(state, 'terra_single_repair_recorded', { node_id: reviewNode.id, source_review_claim_id: sourceClaimId, repaired_by: repairedBy });
+      await writeState(filePath, state);
+      return { task_id: state.task_id, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), repair_record: stored };
+    }
+    if (isReviewProtocolState(state) && reviewNode && reviewNode.kind === 'total_review' && !isMaxReviewNode(reviewNode) && reviewNode.status === 'failed') {
+      const sourceReview = protocolLatestFailedReview(state, reviewNode);
+      const sourceClaimId = requiredString(repair.source_review_claim_id, 'source_review_claim_id');
+      if (!sourceReview || sourceClaimId !== sourceReview.claim_id) throw new ControllerError('A Sol repair record must reference the latest failed review claim');
+      if (state.repair_records.some(record => record.source_review_claim_id === sourceClaimId)) throw new ControllerError('The failed Sol review already has a repair record');
+      const repairedBy = requiredString(repair.repaired_by, 'repaired_by');
+      const addressedFindings = addressedReviewFindings(sourceReview, repair.addressed_findings);
+      const verificationEvidence = requiredReviewValue(repair.verification_evidence, 'verification_evidence');
+      const fingerprint = await workspaceFingerprint(state.workspace, state.workspace_claims);
+      if (!sameJson(repair.workspace_fingerprint, fingerprint)) throw new ControllerError('Sol repair fingerprint does not match the current workspace');
+      const stored = { source_review_claim_id: sourceClaimId, source_review_auditor_task: sourceReview.auditor_task, source_workspace_fingerprint: sourceReview.workspace_fingerprint, repaired_by: repairedBy, addressed_findings: addressedFindings, verification_evidence: verificationEvidence, workflow_snapshot: workflowSnapshot(state), workspace_fingerprint: fingerprint, workspace_changed: !sameJson(fingerprint, sourceReview.workspace_fingerprint), recorded_at: utcNow(), sol_stage: protocolStageForNode(reviewNode) };
+      state.repair_records.push(stored);
+      addEvent(state, 'sol_review_repair_recorded', { node_id: reviewNode.id, source_review_claim_id: sourceClaimId, repaired_by: repairedBy, stage: protocolStageForNode(reviewNode) });
+      await writeState(filePath, state);
+      return { task_id: state.task_id, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), repair_record: stored };
+    }
+    if (isReviewProtocolState(state) && reviewNode && protocolStageForNode(reviewNode) === 'sol_max_initial' && reviewNode.status === 'failed') {
+      throw new ControllerError('A Sol/max initial failure must first freeze its closure charter through workflow_retry');
+    }
+    if (reviewNode && isMaxClosureNode(state, reviewNode)) {
       const charter = requireMaxReviewCharter(state, reviewNode);
       if (!['initial_repair_required', 'repair_required'].includes(charter.status) || reviewNode.status !== 'blocked') throw new ControllerError('A max repair record requires a blocked max review charter awaiting protected repair');
       const sourceClaimId = requiredString(repair.source_review_claim_id, 'source_review_claim_id');
@@ -4171,20 +4729,21 @@ async function recordReview(parameters) {
   const [filePath] = await readTask(parameters);
   return withActiveWorkspaceStateLock(filePath, async state => {
     const auditor = String(review.auditor_task ?? ''); const role = String(review.auditor_role ?? ''); const verdict = String(review.verdict ?? '');
-    const reviewNode = Object.values(state.nodes).find(node => isReviewNode(node, state.routing_schema_version) && node.status === RUNNING && node.agent_task_path === auditor);
+    const reviewNode = Object.values(state.nodes).find(node => isReviewNode(node, state.routing_schema_version) && (node.status === RUNNING || isCohortReviewNode(state, node)) && (node.agent_task_path === auditor || activeCohortLaneForTask(node, auditor)));
+    const cohortLane = reviewNode && isCohortReviewNode(state, reviewNode) ? activeCohortLaneForTask(reviewNode, auditor) : null;
     const priorReviewers = new Set(state.reviews.map(item => item.auditor_task));
     const participatedOutsideReview = reviewNode && state.participants.some(item => item.agent_task_path === auditor && item.node_id !== reviewNode.id);
     if (!auditor || !reviewNode || participatedOutsideReview || priorReviewers.has(auditor)) throw new ControllerError('Review gate reviewer must be a new agent that did not previously participate');
     const isTerraReview = reviewNode.kind === QUALITY_REVIEW_KIND;
     if (isTerraReview && role !== TERRA_REVIEW_ROLE) throw new ControllerError('A quality_review requires avsp_terra_xhigh');
     if (!isTerraReview && !SOL_ROLES.has(role) && role !== FALLBACK_ROLE) throw new ControllerError('Unsupported total reviewer role');
-    if (reviewNode.agent_role !== role) throw new ControllerError('Reviewer role must match its claimed review node');
-    requireActiveClaim(reviewNode, { node_id: reviewNode.id, claim_id: review.claim_id });
-    if (!reviewNode.activation_at || reviewNode.heartbeat_count < 1) throw new ControllerError('Reviewer must activate its claim with workflow_heartbeat before recording a review');
+    if ((cohortLane?.agent_role ?? reviewNode.agent_role) !== role) throw new ControllerError('Reviewer role must match its claimed review node');
+    const activeClaim = activeClaimForOperation(state, reviewNode, { node_id: reviewNode.id, claim_id: review.claim_id });
+    if (!activeClaim.activation_at || activeClaim.heartbeat_count < 1) throw new ControllerError('Reviewer must activate its claim with workflow_heartbeat before recording a review');
     if (role === FALLBACK_ROLE && !review.fallback_reason) throw new ControllerError('Terra fallback review requires fallback_reason');
     if (!['pass', 'fail', 'unavailable'].includes(verdict)) throw new ControllerError('Review verdict must be pass, fail, or unavailable');
     const findings = reviewFindings(state, review.findings, verdict);
-    const closureReview = isMaxReviewNode(reviewNode) && maxClosureReview(state, reviewNode);
+    const closureReview = isMaxClosureNode(state, reviewNode) && maxClosureReview(state, reviewNode);
     const repairRegressions = closureReview ? maxClosureRepairRegressions(state, review, findings) : [];
     if (!closureReview && hasOwn(review, 'repair_regressions')) throw new ControllerError('repair_regressions is only valid for a max closure review');
     const coverage = requireRequirementCoverage(state, review.requirement_coverage, 'Review');
@@ -4197,8 +4756,29 @@ async function recordReview(parameters) {
     const scopeAndRegression = requiredReviewValue(review.scope_and_regression, 'scope_and_regression');
     const verificationGaps = requiredReviewValue(review.verification_gaps, 'verification_gaps');
     const residualRisk = requiredReviewValue(review.residual_risk, 'residual_risk');
+    const independentAssessment = isReviewProtocolState(state) ? requiredReviewValue(review.independent_assessment, 'independent_assessment') : review.independent_assessment ?? null;
+    const historyReconciliation = isReviewProtocolState(state) ? requiredReviewValue(review.history_reconciliation, 'history_reconciliation') : review.history_reconciliation ?? null;
+    const reviewHistoryDigest = isReviewProtocolState(state) ? requiredString(review.review_history_digest, 'review_history_digest') : review.review_history_digest ?? null;
+    if (isReviewProtocolState(state) && reviewHistoryDigest !== protocolReviewHistoryDigest(state, { excludeActiveCohortPhase: Boolean(cohortLane) })) throw new ControllerError('review_history_digest does not match the complete current review and repair history');
     if (state.reviews.length >= MAX_REVIEWS) throw new ControllerError(`Task exceeded the ${MAX_REVIEWS}-review limit; create a replacement workflow task`);
-    const stored = { auditor_task: auditor, auditor_role: role, node_id: reviewNode.id, claim_id: reviewNode.claim_id, review_kind: reviewNode.kind, verdict, findings, repair_regressions: repairRegressions, requirement_coverage: coverage, scope_and_regression: scopeAndRegression, verification_gaps: verificationGaps, residual_risk: residualRisk, fallback_reason: review.fallback_reason ?? null, workflow_snapshot: snapshot, workspace_fingerprint: fingerprint, recorded_at: utcNow() };
+    let reviewPhase = null; let reviewerSlot = null;
+    if (cohortLane) {
+      reviewPhase = reviewNode.review_gate.cohort.phase;
+      reviewerSlot = cohortLane.slot;
+      if (!['blind', 'cross_questioning'].includes(reviewPhase)) throw new ControllerError(`Terra cohort review cannot be recorded in phase: ${reviewPhase}`);
+      if (reviewPhase === 'cross_questioning') {
+        const targets = review.challenge_targets;
+        const otherSlot = COHORT_SLOTS.find(slot => slot !== reviewerSlot);
+        const blindClaimId = reviewNode.review_gate.cohort.lanes[otherSlot]?.blind_review_claim_id;
+        const blindReview = state.reviews.find(item => item.node_id === reviewNode.id && item.review_phase === 'blind' && item.reviewer_slot === otherSlot && item.claim_id === blindClaimId);
+        if (!Array.isArray(targets) || targets.length !== 1 || targets[0] !== blindReview?.claim_id) throw new ControllerError('A Terra cohort cross-questioning review must challenge the other lane blind review exactly once');
+      } else if (hasOwn(review, 'challenge_targets')) {
+        throw new ControllerError('challenge_targets is only valid during Terra cohort cross_questioning');
+      }
+    } else if (hasOwn(review, 'challenge_targets')) {
+      throw new ControllerError('challenge_targets is only valid during Terra cohort cross_questioning');
+    }
+    const stored = { auditor_task: auditor, auditor_role: role, node_id: reviewNode.id, claim_id: activeClaim.claim_id, review_kind: reviewNode.kind, review_phase: reviewPhase, reviewer_slot: reviewerSlot, verdict, findings, repair_regressions: repairRegressions, requirement_coverage: coverage, scope_and_regression: scopeAndRegression, verification_gaps: verificationGaps, residual_risk: residualRisk, independent_assessment: independentAssessment, history_reconciliation: historyReconciliation, review_history_digest: reviewHistoryDigest, fallback_reason: review.fallback_reason ?? null, workflow_snapshot: snapshot, workspace_fingerprint: fingerprint, recorded_at: utcNow() };
     if (closureReview) {
       const charter = requireMaxReviewCharter(state, reviewNode);
       const blocking = findings.filter(finding => finding.severity === 'blocking');
@@ -4219,6 +4799,12 @@ async function recordReview(parameters) {
         charter.status = 'closure_passed';
         charter.pending_repair_source_claim_id = null;
         addEvent(state, 'max_review_closure_passed', { node_id: reviewNode.id, claim_id: reviewNode.claim_id });
+      } else if (isReviewProtocolState(state)) {
+        charter.status = 'scope_decision_required';
+        charter.scope_decision_required = true;
+        charter.pending_repair_source_claim_id = null;
+        charter.out_of_charter_findings.push(...blocking.map(finding => ({ ...finding, review_claim_id: reviewNode.claim_id, recorded_at: utcNow(), terminal_max_failure: true })));
+        addEvent(state, 'max_review_terminal_failure', { node_id: reviewNode.id, claim_id: reviewNode.claim_id, finding_ids: blocking.map(finding => finding.id) });
       } else {
         charter.status = 'repair_required';
         charter.pending_repair_source_claim_id = reviewNode.claim_id;
@@ -4247,7 +4833,7 @@ async function closeReasons(state) {
     return reasons;
   }
   const reviewNode = reviewNodesForState(state)[0] ?? null;
-  if (reviewNode && isMaxReviewNode(reviewNode)) {
+  if (reviewNode && isMaxClosureNode(state, reviewNode)) {
     if (maxReviewCharterMissing(state, reviewNode)) reasons.push('max total_review is missing a frozen review charter');
     else if (state.max_review_charter.status !== 'closure_passed' || state.max_review_charter.scope_decision_required) reasons.push(`max review charter is ${state.max_review_charter.status}`);
   }
@@ -4255,6 +4841,19 @@ async function closeReasons(state) {
   const reviewDescription = reviewNode?.kind === QUALITY_REVIEW_KIND ? 'quality_review' : 'total review';
   if (!reviewNode || reviewNode.status !== SUCCEEDED) reasons.push(`${reviewName} is not succeeded`);
   if (reviewNode?.kind === 'total_review' && !isCompletedWorkflowOutcome(reviewNode.result, state, reviewNode)) reasons.push('total_review workflow outcome completion is pending or invalid');
+  if (reviewNode && isCohortReviewNode(state, reviewNode)) {
+    const cohort = reviewNode.review_gate.cohort;
+    const aggregate = cohort?.aggregate;
+    if (cohort?.phase !== 'passed' || aggregate?.verdict !== 'pass') reasons.push('Terra cohort did not reach a passing cross-review conclusion');
+    const finalReviews = currentCohortReviews(state, reviewNode, 'cross_questioning').filter(review => review.verdict === 'pass' && reviewCompletion(state, review).status === SUCCEEDED);
+    if (finalReviews.length !== COHORT_SLOTS.length || new Set(finalReviews.map(review => review.reviewer_slot)).size !== COHORT_SLOTS.length) reasons.push('Terra cohort is missing a completed passing cross-questioning review from each lane');
+    if (aggregate && !sameJson(aggregate.workspace_fingerprint, await workspaceFingerprint(state.workspace, state.workspace_claims))) reasons.push('workspace changed after Terra cohort cross-review');
+    for (const review of finalReviews) {
+      if (!workflowSnapshotMatchesState(review.workflow_snapshot, state)) reasons.push('task state changed after Terra cohort cross-review');
+      if (!sameJson(review.workspace_fingerprint, await workspaceFingerprint(state.workspace, state.workspace_claims))) reasons.push('workspace changed after Terra cohort cross-review');
+    }
+    return reasons;
+  }
   const review = state.reviews.at(-1);
   if (!review) reasons.push(reviewNode?.kind === QUALITY_REVIEW_KIND ? 'no quality_review' : 'no total review'); else {
     if (review.verdict !== 'pass') reasons.push(`latest review verdict is ${review.verdict}`);

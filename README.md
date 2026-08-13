@@ -9,6 +9,7 @@
 ## 你会得到
 
 - 可供 Codex 使用的全局规则与跨平台文档。
+- 默认引导 Codex 根据任务复杂度选择最小充分实现和适当的答复密度。
 - 可按任务需要使用的 agent role profiles。
 - `agnets-workflow` 插件及其工作流工具。
 - `agent-toolchain` 提供 CodeGraph 与 RTK 的项目受控接入与维护。
@@ -100,7 +101,7 @@ sh ./install-codex.sh
 
 ```toml
 model = "gpt-5.6-terra"
-model_reasoning_effort = "xhigh"
+model_reasoning_effort = "high"
 sandbox_mode = "danger-full-access"
 
 

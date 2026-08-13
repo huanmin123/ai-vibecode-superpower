@@ -36,6 +36,32 @@ function findingsFor(name, verdict) {
     : [];
 }
 
+const v3ReviewContext = {
+  environment: 'Local Windows workspace and the configured project runtime.',
+  scenarios: ['Primary expected workflow', 'Failure repair and escalation boundary'],
+  boundaries: 'Only the declared workspace claims and original requirements are in scope.',
+};
+
+function v3ReviewPayload({ taskPath, role, claimId, verdict, context, name, extra = {} }) {
+  return {
+    auditor_task: taskPath,
+    auditor_role: role,
+    claim_id: claimId,
+    verdict,
+    findings: findingsFor(name, verdict),
+    requirement_coverage: { R1: `${name} coverage` },
+    workflow_snapshot: context.workflow_snapshot,
+    workspace_fingerprint: context.workspace_fingerprint,
+    scope_and_regression: `${name} scope and regressions`,
+    verification_gaps: `${name} verification gaps`,
+    residual_risk: `${name} residual risk`,
+    independent_assessment: `${name} independent assessment from the original requirements and current workspace.`,
+    history_reconciliation: `${name} reconciled all previous review and repair evidence without treating it as conclusive.`,
+    review_history_digest: context.review_history_digest,
+    ...extra,
+  };
+}
+
 const verificationAssuranceAssessment = assuranceAssessmentFor('verification');
 const terraAssuranceAssessment = assuranceAssessmentFor('terra');
 const solAssuranceAssessment = assuranceAssessmentFor('sol');
@@ -736,6 +762,154 @@ test('uses v2 assurance gates with frozen verification and Terra-to-Sol escalati
     await call('complete', { task_id: 'feature-1', node_id: 'review-gate', claim_id: sol.node.claim_id, status: 'succeeded', result: solResult });
     const [closed, code] = await call('close-check', { task_id: 'feature-1' });
     assert.equal(code, 0); assert.equal(closed.close_allowed, true);
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test('v3 review protocol starts from a selected stage, requires repairs before escalation, and terminates a failed max closure', async () => {
+  const fixture = await setup();
+  try {
+    const call = (command, parameters) => callForFixture(fixture, command, parameters);
+    const workRoute = { execution_risk: 'protected', routing_reason: 'bounded change', execution_owner: '/root/v3-work', integration_owner: '/root', quality_guard: 'targeted verification' };
+    const reviewRoute = { execution_risk: 'read_only', routing_reason: 'global review gate', execution_owner: '/root/v3-high', integration_owner: '/root', quality_guard: 'review requirements and evidence' };
+    await writeFile(fixture.manifest, JSON.stringify({ task_id: 'feature-1', workspace: fixture.workspace, goal: 'Run the bounded review protocol', routing_schema_version: 3, assurance_level: 'sol', assurance_assessment: solAssuranceAssessment, review_entry_stage: 'sol_high', review_context: v3ReviewContext, requirements: [{ id: 'R1', text: 'close only when the protocol gate passes' }], nodes: [{ id: 'work', kind: 'implementation', ...workRoute }, { id: 'review-gate', kind: 'total_review', depends_on: ['work'], ...reviewRoute }] }));
+    await call('init', { manifest: fixture.manifest });
+    const [work] = await call('claim', { task_id: 'feature-1', node_id: 'work', agent_task_path: '/root/v3-work', agent_role: 'avsp_terra_high' });
+    const workResult = path.join(fixture.root, 'v3-work.json'); await writeFile(workResult, JSON.stringify({}));
+    await call('complete', { task_id: 'feature-1', node_id: 'work', claim_id: work.node.claim_id, status: 'succeeded', result: workResult });
+
+    const reviewOnce = async (name, role, verdict = 'fail') => {
+      const taskPath = `/root/${name}`;
+      const [claim] = await call('claim', { task_id: 'feature-1', node_id: 'review-gate', agent_task_path: taskPath, agent_role: role });
+      const claimId = claim.claim_id ?? claim.node.claim_id;
+      await call('heartbeat', { task_id: 'feature-1', node_id: 'review-gate', claim_id: claimId });
+      const [context] = await call('audit-context', { task_id: 'feature-1' }); const reviewPath = path.join(fixture.root, `${name}.review.json`);
+      await writeFile(reviewPath, JSON.stringify(v3ReviewPayload({ taskPath, role, claimId, verdict, context, name })));
+      await call('record-review', { task_id: 'feature-1', review: reviewPath });
+      const outcome = path.join(fixture.root, `${name}.outcome.json`); await writeFile(outcome, JSON.stringify({}));
+      await call('complete', { task_id: 'feature-1', node_id: 'review-gate', claim_id: claimId, status: verdict === 'pass' ? 'succeeded' : 'failed', result: outcome });
+      return { claimId, context };
+    };
+    const recordRepair = async (sourceClaimId, findingId) => {
+      const [context] = await call('audit-context', { task_id: 'feature-1' }); const repair = path.join(fixture.root, `${sourceClaimId}.repair.json`);
+      await writeFile(repair, JSON.stringify({ source_review_claim_id: sourceClaimId, repaired_by: '/root/v3-repair', addressed_findings: [{ finding_id: findingId, resolution: 'Fixed the recorded blocker.', verification_evidence: 'Targeted verification passes.' }], verification_evidence: 'Repair verified.', workspace_fingerprint: context.workspace_fingerprint }));
+      await call('record-repair', { task_id: 'feature-1', repair });
+    };
+    const retry = replacement => call('retry', { task_id: 'feature-1', node_id: 'review-gate', reason: 'previous reviewer stopped', replacement_agent_task_path: replacement, previous_agent_stopped: true });
+
+    const high = await reviewOnce('v3-high', 'avsp_sol_high');
+    await assert.rejects(() => retry('/root/v3-xhigh'), /requires a recorded repair/);
+    await recordRepair(high.claimId, 'v3-high-blocking');
+    let [escalated] = await retry('/root/v3-xhigh'); assert.equal(escalated.node.agent_type, 'avsp_sol_xhigh');
+    const xhigh = await reviewOnce('v3-xhigh', 'avsp_sol_xhigh');
+    await assert.rejects(() => retry('/root/v3-max-initial'), /requires a recorded repair/);
+    await recordRepair(xhigh.claimId, 'v3-xhigh-blocking');
+    [escalated] = await retry('/root/v3-max-initial'); assert.equal(escalated.node.agent_type, 'avsp_sol_max'); assert.equal(escalated.node.review_gate.stage, 'sol_max_initial');
+    const maxInitial = await reviewOnce('v3-max-initial', 'avsp_sol_max');
+    [escalated] = await retry('/root/v3-max-closure'); assert.equal(escalated.node.status, 'blocked'); assert.equal(escalated.node.review_gate.stage, 'sol_max_closure');
+    await recordRepair(maxInitial.claimId, 'v3-max-initial-blocking');
+    [escalated] = await retry('/root/v3-max-closure'); assert.equal(escalated.node.status, 'pending');
+    await reviewOnce('v3-max-closure', 'avsp_sol_max');
+    const state = await readControllerState(fixture.stateDir); assert.equal(state.nodes['review-gate'].status, 'blocked'); assert.equal(state.max_review_charter.status, 'scope_decision_required');
+    await assert.rejects(() => retry('/root/v3-forbidden-retry'), /scope decision/);
+    const [closed, closeCode] = await call('close-check', { task_id: 'feature-1' }); assert.equal(closeCode, 2); assert.ok(closed.reasons.includes('max review charter is scope_decision_required'));
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test('v3 passed Sol/max closure can be invalidated and reopened for one new independent closure', async () => {
+  const fixture = await setup();
+  try {
+    const call = (command, parameters) => callForFixture(fixture, command, parameters);
+    const workRoute = { execution_risk: 'protected', routing_reason: 'bounded change', execution_owner: '/root/v3-max-reopen-work', integration_owner: '/root', quality_guard: 'targeted verification' };
+    const reviewRoute = { execution_risk: 'read_only', routing_reason: 'global review gate', execution_owner: '/root/v3-max-reopen-xhigh', integration_owner: '/root', quality_guard: 'review requirements and evidence' };
+    await writeFile(fixture.manifest, JSON.stringify({ task_id: 'feature-1', workspace: fixture.workspace, goal: 'Reopen an invalidated max closure', routing_schema_version: 3, assurance_level: 'sol', assurance_assessment: solAssuranceAssessment, review_entry_stage: 'sol_xhigh', review_context: v3ReviewContext, requirements: [{ id: 'R1', text: 'max closure is reopened after a material change' }], nodes: [{ id: 'work', kind: 'implementation', ...workRoute }, { id: 'review-gate', kind: 'total_review', depends_on: ['work'], ...reviewRoute }] }));
+    await call('init', { manifest: fixture.manifest });
+    const [work] = await call('claim', { task_id: 'feature-1', node_id: 'work', agent_task_path: '/root/v3-max-reopen-work', agent_role: 'avsp_terra_high' }); const workResult = path.join(fixture.root, 'v3-max-reopen-work.json'); await writeFile(workResult, JSON.stringify({})); await call('complete', { task_id: 'feature-1', node_id: 'work', claim_id: work.node.claim_id, status: 'succeeded', result: workResult });
+    const reviewOnce = async (name, role, verdict) => {
+      const taskPath = `/root/${name}`; const [claim] = await call('claim', { task_id: 'feature-1', node_id: 'review-gate', agent_task_path: taskPath, agent_role: role }); const claimId = claim.claim_id ?? claim.node.claim_id;
+      await call('heartbeat', { task_id: 'feature-1', node_id: 'review-gate', claim_id: claimId }); const [context] = await call('audit-context', { task_id: 'feature-1' }); const review = path.join(fixture.root, `${name}.json`); await writeFile(review, JSON.stringify(v3ReviewPayload({ taskPath, role, claimId, verdict, context, name }))); await call('record-review', { task_id: 'feature-1', review }); const outcome = path.join(fixture.root, `${name}.outcome.json`); await writeFile(outcome, JSON.stringify({})); await call('complete', { task_id: 'feature-1', node_id: 'review-gate', claim_id: claimId, status: verdict === 'pass' ? 'succeeded' : 'failed', result: outcome }); return claimId;
+    };
+    const recordRepair = async (sourceReviewClaimId, findingId) => { const [context] = await call('audit-context', { task_id: 'feature-1' }); const repair = path.join(fixture.root, `${sourceReviewClaimId}.repair.json`); await writeFile(repair, JSON.stringify({ source_review_claim_id: sourceReviewClaimId, repaired_by: '/root/v3-max-reopen-repair', addressed_findings: [{ finding_id: findingId, resolution: 'Fixed the blocking finding.', verification_evidence: 'Targeted verification passes.' }], verification_evidence: 'Repair verified.', workspace_fingerprint: context.workspace_fingerprint })); await call('record-repair', { task_id: 'feature-1', repair }); };
+    const retry = replacement => call('retry', { task_id: 'feature-1', node_id: 'review-gate', reason: 'Advance the bounded protocol after the prior reviewer stopped.', replacement_agent_task_path: replacement, previous_agent_stopped: true });
+    const xhighClaimId = await reviewOnce('v3-max-reopen-xhigh', 'avsp_sol_xhigh', 'fail'); await recordRepair(xhighClaimId, 'v3-max-reopen-xhigh-blocking'); await retry('/root/v3-max-reopen-initial');
+    const maxInitialClaimId = await reviewOnce('v3-max-reopen-initial', 'avsp_sol_max', 'fail'); await retry('/root/v3-max-reopen-closure'); await recordRepair(maxInitialClaimId, 'v3-max-reopen-initial-blocking'); await retry('/root/v3-max-reopen-closure');
+    await reviewOnce('v3-max-reopen-closure', 'avsp_sol_max', 'pass');
+    let state = await readControllerState(fixture.stateDir); assert.equal(state.nodes['review-gate'].status, 'succeeded'); assert.equal(state.max_review_charter.status, 'closure_passed'); assert.equal(state.max_review_charter.closure_attempt_count, 1);
+    state.nodes.work.result = { changed_after_max_closure: true }; await writeControllerState(fixture.stateDir, state);
+    const [closeResult, closeCode] = await call('close-check', { task_id: 'feature-1' }); assert.equal(closeCode, 2); assert.ok(closeResult.reasons.includes('task state changed after total review'));
+    const [invalidated] = await call('invalidate-gate', { task_id: 'feature-1', reason: 'The work result changed after the max closure pass.', replacement_agent_task_path: '/root/v3-max-reopen-replacement' });
+    assert.equal(invalidated.node.status, 'pending'); state = await readControllerState(fixture.stateDir); assert.equal(state.max_review_charter.status, 'closure_ready'); assert.equal(state.max_review_charter.closure_attempt_count, 0);
+    const [replacement] = await call('claim', { task_id: 'feature-1', node_id: 'review-gate', agent_task_path: '/root/v3-max-reopen-replacement', agent_role: 'avsp_sol_max' }); assert.equal(replacement.node.status, 'running');
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test('v3 Terra cohort requires two blind lanes and one bounded cross-questioning round', async () => {
+  const fixture = await setup();
+  try {
+    const call = (command, parameters) => callForFixture(fixture, command, parameters);
+    const workRoute = { execution_risk: 'protected', routing_reason: 'bounded change', execution_owner: '/root/cohort-work', integration_owner: '/root', quality_guard: 'targeted verification' };
+    const reviewRoute = { execution_risk: 'read_only', routing_reason: 'parallel cross-review gate', execution_owner: '/root/cohort-coverage-blind', integration_owner: '/root', quality_guard: 'review requirements and evidence' };
+    await writeFile(fixture.manifest, JSON.stringify({ task_id: 'feature-1', workspace: fixture.workspace, goal: 'Run a Terra cross-review cohort', routing_schema_version: 3, assurance_level: 'terra', assurance_assessment: terraAssuranceAssessment, review_entry_stage: 'terra_cohort', review_context: v3ReviewContext, requirements: [{ id: 'R1', text: 'cross-review must be independently evidenced' }], nodes: [{ id: 'work', kind: 'implementation', ...workRoute }, { id: 'review-gate', kind: 'quality_review', depends_on: ['work'], ...reviewRoute }] }));
+    await call('init', { manifest: fixture.manifest });
+    const [work] = await call('claim', { task_id: 'feature-1', node_id: 'work', agent_task_path: '/root/cohort-work', agent_role: 'avsp_terra_high' }); const workResult = path.join(fixture.root, 'cohort-work.json'); await writeFile(workResult, JSON.stringify({})); await call('complete', { task_id: 'feature-1', node_id: 'work', claim_id: work.node.claim_id, status: 'succeeded', result: workResult });
+    const runLane = async (slot, name, phase, target = null) => {
+      const taskPath = `/root/${name}`; const [claim] = await call('claim', { task_id: 'feature-1', node_id: 'review-gate', reviewer_slot: slot, agent_task_path: taskPath, agent_role: 'avsp_terra_xhigh' }); const claimId = claim.claim_id ?? claim.node.claim_id;
+      await call('heartbeat', { task_id: 'feature-1', node_id: 'review-gate', claim_id: claimId }); const [context] = await call('audit-context', { task_id: 'feature-1' }); const reviewPath = path.join(fixture.root, `${name}.json`);
+      await writeFile(reviewPath, JSON.stringify(v3ReviewPayload({ taskPath, role: 'avsp_terra_xhigh', claimId, verdict: 'pass', context, name, extra: phase === 'cross' ? { challenge_targets: [target] } : {} })));
+      await call('record-review', { task_id: 'feature-1', review: reviewPath }); const outcome = path.join(fixture.root, `${name}.outcome.json`); await writeFile(outcome, JSON.stringify({})); await call('complete', { task_id: 'feature-1', node_id: 'review-gate', claim_id: claimId, status: 'succeeded', result: outcome }); return claimId;
+    };
+    const coverageBlind = await runLane('coverage', 'cohort-coverage-blind', 'blind'); const adversarialBlind = await runLane('adversarial', 'cohort-adversarial-blind', 'blind');
+    const coverageCross = await runLane('coverage', 'cohort-coverage-cross', 'cross', adversarialBlind); await runLane('adversarial', 'cohort-adversarial-cross', 'cross', coverageBlind);
+    const state = await readControllerState(fixture.stateDir); assert.equal(state.nodes['review-gate'].status, 'succeeded'); assert.equal(state.nodes['review-gate'].review_gate.cohort.phase, 'passed'); assert.equal(state.nodes['review-gate'].review_gate.cohort.aggregate.verdict, 'pass'); assert.equal(coverageCross.length > 0, true);
+    const priorRound = state.nodes['review-gate'].review_gate.cohort.round_id;
+    state.nodes.work.result = { changed_after_cohort_pass: true }; await writeControllerState(fixture.stateDir, state);
+    const [closeResult, closeCode] = await call('close-check', { task_id: 'feature-1' }); assert.equal(closeCode, 2); assert.ok(closeResult.reasons.includes('task state changed after Terra cohort cross-review'));
+    const [invalidated] = await call('invalidate-gate', { task_id: 'feature-1', reason: 'Material task evidence changed after the cohort pass.', reviewer_slot: 'adversarial', replacement_agent_task_path: '/root/cohort-reopened-adversarial' });
+    assert.equal(invalidated.node.status, 'pending'); assert.equal(invalidated.node.review_gate.cohort.phase, 'blind'); assert.notEqual(invalidated.node.review_gate.cohort.round_id, priorRound);
+    await assert.rejects(() => call('claim', { task_id: 'feature-1', node_id: 'review-gate', reviewer_slot: 'adversarial', agent_task_path: '/root/not-reserved', agent_role: 'avsp_terra_xhigh' }), /reserved for a replacement reviewer/);
+    const [reopened] = await call('claim', { task_id: 'feature-1', node_id: 'review-gate', reviewer_slot: 'adversarial', agent_task_path: '/root/cohort-reopened-adversarial', agent_role: 'avsp_terra_xhigh' });
+    assert.equal(reopened.reviewer_slot, 'adversarial');
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test('v3 Terra cohort accepts parallel history snapshots and preserves an unavailable lane budget on retry', async () => {
+  const fixture = await setup();
+  try {
+    const call = (command, parameters) => callForFixture(fixture, command, parameters);
+    const workRoute = { execution_risk: 'protected', routing_reason: 'bounded change', execution_owner: '/root/cohort-retry-work', integration_owner: '/root', quality_guard: 'targeted verification' };
+    const reviewRoute = { execution_risk: 'read_only', routing_reason: 'parallel cross-review gate', execution_owner: '/root/cohort-retry-coverage', integration_owner: '/root', quality_guard: 'review requirements and evidence' };
+    await writeFile(fixture.manifest, JSON.stringify({ task_id: 'feature-1', workspace: fixture.workspace, goal: 'Preserve bounded cohort retries', routing_schema_version: 3, assurance_level: 'terra', assurance_assessment: terraAssuranceAssessment, review_entry_stage: 'terra_cohort', review_context: v3ReviewContext, requirements: [{ id: 'R1', text: 'parallel review history remains coherent' }], nodes: [{ id: 'work', kind: 'implementation', ...workRoute }, { id: 'review-gate', kind: 'quality_review', depends_on: ['work'], ...reviewRoute }] }));
+    await call('init', { manifest: fixture.manifest });
+    const [work] = await call('claim', { task_id: 'feature-1', node_id: 'work', agent_task_path: '/root/cohort-retry-work', agent_role: 'avsp_terra_high' }); const workResult = path.join(fixture.root, 'cohort-retry-work.json'); await writeFile(workResult, JSON.stringify({})); await call('complete', { task_id: 'feature-1', node_id: 'work', claim_id: work.node.claim_id, status: 'succeeded', result: workResult });
+    const [coverage] = await call('claim', { task_id: 'feature-1', node_id: 'review-gate', reviewer_slot: 'coverage', agent_task_path: '/root/cohort-retry-coverage', agent_role: 'avsp_terra_xhigh' });
+    const [adversarial] = await call('claim', { task_id: 'feature-1', node_id: 'review-gate', reviewer_slot: 'adversarial', agent_task_path: '/root/cohort-retry-adversarial', agent_role: 'avsp_terra_xhigh' });
+    await call('heartbeat', { task_id: 'feature-1', node_id: 'review-gate', claim_id: coverage.claim_id }); await call('heartbeat', { task_id: 'feature-1', node_id: 'review-gate', claim_id: adversarial.claim_id });
+    const [sharedContext] = await call('audit-context', { task_id: 'feature-1' });
+    for (const [name, taskPath, claimId, verdict] of [['cohort-retry-coverage', '/root/cohort-retry-coverage', coverage.claim_id, 'unavailable'], ['cohort-retry-adversarial', '/root/cohort-retry-adversarial', adversarial.claim_id, 'pass']]) {
+      const reviewPath = path.join(fixture.root, `${name}.json`); await writeFile(reviewPath, JSON.stringify(v3ReviewPayload({ taskPath, role: 'avsp_terra_xhigh', claimId, verdict, context: sharedContext, name })));
+      await call('record-review', { task_id: 'feature-1', review: reviewPath }); const outcome = path.join(fixture.root, `${name}.outcome.json`); await writeFile(outcome, JSON.stringify({})); await call('complete', { task_id: 'feature-1', node_id: 'review-gate', claim_id: claimId, status: verdict === 'pass' ? 'succeeded' : 'unavailable', result: outcome });
+    }
+    let state = await readControllerState(fixture.stateDir); assert.equal(state.nodes['review-gate'].status, 'unavailable'); assert.equal(state.nodes['review-gate'].review_gate.cohort.lanes.coverage.unavailable_attempts, 1); assert.equal(state.nodes['review-gate'].review_gate.cohort.lanes.coverage.attempt, 1);
+    await call('retry', { task_id: 'feature-1', node_id: 'review-gate', reviewer_slot: 'coverage', reason: 'The first coverage reviewer was unavailable.', replacement_agent_task_path: '/root/cohort-retry-coverage-replacement', previous_agent_stopped: true });
+    await assert.rejects(() => call('claim', { task_id: 'feature-1', node_id: 'review-gate', reviewer_slot: 'coverage', agent_task_path: '/root/cohort-retry-other', agent_role: 'avsp_terra_xhigh' }), /reserved for a replacement reviewer/);
+    const [replacement] = await call('claim', { task_id: 'feature-1', node_id: 'review-gate', reviewer_slot: 'coverage', agent_task_path: '/root/cohort-retry-coverage-replacement', agent_role: 'avsp_terra_xhigh' });
+    state = await readControllerState(fixture.stateDir); assert.equal(state.nodes['review-gate'].review_gate.cohort.lanes.coverage.unavailable_attempts, 1); assert.equal(replacement.node.review_gate.cohort.lanes.coverage.attempt, 2);
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test('v3 Terra cohort stale lane requeue reserves its replacement and returns recovery evidence', async () => {
+  const fixture = await setup();
+  try {
+    const call = (command, parameters) => callForFixture(fixture, command, parameters);
+    const workRoute = { execution_risk: 'protected', routing_reason: 'bounded change', execution_owner: '/root/cohort-stale-work', integration_owner: '/root', quality_guard: 'targeted verification' };
+    const reviewRoute = { execution_risk: 'read_only', routing_reason: 'parallel cross-review gate', execution_owner: '/root/cohort-stale-coverage', integration_owner: '/root', quality_guard: 'review requirements and evidence' };
+    await writeFile(fixture.manifest, JSON.stringify({ task_id: 'feature-1', workspace: fixture.workspace, goal: 'Recover a stale cohort lane', routing_schema_version: 3, assurance_level: 'terra', assurance_assessment: terraAssuranceAssessment, review_entry_stage: 'terra_cohort', review_context: v3ReviewContext, requirements: [{ id: 'R1', text: 'stale parallel reviews remain recoverable' }], nodes: [{ id: 'work', kind: 'implementation', ...workRoute }, { id: 'review-gate', kind: 'quality_review', depends_on: ['work'], ...reviewRoute }] }));
+    await call('init', { manifest: fixture.manifest });
+    const [work] = await call('claim', { task_id: 'feature-1', node_id: 'work', agent_task_path: '/root/cohort-stale-work', agent_role: 'avsp_terra_high' }); const workResult = path.join(fixture.root, 'cohort-stale-work.json'); await writeFile(workResult, JSON.stringify({})); await call('complete', { task_id: 'feature-1', node_id: 'work', claim_id: work.node.claim_id, status: 'succeeded', result: workResult });
+    const [coverage] = await call('claim', { task_id: 'feature-1', node_id: 'review-gate', reviewer_slot: 'coverage', agent_task_path: '/root/cohort-stale-coverage', agent_role: 'avsp_terra_xhigh', lease_duration_sec: 1 }); await call('heartbeat', { task_id: 'feature-1', node_id: 'review-gate', claim_id: coverage.claim_id });
+    const state = await readControllerState(fixture.stateDir); state.nodes['review-gate'].review_gate.cohort.lanes.coverage.heartbeat_at = '1970-01-01T00:00:00.000Z'; await writeControllerState(fixture.stateDir, state);
+    const [requeued] = await call('requeue-stale', { task_id: 'feature-1', node_id: 'review-gate', reviewer_slot: 'coverage', claim_id: coverage.claim_id, reason: 'Coverage reviewer is confirmed stopped.', replacement_agent_task_path: '/root/cohort-stale-replacement', previous_agent_stopped: true });
+    assert.equal(requeued.recovery_package.previous_attempt.claim_id, coverage.claim_id); assert.equal(requeued.node.review_gate.cohort.lanes.coverage.reserved_agent_task_path, '/root/cohort-stale-replacement');
+    const [replacement] = await call('claim', { task_id: 'feature-1', node_id: 'review-gate', reviewer_slot: 'coverage', agent_task_path: '/root/cohort-stale-replacement', agent_role: 'avsp_terra_xhigh' }); assert.equal(replacement.node.review_gate.cohort.lanes.coverage.attempt, 2);
   } finally { await rm(fixture.root, { recursive: true, force: true }); }
 });
 
