@@ -16,7 +16,7 @@ const SOL_ROLES = new Set(['avsp_sol_high', 'avsp_sol_xhigh', 'avsp_sol_max']);
 const SOL_ESCALATION_ORDER = ['avsp_sol_high', 'avsp_sol_xhigh', 'avsp_sol_max'];
 const TERRA_REVIEW_ROLE = 'avsp_terra_xhigh';
 const QUALITY_REVIEW_KIND = 'quality_review';
-const ASSURANCE_LEVELS = new Set(['verification', 'terra', 'sol']);
+const ASSURANCE_LEVELS = new Set(['terra', 'sol']);
 const ASSURANCE_ASSESSMENT_FIELDS = ['impact', 'recoverability', 'uncertainty', 'verifiability', 'coupling', 'selection_reason'];
 const ASSURANCE_DIMENSION_FIELDS = ASSURANCE_ASSESSMENT_FIELDS.filter(field => field !== 'selection_reason');
 const ASSURANCE_DIMENSION_STATUSES = new Set(['controlled', 'partial', 'unknown']);
@@ -28,11 +28,7 @@ const FALLBACK_ROLE = 'avsp_terra_xhigh_readonly';
 const LUNA_EXECUTOR_ROLES = new Set([
   'avsp_luna_high_executor',
   'avsp_luna_xhigh_executor',
-  // Writers are retained for existing tasks; new tasks use the executor roles.
-  'avsp_luna_high_writer',
-  'avsp_luna_xhigh_writer',
 ]);
-const LEGACY_LUNA_WRITER_ROLES = new Set(['avsp_luna_high_writer', 'avsp_luna_xhigh_writer']);
 const READ_ONLY_ROLES = new Set([
   'avsp_luna_high',
   'avsp_luna_xhigh',
@@ -55,7 +51,6 @@ const IGNORED_DIRECTORIES = new Set(['.git', '.codex', 'node_modules', '.venv'])
 const WORKSPACE_LEASE_AUTHORITY_FILENAME = '.codex-workflow-controller-authority.json';
 const WORKSPACE_LEASE_PUBLICATION_SUFFIX = '.publication.json';
 const WORKSPACE_LEASE_AUTHORITY_VERSION = 2;
-const LEGACY_WORKSPACE_LEASE_AUTHORITY_VERSION = 1;
 const MAX_MANIFEST_BYTES = 1 * 1024 * 1024;
 const MAX_NODE_RESULT_BYTES = 64 * 1024;
 const MAX_REVIEW_BYTES = 128 * 1024;
@@ -71,9 +66,7 @@ const MAX_UNAVAILABLE_ATTEMPTS = 8;
 const MAX_TOTAL_NODE_ATTEMPTS = MAX_NODE_ATTEMPTS + MAX_UNAVAILABLE_ATTEMPTS;
 const MAX_REVIEWS = 16;
 const MAX_REPAIR_RECORDS = MAX_REVIEWS;
-const MAX_VERIFICATION_HISTORY = MAX_REVIEWS;
 const MAX_REVIEW_FINDINGS = 64;
-const MAX_MAX_CLOSURE_ATTEMPTS = 2;
 const PROTOCOL_MAX_CLOSURE_ATTEMPTS = 1;
 const REVIEW_ENTRY_STAGES = new Set(['terra_single', 'terra_cohort', 'sol_high', 'sol_xhigh']);
 const REVIEW_PROTOCOL_STAGES = new Set([...REVIEW_ENTRY_STAGES, 'sol_max_initial', 'sol_max_closure']);
@@ -106,7 +99,6 @@ const DEFAULT_STALE_LOCK_SEC = 30;
 const DEFAULT_LEASE_SEC = 1800;
 const DEFAULT_ACTIVATION_TIMEOUT_SEC = 600;
 const WORKSPACE_LEASE_VERSION = 2;
-const LEGACY_WORKSPACE_LEASE_VERSION = 1;
 const WORKSPACE_CLAIM_MODES = new Set(['read', 'write']);
 const MAX_WORKSPACE_CLAIMS = 128;
 const MAX_WORKSPACE_CLAIM_PREFIX_LENGTH = 1024;
@@ -201,14 +193,7 @@ function trueValue(value, name) {
 }
 
 function retryConfirmation(parameters) {
-  const hasCanonical = hasOwn(parameters, 'previous_agent_stopped');
-  const hasLegacyAlias = hasOwn(parameters, 'previous_agents_stopped');
-  if (!hasCanonical && !hasLegacyAlias) throw new ControllerError('previous_agent_stopped or previous_agents_stopped is required');
-  const canonicalValue = hasCanonical && (parameters.previous_agent_stopped === true || parameters.previous_agent_stopped === 'true');
-  const legacyValue = hasLegacyAlias && (parameters.previous_agents_stopped === true || parameters.previous_agents_stopped === 'true');
-  if (hasCanonical && hasLegacyAlias && canonicalValue !== legacyValue) throw new ControllerError('previous_agent_stopped and previous_agents_stopped must not conflict');
-  if (hasCanonical) trueValue(parameters.previous_agent_stopped, 'previous_agent_stopped');
-  if (hasLegacyAlias) trueValue(parameters.previous_agents_stopped, 'previous_agents_stopped');
+  trueValue(parameters.previous_agent_stopped, 'previous_agent_stopped');
 }
 
 function nonEmptyReviewValue(value) {
@@ -222,17 +207,12 @@ function requiredReviewValue(value, name) {
   return value;
 }
 
-function assuranceAssessment(value, label = 'assurance_assessment', { allowLegacy = false } = {}) {
+function assuranceAssessment(value, label = 'assurance_assessment') {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new ControllerError(`${label} must be an object`);
   const keys = Object.keys(value).sort();
   const expected = [...ASSURANCE_ASSESSMENT_FIELDS].sort();
   if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
     throw new ControllerError(`${label} must contain exactly: ${ASSURANCE_ASSESSMENT_FIELDS.join(', ')}`);
-  }
-  const legacy = ASSURANCE_ASSESSMENT_FIELDS.every(field => typeof value[field] === 'string');
-  if (legacy) {
-    if (!allowLegacy) throw new ControllerError(`${label} dimensions must use structured status, evidence, and rationale values`);
-    return Object.fromEntries(ASSURANCE_ASSESSMENT_FIELDS.map(field => [field, requiredString(value[field], `${label}.${field}`)]));
   }
   const assessment = Object.create(null);
   for (const field of ASSURANCE_DIMENSION_FIELDS) {
@@ -257,16 +237,16 @@ function assuranceAssessment(value, label = 'assurance_assessment', { allowLegac
 }
 
 function assuranceLevelForAssessment(assessment) {
-  if (typeof assessment?.impact === 'string') return null;
   const statuses = ASSURANCE_DIMENSION_FIELDS.map(field => assessment[field].status);
   if (statuses.includes('unknown')) return 'sol';
   if (statuses.includes('partial')) return 'terra';
-  return 'verification';
+  return null;
 }
 
 function requireAssuranceLevelMatches(level, assessment, label = 'assurance_level') {
   const expectedLevel = assuranceLevelForAssessment(assessment);
-  if (expectedLevel && level !== expectedLevel) throw new ControllerError(`${label} must be ${expectedLevel} for the supplied assurance_assessment`);
+  if (expectedLevel === null) throw new ControllerError(`${label} cannot initialize a persistent workflow when every assurance dimension is controlled`);
+  if (level !== expectedLevel) throw new ControllerError(`${label} must be ${expectedLevel} for the supplied assurance_assessment`);
 }
 
 function reviewContextValue(value, label = 'review_context') {
@@ -520,22 +500,21 @@ function protocolReviewHistoryDigest(state, { excludeActiveCohortPhase = false }
 
 function validMaxReviewCharter(state, charter) {
   if (!charter || typeof charter !== 'object' || Array.isArray(charter)) return false;
-  const protocolCharter = charter.schema_version === 2;
-  if (![1, 2].includes(charter.schema_version) || !['initial_repair_required', 'closure_ready', 'closure_reviewing', 'repair_required', 'scope_decision_required', 'closure_passed'].includes(charter.status)) return false;
+  if (charter.schema_version !== 2 || !['initial_repair_required', 'closure_ready', 'closure_reviewing', 'repair_required', 'scope_decision_required', 'closure_passed'].includes(charter.status)) return false;
   if (typeof charter.created_at !== 'string' || !Number.isFinite(Date.parse(charter.created_at)) || typeof charter.source_review_claim_id !== 'string') return false;
   if (!charter.workflow_snapshot || typeof charter.workflow_snapshot !== 'object' || !charter.workspace_fingerprint || typeof charter.workspace_fingerprint !== 'object') return false;
   if (!sameJson(charter.requirements, state.requirements) || !sameJson(charter.workspace_claims, state.workspace_claims)) return false;
   if (!Array.isArray(charter.blocking_finding_ids) || !charter.blocking_finding_ids.length || !Array.isArray(charter.blocking_findings) || !Array.isArray(charter.out_of_charter_findings)) return false;
   if (new Set(charter.blocking_finding_ids).size !== charter.blocking_finding_ids.length || charter.blocking_findings.some(finding => !finding || typeof finding.id !== 'string') || !sameJson([...charter.blocking_finding_ids].sort(), charter.blocking_findings.map(finding => finding.id).sort())) return false;
-  const closureLimit = protocolCharter ? PROTOCOL_MAX_CLOSURE_ATTEMPTS : MAX_MAX_CLOSURE_ATTEMPTS;
+  const closureLimit = PROTOCOL_MAX_CLOSURE_ATTEMPTS;
   if (!Number.isSafeInteger(charter.repair_count) || charter.repair_count < 0 || !Number.isSafeInteger(charter.closure_attempt_count) || charter.closure_attempt_count < 0 || charter.closure_attempt_limit !== closureLimit || charter.closure_attempt_count > charter.closure_attempt_limit || typeof charter.scope_decision_required !== 'boolean') return false;
-  if (protocolCharter && (charter.source_max_initial !== true || !isReviewProtocolState(state))) return false;
+  if (charter.source_max_initial !== true || !isReviewProtocolState(state)) return false;
   return (charter.pending_repair_source_claim_id === null || typeof charter.pending_repair_source_claim_id === 'string')
     && (charter.active_closure_claim_id === undefined || charter.active_closure_claim_id === null || typeof charter.active_closure_claim_id === 'string');
 }
 
 function isMaxClosureNode(state, node) {
-  return isMaxReviewNode(node) && (!isReviewProtocolState(state) || protocolStageForNode(node) === 'sol_max_closure');
+  return isMaxReviewNode(node) && protocolStageForNode(node) === 'sol_max_closure';
 }
 
 function maxReviewCharterMissing(state, node) {
@@ -544,38 +523,8 @@ function maxReviewCharterMissing(state, node) {
 
 function requireMaxReviewCharter(state, node) {
   if (maxReviewCharterMissing(state, node)) {
-    throw new ControllerError('A max total_review requires a frozen max_review_charter; legacy or incomplete max state requires explicit migration or a replacement task');
+    throw new ControllerError('A max total_review requires a complete frozen max_review_charter');
   }
-  return state.max_review_charter;
-}
-
-async function freezeMaxReviewCharter(state, node, sourceReview) {
-  const blockingFindings = sourceReview.findings.filter(finding => finding.severity === 'blocking');
-  if (!blockingFindings.length) throw new ControllerError('A max review charter requires blocking findings from the finalized xhigh review');
-  state.max_review_charter = {
-    schema_version: 1,
-    status: 'initial_repair_required',
-    created_at: utcNow(),
-    source_review_claim_id: sourceReview.claim_id,
-    pending_repair_source_claim_id: sourceReview.claim_id,
-    workflow_snapshot: workflowSnapshot(state),
-    workspace_fingerprint: await workspaceFingerprint(state.workspace, state.workspace_claims),
-    requirements: structuredClone(state.requirements),
-    workspace_claims: structuredClone(state.workspace_claims),
-    blocking_finding_ids: blockingFindings.map(finding => finding.id),
-    blocking_findings: structuredClone(blockingFindings),
-    repair_count: 0,
-    closure_attempt_count: 0,
-    closure_attempt_limit: MAX_MAX_CLOSURE_ATTEMPTS,
-    out_of_charter_findings: [],
-    scope_decision_required: false,
-  };
-  addEvent(state, 'max_review_charter_frozen', {
-    node_id: node.id,
-    source_review_claim_id: sourceReview.claim_id,
-    blocking_finding_ids: state.max_review_charter.blocking_finding_ids,
-    closure_attempt_limit: MAX_MAX_CLOSURE_ATTEMPTS,
-  });
   return state.max_review_charter;
 }
 
@@ -679,44 +628,13 @@ function databasePath(filePath) {
 }
 
 async function stateExists(filePath) {
-  if (await taskStateExists(databasePath(filePath))) return true;
-  try {
-    await fs.access(filePath);
-    return true;
-  } catch (error) {
-    if (error.code === 'ENOENT') return false;
-    throw error;
-  }
+  return taskStateExists(databasePath(filePath));
 }
 
 async function writeState(filePath, state, { parentAuthority = null } = {}) {
   const authority = parentAuthority ?? await stateParentAuthorityForState(state, filePath);
   await verifyRegularDirectorySnapshot(authority, 'Controller state parent');
-  let legacyStateExists = false;
-  try {
-    const legacyState = await fs.stat(filePath);
-    if (!legacyState.isFile()) throw new ControllerError(`Legacy controller state is not a regular file: ${filePath}`);
-    legacyStateExists = true;
-  } catch (error) {
-    if (error.code !== 'ENOENT') throw error;
-  }
-  if (legacyStateExists) {
-    try {
-      const archive = await fs.stat(`${filePath}.legacy`);
-      if (!archive.isFile()) throw new ControllerError(`Legacy controller archive is not a regular file: ${filePath}.legacy`);
-      throw new ControllerError(`Both legacy controller state and archive exist; resolve migration manually: ${filePath}`);
-    } catch (error) {
-      if (error.code !== 'ENOENT') throw error;
-    }
-  }
   await writeTaskState(databasePath(filePath), state, { parentAuthority: authority });
-  // A legacy file is retained as an immutable recovery copy after the SQLite commit succeeds.
-  if (legacyStateExists) {
-    try { await fs.rename(filePath, `${filePath}.legacy`); }
-    catch (error) {
-      if (error.code !== 'ENOENT') throw new ControllerError(`SQLite state committed but legacy state could not be archived: ${filePath}: ${error.message}`);
-    }
-  }
 }
 
 async function deleteState(filePath, { parentAuthority } = {}) {
@@ -728,11 +646,6 @@ async function deleteState(filePath, { parentAuthority } = {}) {
     await fs.rm(path.join(path.dirname(filePath), REVIEW_ARTIFACT_DIRECTORY, taskId), { recursive: true, force: true });
   }
   await deleteTaskState(databasePath(filePath), { parentAuthority });
-  for (const suffix of ['', '.legacy']) {
-    await fs.unlink(`${filePath}${suffix}`).catch(error => {
-      if (error.code !== 'ENOENT') throw error;
-    });
-  }
 }
 
 
@@ -935,17 +848,14 @@ function workspaceLeaseControlFromRecord(record) {
 
 function validateWorkspaceLeaseAuthorityRecord(record, workspace, authorityPath) {
   const baseFields = ['version', 'workspace', 'workspace_identity', 'control_directory', 'control_real_path', 'control_identity', 'registry_path', 'created_at'];
-  const fields = record?.version === LEGACY_WORKSPACE_LEASE_AUTHORITY_VERSION
-    ? new Set(baseFields)
-    : new Set([...baseFields, 'registry_initialized', 'registry_identity', 'registry_bound_at']);
-  const supportedVersion = record?.version === LEGACY_WORKSPACE_LEASE_AUTHORITY_VERSION || record?.version === WORKSPACE_LEASE_AUTHORITY_VERSION;
-  const validRegistryBinding = record?.version === LEGACY_WORKSPACE_LEASE_AUTHORITY_VERSION || (
+  const fields = new Set([...baseFields, 'registry_initialized', 'registry_identity', 'registry_bound_at']);
+  const validRegistryBinding = (
     typeof record.registry_initialized === 'boolean'
     && (record.registry_initialized
       ? validPersistentFileObjectIdentity(record.registry_identity) && validTimestamp(record.registry_bound_at)
       : record.registry_identity === null && record.registry_bound_at === null)
   );
-  if (!hasExactFields(record, fields) || !supportedVersion || !validRegistryBinding || record.workspace !== workspace || record.registry_path !== workspaceLeasePath(workspace)
+  if (!hasExactFields(record, fields) || record?.version !== WORKSPACE_LEASE_AUTHORITY_VERSION || !validRegistryBinding || record.workspace !== workspace || record.registry_path !== workspaceLeasePath(workspace)
     || record.control_directory !== path.dirname(record.registry_path) || typeof record.control_real_path !== 'string' || !path.isAbsolute(record.control_real_path)
     || !sameStatePath(record.control_real_path, record.control_directory) || !validTimestamp(record.created_at)
     || !validPersistentFileObjectIdentity(record.workspace_identity)
@@ -1064,31 +974,9 @@ async function verifyWorkspaceLeaseRegistryBinding(snapshot, { allowUninitialize
   if (!sameFileObjectIdentity(record.registry_identity, identity)) throw new ControllerError(`Workspace lease registry identity changed: ${record.registry_path}`);
 }
 
-async function migrateWorkspaceLeaseAuthority(snapshot, { authorityParent } = {}) {
-  if (!authorityParent) throw new ControllerError(`Workspace lease authority migration requires a caller-verified authority parent: ${snapshot.authority_path}`);
-  await verifyRegularDirectorySnapshot(authorityParent, 'Workspace authority parent');
-  await verifyWorkspaceLeaseAuthoritySnapshot(snapshot);
-  const control = await safeWorkspaceLeaseControlDirectory(snapshot.record.workspace);
-  if (!workspaceLeaseControlMatches(snapshot.record, control)) throw new ControllerError(`Workspace lease control directory identity changed during authority migration: ${snapshot.record.control_directory}`);
-  const registryIdentity = await workspaceLeaseRegistryIdentity(snapshot.record.registry_path);
-  const record = workspaceLeaseAuthorityRecord(snapshot.record.workspace, workspaceLeaseControlFromRecord(snapshot.record), {
-    registryIdentity,
-    createdAt: snapshot.record.created_at,
-    registryBoundAt: utcNow(),
-  });
-  await verifyWorkspaceLeaseAuthoritySnapshot(snapshot);
-  await atomicWrite(snapshot.authority_path, record, MAX_MANIFEST_BYTES, { parentAuthority: authorityParent });
-  return readWorkspaceLeaseAuthority(snapshot.record.workspace);
-}
-
-async function ensureWorkspaceLeaseAuthority(workspace, { allowCreate = false, allowMigration = false, authorityParent = null } = {}) {
+async function ensureWorkspaceLeaseAuthority(workspace, { allowCreate = false, authorityParent = null } = {}) {
   try {
-    const current = await readWorkspaceLeaseAuthority(workspace);
-    if (current.record.version === LEGACY_WORKSPACE_LEASE_AUTHORITY_VERSION) {
-      if (!allowMigration) throw new ControllerError(`Workspace lease authority requires explicit migration: ${current.authority_path}`);
-      return migrateWorkspaceLeaseAuthority(current, { authorityParent });
-    }
-    return current;
+    return await readWorkspaceLeaseAuthority(workspace);
   }
   catch (error) {
     if (!(error instanceof ControllerError && (error.message.startsWith('JSON input does not exist:') || error.message.startsWith('Workspace lease authority does not exist:'))) && error.code !== 'ENOENT') throw error;
@@ -1104,26 +992,19 @@ async function ensureWorkspaceLeaseAuthority(workspace, { allowCreate = false, a
     if (metadata.isSymbolicLink() || !metadata.isFile()) throw new ControllerError(`Workspace lease is not a regular registry file: ${leasePath}`);
     registryExists = true;
   } catch (error) { if (error.code !== 'ENOENT') throw error; }
-  if (registryExists) {
-    const existingRegistry = await readJsonSnapshot(leasePath, { label: 'Workspace lease', maxBytes: MAX_MANIFEST_BYTES });
-    if (existingRegistry.value?.version !== 1) {
-      throw new ControllerError(`Cannot create workspace lease authority for an existing non-legacy registry: ${leasePath}`);
-    }
-    await validateLegacyWorkspaceLeaseForAuthority(existingRegistry.value, workspace, leasePath);
-  }
+  if (registryExists) throw new ControllerError(`Cannot create workspace lease authority for an existing registry: ${leasePath}`);
   if (!control.created_control_directory && !registryExists) throw new ControllerError(`Cannot create workspace lease authority for an existing control directory without a registry: ${control.control_directory}`);
-  const registryIdentity = registryExists ? await workspaceLeaseRegistryIdentity(leasePath) : null;
-  await atomicWrite(workspaceLeaseAuthorityPath(workspace), workspaceLeaseAuthorityRecord(workspace, control, { registryIdentity }), MAX_MANIFEST_BYTES, { parentAuthority: authorityParent });
+  await atomicWrite(workspaceLeaseAuthorityPath(workspace), workspaceLeaseAuthorityRecord(workspace, control), MAX_MANIFEST_BYTES, { parentAuthority: authorityParent });
   return readWorkspaceLeaseAuthority(workspace);
 }
 
-async function withWorkspaceLeaseLock(workspace, callback, { allowAuthorityMigration = false } = {}) {
+async function withWorkspaceLeaseLock(workspace, callback, { allowAuthorityCreation = false } = {}) {
   const authorityPath = workspaceLeaseAuthorityPath(workspace);
   const authorityParent = await snapshotRegularDirectory(path.dirname(authorityPath), 'Workspace authority parent');
   return withStateLock(authorityPath, async () => {
     await verifyRegularDirectorySnapshot(authorityParent, 'Workspace authority parent');
     await recoverWorkspaceLeasePublication(workspace, { authorityParent });
-    const authority = await ensureWorkspaceLeaseAuthority(workspace, { allowCreate: allowAuthorityMigration, allowMigration: allowAuthorityMigration, authorityParent });
+    const authority = await ensureWorkspaceLeaseAuthority(workspace, { allowCreate: allowAuthorityCreation, authorityParent });
     const control = await safeWorkspaceLeaseControlDirectory(workspace);
     const context = {
       authority,
@@ -1216,10 +1097,8 @@ async function assertClaimDoesNotTraverseLink(workspace, prefix) {
   }
 }
 
-async function normalizeWorkspaceClaims(rawClaims, workspace, { legacy = false } = {}) {
-  const input = rawClaims === undefined || rawClaims === null
-    ? (legacy ? [{ mode: 'write', prefix: '.' }] : null)
-    : rawClaims;
+async function normalizeWorkspaceClaims(rawClaims, workspace) {
+  const input = rawClaims;
   if (!Array.isArray(input) || !input.length) throw new ControllerError('workspace_claims must be a non-empty array');
   if (input.length > MAX_WORKSPACE_CLAIMS) throw new ControllerError(`workspace_claims exceeds the ${MAX_WORKSPACE_CLAIMS}-claim limit`);
   const byPrefix = new Map();
@@ -1245,10 +1124,8 @@ async function normalizeWorkspaceClaims(rawClaims, workspace, { legacy = false }
   return ordered.filter((claim, index) => !ordered.some((other, otherIndex) => otherIndex !== index && other.mode === claim.mode && isClaimAncestor(other.prefix, claim.prefix)));
 }
 
-function legacyWorkspaceClaims() { return [{ mode: 'write', prefix: '.' }]; }
-
-function normalizeStoredWorkspaceClaims(rawClaims, { legacy = false } = {}) {
-  const input = rawClaims === undefined || rawClaims === null ? (legacy ? legacyWorkspaceClaims() : null) : rawClaims;
+function normalizeStoredWorkspaceClaims(rawClaims) {
+  const input = rawClaims;
   if (!Array.isArray(input) || !input.length) throw new ControllerError('workspace_claims must be a non-empty array');
   if (input.length > MAX_WORKSPACE_CLAIMS) throw new ControllerError(`workspace_claims exceeds the ${MAX_WORKSPACE_CLAIMS}-claim limit`);
   const byPrefix = new Map();
@@ -1507,8 +1384,8 @@ async function withStateLock(filePath, callback, { createParent = true, parentAu
 }
 
 async function loadState(filePath) {
-  let state = await readTaskState(databasePath(filePath));
-  if (state === null) state = await readJson(filePath, { label: 'Controller state', maxBytes: MAX_STATE_BYTES });
+  const state = await readTaskState(databasePath(filePath));
+  if (state === null) throw new ControllerError(`Current SQLite controller state does not exist: ${filePath}`);
   if (!state || typeof state !== 'object' || state.version !== VERSION) throw new ControllerError(`Unsupported controller state: ${filePath}`);
   if (state.workspace_lease?.state_path !== undefined) {
     const leasePath = await canonicalStatePath(state.workspace_lease.state_path, 'workspace_lease.state_path');
@@ -1659,7 +1536,7 @@ async function fingerprintAttempt(workspace, claims) {
 
 export async function workspaceFingerprint(workspaceValue, rawClaims = undefined) {
   const workspace = await canonicalWorkspace(workspaceValue);
-  const claims = await normalizeWorkspaceClaims(rawClaims, workspace, { legacy: rawClaims === undefined || rawClaims === null });
+  const claims = await normalizeWorkspaceClaims(rawClaims, workspace);
   for (let attempt = 1; attempt <= FINGERPRINT_ATTEMPTS; attempt++) {
     try { return await fingerprintAttempt(workspace, claims); }
     catch (error) {
@@ -1695,7 +1572,7 @@ function validateNodes(nodes) {
 }
 
 function isReviewNode(node, routingSchemaVersion = null) {
-  return node?.kind === 'total_review' || (routingSchemaVersion >= 2 && node?.kind === QUALITY_REVIEW_KIND);
+  return routingSchemaVersion === REVIEW_PROTOCOL_VERSION && (node?.kind === 'total_review' || node?.kind === QUALITY_REVIEW_KIND);
 }
 
 function reviewNodes(nodes, routingSchemaVersion = null) {
@@ -1707,21 +1584,17 @@ function reviewNodesForState(state) {
 }
 
 function effectiveAssuranceLevel(state) {
-  if (state.routing_schema_version < 2) return null;
+  if (state.routing_schema_version !== REVIEW_PROTOCOL_VERSION) return null;
   const reviewNode = reviewNodesForState(state)[0];
   return state.assurance_level === 'terra' && reviewNode?.review_stage === 'sol' ? 'sol' : state.assurance_level;
 }
 
 function validateReviewTopology(nodes, assuranceLevel = null, routingSchemaVersion = null, reviewEntryStage = null) {
   const allNodes = Object.values(nodes);
-  const schemaVersion = routingSchemaVersion ?? (assuranceLevel === null ? 1 : 2);
+  const schemaVersion = routingSchemaVersion;
   const reviews = reviewNodes(nodes, schemaVersion);
-  if (!assuranceLevel) {
-    if (reviews.length !== 1 || reviews[0].kind !== 'total_review') throw new ControllerError('A new task manifest must contain exactly one total_review node');
-  } else if (assuranceLevel === 'verification') {
-    if (reviews.length) throw new ControllerError('A verification assurance task cannot contain a review node');
-    return;
-  } else if (assuranceLevel === 'terra') {
+  if (schemaVersion !== REVIEW_PROTOCOL_VERSION) throw new ControllerError('Task topology requires routing_schema_version=3');
+  if (assuranceLevel === 'terra') {
     if (reviews.length !== 1) throw new ControllerError('A terra assurance task must contain exactly one review node');
     const review = reviews[0];
     const initialTerraGate = review.kind === QUALITY_REVIEW_KIND && review.review_stage === 'terra' && review.agent_type === TERRA_REVIEW_ROLE;
@@ -1736,7 +1609,7 @@ function validateReviewTopology(nodes, assuranceLevel = null, routingSchemaVersi
     throw new ControllerError(`Unsupported assurance_level: ${assuranceLevel}`);
   }
   const review = reviews[0];
-  if (schemaVersion === REVIEW_PROTOCOL_VERSION) {
+  {
     if (!REVIEW_ENTRY_STAGES.has(reviewEntryStage)) throw new ControllerError('A v3 task requires a supported review_entry_stage');
     const expectedStage = reviewEntryStage;
     if (assuranceLevel === 'terra' && !expectedStage.startsWith('terra')) throw new ControllerError('A terra v3 task must start at a Terra review stage');
@@ -1789,7 +1662,7 @@ function workflowSnapshotMaterial(state, { includeAssurance = true, excludeAllRe
     non_goals: state.non_goals,
     nodes: materialNodes,
   };
-  if (includeClaims) material.workspace_claims = state.workspace_claims ?? legacyWorkspaceClaims();
+  if (includeClaims) material.workspace_claims = state.workspace_claims;
   if (includeAssurance) {
     material.assurance_level = state.assurance_level;
     material.assurance_assessment = state.assurance_assessment;
@@ -1816,17 +1689,7 @@ function workflowSnapshot(state) {
 
 function workflowSnapshotMatchesState(recorded, state) {
   if (!recorded || typeof recorded !== 'object' || Array.isArray(recorded)) return false;
-  if (recorded.digest_algorithm === 'sha256-stable-json-v2') return sameJson(recorded, workflowSnapshot(state));
-  if (recorded.digest_algorithm !== 'sha256-stable-json-v1') return false;
-  const legacyCandidates = [
-    // Original v1 tasks excluded only total_review and had no assurance fields.
-    workflowSnapshotFor(state, { digestAlgorithm: 'sha256-stable-json-v1', includeAssurance: false, excludeAllReviews: false, includeClaims: false }),
-    // Early v2 assurance tasks excluded every review node but still emitted a v1 digest.
-    workflowSnapshotFor(state, { digestAlgorithm: 'sha256-stable-json-v1', includeAssurance: false, excludeAllReviews: true, includeClaims: false }),
-    // Accept records emitted by the short-lived assurance-aware v1 implementation.
-    workflowSnapshotFor(state, { digestAlgorithm: 'sha256-stable-json-v1', includeAssurance: true, excludeAllReviews: true, includeClaims: false }),
-  ];
-  return legacyCandidates.some(candidate => sameJson(recorded, candidate));
+  return recorded.digest_algorithm === 'sha256-stable-json-v2' && sameJson(recorded, workflowSnapshot(state));
 }
 
 export function sameJson(left, right) { return stableJson(left) === stableJson(right); }
@@ -1838,18 +1701,6 @@ function bumpWorkflowRevision(state, eventType, details = {}) {
 
 function nodeRouting(raw, routingRequired) {
   const supplied = ROUTING_FIELDS.filter(field => hasOwn(raw, field));
-  if (!supplied.length) {
-    if (routingRequired) throw new ControllerError(`node requires routing fields: ${ROUTING_FIELDS.join(', ')}`);
-    // Legacy manifests remain runnable only as protected work; they cannot authorize a Luna executor.
-    return {
-      execution_risk: 'protected',
-      routing_reason: 'legacy manifest omitted routing audit fields; Luna executor delegation is prohibited',
-      execution_owner: null,
-      integration_owner: null,
-      quality_guard: 'legacy routing metadata unavailable',
-      routing_legacy: true,
-    };
-  }
   if (supplied.length !== ROUTING_FIELDS.length) throw new ControllerError(`node routing fields must be complete: ${ROUTING_FIELDS.join(', ')}`);
   const executionRisk = requiredString(raw.execution_risk, 'node.execution_risk');
   if (!['read_only', 'delegable', 'protected'].includes(executionRisk)) throw new ControllerError('node.execution_risk must be read_only, delegable, or protected');
@@ -1859,29 +1710,23 @@ function nodeRouting(raw, routingRequired) {
     execution_owner: requiredString(raw.execution_owner, 'node.execution_owner'),
     integration_owner: requiredString(raw.integration_owner, 'node.integration_owner'),
     quality_guard: requiredString(raw.quality_guard, 'node.quality_guard'),
-    routing_legacy: false,
   };
 }
 
-function validateV1AgentType(kind, executionRisk, agentType) {
+function validateAgentType(kind, executionRisk, agentType) {
   if (kind === 'total_review') {
-    if (executionRisk === 'delegable') throw new ControllerError('A v1 total_review node cannot be delegable');
-    if (!SOL_ROLES.has(agentType)) throw new ControllerError('A v1 total_review node requires a Sol agent_type; Terra is fallback-only');
+    if (executionRisk !== 'read_only' || !SOL_ROLES.has(agentType)) throw new ControllerError('A total_review node requires a read_only Sol agent_type');
     return;
   }
   if (agentType == null) return;
-  if (executionRisk === 'protected' && agentType !== PROTECTED_EXECUTOR_ROLE) throw new ControllerError('A v1 protected node agent_type must be avsp_terra_high or omitted');
-  if (executionRisk === 'delegable' && !LUNA_EXECUTOR_ROLES.has(agentType) && agentType !== PROTECTED_EXECUTOR_ROLE) throw new ControllerError('A v1 delegable node agent_type must be a Luna executor, legacy writer, or avsp_terra_high');
-  if (executionRisk === 'read_only' && (!READ_ONLY_ROLES.has(agentType) || READ_ONLY_FALLBACK_ROLE_SET.has(agentType))) throw new ControllerError('A v1 read_only node agent_type cannot configure a Terra fallback role or other non-primary role');
-}
-
-function validateV2AgentType(kind, executionRisk, agentType) {
   if (kind === QUALITY_REVIEW_KIND) {
-    if (executionRisk !== 'read_only') throw new ControllerError('A v2 quality_review node must be read_only');
-    if (agentType !== TERRA_REVIEW_ROLE) throw new ControllerError('A v2 quality_review node requires avsp_terra_xhigh');
+    if (executionRisk !== 'read_only') throw new ControllerError('A quality_review node must be read_only');
+    if (agentType !== TERRA_REVIEW_ROLE) throw new ControllerError('A quality_review node requires avsp_terra_xhigh');
     return;
   }
-  validateV1AgentType(kind, executionRisk, agentType);
+  if (executionRisk === 'protected' && agentType !== PROTECTED_EXECUTOR_ROLE) throw new ControllerError('A protected node agent_type must be avsp_terra_high or omitted');
+  if (executionRisk === 'delegable' && !LUNA_EXECUTOR_ROLES.has(agentType) && agentType !== PROTECTED_EXECUTOR_ROLE) throw new ControllerError('A delegable node agent_type must be a Luna executor or avsp_terra_high');
+  if (executionRisk === 'read_only' && (!READ_ONLY_ROLES.has(agentType) || READ_ONLY_FALLBACK_ROLE_SET.has(agentType))) throw new ControllerError('A read_only node agent_type cannot configure a Terra fallback role or other non-primary role');
 }
 
 function nodeRecord(raw, options = {}) {
@@ -1891,47 +1736,34 @@ function nodeRecord(raw, options = {}) {
   const dependencies = raw.depends_on ?? [];
   if (!Array.isArray(dependencies) || dependencies.some(dependency => typeof dependency !== 'string' || !dependency.trim())) throw new ControllerError('node.depends_on must contain non-empty string identifiers');
   const routing = nodeRouting(raw, options.routingRequired === true);
-  const isV2QualityReview = options.routingSchemaVersion >= 2 && kind === QUALITY_REVIEW_KIND;
-  const defaultAgentType = options.routingSchemaVersion >= 1 && !routing.routing_legacy && raw.agent_type == null
-    ? (kind === 'total_review' ? 'avsp_sol_high' : (isV2QualityReview ? TERRA_REVIEW_ROLE : ({ read_only: 'avsp_luna_high', delegable: 'avsp_luna_high_executor' }[routing.execution_risk] ?? null)))
+  const isQualityReview = kind === QUALITY_REVIEW_KIND;
+  const defaultAgentType = raw.agent_type == null
+    ? (kind === 'total_review' ? 'avsp_sol_high' : (isQualityReview ? TERRA_REVIEW_ROLE : ({ read_only: 'avsp_luna_high', delegable: 'avsp_luna_high_executor', protected: PROTECTED_EXECUTOR_ROLE }[routing.execution_risk] ?? null)))
     : null;
   const agentType = raw.agent_type ?? defaultAgentType;
-  if (options.routingSchemaVersion === 1) validateV1AgentType(kind, routing.execution_risk, agentType);
-  if (options.routingSchemaVersion >= 2) validateV2AgentType(kind, routing.execution_risk, agentType);
-  return { id, kind, review_stage: isV2QualityReview ? 'terra' : kind === 'total_review' ? 'sol' : null, agent_type: agentType, depends_on: dependencies, ...routing, rescue_role: null, rescue_reason: null, rescued_at: null, rescue_count: 0, status: PENDING, agent_task_path: null, agent_thread_id: null, agent_role: null, claim_id: null, claimed_at: null, activation_at: null, activation_deadline_at: null, heartbeat_at: null, heartbeat_count: 0, lease_duration_sec: null, attempt: 0, attempt_budget_used: 0, unavailable_attempts: 0, result: null, checkpoint: null, checkpoint_at: null, workflow_completion_intent: null, recovery_history: [], review_gate: null };
+  validateAgentType(kind, routing.execution_risk, agentType);
+  return { id, kind, review_stage: isQualityReview ? 'terra' : kind === 'total_review' ? 'sol' : null, agent_type: agentType, depends_on: dependencies, ...routing, rescue_role: null, rescue_reason: null, rescued_at: null, rescue_count: 0, status: PENDING, agent_task_path: null, agent_thread_id: null, agent_role: null, claim_id: null, claimed_at: null, activation_at: null, activation_deadline_at: null, heartbeat_at: null, heartbeat_count: 0, lease_duration_sec: null, attempt: 0, attempt_budget_used: 0, unavailable_attempts: 0, result: null, checkpoint: null, checkpoint_at: null, workflow_completion_intent: null, recovery_history: [], review_gate: null };
 }
 
 function normalizeState(state) {
   if (!state || typeof state !== 'object' || Array.isArray(state)) throw new ControllerError('Task state must be an object');
   if (!state.nodes || typeof state.nodes !== 'object' || Array.isArray(state.nodes) || !Object.keys(state.nodes).length) throw new ControllerError('Task state must contain nodes');
-  if (state.workspace_claims === undefined || state.workspace_claims === null) state.workspace_claims = legacyWorkspaceClaims();
+  if (state.workspace_claims === undefined || state.workspace_claims === null) throw new ControllerError('Current task state requires workspace_claims');
   state.workspace_claims = normalizeStoredWorkspaceClaims(state.workspace_claims);
   state.workflow_revision ??= 0;
   state.closed_revision ??= null;
   state.closed_at ??= null;
-  state.verification_record ??= null;
-  state.verification_history ??= [];
-  if (!Array.isArray(state.verification_history)) throw new ControllerError('Task verification_history must be an array');
   state.assurance_assessment ??= null;
   state.repair_records ??= [];
   if (!Array.isArray(state.repair_records)) throw new ControllerError('Task repair_records must be an array');
-  if (state.routing_schema_version === 2 || state.routing_schema_version === REVIEW_PROTOCOL_VERSION) {
-    if (!ASSURANCE_LEVELS.has(state.assurance_level)) throw new ControllerError('A v2 task state requires assurance_level verification, terra, or sol');
-    if (state.assurance_assessment !== null) state.assurance_assessment = assuranceAssessment(state.assurance_assessment, 'assurance_assessment', { allowLegacy: true });
-  } else {
-    state.assurance_level ??= null;
-    state.assurance_assessment = null;
-  }
-  if (state.routing_schema_version === REVIEW_PROTOCOL_VERSION) {
-    if (state.assurance_level === 'verification') throw new ControllerError('A v3 review protocol task must select terra or sol assurance');
+  if (state.routing_schema_version !== REVIEW_PROTOCOL_VERSION) throw new ControllerError('Task state must use routing_schema_version=3');
+  if (!ASSURANCE_LEVELS.has(state.assurance_level)) throw new ControllerError('A v3 task state requires assurance_level terra or sol');
+  if (state.assurance_assessment !== null) state.assurance_assessment = assuranceAssessment(state.assurance_assessment, 'assurance_assessment');
+  {
     if (state.review_protocol_version !== REVIEW_PROTOCOL_VERSION || !REVIEW_ENTRY_STAGES.has(state.review_entry_stage)) {
-      throw new ControllerError('A v3 task state requires complete review protocol metadata; explicit migration is required');
+      throw new ControllerError('A v3 task state requires complete review protocol metadata');
     }
     state.review_context = reviewContextValue(state.review_context);
-  } else {
-    state.review_protocol_version ??= null;
-    state.review_entry_stage ??= null;
-    state.review_context ??= null;
   }
   for (const [nodeId, node] of Object.entries(state.nodes)) {
     if (!node || typeof node !== 'object' || Array.isArray(node)) throw new ControllerError(`Task node must be an object: ${nodeId}`);
@@ -1944,9 +1776,9 @@ function normalizeState(state) {
     }
     node.checkpoint ??= null; node.checkpoint_at ??= null; node.recovery_history ??= []; node.workflow_completion_intent ??= null;
     node.rescue_role ??= null; node.rescue_reason ??= null; node.rescued_at ??= null; node.rescue_count ??= 0;
-    node.review_stage ??= state.routing_schema_version >= 2 && node.kind === QUALITY_REVIEW_KIND ? 'terra' : node.kind === 'total_review' ? 'sol' : null;
+    node.review_stage ??= node.kind === QUALITY_REVIEW_KIND ? 'terra' : node.kind === 'total_review' ? 'sol' : null;
     node.review_gate ??= null;
-    if (state.routing_schema_version === REVIEW_PROTOCOL_VERSION && isReviewNode(node, state.routing_schema_version)) {
+    if (isReviewNode(node, state.routing_schema_version)) {
       if (!node.review_gate || typeof node.review_gate !== 'object' || !REVIEW_PROTOCOL_STAGES.has(node.review_gate.stage)) throw new ControllerError('A v3 review node requires an explicit review_gate; explicit migration is required');
       if (node.kind !== protocolNodeKind(node.review_gate.stage) || node.agent_type !== protocolNodeRole(node.review_gate.stage)) throw new ControllerError('A v3 review node does not match its review_gate stage');
       if (node.review_gate.stage === 'terra_cohort') {
@@ -1954,7 +1786,7 @@ function normalizeState(state) {
         if (!cohort || typeof cohort !== 'object' || !COHORT_PHASES.has(cohort.phase) || !cohort.lanes || typeof cohort.lanes !== 'object' || COHORT_SLOTS.some(slot => !cohort.lanes[slot])) throw new ControllerError('A v3 Terra cohort requires two explicit lanes');
       }
     }
-    if (!hasOwn(node, 'execution_risk')) Object.assign(node, nodeRouting(node, false));
+    if (!hasOwn(node, 'execution_risk')) throw new ControllerError(`Task node lacks current routing fields: ${nodeId}`);
   }
   validateNodes(state.nodes);
   validateReviewTopology(state.nodes, state.assurance_level, state.routing_schema_version, state.review_entry_stage);
@@ -1965,14 +1797,15 @@ async function makeState(manifest) {
   const required = ['task_id', 'workspace', 'goal', 'requirements'];
   if (!manifest || typeof manifest !== 'object' || required.some(key => !hasOwn(manifest, key))) throw new ControllerError('Manifest requires task_id, workspace, goal, and requirements');
   const taskId = requiredIdentifier(manifest.task_id, 'task_id');
-  const routingSchemaVersion = manifest.routing_schema_version ?? 0;
-  if (![0, 1, 2, REVIEW_PROTOCOL_VERSION].includes(routingSchemaVersion)) throw new ControllerError('routing_schema_version must be 1, 2, or 3 when provided');
-  const assuranceLevel = routingSchemaVersion >= 2 ? requiredString(manifest.assurance_level, 'assurance_level') : null;
-  if (assuranceLevel !== null && !ASSURANCE_LEVELS.has(assuranceLevel)) throw new ControllerError('assurance_level must be verification, terra, or sol');
-  const assuranceAssessmentValue = routingSchemaVersion >= 2 ? assuranceAssessment(manifest.assurance_assessment) : null;
-  if (assuranceAssessmentValue !== null) requireAssuranceLevelMatches(assuranceLevel, assuranceAssessmentValue);
+  const routingSchemaVersion = manifest.routing_schema_version;
+  if (routingSchemaVersion !== REVIEW_PROTOCOL_VERSION) throw new ControllerError('routing_schema_version must be 3');
+  const assuranceLevel = requiredString(manifest.assurance_level, 'assurance_level');
+  if (!ASSURANCE_LEVELS.has(assuranceLevel)) throw new ControllerError('assurance_level must be terra or sol');
+  const assuranceAssessmentValue = assuranceAssessment(manifest.assurance_assessment);
+  requireAssuranceLevelMatches(assuranceLevel, assuranceAssessmentValue);
+  if (!hasOwn(manifest, 'workspace_claims')) throw new ControllerError('Current v3 manifests require workspace_claims');
   const workspace = await canonicalWorkspace(manifest.workspace);
-  const workspaceClaims = await normalizeWorkspaceClaims(manifest.workspace_claims, workspace, { legacy: !hasOwn(manifest, 'workspace_claims') });
+  const workspaceClaims = await normalizeWorkspaceClaims(manifest.workspace_claims, workspace);
   const goal = requiredString(manifest.goal, 'goal');
   await workspaceFingerprint(workspace, workspaceClaims);
   if (!Array.isArray(manifest.requirements) || !manifest.requirements.length || manifest.requirements.length > MAX_REQUIREMENTS) throw new ControllerError(`Manifest requires between 1 and ${MAX_REQUIREMENTS} requirements`);
@@ -1985,7 +1818,7 @@ async function makeState(manifest) {
   if (!Array.isArray(manifest.nodes) || !manifest.nodes.length || manifest.nodes.length > MAX_NODES) throw new ControllerError(`Manifest requires between 1 and ${MAX_NODES} nodes`);
   const nodes = Object.create(null);
   for (const rawNode of manifest.nodes ?? []) {
-    const node = nodeRecord(rawNode, { routingRequired: routingSchemaVersion >= 1, routingSchemaVersion, expectedTaskId: taskId });
+    const node = nodeRecord(rawNode, { routingRequired: true, routingSchemaVersion, expectedTaskId: taskId });
     if (hasOwn(nodes, node.id)) throw new ControllerError(`Duplicate node id: ${node.id}`);
     nodes[node.id] = node;
   }
@@ -1996,13 +1829,9 @@ async function makeState(manifest) {
     throw new ControllerError('review_entry_stage must be terra_single, terra_cohort, sol_high, or sol_xhigh');
   }
   const reviewContext = routingSchemaVersion === REVIEW_PROTOCOL_VERSION ? reviewContextValue(manifest.review_context) : null;
-  if (routingSchemaVersion === REVIEW_PROTOCOL_VERSION && assuranceLevel === 'verification') throw new ControllerError('A v3 review protocol task must select terra or sol assurance');
   if (routingSchemaVersion === REVIEW_PROTOCOL_VERSION) {
     const review = reviewNodes(nodes, routingSchemaVersion)[0];
     if (review) applyProtocolStage(review, reviewEntryStage);
-  }
-  if (routingSchemaVersion === 2 && assuranceLevel === 'sol' && reviewNodes(nodes, routingSchemaVersion)[0]?.agent_type === 'avsp_sol_max') {
-    throw new ControllerError('A v2 task cannot start at avsp_sol_max; begin at high or xhigh, or use the v3 review protocol');
   }
   validateNodes(nodes);
   validateReviewTopology(nodes, assuranceLevel, routingSchemaVersion, reviewEntryStage);
@@ -2010,7 +1839,7 @@ async function makeState(manifest) {
     throw new ControllerError('workspace_claims requires at least one write claim for non-read-only work');
   }
   const created = utcNow();
-  const state = { version: VERSION, routing_schema_version: routingSchemaVersion || null, assurance_level: assuranceLevel, assurance_assessment: assuranceAssessmentValue, review_protocol_version: routingSchemaVersion === REVIEW_PROTOCOL_VERSION ? REVIEW_PROTOCOL_VERSION : null, review_entry_stage: reviewEntryStage, review_context: reviewContext, task_id: taskId, workspace, workspace_claims: workspaceClaims, goal, requirements, scope: manifest.scope ?? [], non_goals: manifest.non_goals ?? [], nodes, participants: [], reviews: [], repair_records: [], max_review_charter: null, verification_record: null, verification_history: [], events: [{ at: created, type: 'task_initialized', workflow_revision: 0 }], workflow_revision: 0, closed_revision: null, closed_at: null, created_at: created, updated_at: created };
+  const state = { version: VERSION, routing_schema_version: REVIEW_PROTOCOL_VERSION, assurance_level: assuranceLevel, assurance_assessment: assuranceAssessmentValue, review_protocol_version: REVIEW_PROTOCOL_VERSION, review_entry_stage: reviewEntryStage, review_context: reviewContext, task_id: taskId, workspace, workspace_claims: workspaceClaims, goal, requirements, scope: manifest.scope ?? [], non_goals: manifest.non_goals ?? [], nodes, participants: [], reviews: [], repair_records: [], max_review_charter: null, events: [{ at: created, type: 'task_initialized', workflow_revision: 0 }], workflow_revision: 0, closed_revision: null, closed_at: null, created_at: created, updated_at: created };
   return state;
 }
 
@@ -2068,7 +1897,7 @@ function staleNodes(state, now = Date.now()) {
 }
 
 function compactState(state) {
-  return { task_id: state.task_id, workspace: state.workspace, workspace_claims: state.workspace_claims, workspace_lease: state.workspace_lease ?? null, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), assurance_assessment: state.assurance_assessment, review_protocol_version: state.review_protocol_version, review_entry_stage: state.review_entry_stage, review_context: state.review_context, goal: state.goal, nodes: Object.values(state.nodes), ready_nodes: readyNodes(state), stale_nodes: staleNodes(state), participants: state.participants, reviews: externallyVisibleReviews(state), repair_records: state.repair_records, verification_record: state.verification_record, verification_history: state.verification_history, workflow_revision: state.workflow_revision, updated_at: state.updated_at };
+  return { task_id: state.task_id, workspace: state.workspace, workspace_claims: state.workspace_claims, workspace_lease: state.workspace_lease ?? null, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), assurance_assessment: state.assurance_assessment, review_protocol_version: state.review_protocol_version, review_entry_stage: state.review_entry_stage, review_context: state.review_context, goal: state.goal, nodes: Object.values(state.nodes), ready_nodes: readyNodes(state), stale_nodes: staleNodes(state), participants: state.participants, reviews: externallyVisibleReviews(state), repair_records: state.repair_records, workflow_revision: state.workflow_revision, updated_at: state.updated_at };
 }
 
 async function coordinationStatus(lockPath) {
@@ -2157,7 +1986,7 @@ async function doctorTask(parameters) {
     const metadata = await fs.stat(database);
     checks.push(doctorCheck('state_database', 'pass', { path: database, bytes: metadata.size, modified_at: metadata.mtime.toISOString() }));
   } catch (error) {
-    if (error.code === 'ENOENT') checks.push(doctorCheck('state_database', 'attention', { path: database, reason: 'legacy JSON state is in use' }));
+    if (error.code === 'ENOENT') checks.push(doctorCheck('state_database', 'fail', { path: database, reason: 'SQLite state database is missing' }));
     else checks.push(doctorCheck('state_database', 'fail', { path: database, error: error.message }));
   }
 
@@ -2172,7 +2001,7 @@ async function doctorTask(parameters) {
   }
 
   if (!state.workspace_lease) {
-    checks.push(doctorCheck('workspace_lease', 'attention', { reason: 'legacy task has no workspace lease' }));
+    checks.push(doctorCheck('workspace_lease', 'fail', { reason: 'current task has no workspace lease' }));
   } else {
     try {
       const lease = await loadWorkspaceLease(state.workspace_lease.registry_path, state.workspace);
@@ -2234,26 +2063,7 @@ async function loadWorkspaceLease(leasePath, workspace, { allowMissing = false, 
     if (!sameFileObjectIdentity(authority.record.registry_identity, snapshot.object_identity)) throw new ControllerError(`Workspace lease registry identity changed: ${leasePath}`);
     const lease = snapshot.value;
     if (!lease || typeof lease !== 'object' || Array.isArray(lease) || lease.workspace !== workspace || !validTimestamp(lease.updated_at)) throw new ControllerError(`Unsupported workspace lease: ${leasePath}`);
-    if (lease.version === LEGACY_WORKSPACE_LEASE_VERSION && hasExactFields(lease, new Set(['version', 'workspace', 'active_task', 'updated_at']))) {
-      let activeTasks = [];
-      if (lease.active_task !== null) {
-        await validateLegacyWorkspaceLeaseForAuthority(lease, workspace, leasePath);
-        const legacyTask = lease.active_task;
-        const legacyStatePath = await canonicalStatePath(legacyTask.state_path, 'legacy workspace lease state_path');
-        const legacyState = await loadState(legacyStatePath);
-        const parentAuthority = await stateParentAuthorityForState(legacyState, legacyStatePath);
-        await verifyRegularDirectorySnapshot(parentAuthority, 'Controller state parent');
-        if (legacyState.task_id !== legacyTask.task_id || legacyState.workspace !== workspace || legacyState.workspace_lease?.acquired_at !== legacyTask.acquired_at) {
-          throw new ControllerError(`Legacy workspace lease does not match its task state; controlled recovery is required: ${leasePath}`);
-        }
-        activeTasks = [{ ...legacyTask, phase: legacyTask.phase ?? 'active', state_dir: legacyTask.state_dir ?? path.dirname(legacyStatePath), state_parent_authority: parentAuthority, workspace_claims: legacyWorkspaceClaims() }];
-      }
-      const migrated = { version: WORKSPACE_LEASE_VERSION, workspace, active_tasks: activeTasks, updated_at: lease.updated_at };
-      await validateWorkspaceLease(migrated, leasePath);
-      await verifyWorkspaceLeaseAuthoritySnapshot(authority);
-      Object.defineProperty(migrated, 'migrated_from_v1', { value: true, enumerable: false });
-      return migrated;
-    }
+    if (lease.version !== WORKSPACE_LEASE_VERSION) throw new ControllerError(`Unsupported workspace lease version: ${leasePath}`);
     await validateWorkspaceLease(lease, leasePath);
     await verifyWorkspaceLeaseAuthoritySnapshot(authority);
     await verifyWorkspaceLeaseRegistryBinding(authority);
@@ -2299,30 +2109,7 @@ async function validateWorkspaceLease(lease, leasePath) {
   }
 }
 
-async function validateLegacyWorkspaceLeaseForAuthority(lease, workspace, leasePath) {
-  if (!hasExactFields(lease, new Set(['version', 'workspace', 'active_task', 'updated_at']))
-    || lease.version !== LEGACY_WORKSPACE_LEASE_VERSION || lease.workspace !== workspace || !validTimestamp(lease.updated_at)
-    || (lease.active_task !== null && (!lease.active_task || typeof lease.active_task !== 'object' || Array.isArray(lease.active_task)))) {
-    throw new ControllerError(`Cannot create workspace lease authority for an invalid legacy registry: ${leasePath}`);
-  }
-  if (lease.active_task === null) return;
-  const task = lease.active_task;
-  const fields = new Set(Object.keys(task));
-  const allowed = [new Set(['task_id', 'state_path', 'acquired_at']), new Set(['task_id', 'state_path', 'state_dir', 'acquired_at']), new Set(['task_id', 'state_path', 'state_dir', 'acquired_at', 'phase'])];
-  if (!allowed.some(candidate => hasExactFields(task, candidate)) || !validTimestamp(task.acquired_at) || typeof task.state_path !== 'string' || !path.isAbsolute(task.state_path)) {
-    throw new ControllerError(`Cannot create workspace lease authority for an invalid legacy registry: ${leasePath}`);
-  }
-  requiredIdentifier(task.task_id, 'legacy workspace lease task_id');
-  const statePath = await canonicalStatePath(task.state_path, 'legacy workspace lease state_path');
-  if (task.state_dir !== undefined) {
-    if (typeof task.state_dir !== 'string' || !path.isAbsolute(task.state_dir) || !sameStatePath(await canonicalStateDirectory(task.state_dir, 'legacy workspace lease state_dir'), path.dirname(statePath))) {
-      throw new ControllerError(`Cannot create workspace lease authority for an invalid legacy registry: ${leasePath}`);
-    }
-  }
-  if (task.phase !== undefined && !['initializing', 'active'].includes(task.phase)) throw new ControllerError(`Cannot create workspace lease authority for an invalid legacy registry: ${leasePath}`);
-}
-
-function stateWorkspaceClaims(state) { return state.workspace_lease?.workspace_claims ?? state.workspace_claims ?? legacyWorkspaceClaims(); }
+function stateWorkspaceClaims(state) { return state.workspace_lease?.workspace_claims ?? state.workspace_claims; }
 
 function workspaceLeaseEntryMatches(entry, state, filePath, { activeOnly = true } = {}) {
   return entry.task_id === state.task_id
@@ -2352,7 +2139,7 @@ function claimsConflict(leftClaims, rightClaims) {
 }
 
 async function requireActiveWorkspaceLease(state, filePath, authorityContext = null) {
-  if (!state.workspace_lease) throw new ControllerError('Legacy task has no workspace lease and cannot change state; create a new workflow task');
+  if (!state.workspace_lease) throw new ControllerError('Current task has no workspace lease and cannot change state');
   if (state.workspace_lease.status !== 'active') throw new ControllerError(`Workspace lease is not active for this task: ${state.workspace_lease.registry_path}`);
   const lease = await loadWorkspaceLease(state.workspace_lease.registry_path, state.workspace, { authorityContext });
   const entry = workspaceLeaseMatches(lease, state, filePath);
@@ -2373,7 +2160,7 @@ async function bindStateParentAuthorityToWorkspaceLease(lease, state, filePath, 
 
 async function withActiveWorkspaceStateLock(filePath, callback) {
   const initialState = normalizeState(await loadState(filePath));
-  if (!initialState.workspace_lease) throw new ControllerError('Legacy task has no workspace lease and cannot change state; create a new workflow task');
+  if (!initialState.workspace_lease) throw new ControllerError('Current task has no workspace lease and cannot change state');
   const parentAuthority = await stateParentAuthorityForState(initialState, filePath);
   await verifyRegularDirectorySnapshot(parentAuthority, 'Controller state parent');
   const expectedLeasePath = initialState.workspace_lease.registry_path;
@@ -2390,14 +2177,14 @@ async function withActiveWorkspaceStateLock(filePath, callback) {
       await bindStateParentAuthorityToWorkspaceLease(lease, state, filePath, authorityContext);
       return callback(state, lease, authorityContext);
     }, { parentAuthority });
-  }, { allowAuthorityMigration: true });
+  }, { allowAuthorityCreation: true });
 }
 
 async function releaseWorkspaceLease(parameters, { closeAllowed = false } = {}) {
   const filePath = await configuredStatePath(parameters, requiredString(parameters.task_id, 'task_id'));
-  const initialState = await loadState(filePath);
+  const initialState = normalizeState(await loadState(filePath));
   const stateLease = initialState.workspace_lease;
-  if (!stateLease) return { released: false, reason: 'legacy task has no workspace lease' };
+  if (!stateLease) return { released: false, reason: 'current task has no workspace lease' };
   if (!stateLease || typeof stateLease !== 'object' || typeof initialState.workspace !== 'string' || !path.isAbsolute(initialState.workspace)
     || typeof stateLease.registry_path !== 'string' || !path.isAbsolute(stateLease.registry_path)
     || path.resolve(stateLease.registry_path) !== workspaceLeasePath(initialState.workspace)
@@ -2409,18 +2196,18 @@ async function releaseWorkspaceLease(parameters, { closeAllowed = false } = {}) 
     if (lockedLeasePath !== leasePath) throw new ControllerError('Cannot release workspace lease: registry authority path changed');
     return withStateLock(filePath, async () => {
     await verifyRegularDirectorySnapshot(parentAuthority, 'Controller state parent');
-    const state = await loadState(filePath);
+    const state = normalizeState(await loadState(filePath));
     const currentParentAuthority = await stateParentAuthorityForState(state, filePath);
     if (!sameStateParentAuthority(currentParentAuthority, parentAuthority)) throw new ControllerError(`Controller state parent authority changed: ${filePath}`);
     await attachStateParentAuthority(state, filePath, parentAuthority);
-    state.workspace_claims = normalizeStoredWorkspaceClaims(state.workspace_claims, { legacy: state.workspace_claims === undefined || state.workspace_claims === null });
-    if (state.workspace_lease) state.workspace_lease.workspace_claims = normalizeStoredWorkspaceClaims(state.workspace_lease.workspace_claims ?? state.workspace_claims, { legacy: state.workspace_lease.workspace_claims === undefined || state.workspace_lease.workspace_claims === null });
+    state.workspace_claims = normalizeStoredWorkspaceClaims(state.workspace_claims);
+    if (state.workspace_lease) state.workspace_lease.workspace_claims = normalizeStoredWorkspaceClaims(state.workspace_lease.workspace_claims ?? state.workspace_claims);
     if (!state.nodes || typeof state.nodes !== 'object' || Array.isArray(state.nodes) || !Object.keys(state.nodes).length) throw new ControllerError('Cannot release workspace lease: task nodes are unreadable or empty');
     const unknownNodes = Object.values(state.nodes).filter(node => !node || typeof node !== 'object' || ![PENDING, RUNNING, ...TERMINAL].includes(node.status));
     if (unknownNodes.length) throw new ControllerError('Cannot release workspace lease while node statuses are unknown');
     const running = Object.values(state.nodes).filter(node => node.status === RUNNING).map(node => node.id);
     if (running.length) throw new ControllerError(`Cannot release workspace lease while nodes are running: ${running.join(', ')}`);
-    if (!closeAllowed) trueValue(parameters.previous_agents_stopped, 'previous_agents_stopped');
+    if (!closeAllowed) trueValue(parameters.previous_agent_stopped, 'previous_agent_stopped');
     const lease = await loadWorkspaceLease(leasePath, state.workspace, { authorityContext });
     await bindStateParentAuthorityToWorkspaceLease(lease, state, filePath, authorityContext);
     const peerOwners = workspaceLeasePeerOwners(lease, state, filePath);
@@ -2443,7 +2230,7 @@ async function releaseWorkspaceLease(parameters, { closeAllowed = false } = {}) 
     lease.active_tasks = lease.active_tasks.filter(entry => !workspaceLeaseEntryMatches(entry, state, filePath, { activeOnly: false })); lease.updated_at = utcNow(); await writeWorkspaceLeaseRegistry(authorityContext, leasePath, lease);
       return { released: true, lease_path: leasePath };
     }, { parentAuthority });
-  }, { allowAuthorityMigration: true });
+  }, { allowAuthorityCreation: true });
 }
 
 async function initTask(parameters) {
@@ -2483,7 +2270,7 @@ async function initTask(parameters) {
       lease.active_tasks = lease.active_tasks.filter(candidate => candidate !== entry); lease.updated_at = utcNow(); await writeWorkspaceLeaseRegistry(authorityContext, leasePath, lease);
       throw error;
     }
-  }, { allowAuthorityMigration: true });
+  }, { allowAuthorityCreation: true });
   return { state_path: filePath, task: compactState(state) };
 }
 
@@ -2510,7 +2297,7 @@ async function reconcileWorkspace(parameters) {
       let state;
       try { state = normalizeState(await loadState(entry.state_path)); }
       catch (error) {
-        if (error instanceof ControllerError && (error.message.startsWith('JSON input does not exist:') || error.message.startsWith('Controller state does not exist:'))) {
+        if (error instanceof ControllerError && error.message.startsWith('Current SQLite controller state does not exist:')) {
           lease.active_tasks = lease.active_tasks.filter(candidate => candidate !== entry); lease.updated_at = utcNow(); await writeWorkspaceLeaseRegistry(authorityContext, leasePath, lease);
           return { workspace, lease_path: leasePath, reconciled: true, action: 'cleared_missing_initialization', task_id: entry.task_id, state_dir: entry.state_dir };
         }
@@ -2528,7 +2315,7 @@ async function reconcileWorkspace(parameters) {
       entry.phase = 'active'; lease.updated_at = utcNow(); await writeWorkspaceLeaseRegistry(authorityContext, leasePath, lease);
       return { workspace, lease_path: leasePath, reconciled: true, action: 'activated_existing_initialization', active_task: entry };
     }, { parentAuthority });
-  }, { allowAuthorityMigration: true });
+  }, { allowAuthorityCreation: true });
 }
 
 async function addNode(parameters) {
@@ -2545,13 +2332,10 @@ async function raiseAssurance(parameters) {
   const replacement = requiredString(parameters.replacement_agent_task_path, 'replacement_agent_task_path');
   const integrationOwner = requiredString(parameters.integration_owner, 'integration_owner');
   return withActiveWorkspaceStateLock(filePath, async state => {
-    if (![2, REVIEW_PROTOCOL_VERSION].includes(state.routing_schema_version)) throw new ControllerError('Only a v2 or v3 task can raise assurance_level');
-    const rank = { verification: 0, terra: 1, sol: 2 };
-    if (!hasOwn(rank, targetLevel) || rank[targetLevel] <= rank[state.assurance_level]) {
-      throw new ControllerError('target_assurance_level must be higher than the current assurance_level');
-    }
+    if (state.routing_schema_version !== REVIEW_PROTOCOL_VERSION) throw new ControllerError('Only a v3 task can raise assurance_level');
+    if (state.assurance_level !== 'terra' || targetLevel !== 'sol') throw new ControllerError('A v3 assurance level can only be raised from terra to sol');
     requireAssuranceLevelMatches(targetLevel, nextAssessment, 'target_assurance_level');
-    if (state.reviews.length || state.repair_records.length || state.verification_record) {
+    if (state.reviews.length || state.repair_records.length) {
       throw new ControllerError('assurance_level can only be raised before the terminal assurance gate starts');
     }
     if (participantPaths(state).has(replacement)) throw new ControllerError('The raised assurance gate reviewer must not be a prior participant');
@@ -2561,42 +2345,15 @@ async function raiseAssurance(parameters) {
 
     const priorLevel = state.assurance_level;
     const priorAssessment = state.assurance_assessment;
-    let reviewNode;
-    if (priorLevel === 'verification') {
-      if (isReviewProtocolState(state)) throw new ControllerError('A v3 task cannot start from verification assurance');
-      if (Object.keys(state.nodes).length >= MAX_NODES) throw new ControllerError(`Task already has the ${MAX_NODES}-node limit`);
-      const reviewNodeId = requiredIdentifier(parameters.review_node_id, 'review_node_id');
-      if (hasOwn(state.nodes, reviewNodeId)) throw new ControllerError(`Duplicate node id: ${reviewNodeId}`);
-      reviewNode = nodeRecord({
-        id: reviewNodeId,
-        kind: targetLevel === 'terra' ? QUALITY_REVIEW_KIND : 'total_review',
-        depends_on: Object.keys(state.nodes),
-        execution_risk: 'read_only',
-        routing_reason: reason,
-        execution_owner: replacement,
-        integration_owner: integrationOwner,
-        quality_guard: 'Review the complete task requirements, implementation evidence, verification evidence, scope, regressions, gaps, and residual risk.',
-      }, { routingRequired: true, routingSchemaVersion: 2, expectedTaskId: state.task_id });
-      state.nodes[reviewNodeId] = reviewNode;
-    } else {
-      if (targetLevel !== 'sol') throw new ControllerError('A terra assurance task can only be raised to sol');
-      if (hasOwn(parameters, 'review_node_id')) throw new ControllerError('review_node_id is only valid when raising a verification task');
-      reviewNode = reviewNodesForState(state)[0];
-      if (!reviewNode || reviewNode.kind !== QUALITY_REVIEW_KIND || reviewNode.status !== PENDING || reviewNode.claim_id || reviewNode.attempt !== 0) {
-        throw new ControllerError('Terra assurance can only be raised before its terminal review gate is claimed');
-      }
-      if (isReviewProtocolState(state)) {
-        applyProtocolStage(reviewNode, 'sol_high');
-        state.review_entry_stage = 'sol_high';
-      } else {
-        reviewNode.kind = 'total_review';
-        reviewNode.review_stage = 'sol';
-        reviewNode.agent_type = 'avsp_sol_high';
-      }
-      reviewNode.execution_owner = replacement;
-      reviewNode.integration_owner = integrationOwner;
-      reviewNode.routing_reason = reason;
+    const reviewNode = reviewNodesForState(state)[0];
+    if (!reviewNode || reviewNode.kind !== QUALITY_REVIEW_KIND || reviewNode.status !== PENDING || reviewNode.claim_id || reviewNode.attempt !== 0) {
+      throw new ControllerError('Terra assurance can only be raised before its terminal review gate is claimed');
     }
+    applyProtocolStage(reviewNode, 'sol_high');
+    state.review_entry_stage = 'sol_high';
+    reviewNode.execution_owner = replacement;
+    reviewNode.integration_owner = integrationOwner;
+    reviewNode.routing_reason = reason;
 
     state.assurance_level = targetLevel;
     state.assurance_assessment = nextAssessment;
@@ -2623,7 +2380,6 @@ async function rebindPendingOwner(parameters) {
   return withActiveWorkspaceStateLock(filePath, async state => {
     const node = state.nodes[nodeId];
     if (!node || node.status !== PENDING || node.claim_id || node.agent_task_path) throw new ControllerError(`Only an unclaimed pending node can rebind execution_owner: ${nodeId}`);
-    if (node.routing_legacy) throw new ControllerError('A legacy node does not support execution_owner rebinding');
     nodeAttemptAvailability(node, nodeId);
     const replacement = replacementExecutionOwner(state, node, parameters);
     if (replacement === node.execution_owner) throw new ControllerError('replacement_agent_task_path must differ from the current execution_owner');
@@ -2644,19 +2400,6 @@ async function invalidateGate(parameters) {
   return withActiveWorkspaceStateLock(filePath, async state => {
     const invalidationReasons = gateInvalidationReasons(await closeReasons(state));
     if (!invalidationReasons.length) throw new ControllerError('The terminal assurance gate is not invalidated by a task or workspace change');
-    if (state.assurance_level === 'verification') {
-      if (!state.verification_record) throw new ControllerError('No verification record exists to invalidate');
-      const priorRecord = state.verification_record;
-      const invalidatedAt = utcNow();
-      const historyEntry = { verification_record: priorRecord, invalidated_at: invalidatedAt, invalidation_reason: reason, invalidation_reasons: invalidationReasons };
-      const retainedHistory = [...state.verification_history, historyEntry];
-      const discardedHistoryCount = Math.max(0, retainedHistory.length - MAX_VERIFICATION_HISTORY);
-      state.verification_history = retainedHistory.slice(-MAX_VERIFICATION_HISTORY);
-      state.verification_record = null;
-      bumpWorkflowRevision(state, 'verification_invalidated', { reason, invalidation_reasons: invalidationReasons, prior_recorded_at: priorRecord.recorded_at, invalidated_at: invalidatedAt, verification_history_discarded: discardedHistoryCount });
-      await writeState(filePath, state);
-      return { task_id: state.task_id, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), gate_kind: 'verification', invalidation_reasons: invalidationReasons, node: null, ready_nodes: readyNodes(state) };
-    }
     const node = reviewNodesForState(state)[0];
     if (!node || node.status !== SUCCEEDED) {
       throw new ControllerError('Only a succeeded terminal review with a recorded pass can be invalidated');
@@ -2740,13 +2483,12 @@ async function claimNode(parameters, activateImmediately = false) {
     // Total reviews are read-only guards, not protected execution work.
     if (node.execution_risk === 'protected' && node.kind !== 'total_review' && role !== PROTECTED_EXECUTOR_ROLE) throw new ControllerError('Only avsp_terra_high can claim protected work');
     if (node.execution_risk === 'read_only' && node.kind !== 'total_review' && !READ_ONLY_ROLES.has(role)) throw new ControllerError('A read_only node requires a configured read-only role');
-    if (node.execution_risk === 'delegable' && !LUNA_EXECUTOR_ROLES.has(role) && role !== PROTECTED_EXECUTOR_ROLE && !(node.rescue_role === ROOT_RESCUE_ROLE && role === ROOT_RESCUE_ROLE)) throw new ControllerError('A delegable node requires a Luna executor or legacy writer, avsp_terra_high, or an explicit main/root rescue');
-    if (node.execution_risk === 'delegable' && LEGACY_LUNA_WRITER_ROLES.has(role) && node.agent_type !== role) throw new ControllerError('A legacy Luna writer requires an explicitly matching node agent_type');
+    if (node.execution_risk === 'delegable' && !LUNA_EXECUTOR_ROLES.has(role) && role !== PROTECTED_EXECUTOR_ROLE && !(node.rescue_role === ROOT_RESCUE_ROLE && role === ROOT_RESCUE_ROLE)) throw new ControllerError('A delegable node requires a Luna executor, avsp_terra_high, or an explicit main/root rescue');
     if (LUNA_EXECUTOR_ROLES.has(role)) {
-      if (node.routing_legacy || node.execution_risk !== 'delegable') throw new ControllerError('A Luna executor requires complete delegable routing metadata');
+      if (node.execution_risk !== 'delegable') throw new ControllerError('A Luna executor requires delegable routing metadata');
       if (node.execution_owner !== taskPath) throw new ControllerError('Luna executor claim must match node execution_owner');
     }
-    if (!cohortNode && !node.routing_legacy && node.execution_owner !== taskPath) throw new ControllerError('Node claim must match execution_owner');
+    if (!cohortNode && node.execution_owner !== taskPath) throw new ControllerError('Node claim must match execution_owner');
     if (isMaxClosureNode(state, node)) {
       const charter = requireMaxReviewCharter(state, node);
       if (charter.status !== 'closure_ready' || charter.scope_decision_required) throw new ControllerError(`The max review charter cannot be claimed for closure: ${charter.status}`);
@@ -2801,20 +2543,7 @@ function hasRecordedPassingReview(state, node) {
 }
 
 function reviewCompletion(state, review) {
-  const completionEvent = [...state.events].reverse().find(event => (event.type === 'node_completed' || event.type === 'terra_cohort_lane_completed') && event.node_id === review.node_id && event.claim_id === review.claim_id) ?? (() => {
-    const reviews = state.reviews.filter(candidate => candidate.node_id === review.node_id && !state.events.some(event => event.type === 'node_completed' && event.node_id === candidate.node_id && event.claim_id === candidate.claim_id)).sort((left, right) => Date.parse(left.recorded_at) - Date.parse(right.recorded_at));
-    const legacyEvents = state.events.filter(event => event.type === 'node_completed' && event.node_id === review.node_id && !hasOwn(event, 'claim_id')).sort((left, right) => Date.parse(left.at) - Date.parse(right.at));
-    const used = new Set();
-    for (const candidate of reviews) {
-      const recordedAt = Date.parse(candidate.recorded_at);
-      const eventIndex = legacyEvents.findIndex((event, index) => !used.has(index) && (!Number.isFinite(recordedAt) || !Number.isFinite(Date.parse(event.at)) || Date.parse(event.at) >= recordedAt));
-      if (eventIndex >= 0) {
-        used.add(eventIndex);
-        if (candidate === review) return legacyEvents[eventIndex];
-      }
-    }
-    return null;
-  })();
+  const completionEvent = [...state.events].reverse().find(event => (event.type === 'node_completed' || event.type === 'terra_cohort_lane_completed') && event.node_id === review.node_id && event.claim_id === review.claim_id);
   return {
     status: review.completion_status ?? completionEvent?.status ?? null,
     completion_attestation: review.completion_attestation ?? completionEvent?.completion_attestation ?? null,
@@ -3265,13 +2994,13 @@ function replacementExecutionOwner(state, node, parameters) {
   if (replacement === node.agent_task_path) throw new ControllerError('replacement_agent_task_path must differ from the stale or prior agent_task_path');
   if (node.kind === 'total_review' && participantPaths(state).has(replacement)) throw new ControllerError('A replacement total reviewer must not be a prior participant');
   if (isReviewNode(node, state.routing_schema_version) && node.kind === QUALITY_REVIEW_KIND && participantPaths(state).has(replacement)) throw new ControllerError('A replacement review gate reviewer must not be a prior participant');
-  if (!node.routing_legacy && Object.values(state.nodes).some(candidate => candidate.id !== node.id && candidate.execution_owner === replacement)) throw new ControllerError(`replacement_agent_task_path is already reserved by another node: ${replacement}`);
+  if (Object.values(state.nodes).some(candidate => candidate.id !== node.id && candidate.execution_owner === replacement)) throw new ControllerError(`replacement_agent_task_path is already reserved by another node: ${replacement}`);
   return replacement;
 }
 
 function rebindExecutionOwner(node, replacement) {
   const priorExecutionOwner = node.execution_owner;
-  if (!node.routing_legacy) node.execution_owner = replacement;
+  node.execution_owner = replacement;
   return priorExecutionOwner;
 }
 
@@ -3328,7 +3057,7 @@ async function rescueNode(parameters) {
     const node = state.nodes[nodeId]; requireActiveClaim(node, parameters);
     if (node.kind === 'total_review') throw new ControllerError('A total_review node cannot be rescued by main/root');
     if (node.execution_risk !== 'delegable') throw new ControllerError('Only delegable Luna execution can be rescued by main/root');
-    if (!LUNA_EXECUTOR_ROLES.has(node.agent_role)) throw new ControllerError('Only a Luna executor or explicitly matched legacy writer attempt can be rescued by main/root');
+    if (!LUNA_EXECUTOR_ROLES.has(node.agent_role)) throw new ControllerError('Only a Luna executor attempt can be rescued by main/root');
     if (node.rescue_role) throw new ControllerError(`Node already has an active rescue role: ${nodeId}`);
     nodeAttemptAvailability(node, nodeId);
     const replacement = replacementExecutionOwner(state, node, parameters);
@@ -3398,8 +3127,8 @@ async function retryNode(parameters) {
     const downstreamStarted = Object.values(state.nodes).some(candidate => candidate.depends_on.includes(nodeId) && candidate.status !== PENDING);
     if (downstreamStarted) throw new ControllerError(`Cannot retry after a dependent node changed state: ${nodeId}`);
     nodeAttemptAvailability(node, nodeId);
-    if (state.routing_schema_version >= 2 && reviewNode && !hasOwn(parameters, 'replacement_agent_task_path')) throw new ControllerError('A retried review node requires replacement_agent_task_path for an independent reviewer');
-    const replacement = node.routing_legacy ? null : replacementExecutionOwner(state, node, parameters); const priorExecutionOwner = replacement ? rebindExecutionOwner(node, replacement) : node.execution_owner;
+    if (reviewNode && !hasOwn(parameters, 'replacement_agent_task_path')) throw new ControllerError('A retried review node requires replacement_agent_task_path for an independent reviewer');
+    const replacement = replacementExecutionOwner(state, node, parameters); const priorExecutionOwner = rebindExecutionOwner(node, replacement);
     const priorClaimId = node.claim_id; const wasTotalReview = node.kind === 'total_review'; const priorReviewRole = reviewNode ? node.agent_type : null;
     if (protocolNode) {
       const stage = protocolStageForNode(node);
@@ -3463,7 +3192,7 @@ async function retryNode(parameters) {
     if (nextReview?.agent_type === 'avsp_sol_max' && !isMaxReviewNode(node)) {
       const sourceReview = finalizedLatestReview(state, node);
       if (!sourceReview) throw new ControllerError('Escalation to max requires a finalized xhigh failure');
-      await freezeMaxReviewCharter(state, node, sourceReview);
+      await freezeProtocolMaxReviewCharter(state, node, sourceReview);
       node.kind = nextReview.kind;
       node.review_stage = nextReview.review_stage;
       node.agent_type = nextReview.agent_type;
@@ -3495,29 +3224,14 @@ async function retryNode(parameters) {
   });
 }
 
-const PRUNABLE_STATE_FIELDS = new Set(['version', 'routing_schema_version', 'assurance_level', 'assurance_assessment', 'review_protocol_version', 'review_entry_stage', 'review_context', 'task_id', 'workspace', 'workspace_claims', 'goal', 'requirements', 'scope', 'non_goals', 'nodes', 'participants', 'reviews', 'repair_records', 'max_review_charter', 'verification_record', 'verification_history', 'events', 'workflow_revision', 'closed_revision', 'closed_at', 'created_at', 'updated_at', 'workspace_lease']);
-const PRUNABLE_NODE_FIELDS = new Set(['id', 'kind', 'review_stage', 'agent_type', 'depends_on', 'execution_risk', 'routing_reason', 'execution_owner', 'integration_owner', 'quality_guard', 'routing_legacy', 'rescue_role', 'rescue_reason', 'rescued_at', 'rescue_count', 'status', 'agent_task_path', 'agent_thread_id', 'agent_role', 'claim_id', 'claimed_at', 'activation_at', 'activation_deadline_at', 'heartbeat_at', 'heartbeat_count', 'lease_duration_sec', 'attempt', 'attempt_budget_used', 'unavailable_attempts', 'result', 'checkpoint', 'checkpoint_at', 'workflow_completion_intent', 'recovery_history', 'review_gate']);
-const LEGACY_V1_PRUNABLE_STATE_FIELDS = new Set([...PRUNABLE_STATE_FIELDS].filter(field => !['assurance_level', 'assurance_assessment', 'repair_records', 'max_review_charter', 'verification_record', 'verification_history'].includes(field)));
-const LEGACY_V1_NULL_MAX_CHARTER_PRUNABLE_STATE_FIELDS = new Set([...LEGACY_V1_PRUNABLE_STATE_FIELDS, 'max_review_charter']);
-const LEGACY_V2_PRUNABLE_STATE_FIELDS = new Set([...PRUNABLE_STATE_FIELDS].filter(field => !['assurance_assessment', 'repair_records', 'max_review_charter', 'verification_history'].includes(field)));
-const LEGACY_PRE_VERIFICATION_HISTORY_PRUNABLE_STATE_FIELDS = new Set([...PRUNABLE_STATE_FIELDS].filter(field => !['max_review_charter', 'verification_history'].includes(field)));
-const LEGACY_PRE_MAX_CHARTER_PRUNABLE_STATE_FIELDS = new Set([...PRUNABLE_STATE_FIELDS].filter(field => field !== 'max_review_charter'));
-const LEGACY_CLAIMLESS_PRUNABLE_STATE_FIELDS = new Set([...PRUNABLE_STATE_FIELDS].filter(field => field !== 'workspace_claims'));
-const LEGACY_V1_PRUNABLE_NODE_FIELDS = new Set([...PRUNABLE_NODE_FIELDS].filter(field => !['review_stage', 'attempt_budget_used', 'unavailable_attempts'].includes(field)));
-const LEGACY_V2_PRUNABLE_NODE_FIELDS = new Set([...PRUNABLE_NODE_FIELDS].filter(field => !['attempt_budget_used', 'unavailable_attempts'].includes(field)));
+const PRUNABLE_STATE_FIELDS = new Set(['version', 'routing_schema_version', 'assurance_level', 'assurance_assessment', 'review_protocol_version', 'review_entry_stage', 'review_context', 'task_id', 'workspace', 'workspace_claims', 'goal', 'requirements', 'scope', 'non_goals', 'nodes', 'participants', 'reviews', 'repair_records', 'max_review_charter', 'events', 'workflow_revision', 'closed_revision', 'closed_at', 'created_at', 'updated_at', 'workspace_lease']);
+const PRUNABLE_NODE_FIELDS = new Set(['id', 'kind', 'review_stage', 'agent_type', 'depends_on', 'execution_risk', 'routing_reason', 'execution_owner', 'integration_owner', 'quality_guard', 'rescue_role', 'rescue_reason', 'rescued_at', 'rescue_count', 'status', 'agent_task_path', 'agent_thread_id', 'agent_role', 'claim_id', 'claimed_at', 'activation_at', 'activation_deadline_at', 'heartbeat_at', 'heartbeat_count', 'lease_duration_sec', 'attempt', 'attempt_budget_used', 'unavailable_attempts', 'result', 'checkpoint', 'checkpoint_at', 'workflow_completion_intent', 'recovery_history', 'review_gate']);
 const PRUNABLE_LEASE_FIELDS = new Set(['version', 'workspace', 'active_tasks', 'updated_at']);
 const PRUNABLE_TASK_LEASE_FIELDS = new Set(['registry_path', 'state_path', 'status', 'acquired_at', 'released_at', 'workspace_claims']);
-const LEGACY_CLAIMLESS_PRUNABLE_TASK_LEASE_FIELDS = new Set([...PRUNABLE_TASK_LEASE_FIELDS].filter(field => field !== 'workspace_claims'));
 const PRUNABLE_TASK_LEASE_AUTHORITY_FIELDS = new Set([...PRUNABLE_TASK_LEASE_FIELDS, 'state_parent_authority']);
-const LEGACY_CLAIMLESS_PRUNABLE_TASK_LEASE_AUTHORITY_FIELDS = new Set([...LEGACY_CLAIMLESS_PRUNABLE_TASK_LEASE_FIELDS, 'state_parent_authority']);
 const PRUNE_SWEEP_FIELDS = new Set(['version', 'last_sweep_at', 'last_result']);
-const QUARANTINE_FIELDS_V1 = new Set(['version', 'status', 'task_id', 'original_state_path', 'error_path', 'reason', 'quarantined_at', 'delete_after', 'files', 'move_error']);
-const QUARANTINE_FIELDS_V2 = new Set([...QUARANTINE_FIELDS_V1, 'review_artifacts']);
-const QUARANTINE_FIELDS_V3 = new Set([...QUARANTINE_FIELDS_V2, 'workspace', 'registry_path', 'binding']);
-const QUARANTINE_FIELDS = new Set([...QUARANTINE_FIELDS_V3, 'authority_anchor']);
-const QUARANTINE_EXPIRY_FIELDS_V1 = new Set(['version', 'task_id', 'original_state_path', 'quarantined_at', 'delete_after', 'files', 'review_artifacts']);
-const QUARANTINE_EXPIRY_FIELDS_V2 = new Set([...QUARANTINE_EXPIRY_FIELDS_V1, 'workspace', 'registry_path', 'binding']);
-const QUARANTINE_EXPIRY_FIELDS = new Set([...QUARANTINE_EXPIRY_FIELDS_V2, 'authority_anchor']);
+const QUARANTINE_FIELDS = new Set(['version', 'status', 'task_id', 'original_state_path', 'error_path', 'reason', 'quarantined_at', 'delete_after', 'files', 'move_error', 'review_artifacts', 'workspace', 'registry_path', 'binding', 'authority_anchor']);
+const QUARANTINE_EXPIRY_FIELDS = new Set(['version', 'task_id', 'original_state_path', 'quarantined_at', 'delete_after', 'files', 'review_artifacts', 'workspace', 'registry_path', 'binding', 'authority_anchor']);
 const PRUNE_RESULT_FIELDS = new Set(['deleted_count', 'quarantined_count', 'retained_count', 'quarantine_deleted_count', 'quarantine_retained_count', 'report_truncated']);
 
 function hasExactFields(value, fields) {
@@ -3528,36 +3242,24 @@ function hasExactFields(value, fields) {
 function validTimestamp(value) { return typeof value === 'string' && Number.isFinite(Date.parse(value)); }
 
 function taskPruneEligibility(state, filePath, now) {
-  const isPreV2V1State = state?.routing_schema_version === 1 && !hasOwn(state, 'assurance_level') && !hasOwn(state, 'verification_record');
-  const isPreRepairV2State = state?.routing_schema_version === 2 && !hasOwn(state, 'assurance_assessment') && !hasOwn(state, 'repair_records');
-  const claimless = !hasOwn(state, 'workspace_claims');
-  const baseStateFields = isPreV2V1State
-    ? state.max_review_charter === null ? LEGACY_V1_NULL_MAX_CHARTER_PRUNABLE_STATE_FIELDS : LEGACY_V1_PRUNABLE_STATE_FIELDS
-    : isPreRepairV2State ? LEGACY_V2_PRUNABLE_STATE_FIELDS : !hasOwn(state, 'verification_history') ? LEGACY_PRE_VERIFICATION_HISTORY_PRUNABLE_STATE_FIELDS : !hasOwn(state, 'max_review_charter') ? LEGACY_PRE_MAX_CHARTER_PRUNABLE_STATE_FIELDS : PRUNABLE_STATE_FIELDS;
-  const stateFields = claimless ? new Set([...baseStateFields].filter(field => field !== 'workspace_claims')) : baseStateFields;
-  const legacyNodeFields = isPreV2V1State ? LEGACY_V1_PRUNABLE_NODE_FIELDS : isPreRepairV2State ? LEGACY_V2_PRUNABLE_NODE_FIELDS : null;
-  const nodeFields = legacyNodeFields ?? PRUNABLE_NODE_FIELDS;
-  if (!hasExactFields(state, stateFields)) return { eligible: false, reason: 'incomplete or unknown state fields' };
-  if (state.version !== VERSION || ![1, 2, REVIEW_PROTOCOL_VERSION].includes(state.routing_schema_version)) return { eligible: false, reason: 'legacy or unsupported state schema' };
-  if (state.routing_schema_version === 1 && state.assurance_level !== undefined && state.assurance_level !== null) return { eligible: false, reason: 'invalid v1 assurance state' };
-  if (state.routing_schema_version >= 2 && !ASSURANCE_LEVELS.has(state.assurance_level)) return { eligible: false, reason: 'invalid assurance state' };
+  if (!hasExactFields(state, PRUNABLE_STATE_FIELDS)) return { eligible: false, reason: 'incomplete or unknown state fields' };
+  if (state.version !== VERSION || state.routing_schema_version !== REVIEW_PROTOCOL_VERSION) return { eligible: false, reason: 'unsupported state schema' };
+  if (!ASSURANCE_LEVELS.has(state.assurance_level)) return { eligible: false, reason: 'invalid assurance state' };
   try { requiredIdentifier(state.task_id, 'task_id'); requiredString(state.workspace, 'workspace'); requiredString(state.goal, 'goal'); }
   catch (error) { return { eligible: false, reason: `invalid task identity: ${error.message}` }; }
   if (state.task_id !== path.basename(filePath, '.json')) return { eligible: false, reason: 'task_id does not match state path' };
   if (!path.isAbsolute(state.workspace) || path.resolve(state.workspace) !== state.workspace) return { eligible: false, reason: 'workspace is not canonical absolute path' };
-  if (!Array.isArray(state.requirements) || !Array.isArray(state.scope) || !Array.isArray(state.non_goals) || !Array.isArray(state.participants) || !Array.isArray(state.reviews) || !Array.isArray(state.events) || (!isPreRepairV2State && !isPreV2V1State && !Array.isArray(state.repair_records)) || (hasOwn(state, 'verification_history') && !Array.isArray(state.verification_history))) return { eligible: false, reason: 'invalid state collection' };
+  if (!Array.isArray(state.requirements) || !Array.isArray(state.scope) || !Array.isArray(state.non_goals) || !Array.isArray(state.participants) || !Array.isArray(state.reviews) || !Array.isArray(state.events) || !Array.isArray(state.repair_records)) return { eligible: false, reason: 'invalid state collection' };
   if (state.requirements.some(item => !item || typeof item !== 'object' || Array.isArray(item) || typeof item.id !== 'string' || !item.id.trim() || typeof item.text !== 'string' || !item.text.trim()) || state.participants.some(item => !item || typeof item !== 'object' || Array.isArray(item)) || state.reviews.some(item => !item || typeof item !== 'object' || Array.isArray(item)) || state.events.some(item => !item || typeof item !== 'object' || Array.isArray(item) || !validTimestamp(item.at) || typeof item.type !== 'string' || !item.type.trim())) return { eligible: false, reason: 'malformed state collection item' };
   if (!state.nodes || typeof state.nodes !== 'object' || Array.isArray(state.nodes) || !Object.keys(state.nodes).length) return { eligible: false, reason: 'invalid node collection' };
   for (const [id, node] of Object.entries(state.nodes)) {
-    if (!hasExactFields(node, nodeFields) || node.id !== id || (node.status !== PENDING && !TERMINAL.has(node.status))) return { eligible: false, reason: 'incomplete, unknown, or active node state' };
+    if (!hasExactFields(node, PRUNABLE_NODE_FIELDS) || node.id !== id || (node.status !== PENDING && !TERMINAL.has(node.status))) return { eligible: false, reason: 'incomplete, unknown, or active node state' };
     try { requiredIdentifier(node.id, 'node.id'); requiredString(node.kind, 'node.kind'); requiredString(node.execution_risk, 'node.execution_risk'); requiredString(node.routing_reason, 'node.routing_reason'); requiredString(node.execution_owner, 'node.execution_owner'); requiredString(node.integration_owner, 'node.integration_owner'); requiredString(node.quality_guard, 'node.quality_guard'); }
     catch (error) { return { eligible: false, reason: `invalid node state: ${error.message}` }; }
-    const hasValidAttemptAccounting = isPreV2V1State || isPreRepairV2State
-      ? true
-      : Number.isSafeInteger(node.attempt_budget_used) && node.attempt_budget_used >= 0 && node.attempt_budget_used <= MAX_NODE_ATTEMPTS
-        && Number.isSafeInteger(node.unavailable_attempts) && node.unavailable_attempts >= 0 && node.unavailable_attempts <= MAX_UNAVAILABLE_ATTEMPTS
-        && node.attempt_budget_used + node.unavailable_attempts <= node.attempt;
-    if (!['read_only', 'delegable', 'protected'].includes(node.execution_risk) || !Array.isArray(node.depends_on) || node.depends_on.some(dependency => typeof dependency !== 'string') || node.routing_legacy !== false || !Number.isSafeInteger(node.attempt) || node.attempt < 0 || node.attempt > MAX_TOTAL_NODE_ATTEMPTS || !hasValidAttemptAccounting || !Number.isSafeInteger(node.heartbeat_count) || node.heartbeat_count < 0 || !Array.isArray(node.recovery_history)) return { eligible: false, reason: 'legacy or invalid node routing' };
+    const hasValidAttemptAccounting = Number.isSafeInteger(node.attempt_budget_used) && node.attempt_budget_used >= 0 && node.attempt_budget_used <= MAX_NODE_ATTEMPTS
+      && Number.isSafeInteger(node.unavailable_attempts) && node.unavailable_attempts >= 0 && node.unavailable_attempts <= MAX_UNAVAILABLE_ATTEMPTS
+      && node.attempt_budget_used + node.unavailable_attempts <= node.attempt;
+    if (!['read_only', 'delegable', 'protected'].includes(node.execution_risk) || !Array.isArray(node.depends_on) || node.depends_on.some(dependency => typeof dependency !== 'string') || !Number.isSafeInteger(node.attempt) || node.attempt < 0 || node.attempt > MAX_TOTAL_NODE_ATTEMPTS || !hasValidAttemptAccounting || !Number.isSafeInteger(node.heartbeat_count) || node.heartbeat_count < 0 || !Array.isArray(node.recovery_history)) return { eligible: false, reason: 'invalid node routing' };
   }
   try { validateNodes(state.nodes); validateReviewTopology(state.nodes, state.assurance_level, state.routing_schema_version, state.review_entry_stage); }
   catch (error) { return { eligible: false, reason: `invalid task topology: ${error.message}` }; }
@@ -3566,22 +3268,19 @@ function taskPruneEligibility(state, filePath, now) {
   if (!Number.isFinite(updatedAt)) return { eligible: false, reason: 'invalid updated_at' };
   if (now - updatedAt < DEFAULT_TASK_RETENTION_DAYS * DAY_MS) return { eligible: false, reason: 'younger than retention period' };
   if (!state.workspace_lease || state.workspace_lease.status !== 'released') return { eligible: false, reason: 'workspace lease is not released' };
-  const claimlessLease = !hasOwn(state.workspace_lease, 'workspace_claims');
-  const hasStateParentAuthority = hasOwn(state.workspace_lease, 'state_parent_authority');
-  const expectedLeaseFields = claimlessLease ? LEGACY_CLAIMLESS_PRUNABLE_TASK_LEASE_AUTHORITY_FIELDS : PRUNABLE_TASK_LEASE_AUTHORITY_FIELDS;
-  if (!hasExactFields(state.workspace_lease, expectedLeaseFields)) return { eligible: false, reason: 'workspace lease is not a complete released state' };
+  if (!hasExactFields(state.workspace_lease, PRUNABLE_TASK_LEASE_AUTHORITY_FIELDS)) return { eligible: false, reason: 'workspace lease is not a complete released state' };
   if (Object.values(state.nodes).some(node => node.status === RUNNING)) return { eligible: false, reason: 'has running nodes' };
   if (typeof state.workspace_lease.registry_path !== 'string' || !path.isAbsolute(state.workspace_lease.registry_path) || path.resolve(state.workspace_lease.registry_path) !== workspaceLeasePath(state.workspace)) return { eligible: false, reason: 'invalid workspace lease path' };
   if (!sameStatePath(state.workspace_lease.state_path, filePath) || !validTimestamp(state.workspace_lease.acquired_at) || !validTimestamp(state.workspace_lease.released_at)) return { eligible: false, reason: 'invalid released workspace lease state' };
-  if (!hasStateParentAuthority || !validStateParentAuthority(state.workspace_lease.state_parent_authority, filePath)) return { eligible: false, reason: 'invalid released workspace lease state parent authority' };
-  try { normalizeStoredWorkspaceClaims(state.workspace_lease.workspace_claims ?? legacyWorkspaceClaims()); } catch (error) { return { eligible: false, reason: 'invalid released workspace lease claims' }; }
+  if (!validStateParentAuthority(state.workspace_lease.state_parent_authority, filePath)) return { eligible: false, reason: 'invalid released workspace lease state parent authority' };
+  try { normalizeStoredWorkspaceClaims(state.workspace_lease.workspace_claims); } catch (error) { return { eligible: false, reason: 'invalid released workspace lease claims' }; }
   if (path.resolve(state.workspace_lease.registry_path) === path.resolve(filePath)) return { eligible: false, reason: 'state path conflicts with workspace lease path' };
   return { eligible: true };
 }
 
 async function releasedLeaseEligibility(leasePath, state, filePath, authorityContext = null) {
   let lease;
-  try { lease = authorityContext?.legacy_verified_lease ?? await loadWorkspaceLease(leasePath, state.workspace, { authorityContext }); }
+  try { lease = await loadWorkspaceLease(leasePath, state.workspace, { authorityContext }); }
   catch (error) { return { eligible: false, reason: `workspace lease is unreadable: ${error.message}` }; }
   if (lease.workspace !== state.workspace || !Array.isArray(lease.active_tasks) || !validTimestamp(lease.updated_at)) return { eligible: false, reason: 'workspace lease is not a verified released registry' };
   if (workspaceLeaseStatePathOwners(lease, state.workspace_lease.state_path).length) return { eligible: false, reason: 'workspace lease still has an active state-path owner' };
@@ -3592,57 +3291,18 @@ async function releasedLeaseEligibility(leasePath, state, filePath, authorityCon
   } catch (error) {
     if (error.code !== 'ENOENT') return { eligible: false, reason: `review artifact tree cannot be verified: ${error.message}` };
   }
-  const sourcePaths = [filePath, databasePath(filePath), `${filePath}.legacy`];
+  const sourcePaths = [filePath, databasePath(filePath)];
   const activeOwner = await activeLeaseOwnerForSources(lease, sourcePaths, reviewSource);
   if (activeOwner) return { eligible: false, reason: `cleanup source overlaps an active workspace lease entry: ${activeOwner.task_id} (${activeOwner.state_path})` };
   return { eligible: true };
-}
-
-async function withLegacyReleasedWorkspaceLeaseLock(workspace, callback) {
-  const authorityPath = workspaceLeaseAuthorityPath(workspace);
-  const leasePath = workspaceLeasePath(workspace);
-  const control = await safeWorkspaceLeaseControlDirectory(workspace);
-  const assertAuthorityAbsent = async () => {
-    try {
-      await fs.lstat(authorityPath);
-      throw new ControllerError(`Workspace lease authority appeared during legacy cleanup: ${authorityPath}`);
-    } catch (error) {
-      if (error.code !== 'ENOENT') throw error;
-    }
-  };
-  await assertAuthorityAbsent();
-  return withStateLock(leasePath, async () => {
-    await assertAuthorityAbsent();
-    const snapshot = await readJsonSnapshot(leasePath, { label: 'Legacy workspace lease', maxBytes: MAX_MANIFEST_BYTES });
-    await validateLegacyWorkspaceLeaseForAuthority(snapshot.value, workspace, leasePath);
-    if (snapshot.value.active_task !== null) throw new ControllerError(`Legacy workspace lease is still active: ${leasePath}`);
-    const legacyVerifiedLease = { version: WORKSPACE_LEASE_VERSION, workspace, active_tasks: [], updated_at: snapshot.value.updated_at };
-    await validateWorkspaceLease(legacyVerifiedLease, leasePath);
-    const result = await callback(leasePath, {
-      legacy_verified_lease: legacyVerifiedLease,
-      parent_authorities: { registry: { path: control.control_directory, real_path: control.control_real_path, identity: control.control_identity } },
-    });
-    await verifyRegularDirectorySnapshot({ path: control.control_directory, real_path: control.control_real_path, identity: control.control_identity }, 'Legacy workspace lease parent');
-    await verifyJsonSnapshot(leasePath, snapshot, 'Legacy workspace lease');
-    await assertAuthorityAbsent();
-    return result;
-  }, { createParent: false });
 }
 
 async function quarantineEligibility(state, filePath, now) {
   let storageMetadata;
   try { storageMetadata = await fs.stat(databasePath(filePath)); }
   catch (error) {
-    if (error.code !== 'ENOENT') throw error;
-    try { storageMetadata = await fs.stat(filePath); }
-    catch (legacyError) {
-      if (legacyError.code !== 'ENOENT') throw legacyError;
-      try { storageMetadata = await fs.stat(`${filePath}.legacy`); }
-      catch (archiveError) {
-        if (archiveError.code === 'ENOENT') return { eligible: false, reason: 'state disappeared before quarantine' };
-        throw archiveError;
-      }
-    }
+    if (error.code === 'ENOENT') return { eligible: false, reason: 'state database disappeared before quarantine' };
+    throw error;
   }
   const updatedAt = state && validTimestamp(state.updated_at) ? Date.parse(state.updated_at) : storageMetadata.mtimeMs;
   if (now - updatedAt < QUARANTINE_AFTER_DAYS * DAY_MS) return { eligible: false, reason: 'younger than quarantine retention period' };
@@ -3677,10 +3337,6 @@ function errorQuarantinePath(errorPath) { return path.join(errorPath, ERROR_QUAR
 function quarantineExpiryPath(errorPath) { return path.join(errorPath, QUARANTINE_EXPIRY_FILENAME); }
 function reviewArtifactTaskPath(stateDir, taskId) { return path.join(path.resolve(stateDir), REVIEW_ARTIFACT_DIRECTORY, taskId); }
 function quarantineReviewArtifactPath(errorPath) { return path.join(errorPath, QUARANTINE_REVIEW_DIRECTORY); }
-function quarantineLegacyPathBinding(originalStatePath) { return createHash('sha256').update(path.resolve(originalStatePath), 'utf8').digest('hex').slice(0, 32); }
-function quarantineLegacyEntryMatchesStatePath(errorPath, originalStatePath) {
-  return new RegExp(`^${quarantineLegacyPathBinding(originalStatePath)}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`, 'u').test(path.basename(errorPath));
-}
 function quarantineAuthorityAnchor(record) {
   return createHash('sha256').update(stableJson({
     schema: 'workflow-quarantine-authority-v1',
@@ -3698,11 +3354,6 @@ function quarantineEntryMatchesAuthority(errorPath, record) {
   return path.basename(errorPath).startsWith(prefix) && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(uuid);
 }
 
-function quarantineEntryMatchesTruncatedAuthority(errorPath, record) {
-  const prefix = `${record.task_id}-${record.authority_anchor.slice(0, 32)}-`;
-  const uuid = path.basename(errorPath).slice(prefix.length);
-  return path.basename(errorPath).startsWith(prefix) && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(uuid);
-}
 function logicalTaskIdFromStatePath(filePath) {
   const taskId = path.basename(filePath, '.json');
   if (!validQuarantineTaskId(taskId)) throw new ControllerError(`State path does not contain a valid task identifier: ${filePath}`);
@@ -3739,7 +3390,7 @@ function isDirectChild(parent, candidate) {
 
 async function stateFilesForQuarantine(filePath) {
   const files = [];
-  for (const sourcePath of [databasePath(filePath), filePath, `${filePath}.legacy`]) {
+  for (const sourcePath of [databasePath(filePath)]) {
     try {
       const metadata = await fs.lstat(sourcePath);
       if (!metadata.isFile()) return { files: null, reason: `state component is not a regular file: ${sourcePath}` };
@@ -3793,11 +3444,8 @@ async function assertQuarantineWritePaths(errorPath, components, artifactSource)
 
 function quarantineMetadataIsValid(metadata, stateDir, errorPath) {
   const currentMetadata = hasExactFields(metadata, QUARANTINE_FIELDS) && metadata.version === 4;
-  const priorMetadata = hasExactFields(metadata, QUARANTINE_FIELDS_V3) && metadata.version === 3;
-  const olderMetadata = hasExactFields(metadata, QUARANTINE_FIELDS_V2) && metadata.version === 2;
-  const legacyMetadata = hasExactFields(metadata, QUARANTINE_FIELDS_V1) && metadata.version === 1;
-  if ((!currentMetadata && !priorMetadata && !olderMetadata && !legacyMetadata) || !['quarantining', 'quarantined'].includes(metadata.status)) return false;
-  if ((currentMetadata || priorMetadata || olderMetadata) && metadata.review_artifacts !== null && metadata.review_artifacts !== QUARANTINE_REVIEW_DIRECTORY) return false;
+  if (!currentMetadata || !['quarantining', 'quarantined'].includes(metadata.status)) return false;
+  if (metadata.review_artifacts !== null && metadata.review_artifacts !== QUARANTINE_REVIEW_DIRECTORY) return false;
   if (typeof metadata.original_state_path !== 'string' || typeof metadata.error_path !== 'string' || typeof metadata.reason !== 'string' || !metadata.reason.trim()) return false;
   if (!validTimestamp(metadata.quarantined_at) || !validTimestamp(metadata.delete_after) || (metadata.move_error !== null && (typeof metadata.move_error !== 'string' || !metadata.move_error.trim()))) return false;
   if (!Array.isArray(metadata.files) || !metadata.files.length || metadata.files.some(name => typeof name !== 'string' || !name || path.basename(name) !== name) || new Set(metadata.files).size !== metadata.files.length) return false;
@@ -3807,17 +3455,13 @@ function quarantineMetadataIsValid(metadata, stateDir, errorPath) {
   let logicalTaskId;
   try { logicalTaskId = logicalTaskIdFromStatePath(metadata.original_state_path); } catch { return false; }
   if (metadata.task_id !== logicalTaskId) return false;
-  const logicalName = path.basename(metadata.original_state_path);
-  const allowedNames = new Set([logicalName, databasePath(metadata.original_state_path), `${logicalName}.legacy`].map(candidate => path.basename(candidate)));
+  const allowedNames = new Set([databasePath(metadata.original_state_path)].map(candidate => path.basename(candidate)));
   if (metadata.files.some(name => !allowedNames.has(name))) return false;
   const expiry = Date.parse(metadata.quarantined_at) + ERROR_STATE_RETENTION_DAYS * DAY_MS;
   if (metadata.delete_after !== new Date(expiry).toISOString()) return false;
-  if (olderMetadata || legacyMetadata) return true;
-  if (priorMetadata && !quarantineLegacyEntryMatchesStatePath(errorPath, metadata.original_state_path)) return false;
   if ((metadata.workspace === null) !== (metadata.registry_path === null)) return false;
   if (metadata.workspace !== null && (typeof metadata.workspace !== 'string' || !path.isAbsolute(metadata.workspace) || path.resolve(metadata.workspace) !== metadata.workspace || typeof metadata.registry_path !== 'string' || path.resolve(metadata.registry_path) !== workspaceLeasePath(metadata.workspace))) return false;
-  if (priorMetadata) return validQuarantineBinding(metadata.binding) && metadata.binding === quarantineBinding(metadata, errorPath);
-  if (!validQuarantineAnchor(metadata.authority_anchor) || metadata.authority_anchor !== quarantineAuthorityAnchor(metadata) || (!quarantineEntryMatchesAuthority(errorPath, metadata) && !quarantineEntryMatchesTruncatedAuthority(errorPath, metadata))) return false;
+  if (!validQuarantineAnchor(metadata.authority_anchor) || metadata.authority_anchor !== quarantineAuthorityAnchor(metadata) || !quarantineEntryMatchesAuthority(errorPath, metadata)) return false;
   return validQuarantineBinding(metadata.binding) && metadata.binding === quarantineBinding(metadata, errorPath);
 }
 
@@ -3825,39 +3469,38 @@ function validQuarantineBinding(binding) { return typeof binding === 'string' &&
 function validQuarantineAnchor(anchor) { return typeof anchor === 'string' && /^[a-f0-9]{64}$/u.test(anchor); }
 
 function quarantineBinding(record, errorPath) {
-  const anchored = hasOwn(record, 'authority_anchor');
   return createHash('sha256').update(stableJson({
-    schema: anchored ? 'workflow-quarantine-binding-v2' : 'workflow-quarantine-binding-v1',
+    schema: 'workflow-quarantine-binding-v2',
     error_path: path.resolve(errorPath),
     task_id: record.task_id,
     original_state_path: record.original_state_path,
     files: record.files,
-    review_artifacts: record.review_artifacts ?? null,
-    workspace: record.workspace ?? null,
-    registry_path: record.registry_path ?? null,
-    ...(anchored ? { authority_anchor: record.authority_anchor } : {}),
+    review_artifacts: record.review_artifacts,
+    workspace: record.workspace,
+    registry_path: record.registry_path,
+    authority_anchor: record.authority_anchor,
   })).digest('hex');
 }
 
 function quarantineExpiryFromMetadata(metadata) {
-  const current = metadata.version === 4;
   return {
-    version: current ? 3 : 1,
+    version: 3,
     task_id: metadata.task_id,
     original_state_path: metadata.original_state_path,
     quarantined_at: metadata.quarantined_at,
     delete_after: metadata.delete_after,
     files: metadata.files,
-    review_artifacts: metadata.review_artifacts ?? null,
-    ...(current ? { workspace: metadata.workspace, registry_path: metadata.registry_path, binding: metadata.binding, authority_anchor: metadata.authority_anchor } : {}),
+    review_artifacts: metadata.review_artifacts,
+    workspace: metadata.workspace,
+    registry_path: metadata.registry_path,
+    binding: metadata.binding,
+    authority_anchor: metadata.authority_anchor,
   };
 }
 
 function quarantineExpiryIsValid(expiry, stateDir, errorPath) {
   const currentExpiry = hasExactFields(expiry, QUARANTINE_EXPIRY_FIELDS) && expiry.version === 3;
-  const priorExpiry = hasExactFields(expiry, QUARANTINE_EXPIRY_FIELDS_V2) && expiry.version === 2;
-  const legacyExpiry = hasExactFields(expiry, QUARANTINE_EXPIRY_FIELDS_V1) && expiry.version === 1;
-  if (!currentExpiry && !priorExpiry && !legacyExpiry) return false;
+  if (!currentExpiry) return false;
   if (typeof expiry.original_state_path !== 'string' || !validTimestamp(expiry.quarantined_at) || !validTimestamp(expiry.delete_after)) return false;
   if (!Array.isArray(expiry.files) || !expiry.files.length || expiry.files.some(name => typeof name !== 'string' || !name || path.basename(name) !== name) || new Set(expiry.files).size !== expiry.files.length) return false;
   if (expiry.review_artifacts !== null && expiry.review_artifacts !== QUARANTINE_REVIEW_DIRECTORY) return false;
@@ -3865,17 +3508,13 @@ function quarantineExpiryIsValid(expiry, stateDir, errorPath) {
   let logicalTaskId;
   try { logicalTaskId = logicalTaskIdFromStatePath(expiry.original_state_path); } catch { return false; }
   if (expiry.task_id !== logicalTaskId) return false;
-  const logicalName = path.basename(expiry.original_state_path);
-  const allowedNames = new Set([logicalName, databasePath(expiry.original_state_path), `${logicalName}.legacy`].map(candidate => path.basename(candidate)));
+  const allowedNames = new Set([databasePath(expiry.original_state_path)].map(candidate => path.basename(candidate)));
   if (expiry.files.some(name => !allowedNames.has(name))) return false;
   const expectedDeleteAfter = new Date(Date.parse(expiry.quarantined_at) + ERROR_STATE_RETENTION_DAYS * DAY_MS).toISOString();
   if (expiry.delete_after !== expectedDeleteAfter || !isDirectChild(errorStateRoot(stateDir), errorPath)) return false;
-  if (legacyExpiry) return true;
-  if (priorExpiry && !quarantineLegacyEntryMatchesStatePath(errorPath, expiry.original_state_path)) return false;
   if ((expiry.workspace === null) !== (expiry.registry_path === null)) return false;
   if (expiry.workspace !== null && (typeof expiry.workspace !== 'string' || !path.isAbsolute(expiry.workspace) || path.resolve(expiry.workspace) !== expiry.workspace || typeof expiry.registry_path !== 'string' || path.resolve(expiry.registry_path) !== workspaceLeasePath(expiry.workspace))) return false;
-  if (priorExpiry) return validQuarantineBinding(expiry.binding) && expiry.binding === quarantineBinding(expiry, errorPath);
-  if (!validQuarantineAnchor(expiry.authority_anchor) || expiry.authority_anchor !== quarantineAuthorityAnchor(expiry) || (!quarantineEntryMatchesAuthority(errorPath, expiry) && !quarantineEntryMatchesTruncatedAuthority(errorPath, expiry))) return false;
+  if (!validQuarantineAnchor(expiry.authority_anchor) || expiry.authority_anchor !== quarantineAuthorityAnchor(expiry) || !quarantineEntryMatchesAuthority(errorPath, expiry)) return false;
   return validQuarantineBinding(expiry.binding) && expiry.binding === quarantineBinding(expiry, errorPath);
 }
 
@@ -3888,9 +3527,7 @@ function quarantineSidecarsMatch(metadata, expiry) {
       && metadata.binding === expiry.binding
       && metadata.authority_anchor === expiry.authority_anchor;
   }
-  return metadata.version === 3 && expiry.version === 2
-    ? metadata.workspace === expiry.workspace && metadata.registry_path === expiry.registry_path && metadata.binding === expiry.binding
-    : (metadata.version === 1 || metadata.version === 2) && expiry.version === 1;
+  return false;
 }
 
 async function readQuarantineExpiry(stateDir, errorPath) {
@@ -3953,7 +3590,7 @@ async function quarantineIfEligible(filePath, initialState, now) {
         task_id: taskId,
         original_state_path: filePath,
         error_path: '',
-        reason: taskIdMismatch ? `state task_id does not match logical state path; ${current.verified ? 'verified inactive-lease quarantine gate' : current.reason}` : current.verified ? 'legacy or incomplete task state passed the verified inactive-lease quarantine gate' : current.reason,
+        reason: taskIdMismatch ? `state task_id does not match logical state path; ${current.verified ? 'verified inactive-lease quarantine gate' : current.reason}` : current.verified ? 'incomplete task state passed the verified inactive-lease quarantine gate' : current.reason,
         quarantined_at: new Date(now).toISOString(),
         delete_after: new Date(now + ERROR_STATE_RETENTION_DAYS * DAY_MS).toISOString(),
         files: components.files.map(component => path.basename(component)),
@@ -3989,7 +3626,7 @@ async function quarantineIfEligible(filePath, initialState, now) {
     return initial.lease_path ? await withWorkspaceLeaseLock(initialState.workspace, async (leasePath, authorityContext) => {
       if (leasePath !== initial.lease_path) throw new ControllerError('Workspace lease authority path changed before quarantine');
       return run(authorityContext);
-    }, { allowAuthorityMigration: true }) : await run();
+    }, { allowAuthorityCreation: true }) : await run();
   } catch (error) {
     if (error instanceof ControllerError) throw error;
     return { quarantined: false, reason: `quarantine lock unavailable: ${error.message}`, task_id: initialState?.task_id ?? null };
@@ -4010,7 +3647,7 @@ async function quarantineContentsAreSafe(errorPath, record) {
 }
 
 async function activeLeaseEntryOwnsSources(entry, sourcePaths, reviewArtifactSource) {
-  const protectedPaths = [entry.state_path, databasePath(entry.state_path), `${entry.state_path}.legacy`];
+  const protectedPaths = [entry.state_path, databasePath(entry.state_path)];
   protectedPaths.push(await canonicalStateDirectory(reviewArtifactTaskPath(entry.state_dir, entry.task_id), 'active review artifact directory'));
   const candidates = [...sourcePaths];
   if (reviewArtifactSource !== null) candidates.push(await canonicalStateDirectory(reviewArtifactSource, 'candidate review artifact directory'));
@@ -4070,18 +3707,11 @@ async function withQuarantineSourceProtection(stateDir, errorPath, metadata, act
       await inspectRegistry(current, authorityContext);
       return action(current);
     });
-  }, { allowAuthorityMigration: false });
-}
-
-async function upgradeLegacyQuarantine(stateDir, errorPath, metadata) {
-  // An older sidecar never carried a registry-bound creation record.  It may
-  // describe contents already present in errorPath, but cannot authorize a new
-  // read from stateDir or the review-artifact root.
-  return metadata;
+  }, { allowAuthorityCreation: false });
 }
 
 async function reconcileQuarantineEntry(stateDir, errorPath, metadata) {
-  let current = await upgradeLegacyQuarantine(stateDir, errorPath, metadata);
+  let current = metadata;
   await ensureQuarantineExpiry(stateDir, errorPath, current);
   if (current.status === 'quarantined' && current.move_error === null) return { complete: true, metadata: current };
   return withQuarantineSourceProtection(stateDir, errorPath, current, async lockedCurrent => {
@@ -4190,7 +3820,7 @@ async function deleteQuarantineEntry(stateDir, errorPath, { metadata = null, exp
       }
       throw error;
     }
-  }, { allowAuthorityMigration: false });
+  }, { allowAuthorityCreation: false });
 }
 
 async function pruneQuarantinedStates(stateDir, now) {
@@ -4296,30 +3926,6 @@ async function findQuarantinedState(stateDir, filePath) {
   return null;
 }
 
-async function listOrphanLegacyPaths(stateDir) {
-  let entries;
-  try { entries = await fs.readdir(stateDir, { withFileTypes: true }); }
-  catch (error) { if (error.code === 'ENOENT') return []; throw error; }
-  const orphaned = [];
-  for (const entry of entries) {
-    if (!entry.isFile() || !entry.name.endsWith('.json.legacy')) continue;
-    const logicalPath = path.join(stateDir, entry.name.slice(0, -'.legacy'.length));
-    try {
-      await fs.access(logicalPath);
-      continue;
-    } catch (error) {
-      if (error.code !== 'ENOENT') throw error;
-    }
-    try {
-      await fs.access(databasePath(logicalPath));
-    } catch (error) {
-      if (error.code === 'ENOENT') orphaned.push(entry.name);
-      else throw error;
-    }
-  }
-  return orphaned.sort();
-}
-
 async function doctorStateDirectory(parameters) {
   const stateDir = await canonicalStateDirectory(parameters.state_dir);
   const root = errorStateRoot(stateDir);
@@ -4340,16 +3946,14 @@ async function doctorStateDirectory(parameters) {
   } catch (error) {
     if (error.code !== 'ENOENT') throw error;
   }
-  const orphanLegacy = await listOrphanLegacyPaths(stateDir);
   const pruneSweep = await readPruneSweep(stateDir);
-  const attention = quarantinedStates.length > 0 || orphanLegacy.length > 0 || Boolean(pruneSweep.error);
+  const attention = quarantinedStates.length > 0 || Boolean(pruneSweep.error);
   return {
     task_id: null,
     state_dir: stateDir,
     health: invalidEntries.length ? 'blocked' : attention ? 'attention' : 'healthy',
     checks: [
       doctorCheck('quarantined_states', invalidEntries.length ? 'fail' : quarantinedStates.length ? 'attention' : 'pass', { entries: quarantinedStates, invalid_entries: invalidEntries }),
-      doctorCheck('orphan_legacy', orphanLegacy.length ? 'attention' : 'pass', { paths: orphanLegacy }),
       doctorCheck('prune_sweep', pruneSweep.error ? 'attention' : 'pass', pruneSweep.error ? { error: pruneSweep.error } : pruneSweep.sweep ?? { last_sweep_at: null, last_result: null }),
     ],
     close_status: { close_allowed: false, reasons: ['directory-level diagnosis does not represent a task close gate'] },
@@ -4363,26 +3967,6 @@ async function listTaskStatePaths(stateDir) {
     if (!entry.isFile()) continue;
     if (entry.name.endsWith(SQLITE_STATE_SUFFIX)) {
       paths.add(path.join(stateDir, `${entry.name.slice(0, -SQLITE_STATE_SUFFIX.length)}.json`));
-      continue;
-    }
-    if (!entry.name.endsWith('.json') || entry.name === 'workspace-lease.json' || entry.name === PRUNE_SWEEP_FILENAME) continue;
-    const logicalPath = path.join(stateDir, entry.name);
-    try {
-      await fs.access(databasePath(logicalPath));
-    } catch (error) {
-      if (error.code === 'ENOENT') paths.add(logicalPath);
-      else throw error;
-    }
-  }
-  for (const entry of entries) {
-    if (!entry.isFile() || !entry.name.endsWith('.json.legacy')) continue;
-    const logicalPath = path.join(stateDir, entry.name.slice(0, -'.legacy'.length));
-    if (paths.has(logicalPath)) continue;
-    try {
-      await fs.access(databasePath(logicalPath));
-    } catch (error) {
-      if (error.code === 'ENOENT') paths.add(logicalPath);
-      else throw error;
     }
   }
   return [...paths].sort();
@@ -4480,7 +4064,7 @@ async function pruneExpiredTasks(parameters) {
         await verifyRegularDirectorySnapshot(parentAuthority, 'Controller state parent');
         let state;
         try { state = await loadState(filePath); }
-        catch (error) { if (error instanceof ControllerError && error.message.startsWith('JSON input does not exist:')) return { deleted: false, reason: 'state disappeared before cleanup' }; throw error; }
+        catch (error) { if (error instanceof ControllerError && error.message.startsWith('Current SQLite controller state does not exist:')) return { deleted: false, reason: 'state disappeared before cleanup' }; throw error; }
         const currentParentAuthority = await stateParentAuthorityForState(state, filePath);
         if (!sameStateParentAuthority(currentParentAuthority, parentAuthority)) throw new ControllerError(`Controller state parent authority changed: ${filePath}`);
         await attachStateParentAuthority(state, filePath, parentAuthority);
@@ -4492,12 +4076,7 @@ async function pruneExpiredTasks(parameters) {
           return { deleted: true, task_id: state.task_id };
         }, { parentAuthority });
       };
-      let outcome;
-      try { outcome = await withWorkspaceLeaseLock(initial.workspace, cleanup, { allowAuthorityMigration: true }); }
-      catch (error) {
-        if (!(error instanceof ControllerError && error.message.startsWith('Workspace lease authority does not exist:'))) throw error;
-        outcome = await withLegacyReleasedWorkspaceLeaseLock(initial.workspace, cleanup);
-      }
+      const outcome = await withWorkspaceLeaseLock(initial.workspace, cleanup, { allowAuthorityCreation: true });
       if (outcome.deleted) { deletedCount++; appendPruneReport(reports, reports.deleted, { task_id: outcome.task_id, state_path: filePath }); }
       else { retainedCount++; appendPruneReport(reports, reports.retained, { task_id: outcome.task_id ?? initial.task_id, state_path: filePath, reason: outcome.reason }); }
     } catch (error) {
@@ -4550,7 +4129,7 @@ async function persistedStateParentAuthority(parameters) {
   let state;
   try { state = await loadState(filePath); }
   catch (error) {
-    if (error instanceof ControllerError && (error.message.startsWith('JSON input does not exist:') || error.message.startsWith('Controller state does not exist:'))) return null;
+    if (error instanceof ControllerError && error.message.startsWith('Current SQLite controller state does not exist:')) return null;
     throw error;
   }
   if (!state.workspace_lease) return null;
@@ -4561,19 +4140,19 @@ async function persistedStateParentAuthority(parameters) {
 
 async function recoverTaskLock(parameters) {
   const [filePath, state] = await readTask(parameters);
-  if (!state.workspace_lease) throw new ControllerError('Legacy task has no workspace lease and cannot recover its lock; create a new workflow task');
+  if (!state.workspace_lease) throw new ControllerError('Current task has no workspace lease and cannot recover its lock');
   const parentAuthority = await stateParentAuthorityForState(state, filePath);
   await verifyRegularDirectorySnapshot(parentAuthority, 'Controller state parent');
   return withWorkspaceLeaseLock(state.workspace, async (leasePath, authorityContext) => {
     if (leasePath !== state.workspace_lease.registry_path) throw new ControllerError('Workspace lease authority path changed before lock recovery');
     await requireActiveWorkspaceLease(state, filePath, authorityContext);
     return recoverStaleLock(filePath, parameters.stale_after_sec, { parentAuthority });
-  }, { allowAuthorityMigration: true });
+  }, { allowAuthorityCreation: true });
 }
 
 async function auditContext(parameters) {
   const [, state] = await readTask(parameters);
-  return { task_id: state.task_id, workspace_claims: state.workspace_claims, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), assurance_assessment: state.assurance_assessment, review_protocol_version: state.review_protocol_version, review_entry_stage: state.review_entry_stage, review_context: state.review_context, review_history_digest: protocolReviewHistoryDigest(state, { excludeActiveCohortPhase: true }), goal: state.goal, requirements: state.requirements, scope: state.scope, non_goals: state.non_goals, nodes: Object.values(state.nodes), participants: state.participants, reviews: externallyVisibleReviews(state), repair_records: state.repair_records, max_review_charter: state.max_review_charter ?? null, verification_record: state.verification_record, verification_history: state.verification_history, workflow_snapshot: workflowSnapshot(state), workspace_fingerprint: await workspaceFingerprint(state.workspace, state.workspace_claims) };
+  return { task_id: state.task_id, workspace_claims: state.workspace_claims, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), assurance_assessment: state.assurance_assessment, review_protocol_version: state.review_protocol_version, review_entry_stage: state.review_entry_stage, review_context: state.review_context, review_history_digest: protocolReviewHistoryDigest(state, { excludeActiveCohortPhase: true }), goal: state.goal, requirements: state.requirements, scope: state.scope, non_goals: state.non_goals, nodes: Object.values(state.nodes), participants: state.participants, reviews: externallyVisibleReviews(state), repair_records: state.repair_records, max_review_charter: state.max_review_charter ?? null, workflow_snapshot: workflowSnapshot(state), workspace_fingerprint: await workspaceFingerprint(state.workspace, state.workspace_claims) };
 }
 
 function requireRequirementCoverage(state, coverage, label) {
@@ -4586,35 +4165,6 @@ function requireRequirementCoverage(state, coverage, label) {
 
 function unfinishedMaterialNodes(state) {
   return Object.values(state.nodes).filter(node => !isReviewNode(node, state.routing_schema_version) && ![SUCCEEDED, 'skipped'].includes(node.status));
-}
-
-async function recordVerification(parameters) {
-  const verification = await readJson(parameters.verification, { label: 'Verification record', maxBytes: MAX_REVIEW_BYTES });
-  if (!verification || typeof verification !== 'object') throw new ControllerError('Verification record must be a JSON object');
-  const [filePath] = await readTask(parameters);
-  return withActiveWorkspaceStateLock(filePath, async state => {
-    if (state.routing_schema_version !== 2 || state.assurance_level !== 'verification') throw new ControllerError('A verification record is only valid for a v2 verification assurance task');
-    const unfinished = unfinishedMaterialNodes(state);
-    if (unfinished.length) throw new ControllerError(`Verification cannot be recorded before all work nodes finish: ${unfinished.map(node => node.id).join(', ')}`);
-    const verifiedBy = requiredString(verification.verified_by, 'verified_by');
-    const coverage = requireRequirementCoverage(state, verification.requirement_coverage, 'Verification record');
-    const snapshot = workflowSnapshot(state);
-    if (!sameJson(verification.workflow_snapshot, snapshot)) throw new ControllerError('Verification workflow_snapshot does not match the current task state');
-    const fingerprint = await workspaceFingerprint(state.workspace, state.workspace_claims);
-    if (!sameJson(verification.workspace_fingerprint, fingerprint)) throw new ControllerError('Verification fingerprint does not match the current workspace');
-    const scopeAndRegression = requiredReviewValue(verification.scope_and_regression, 'scope_and_regression');
-    const verificationGaps = requiredReviewValue(verification.verification_gaps, 'verification_gaps');
-    const residualRisk = requiredReviewValue(verification.residual_risk, 'residual_risk');
-    const record = { verified_by: verifiedBy, requirement_coverage: coverage, scope_and_regression: scopeAndRegression, verification_gaps: verificationGaps, residual_risk: residualRisk, workflow_snapshot: snapshot, workspace_fingerprint: fingerprint };
-    if (state.verification_record) {
-      const { recorded_at: ignoredRecordedAt, ...existingRecord } = state.verification_record;
-      if (sameJson(existingRecord, record)) return { task_id: state.task_id, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), verification_record: state.verification_record, idempotent: true };
-      throw new ControllerError('A different verification record already exists; call workflow_invalidate_gate before recording a replacement');
-    }
-    state.verification_record = { ...record, recorded_at: utcNow() };
-    addEvent(state, 'verification_recorded', { verified_by: verifiedBy }); await writeState(filePath, state);
-    return { task_id: state.task_id, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), verification_record: state.verification_record, idempotent: false };
-  });
 }
 
 async function recordRepair(parameters) {
@@ -4700,36 +4250,7 @@ async function recordRepair(parameters) {
       await writeState(filePath, state);
       return { task_id: state.task_id, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), repair_record: stored, max_review_charter: charter };
     }
-    if (state.routing_schema_version !== 2 || state.assurance_level !== 'terra') throw new ControllerError('A repair record is only valid for a v2 terra assurance task');
-    if (!reviewNode || reviewNode.kind !== QUALITY_REVIEW_KIND || reviewNode.status !== 'failed') throw new ControllerError('A Terra repair record requires a completed failed quality_review');
-    const failedReviews = finalFailedTerraReviews(state, reviewNode);
-    if (failedReviews.length !== 1) throw new ControllerError('A repair record is only valid after the first finalized Terra fail');
-    const sourceReview = failedReviews[0];
-    const sourceClaimId = requiredString(repair.source_review_claim_id, 'source_review_claim_id');
-    if (sourceClaimId !== sourceReview.claim_id) throw new ControllerError('Terra repair record must reference the first failed Terra review claim');
-    if (state.repair_records.some(record => record.source_review_claim_id === sourceClaimId)) throw new ControllerError('The first failed Terra review already has a repair record');
-    const repairedBy = requiredString(repair.repaired_by, 'repaired_by');
-    const addressedFindings = addressedReviewFindings(sourceReview, repair.addressed_findings);
-    const verificationEvidence = requiredReviewValue(repair.verification_evidence, 'verification_evidence');
-    const fingerprint = await workspaceFingerprint(state.workspace, state.workspace_claims);
-    if (!sameJson(repair.workspace_fingerprint, fingerprint)) throw new ControllerError('Terra repair fingerprint does not match the current workspace');
-    const workspaceChanged = !sameJson(fingerprint, sourceReview.workspace_fingerprint);
-    if (state.repair_records.length >= MAX_REPAIR_RECORDS) throw new ControllerError(`Task exceeded the ${MAX_REPAIR_RECORDS}-repair record limit; create a replacement workflow task`);
-    bumpWorkflowRevision(state, 'terra_repair_recorded', { source_review_claim_id: sourceClaimId, repaired_by: repairedBy, workspace_changed: workspaceChanged });
-    const stored = {
-      source_review_claim_id: sourceClaimId,
-      source_review_auditor_task: sourceReview.auditor_task,
-      source_workspace_fingerprint: sourceReview.workspace_fingerprint,
-      repaired_by: repairedBy,
-      addressed_findings: addressedFindings,
-      verification_evidence: verificationEvidence,
-      workflow_snapshot: workflowSnapshot(state),
-      workspace_fingerprint: fingerprint,
-      workspace_changed: workspaceChanged,
-      recorded_at: utcNow(),
-    };
-    state.repair_records.push(stored); await writeState(filePath, state);
-    return { task_id: state.task_id, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), repair_record: stored };
+    throw new ControllerError('A repair record requires a failed current-protocol review');
   });
 }
 
@@ -4833,14 +4354,6 @@ async function recordReview(parameters) {
 async function closeReasons(state) {
   const incomplete = Object.entries(state.nodes).filter(([, node]) => ![SUCCEEDED, 'skipped'].includes(node.status)).map(([id]) => id);
   const reasons = incomplete.length ? [`incomplete nodes: ${incomplete.join(', ')}`] : [];
-  if (state.assurance_level === 'verification') {
-    const verification = state.verification_record;
-    if (!verification) reasons.push('no verification record'); else {
-      if (!workflowSnapshotMatchesState(verification.workflow_snapshot, state)) reasons.push('task state changed after verification');
-      if (!sameJson(verification.workspace_fingerprint, await workspaceFingerprint(state.workspace, state.workspace_claims))) reasons.push('workspace changed after verification');
-    }
-    return reasons;
-  }
   const reviewNode = reviewNodesForState(state)[0] ?? null;
   if (reviewNode && isMaxClosureNode(state, reviewNode)) {
     if (maxReviewCharterMissing(state, reviewNode)) reasons.push('max total_review is missing a frozen review charter');
@@ -4875,10 +4388,7 @@ async function closeReasons(state) {
 
 async function closeCheck(parameters) {
   const [filePath, initialState] = await readTask(parameters);
-  if (!initialState.workspace_lease) {
-    const reasons = await closeReasons(initialState);
-    return [{ task_id: initialState.task_id, assurance_level: initialState.assurance_level, effective_assurance_level: effectiveAssuranceLevel(initialState), close_allowed: !reasons.length, reasons, workspace_lease: { released: false, reason: 'legacy task has no workspace lease' } }, reasons.length ? 2 : 0];
-  }
+  if (!initialState.workspace_lease) throw new ControllerError('Current task state requires a workspace lease');
   const parentAuthority = await stateParentAuthorityForState(initialState, filePath);
   await verifyRegularDirectorySnapshot(parentAuthority, 'Controller state parent');
   const leasePath = initialState.workspace_lease.registry_path;
@@ -4912,7 +4422,7 @@ async function closeCheck(parameters) {
     lease.active_tasks = lease.active_tasks.filter(entry => !workspaceLeaseEntryMatches(entry, state, filePath, { activeOnly: false })); lease.updated_at = utcNow(); await writeWorkspaceLeaseRegistry(authorityContext, leasePath, lease);
       return [{ task_id: state.task_id, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), close_allowed: true, reasons: [], workspace_lease: { released: true, lease_path: leasePath } }, 0];
     }, { parentAuthority });
-  }, { allowAuthorityMigration: true });
+  }, { allowAuthorityCreation: true });
 }
 
 export async function dispatch(command, parameters) {
@@ -4932,7 +4442,7 @@ export async function dispatch(command, parameters) {
     case 'complete': return [await completeNode(parameters), 0]; case 'heartbeat': return [await heartbeatNode(parameters), 0]; case 'checkpoint': return [await checkpointNode(parameters), 0];
     case 'abandon': return [await abandonNode(parameters), 0]; case 'retry': return [await retryNode(parameters), 0]; case 'requeue-stale': return [await requeueStaleNode(parameters), 0]; case 'rescue': return [await rescueNode(parameters), 0];
     case 'recover-lock': return [await recoverTaskLock(parameters), 0]; case 'audit-context': return [await auditContext(parameters), 0];
-    case 'record-review': return [await recordReview(parameters), 0]; case 'record-verification': return [await recordVerification(parameters), 0]; case 'record-repair': return [await recordRepair(parameters), 0]; case 'close-check': return closeCheck(parameters);
+    case 'record-review': return [await recordReview(parameters), 0]; case 'record-repair': return [await recordRepair(parameters), 0]; case 'close-check': return closeCheck(parameters);
     case 'release-workspace': return [await releaseWorkspaceLease(parameters), 0];
     case 'stale': {
       const [, state] = await readTask(parameters);

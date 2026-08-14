@@ -17,7 +17,7 @@ source_standalone_skills=$script_dir/skills
 managed_plugin_skill_names='agent-toolchain orchestrate-model-workflow workflow-controller'
 legacy_plugin_skill_names_to_remove='adaptive-efficiency'
 managed_standalone_skill_names='gpt-image-2-cli project-doc-planner'
-managed_agent_role_files='ai-vibecode-superpower-avsp_luna_high.toml ai-vibecode-superpower-avsp_luna_xhigh.toml ai-vibecode-superpower-avsp_luna_high_writer.toml ai-vibecode-superpower-avsp_luna_xhigh_writer.toml ai-vibecode-superpower-avsp_luna_high_executor.toml ai-vibecode-superpower-avsp_luna_xhigh_executor.toml ai-vibecode-superpower-avsp_sol_high.toml ai-vibecode-superpower-avsp_sol_max.toml ai-vibecode-superpower-avsp_sol_xhigh.toml ai-vibecode-superpower-avsp_terra_high.toml ai-vibecode-superpower-avsp_terra_xhigh.toml ai-vibecode-superpower-avsp_terra_xhigh_readonly.toml ai-vibecode-superpower-avsp_terra_low_readonly.toml ai-vibecode-superpower-avsp_terra_medium_readonly.toml'
+managed_agent_role_files='ai-vibecode-superpower-avsp_luna_high.toml ai-vibecode-superpower-avsp_luna_xhigh.toml ai-vibecode-superpower-avsp_luna_high_executor.toml ai-vibecode-superpower-avsp_luna_xhigh_executor.toml ai-vibecode-superpower-avsp_sol_high.toml ai-vibecode-superpower-avsp_sol_max.toml ai-vibecode-superpower-avsp_sol_xhigh.toml ai-vibecode-superpower-avsp_terra_high.toml ai-vibecode-superpower-avsp_terra_xhigh.toml ai-vibecode-superpower-avsp_terra_xhigh_readonly.toml ai-vibecode-superpower-avsp_terra_low_readonly.toml ai-vibecode-superpower-avsp_terra_medium_readonly.toml'
 
 for source_path in "$source_agents" "$source_config" "$source_agent_role_manifest" "$source_marketplace"; do
     if [ ! -f "$source_path" ]; then
@@ -114,29 +114,27 @@ install_managed_plugin() {
     CODEX_HOME="$codex_home" codex plugin add "$managed_plugin_name@$managed_marketplace_name"
 }
 
-remove_legacy_managed_plugin() {
-    legacy_plugin_id=workflow-controller@ai-vibecode-superpower-local
+remove_retired_workflow_plugin() {
+    retired_plugin_id=workflow-controller@ai-vibecode-superpower-local
     config_path=$codex_home/config.toml
     [ -f "$config_path" ] || return 0
-
-    if ! rg -F -q -- "[plugins.\"$legacy_plugin_id\"]" "$config_path" && \
-       ! rg -F -q -- "[plugins.'$legacy_plugin_id']" "$config_path"; then
+    if ! rg -F -q -- "[plugins.\"$retired_plugin_id\"]" "$config_path" && \
+       ! rg -F -q -- "[plugins.'$retired_plugin_id']" "$config_path"; then
         return 0
     fi
-
     command -v codex >/dev/null 2>&1 || {
-        printf '%s\n' 'Codex CLI is required to remove the legacy managed plugin, but codex was not found.' >&2
+        printf '%s\n' 'Codex CLI is required to remove the retired workflow plugin, but codex was not found.' >&2
         return 1
     }
     attempt=1
     while :; do
-        if CODEX_HOME="$codex_home" codex plugin remove "$legacy_plugin_id"; then
+        if CODEX_HOME="$codex_home" codex plugin remove "$retired_plugin_id"; then
             return 0
         else
             exit_code=$?
         fi
         if [ "$attempt" -ge 8 ]; then
-            printf '%s\n' "Could not remove legacy managed plugin after 8 attempts: $legacy_plugin_id (exit code $exit_code)" >&2
+            printf '%s\n' "Could not remove retired workflow plugin after 8 attempts: $retired_plugin_id (exit code $exit_code)" >&2
             return "$exit_code"
         fi
         attempt=$((attempt + 1))
@@ -168,8 +166,6 @@ is_managed_agent_role_file() {
     case $1 in
         ai-vibecode-superpower-avsp_luna_high.toml|\
         ai-vibecode-superpower-avsp_luna_xhigh.toml|\
-        ai-vibecode-superpower-avsp_luna_high_writer.toml|\
-        ai-vibecode-superpower-avsp_luna_xhigh_writer.toml|\
         ai-vibecode-superpower-avsp_luna_high_executor.toml|\
         ai-vibecode-superpower-avsp_luna_xhigh_executor.toml|\
         ai-vibecode-superpower-avsp_sol_high.toml|\
@@ -292,18 +288,6 @@ assert_managed_agent_role_contract() {
             expected_model=gpt-5.6-luna
             expected_effort=xhigh
             expected_sandbox=read-only
-            ;;
-        ai-vibecode-superpower-avsp_luna_high_writer.toml)
-            expected_name=avsp_luna_high_writer
-            expected_model=gpt-5.6-luna
-            expected_effort=high
-            expected_sandbox=danger-full-access
-            ;;
-        ai-vibecode-superpower-avsp_luna_xhigh_writer.toml)
-            expected_name=avsp_luna_xhigh_writer
-            expected_model=gpt-5.6-luna
-            expected_effort=xhigh
-            expected_sandbox=danger-full-access
             ;;
         ai-vibecode-superpower-avsp_luna_high_executor.toml)
             expected_name=avsp_luna_high_executor
@@ -1010,9 +994,7 @@ done < "$manifest"
 # is installed, while the transaction can still restore the previous config.
 install_managed_plugin
 
-# The CLI may briefly retain config.toml after plugin add. The bounded retry
-# preserves the final error and occurs before any legacy skill is removed.
-remove_legacy_managed_plugin
+remove_retired_workflow_plugin
 
 while IFS="$tab" read -r target_name target_path candidate_path target_kind target_operation; do
     [ "$target_operation" = remove ] || continue

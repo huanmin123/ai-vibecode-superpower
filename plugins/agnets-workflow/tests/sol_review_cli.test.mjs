@@ -20,6 +20,23 @@ async function fixture() {
   return { root, codexHome, sandbox, evidence, state: path.join(sandbox, 'deny_read_acl_state.json') };
 }
 
+function solAssessment() {
+  const dimension = status => ({ status, evidence: ['workflow review requires an independent Sol gate'], rationale: `risk is ${status}` });
+  return {
+    impact: dimension('controlled'), recoverability: dimension('controlled'), uncertainty: dimension('unknown'), verifiability: dimension('controlled'), coupling: dimension('controlled'),
+    selection_reason: 'The review boundary requires Sol assurance.',
+  };
+}
+
+function v3ReviewManifest(workspace, { goal, requirements, agentType = 'avsp_sol_high', executionOwner = '/root/sol-reviewer' }) {
+  return {
+    task_id: 'review-task', workspace, workspace_claims: [{ mode: 'read', prefix: '.' }], goal, requirements, scope: [], non_goals: [], routing_schema_version: 3,
+    assurance_level: 'sol', assurance_assessment: solAssessment(), review_context: { environment: 'isolated test workspace', scenarios: ['workflow-bound Sol review'], boundaries: 'declared workspace only' },
+    review_entry_stage: agentType === 'avsp_sol_xhigh' ? 'sol_xhigh' : 'sol_high',
+    nodes: [{ id: 'total-review', kind: 'total_review', agent_type: agentType, depends_on: [], execution_risk: 'read_only', routing_reason: 'independent final quality gate', execution_owner: executionOwner, integration_owner: '/root', quality_guard: 'requirements and evidence review' }],
+  };
+}
+
 test('repairs only an invalid Windows deny-read ACL state and keeps a backup', async () => {
   const item = await fixture();
   try {
@@ -336,7 +353,7 @@ test('closes a workflow-bound evidence validation failure as unavailable before 
   try {
     await mkdir(workspace);
     await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
-    await writeFile(manifest, JSON.stringify({ task_id: 'review-task', workspace, goal: 'Persist evidence preflight failure', requirements: [{ id: 'R1', text: 'preflight failure is visible' }], nodes: [{ id: 'total-review', kind: 'total_review', agent_type: 'avsp_sol_high', depends_on: [] }] }));
+    await writeFile(manifest, JSON.stringify(v3ReviewManifest(workspace, { goal: 'Persist evidence preflight failure', requirements: [{ id: 'R1', text: 'preflight failure is visible' }], executionOwner: '/root/evidence-preflight' })));
     await dispatch('init', { state_dir: stateDir, manifest });
     const [claim] = await dispatch('claim', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', agent_task_path: '/root/evidence-preflight', agent_role: 'avsp_sol_high' });
     await dispatch('heartbeat', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', claim_id: claim.node.claim_id });
@@ -370,7 +387,7 @@ test('retains the pending artifact when automatic unavailable completion cannot 
   try {
     await mkdir(workspace);
     await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
-    await writeFile(manifest, JSON.stringify({ task_id: 'review-task', workspace, goal: 'Keep unavailable review retryable', requirements: [{ id: 'R1', text: 'artifact failure remains visible' }], nodes: [{ id: 'total-review', kind: 'total_review', agent_type: 'avsp_sol_high', depends_on: [] }] }));
+    await writeFile(manifest, JSON.stringify(v3ReviewManifest(workspace, { goal: 'Keep unavailable review retryable', requirements: [{ id: 'R1', text: 'artifact failure remains visible' }], executionOwner: '/root/retryable-unavailable' })));
     await dispatch('init', { state_dir: stateDir, manifest });
     const [claim] = await dispatch('claim', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', agent_task_path: '/root/retryable-unavailable', agent_role: 'avsp_sol_high' });
     await dispatch('heartbeat', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', claim_id: claim.node.claim_id });
@@ -589,7 +606,7 @@ test('rejects a relative workflow state directory and completes through a Window
   try {
     await assert.rejects(runSolReview(['--workflow-state-dir', 'relative', '--workflow-task-id', 'review-task', '--workflow-node-id', 'total-review', '--workflow-claim-id', 'claim-1', '--', 'review'], { CODEX_HOME: item.codexHome }, 'win32'), /--workflow-state-dir must be an absolute path/);
     await mkdir(workspace); await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
-    await writeFile(manifest, JSON.stringify({ task_id: 'review-task', workspace, goal: 'canonical workflow state', requirements: [{ id: 'R1', text: 'canonical state binding' }], nodes: [{ id: 'total-review', kind: 'total_review', agent_type: 'avsp_sol_high', depends_on: [] }] }));
+    await writeFile(manifest, JSON.stringify(v3ReviewManifest(workspace, { goal: 'canonical workflow state', requirements: [{ id: 'R1', text: 'canonical state binding' }], executionOwner: '/root/canonical-sol' })));
     await dispatch('init', { state_dir: stateDir, manifest });
     const alias = stateDir.toUpperCase(); const physical = await fsPromises.realpath(stateDir);
     if ((await fsPromises.realpath(alias)).toLocaleLowerCase('und') !== physical.toLocaleLowerCase('und')) return t.skip('the test volume is case-sensitive');
@@ -647,7 +664,7 @@ test('derives the CLI reasoning effort from the active workflow total-review rol
   try {
     await mkdir(workspace);
     await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
-    await writeFile(manifest, JSON.stringify({ task_id: 'review-task', workspace, goal: 'Use xhigh review', requirements: [{ id: 'R1', text: 'role is derived' }], nodes: [{ id: 'total-review', kind: 'total_review', agent_type: 'avsp_sol_xhigh', depends_on: [] }] }));
+    await writeFile(manifest, JSON.stringify(v3ReviewManifest(workspace, { goal: 'Use xhigh review', requirements: [{ id: 'R1', text: 'role is derived' }], agentType: 'avsp_sol_xhigh', executionOwner: '/root/xhigh-review' })));
     await dispatch('init', { state_dir: stateDir, manifest });
     const [claim] = await dispatch('claim', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', agent_task_path: '/root/xhigh-review', agent_role: 'avsp_sol_xhigh' });
     await dispatch('heartbeat', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', claim_id: claim.node.claim_id });
@@ -674,10 +691,7 @@ test('keeps a workflow-bound Sol review running past the soft deadline and saves
   try {
     await mkdir(workspace);
     await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
-    await writeFile(manifest, JSON.stringify({
-      task_id: 'review-task', workspace, goal: 'Verify timeout closure', requirements: [{ id: 'R1', text: 'timeout result is persisted' }],
-      nodes: [{ id: 'total-review', kind: 'total_review', agent_type: 'avsp_sol_high', depends_on: [] }],
-    }));
+    await writeFile(manifest, JSON.stringify(v3ReviewManifest(workspace, { goal: 'Verify timeout closure', requirements: [{ id: 'R1', text: 'timeout result is persisted' }], executionOwner: '/root/timeout-review' })));
     await dispatch('init', { state_dir: stateDir, manifest });
     const [claim] = await dispatch('claim', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', agent_task_path: '/root/timeout-review', agent_role: 'avsp_sol_high' });
     await dispatch('heartbeat', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', claim_id: claim.node.claim_id });
@@ -722,7 +736,7 @@ test('keeps a workflow-bound Sol review running past the soft deadline and saves
     const review = path.join(item.root, 'review.json');
     await writeFile(review, JSON.stringify({
       auditor_task: '/root/timeout-review', auditor_role: 'avsp_sol_high', claim_id: claim.node.claim_id, verdict: 'pass',
-      requirement_coverage: { R1: 'timeout result is persisted' }, workflow_snapshot: auditContext.workflow_snapshot, workspace_fingerprint: auditContext.workspace_fingerprint, scope_and_regression: 'none', verification_gaps: 'none', residual_risk: 'none',
+      requirement_coverage: { R1: 'timeout result is persisted' }, workflow_snapshot: auditContext.workflow_snapshot, workspace_fingerprint: auditContext.workspace_fingerprint, scope_and_regression: 'none', verification_gaps: 'none', residual_risk: 'none', independent_assessment: 'The supplied evidence supports the requirement.', history_reconciliation: 'No prior review or repair record changes this conclusion.', review_history_digest: auditContext.review_history_digest,
     }));
     await dispatch('record-review', { state_dir: stateDir, task_id: 'review-task', review });
     const [completion] = await dispatch('complete', {
@@ -741,7 +755,7 @@ test('marks an exit-zero workflow-bound review unavailable when no valid verdict
   try {
     await mkdir(workspace);
     await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
-    await writeFile(manifest, JSON.stringify({ task_id: 'review-task', workspace, goal: 'Reject empty review', requirements: [{ id: 'R1', text: 'invalid output is visible' }], nodes: [{ id: 'total-review', kind: 'total_review', agent_type: 'avsp_sol_high', depends_on: [] }] }));
+    await writeFile(manifest, JSON.stringify(v3ReviewManifest(workspace, { goal: 'Reject empty review', requirements: [{ id: 'R1', text: 'invalid output is visible' }], executionOwner: '/root/empty-review' })));
     await dispatch('init', { state_dir: stateDir, manifest });
     const [claim] = await dispatch('claim', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', agent_task_path: '/root/empty-review', agent_role: 'avsp_sol_high' });
     await dispatch('heartbeat', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', claim_id: claim.node.claim_id });
@@ -916,7 +930,7 @@ test('rejects inherited coverage for a workflow requirement named toString', asy
   const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(item.root, 'state'); const manifest = path.join(item.root, 'manifest.json');
   try {
     await mkdir(workspace); await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
-    await writeFile(manifest, JSON.stringify({ task_id: 'review-task', workspace, goal: 'Reject inherited coverage', requirements: [{ id: 'toString', text: 'coverage must be own' }], nodes: [{ id: 'total-review', kind: 'total_review', agent_type: 'avsp_sol_high', depends_on: [] }] }));
+    await writeFile(manifest, JSON.stringify(v3ReviewManifest(workspace, { goal: 'Reject inherited coverage', requirements: [{ id: 'toString', text: 'coverage must be own' }], executionOwner: '/root/to-string-review' })));
     await dispatch('init', { state_dir: stateDir, manifest });
     const [claim] = await dispatch('claim', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', agent_task_path: '/root/to-string-review', agent_role: 'avsp_sol_high' });
     await dispatch('heartbeat', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', claim_id: claim.node.claim_id });
@@ -947,7 +961,7 @@ test('marks a structurally complete workflow review unavailable when its audit c
   try {
     await mkdir(workspace);
     await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
-    await writeFile(manifest, JSON.stringify({ task_id: 'review-task', workspace, goal: 'Reject mismatched review', requirements: [{ id: 'R1', text: 'review context must match' }], nodes: [{ id: 'total-review', kind: 'total_review', agent_type: 'avsp_sol_high', depends_on: [] }] }));
+    await writeFile(manifest, JSON.stringify(v3ReviewManifest(workspace, { goal: 'Reject mismatched review', requirements: [{ id: 'R1', text: 'review context must match' }], executionOwner: '/root/mismatched-review' })));
     await dispatch('init', { state_dir: stateDir, manifest });
     const [claim] = await dispatch('claim', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', agent_task_path: '/root/mismatched-review', agent_role: 'avsp_sol_high' });
     await dispatch('heartbeat', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', claim_id: claim.node.claim_id });
@@ -983,7 +997,7 @@ test('closes a workflow-bound unavailable Sol review with an explicit completion
   try {
     await mkdir(workspace);
     await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
-    await writeFile(manifest, JSON.stringify({ task_id: 'review-task', workspace, goal: 'Persist unavailable review', requirements: [{ id: 'R1', text: 'unavailable result is visible' }], nodes: [{ id: 'total-review', kind: 'total_review', agent_type: 'avsp_sol_high', depends_on: [] }] }));
+    await writeFile(manifest, JSON.stringify(v3ReviewManifest(workspace, { goal: 'Persist unavailable review', requirements: [{ id: 'R1', text: 'unavailable result is visible' }], executionOwner: '/root/unavailable-review' })));
     await dispatch('init', { state_dir: stateDir, manifest });
     const [claim] = await dispatch('claim', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', agent_task_path: '/root/unavailable-review', agent_role: 'avsp_sol_high' });
     await dispatch('heartbeat', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', claim_id: claim.node.claim_id });
@@ -1013,7 +1027,7 @@ test('records native_agent_start_failed when the workflow-bound Sol process cann
   try {
     await mkdir(workspace);
     await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
-    await writeFile(manifest, JSON.stringify({ task_id: 'review-task', workspace, goal: 'Persist start failure', requirements: [{ id: 'R1', text: 'start failure is visible' }], nodes: [{ id: 'total-review', kind: 'total_review', agent_type: 'avsp_sol_high', depends_on: [] }] }));
+    await writeFile(manifest, JSON.stringify(v3ReviewManifest(workspace, { goal: 'Persist start failure', requirements: [{ id: 'R1', text: 'start failure is visible' }], executionOwner: '/root/start-failure-review' })));
     await dispatch('init', { state_dir: stateDir, manifest });
     const [claim] = await dispatch('claim', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', agent_task_path: '/root/start-failure-review', agent_role: 'avsp_sol_high' });
     await dispatch('heartbeat', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', claim_id: claim.node.claim_id });
@@ -1041,7 +1055,7 @@ test('records native_agent_exit_confirmed when a started Sol process later repor
   try {
     await mkdir(workspace);
     await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
-    await writeFile(manifest, JSON.stringify({ task_id: 'review-task', workspace, goal: 'Persist post-start process error', requirements: [{ id: 'R1', text: 'post-start failure is visible' }], nodes: [{ id: 'total-review', kind: 'total_review', agent_type: 'avsp_sol_high', depends_on: [] }] }));
+    await writeFile(manifest, JSON.stringify(v3ReviewManifest(workspace, { goal: 'Persist post-start process error', requirements: [{ id: 'R1', text: 'post-start failure is visible' }], executionOwner: '/root/post-start-error-review' })));
     await dispatch('init', { state_dir: stateDir, manifest });
     const [claim] = await dispatch('claim', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', agent_task_path: '/root/post-start-error-review', agent_role: 'avsp_sol_high' });
     await dispatch('heartbeat', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', claim_id: claim.node.claim_id });
@@ -1067,7 +1081,7 @@ test('records native_agent_start_failed when spawning synchronously throws', asy
   try {
     await mkdir(workspace);
     await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
-    await writeFile(manifest, JSON.stringify({ task_id: 'review-task', workspace, goal: 'Persist synchronous start failure', requirements: [{ id: 'R1', text: 'sync start failure is visible' }], nodes: [{ id: 'total-review', kind: 'total_review', agent_type: 'avsp_sol_high', depends_on: [] }] }));
+    await writeFile(manifest, JSON.stringify(v3ReviewManifest(workspace, { goal: 'Persist synchronous start failure', requirements: [{ id: 'R1', text: 'sync start failure is visible' }], executionOwner: '/root/sync-start-failure-review' })));
     await dispatch('init', { state_dir: stateDir, manifest });
     const [claim] = await dispatch('claim', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', agent_task_path: '/root/sync-start-failure-review', agent_role: 'avsp_sol_high' });
     await dispatch('heartbeat', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', claim_id: claim.node.claim_id });

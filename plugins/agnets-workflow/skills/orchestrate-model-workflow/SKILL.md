@@ -15,7 +15,7 @@ Codex 原生提供命名 role、父子 agent、消息、等待/中断和实例�
 
 role 会先应用，但 child 随后继承父 turn 的 approval policy 和 permission profile。因此 profile 中的 `sandbox_mode = "read-only"` 是行为边界和配置意图，不是可由 profile 单独证明的硬隔离。父 agent 在委派前核验实际有效权限；model/effort 以成功加载的 role 为准，role 或模型不可用时保留原始错误。
 
-当前 Codex V2 运行时在 session persistence/state DB 启用且写入成功时，会保留可用于恢复的 thread metadata、父子边和 rollout；重启后可由原生 `send_message`/`followup_task` 按已知 thread UUID 懒加载已关闭的 V2 子代理。控制器不能直接调用内部 `resume_agent`；正在运行的 turn、活动 wait 和未确认的 pending wakeup 不保证恢复。元数据或 rollout 不可读时，才使用控制器 checkpoint、任务状态和工作区证据创建新代理，不得声称恢复了旧会话。
+本文出现的 Codex `V1`/`V2` 只指原生运行时和会话机制，绝不表示 workflow routing schema 的兼容范围；持久化 workflow 一律只接受 `routing_schema_version=3`。当前 Codex V2 运行时在 session persistence/state DB 启用且写入成功时，会保留可用于恢复的 thread metadata、父子边和 rollout；重启后可由原生 `send_message`/`followup_task` 按已知 thread UUID 懒加载已关闭的 V2 子代理。控制器不能直接调用内部 `resume_agent`；正在运行的 turn、活动 wait 和未确认的 pending wakeup 不保证恢复。元数据或 rollout 不可读时，才使用控制器 checkpoint、任务状态和工作区证据创建新代理，不得声称恢复了旧会话。
 
 ## Role 与拓扑
 
@@ -44,19 +44,19 @@ role 会先应用，但 child 随后继承父 turn 的 approval policy 和 permi
 
 一次用户输入建立一份完整任务清单。main/root 先明确目标、范围、非目标、验收和授权；随后完成必要的取证、设计与执行契约，派发全部就绪的取证、实现、集成和验证节点，并在每次状态变更后核验结果与工作区。节点的 `quality_guard` 只定义该节点必须留下的测试或证据，不创建审核代理，也不得把审核插入每个小步骤。
 
-全部非审核节点完成后，main/root 汇总验证、清理已知派生产物并冻结当前快照与工作区指纹；这时才启动清单中唯一的末端质量门。门通过才可关闭、释放租约和交付；门失败后的修复回到任务内部，修复完成后重新进入同一个末端门。审核节点必须直接依赖全部非审核节点，任何节点不得依赖审核节点，禁止为单点、小任务或节点交接单独追加审核。执行期间若新证据证明原门级不足，只能在末端门被认领前调用 `workflow_raise_assurance` 单调提高等级：v2 支持 `verification -> terra/sol`、`terra -> sol`；v3 支持 `terra -> sol`，并把同一个未认领门重绑定为 `sol_high`。该入口不允许通用追加节点或降级。
+全部非审核节点完成后，main/root 汇总验证、清理已知派生产物并冻结当前快照与工作区指纹；这时才启动清单中唯一的末端质量门。门通过才可关闭、释放租约和交付；门失败后的修复回到任务内部，修复完成后重新进入同一个末端门。审核节点必须直接依赖全部非审核节点，任何节点不得依赖审核节点，禁止为单点、小任务或节点交接单独追加审核。执行期间若新证据证明原门级不足，只能在末端门被认领前调用 `workflow_raise_assurance` 将 v3 的 `terra` 单调提高为 `sol`，并把同一个未认领门重绑定为 `sol_high`。该入口不允许通用追加节点或降级。
 
 ### 默认分流
 
 跨文件、未知根因或需扫描的任务，若能拆出独立只读证据域，默认先派 `avsp_luna_high`；单文件且改法明确时可跳过并记录理由。主控保留设计、授权、集成和最终判断。
 
-`routing_schema_version=1` 清单保持原有严格行为。`routing_schema_version=2` 保留既有兼容路径。新复杂任务使用 `routing_schema_version=3`，必须声明 `assurance_level`、结构化 `assurance_assessment`、`review_context`（精确含非空 `environment`、`scenarios`、`boundaries`）和可选 `review_entry_stage`。`review_entry_stage` 只能是 `terra_single`、`terra_cohort`、`sol_high` 或 `sol_xhigh`：常规任务从 `terra_single` 开始；已有中等复杂度、跨域或需挑战单审固化风险时从 `terra_cohort` 开始；高度复杂、证据冲突或低可信 oracle 时可直接从 `sol_high` 或 `sol_xhigh` 开始。不得直接进入 `sol_max`，它只能来自前级有效失败后的受控链。全部 assurance 维度为 `controlled` 时门级必须是 `verification`，任一为 `partial` 且没有 `unknown` 时必须是 `terra`，任一为 `unknown` 时必须是 `sol`。一个任务仍只有一个末端审核节点，cohort 是该节点内部的并行 lane，不是第二个质量门。Sol 仅在所选 Sol 实际不可用时使用 Terra fallback。共享写入、外部副作用或不可恢复变更仍为 `protected`，由 Terra 处理。
+持久化复杂任务使用 `routing_schema_version=3`，必须声明 `assurance_level`、结构化 `assurance_assessment`、`review_context`（精确含非空 `environment`、`scenarios`、`boundaries`）和 `review_entry_stage`。`review_entry_stage` 只能是 `terra_single`、`terra_cohort`、`sol_high` 或 `sol_xhigh`：常规任务从 `terra_single` 开始；已有中等复杂度、跨域或需挑战单审固化风险时从 `terra_cohort` 开始；高度复杂、证据冲突或低可信 oracle 时可直接从 `sol_high` 或 `sol_xhigh` 开始。不得直接进入 `sol_max`，它只能来自前级有效失败后的受控链。全部 assurance 维度为 `controlled` 时不应初始化持久化复杂任务；任一为 `partial` 且没有 `unknown` 时门级必须是 `terra`，任一为 `unknown` 时必须是 `sol`。一个任务仍只有一个末端审核节点，cohort 是该节点内部的并行 lane，不是第二个质量门。Sol 仅在所选 Sol 实际不可用时使用 Terra fallback。共享写入、外部副作用或不可恢复变更仍为 `protected`，由 Terra 处理。
 
 ### 通用委派约束
 
 命名 `agent_type` 的 `spawn_agent` 必须显式传 `fork_turns="none"`，并使用自包含消息。仅确需有限最近上下文时才传正整数；不得省略。`fork_turns="all"` 仅用于继承父 role 的 full-history fork，且不得同时传自定义 `agent_type`。
 
-状态变更包括任何持久工作区文件、配置、依赖或锁文件、生成产物、版本控制状态、数据库或其他数据，以及外部服务、API、部署或消息状态的改变。只有能够证明未改变上述任一状态的任务才是只读；无法证明时必须按状态变更处理。v2 写入任务按影响范围、可恢复性、不确定性、可验证性和耦合性选择一次任务末端质量门，并把状态、证据、理由和选择理由写入 `assurance_assessment`。执行中风险上升时更新同一结构并调用受控升级入口；证据不足只能保持或提升门级，不能降级。
+状态变更包括任何持久工作区文件、配置、依赖或锁文件、生成产物、版本控制状态、数据库或其他数据，以及外部服务、API、部署或消息状态的改变。只有能够证明未改变上述任一状态的任务才是只读；无法证明时必须按状态变更处理。v3 写入任务按影响范围、可恢复性、不确定性、可验证性和耦合性选择一次任务末端质量门，并把状态、证据、理由和选择理由写入 `assurance_assessment`。执行中风险上升时更新同一结构并调用受控升级入口；证据不足只能保持或提升门级，不能降级。
 
 对外部仓库的状态变更，在创建工作流节点、下载完整源码、安装依赖或委派执行者之前，main/root 必须做一次只读预检：固定目标分支的提交、读取根 `AGENTS.md` 以及仓库明确指向的贡献/维护限制，并核对目标需求是否被允许。若规则要求用户确认、仅接受特定类别修复，或禁止该类改动，保留原始约束并停止该仓库的执行；不得把它当作普通失败重试，也不得以本地实验为由绕过。预检未发现限制后，才可建立该仓库的执行合同；网络不可达时可改用可核验的固定提交源码归档，但仍必须完成同一预检。
 

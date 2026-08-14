@@ -22,4 +22,4 @@
 
 ## Max Closure
 
-当 `audit-context.max_review_charter` 存在时，CLI 审查是 closure，不再开放式重新发现。只核验 charter 的固定 blockers、受保护 repair 的差异与回归，以及原始 requirements。`pass` 仅在这些项目全部通过时可用。v3 closure 发现任何 blocking finding 都必须输出 `fail` 和完整证据；控制器会进入 `scope_decision_required`，自动修复/重试链立即终止，等待用户选择替代任务或显式扩大范围。v1/v2 兼容状态仍按其已有 `repair_regressions` 规则处理。
+当 `audit-context.max_review_charter` 存在时，CLI 审查是 closure，不再开放式重新发现。只核验 charter 的固定 blockers、受保护 repair 的差异与回归，以及原始 requirements。`pass` 仅在这些项目全部通过时可用。v3 closure 发现任何 blocking finding 都必须输出 `fail` 和完整证据；控制器会进入 `scope_decision_required`，自动修复/重试链立即终止，等待用户选择替代任务或显式扩大范围。

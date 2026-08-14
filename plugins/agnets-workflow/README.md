@@ -41,7 +41,7 @@ CLI 会保存审查结果和受控日志；绑定工作流时使用控制器要�
 
 控制器不是常驻服务，清理只会在后续控制器调用时触发。`workflow_doctor` 可检查状态和恢复前提；它不会替用户接管运行中的代理。未知或损坏状态不会静默删除，隔离和到期删除都必须经过控制器的保留周期。恢复、换绑和关卡失效处理见 [`workflow-controller`](skills/workflow-controller/SKILL.md)。
 
-同一工作区可运行声明范围互不冲突的任务。清单可选 `workspace_claims` 为非空的 `{mode:"read"|"write",prefix:"..."}` 数组；缺失时按根目录 `write` 兼容。它是协调声明而非文件系统 ACL：末端审核仍须确认实际 diff 和产物仅落在 `write` claims。扩大范围时，先确认旧执行者停止并释放其 entry，再用 claims 超集和新的 `task_id` 初始化替代任务；共享或全局副作用使用根目录 `write` 独占。
+同一工作区可运行声明范围互不冲突的任务。清单必须提供非空 `workspace_claims`：`{mode:"read"|"write",prefix:"..."}` 数组。它是协调声明而非文件系统 ACL：末端审核仍须确认实际 diff 和产物仅落在 `write` claims。扩大范围时，先确认旧执行者停止并释放其 entry，再用 claims 超集和新的 `task_id` 初始化替代任务；共享或全局副作用使用根目录 `write` 独占。
 
 ## MCP
 

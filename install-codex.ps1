@@ -560,28 +560,15 @@ function Install-ManagedPlugin {
     }
 }
 
-function Test-ConfiguredPlugin {
-    param(
-        [Parameter(Mandatory)][string]$ConfigPath,
-        [Parameter(Mandatory)][string]$PluginId
-    )
+function Remove-RetiredWorkflowPlugin {
+    param([Parameter(Mandatory)][string]$CodexHome)
 
-    if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) { return $false }
-    $escapedPluginId = [System.Text.RegularExpressions.Regex]::Escape($PluginId)
+    $pluginId = 'workflow-controller@ai-vibecode-superpower-local'
+    $configPath = Join-Path $CodexHome 'config.toml'
+    if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) { return }
+    $escapedPluginId = [System.Text.RegularExpressions.Regex]::Escape($pluginId)
     $pattern = '^\s*\[plugins\.(?:"' + $escapedPluginId + '"|''' + $escapedPluginId + ''')\]\s*(?:#.*)?$'
-    foreach ($line in [System.IO.File]::ReadAllLines($ConfigPath)) {
-        if ($line -match $pattern) { return $true }
-    }
-    return $false
-}
-
-function Remove-LegacyManagedPlugin {
-    param(
-        [Parameter(Mandatory)][string]$CodexHome,
-        [Parameter(Mandatory)][string]$PluginId
-    )
-
-    if (-not (Test-ConfiguredPlugin -ConfigPath (Join-Path $CodexHome 'config.toml') -PluginId $PluginId)) { return }
+    if (-not ([System.IO.File]::ReadAllLines($configPath) | Where-Object { $_ -match $pattern })) { return }
 
     $codexCli = Get-CodexCliPath
     $hadCodexHome = Test-Path Env:CODEX_HOME
@@ -589,18 +576,15 @@ function Remove-LegacyManagedPlugin {
     try {
         $env:CODEX_HOME = $CodexHome
         for ($attempt = 1; $attempt -le 8; $attempt++) {
-            & $codexCli plugin remove $PluginId
+            & $codexCli plugin remove $pluginId
             if ($LASTEXITCODE -eq 0) { return }
             $exitCode = $LASTEXITCODE
             if ($attempt -lt 8) { Start-Sleep -Seconds 1 }
         }
-        throw "Could not remove legacy managed plugin after 8 attempts: $PluginId (exit code $exitCode)"
+        throw "Could not remove retired workflow plugin after 8 attempts: $pluginId (exit code $exitCode)"
     } finally {
-        if ($hadCodexHome) {
-            $env:CODEX_HOME = $previousCodexHome
-        } else {
-            Remove-Item Env:CODEX_HOME -ErrorAction SilentlyContinue
-        }
+        if ($hadCodexHome) { $env:CODEX_HOME = $previousCodexHome }
+        else { Remove-Item Env:CODEX_HOME -ErrorAction SilentlyContinue }
     }
 }
 
@@ -614,8 +598,6 @@ $sourceAgentRoleManifest = Join-Path $scriptRoot 'codex-global-config\agents\ai-
 $managedAgentRoleContracts = @(
     [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_luna_high.toml'; RoleName = 'avsp_luna_high'; Model = 'gpt-5.6-luna'; ReasoningEffort = 'high'; SandboxMode = 'read-only' }
     [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_luna_xhigh.toml'; RoleName = 'avsp_luna_xhigh'; Model = 'gpt-5.6-luna'; ReasoningEffort = 'xhigh'; SandboxMode = 'read-only' }
-    [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_luna_high_writer.toml'; RoleName = 'avsp_luna_high_writer'; Model = 'gpt-5.6-luna'; ReasoningEffort = 'high'; SandboxMode = 'danger-full-access' }
-    [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_luna_xhigh_writer.toml'; RoleName = 'avsp_luna_xhigh_writer'; Model = 'gpt-5.6-luna'; ReasoningEffort = 'xhigh'; SandboxMode = 'danger-full-access' }
     [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_luna_high_executor.toml'; RoleName = 'avsp_luna_high_executor'; Model = 'gpt-5.6-luna'; ReasoningEffort = 'high'; SandboxMode = 'danger-full-access' }
     [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_luna_xhigh_executor.toml'; RoleName = 'avsp_luna_xhigh_executor'; Model = 'gpt-5.6-luna'; ReasoningEffort = 'xhigh'; SandboxMode = 'danger-full-access' }
     [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_sol_high.toml'; RoleName = 'avsp_sol_high'; Model = 'gpt-5.6-sol'; ReasoningEffort = 'high'; SandboxMode = 'read-only' }
@@ -787,9 +769,8 @@ try {
     # is installed, while the transaction can still restore the previous config.
     Install-ManagedPlugin -CodexHome $codexHome -MarketplaceRoot $scriptRoot -PluginName $managedPluginName -MarketplaceName $managedMarketplaceName
 
-    # The CLI may briefly retain config.toml after plugin add. The bounded retry
-    # preserves the final error and occurs before any legacy skill is removed.
-    Remove-LegacyManagedPlugin -CodexHome $codexHome -PluginId 'workflow-controller@ai-vibecode-superpower-local'
+    # Do not leave the retired controller installed beside the v3-only plugin.
+    Remove-RetiredWorkflowPlugin -CodexHome $codexHome
 
     foreach ($target in $transactionTargets.Where({ $_.Operation -eq 'Remove' })) {
         if ($target.WasPresent) {
