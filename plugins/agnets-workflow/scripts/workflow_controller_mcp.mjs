@@ -6,7 +6,7 @@ import { pathToFileURL } from 'node:url';
 import { ControllerError, canonicalStateDirectory, dispatch } from './workflow_controller.mjs';
 
 export const TOOLS = [
-  ['workflow_init', '从 JSON 清单创建持久化 DAG；v3 可用 review_entry_stage 直接从 terra_single、terra_cohort、sol_high 或 sol_xhigh 开始，并必须给出 review_context.environment/scenarios/boundaries，state_dir 必须为绝对路径。', ['manifest', 'state_dir'], { manifest: { type: 'string' }, state_dir: { type: 'string' } }],
+  ['workflow_init', '从 JSON 清单创建持久化 DAG；v3 可用 review_entry_stage 直接从 terra_single、terra_cohort、sol_high 或 sol_xhigh 开始，并必须给出 review_context.environment/scenarios/boundaries，state_dir 必须为绝对路径。', ['manifest', 'state_dir'], { manifest: { type: 'string', description: '包含 v3 工作流清单的普通 JSON 文件路径；不支持内联 JSON。' }, state_dir: { type: 'string' } }],
   ['workflow_raise_assurance', '在末端质量门开始前，按结构化新证据将 v3 Terra assurance 提高到 Sol，并把同一个未认领门重绑定为 sol_high；不得降级或新增第二个审核门。', ['task_id', 'target_assurance_level', 'reason', 'assurance_assessment', 'replacement_agent_task_path', 'integration_owner', 'state_dir'], { task_id: { type: 'string' }, target_assurance_level: { enum: ['sol'] }, reason: { type: 'string' }, assurance_assessment: { type: 'string', description: '五个风险维度分别含 status、evidence、rationale，并含 selection_reason 的 JSON 文件路径。' }, replacement_agent_task_path: { type: 'string', description: '预留给新末端审核者的独立 agent task path。' }, integration_owner: { type: 'string', description: '负责该末端门集成与关闭的真实协调者 task path。' }, state_dir: { type: 'string' } }],
   ['workflow_rebind_pending', '确认预定实例已停止或未启动后，为未认领的 pending 节点换绑 execution_owner；保留原因和旧 owner。', ['task_id', 'node_id', 'reason', 'replacement_agent_task_path', 'previous_agent_stopped', 'state_dir'], { task_id: { type: 'string' }, node_id: { type: 'string' }, reason: { type: 'string' }, replacement_agent_task_path: { type: 'string' }, previous_agent_stopped: { type: 'boolean', const: true }, state_dir: { type: 'string' } }],
   ['workflow_invalidate_gate', '末端 pass 在关闭前因任务快照或工作区变化失效时，保留旧记录并受控重开质量门；审核门必须绑定新的独立 reviewer，terra_cohort 可指定首个重开 lane。', ['task_id', 'reason', 'state_dir'], { task_id: { type: 'string' }, reason: { type: 'string' }, replacement_agent_task_path: { type: 'string', description: '审核门失效时必填。' }, reviewer_slot: { enum: ['coverage', 'adversarial'], description: '仅重开 v3 terra_cohort 时可选，指定预留给替代审核者的首个 lane，默认 coverage。' }, state_dir: { type: 'string' } }],
@@ -355,6 +355,18 @@ function requestKey(id) {
   return `${typeof id}:${String(id)}`;
 }
 
+function validateWorkflowInitManifest(value) {
+  if (typeof value !== 'string' || !value.trim()) throw new ControllerError('workflow_init.manifest must be a non-empty JSON manifest file path');
+  const manifest = value.trim();
+  if (!manifest.startsWith('{') && !manifest.startsWith('[')) return;
+  try {
+    const parsed = JSON.parse(manifest);
+    if (parsed && typeof parsed === 'object') throw new ControllerError('workflow_init.manifest must be a JSON manifest file path; inline JSON is not supported');
+  } catch (error) {
+    if (error instanceof ControllerError) throw error;
+  }
+}
+
 async function handle(request) {
   const id = request.id; const method = request.method;
   if (method === 'notifications/initialized') return;
@@ -372,6 +384,7 @@ async function handle(request) {
   if (cancellation) cancellableRequests.set(requestKey(id), cancellation);
   try {
     const argumentsValue = request.params?.arguments ?? {};
+    if (request.params.name === 'workflow_init') validateWorkflowInitManifest(argumentsValue.manifest);
     const result = request.params.name === 'workflow_wait'
       ? await waitForWorkflowChange(argumentsValue, cancellation.signal)
       : (await dispatch(command, argumentsValue))[0];

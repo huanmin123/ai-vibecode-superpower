@@ -50,7 +50,7 @@ const ROUTING_FIELDS = ['execution_risk', 'routing_reason', 'execution_owner', '
 const IGNORED_DIRECTORIES = new Set(['.git', '.codex', 'node_modules', '.venv']);
 const WORKSPACE_LEASE_AUTHORITY_FILENAME = '.codex-workflow-controller-authority.json';
 const WORKSPACE_LEASE_PUBLICATION_SUFFIX = '.publication.json';
-const WORKSPACE_LEASE_AUTHORITY_VERSION = 2;
+const WORKSPACE_LEASE_AUTHORITY_VERSION = 3;
 const MAX_MANIFEST_BYTES = 1 * 1024 * 1024;
 const MAX_NODE_RESULT_BYTES = 64 * 1024;
 const MAX_REVIEW_BYTES = 128 * 1024;
@@ -98,7 +98,7 @@ const hasOwn = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
 const DEFAULT_STALE_LOCK_SEC = 30;
 const DEFAULT_LEASE_SEC = 1800;
 const DEFAULT_ACTIVATION_TIMEOUT_SEC = 600;
-const WORKSPACE_LEASE_VERSION = 2;
+const WORKSPACE_LEASE_VERSION = 3;
 const WORKSPACE_CLAIM_MODES = new Set(['read', 'write']);
 const MAX_WORKSPACE_CLAIMS = 128;
 const MAX_WORKSPACE_CLAIM_PREFIX_LENGTH = 1024;
@@ -162,7 +162,7 @@ async function canonicalStatePath(value, label = 'state_path') {
   if (!path.isAbsolute(rawPath)) throw new ControllerError(`${label} must be an absolute path`);
   const resolved = path.resolve(rawPath);
   const name = path.basename(resolved);
-  if (!name.endsWith('.json') || name === '.json') throw new ControllerError(`${label} must name a .json state file`);
+  if (!name.endsWith(SQLITE_STATE_SUFFIX) || name === SQLITE_STATE_SUFFIX) throw new ControllerError(`${label} must name a SQLite state file`);
   return path.join(await canonicalStateDirectory(path.dirname(resolved), `${label} directory`), name);
 }
 
@@ -619,12 +619,12 @@ async function atomicWrite(filePath, value, maxBytes = MAX_STATE_BYTES, { parent
 
 function statePath(stateDir, taskId) {
   requiredIdentifier(taskId, 'task_id');
-  return path.join(path.resolve(stateDir), `${taskId}.json`);
+  return path.join(path.resolve(stateDir), `${taskId}${SQLITE_STATE_SUFFIX}`);
 }
 
 function databasePath(filePath) {
-  if (!filePath.endsWith('.json')) throw new ControllerError(`Invalid logical task state path: ${filePath}`);
-  return `${filePath.slice(0, -'.json'.length)}${SQLITE_STATE_SUFFIX}`;
+  if (!filePath.endsWith(SQLITE_STATE_SUFFIX)) throw new ControllerError(`Invalid SQLite task state path: ${filePath}`);
+  return filePath;
 }
 
 async function stateExists(filePath) {
@@ -640,7 +640,7 @@ async function writeState(filePath, state, { parentAuthority = null } = {}) {
 async function deleteState(filePath, { parentAuthority } = {}) {
   if (!parentAuthority) throw new ControllerError(`Controller state deletion requires a caller-verified parent authority: ${filePath}`);
   await verifyRegularDirectorySnapshot(parentAuthority, 'Controller state parent');
-  const taskId = path.basename(filePath, '.json');
+  const taskId = path.basename(filePath, SQLITE_STATE_SUFFIX);
   if (/^[A-Za-z][A-Za-z0-9._-]{0,79}$/.test(taskId)) {
     // Remove review evidence first; if this fails, keep the task indexable for a later sweep.
     await fs.rm(path.join(path.dirname(filePath), REVIEW_ARTIFACT_DIRECTORY, taskId), { recursive: true, force: true });
@@ -892,6 +892,27 @@ function validateWorkspaceLeasePublicationIntent(intent, workspace) {
   }
 }
 
+function isRecognizedLegacyWorkspaceLeasePublicationIntent(intent, workspace) {
+  return intent && typeof intent === 'object' && !Array.isArray(intent)
+    && intent.version === 1
+    && ((Number.isSafeInteger(intent.prior_authority?.version)
+      && intent.prior_authority.version >= 1 && intent.prior_authority.version < WORKSPACE_LEASE_AUTHORITY_VERSION)
+      || (Number.isSafeInteger(intent.lease?.version)
+        && intent.lease.version >= 1 && intent.lease.version < WORKSPACE_LEASE_VERSION));
+}
+
+async function archiveLegacyWorkspaceLeasePublicationIntent(workspace) {
+  const intentPath = workspaceLeasePublicationIntentPath(workspace);
+  let snapshot;
+  try { snapshot = await readJsonSnapshot(intentPath, { label: 'Workspace lease publication intent', maxBytes: MAX_MANIFEST_BYTES }); }
+  catch (error) { if (error instanceof ControllerError && error.message.startsWith('Workspace lease publication intent does not exist:')) return null; throw error; }
+  if (!isRecognizedLegacyWorkspaceLeasePublicationIntent(snapshot.value, workspace)) return null;
+  await verifyJsonSnapshot(intentPath, snapshot, 'Workspace lease publication intent');
+  const archivePath = `${intentPath}.legacy-v${snapshot.value.prior_authority.version}-${utcNow().replace(/[:.]/g, '-')}-${randomUUID()}`;
+  await fs.rename(intentPath, archivePath);
+  return archivePath;
+}
+
 async function unlinkOwnedFile(filePath, identity) {
   try {
     const metadata = await fs.lstat(filePath, { bigint: true });
@@ -974,28 +995,117 @@ async function verifyWorkspaceLeaseRegistryBinding(snapshot, { allowUninitialize
   if (!sameFileObjectIdentity(record.registry_identity, identity)) throw new ControllerError(`Workspace lease registry identity changed: ${record.registry_path}`);
 }
 
+async function recoverLegacyWorkspaceLease(leasePath, workspace) {
+  const snapshot = await readJsonSnapshot(leasePath, { label: 'Workspace lease', maxBytes: MAX_MANIFEST_BYTES });
+  const lease = snapshot.value;
+  if (!lease || typeof lease !== 'object' || Array.isArray(lease) || !Number.isSafeInteger(lease.version) || lease.version < 1 || lease.version >= WORKSPACE_LEASE_VERSION || lease.workspace !== workspace) {
+    throw new ControllerError(`Unsupported workspace lease version; destructive rebuild requires a recognized legacy registry: ${leasePath}`);
+  }
+  await verifyJsonSnapshot(leasePath, snapshot, 'Workspace lease');
+  const archivePath = `${leasePath}.legacy-v${lease.version}-${utcNow().replace(/[:.]/g, '-')}-${randomUUID()}`;
+  await fs.rename(leasePath, archivePath);
+  const archived = await fs.lstat(archivePath, { bigint: true });
+  if (archived.isSymbolicLink() || !archived.isFile() || !sameFileObjectIdentity(snapshot.object_identity, persistentFileObjectIdentity(archived))) {
+    throw new ControllerError(`Legacy workspace lease changed during archival: ${leasePath}`);
+  }
+  return archivePath;
+}
+
+async function archiveOrphanedWorkspaceControlEntries(controlDirectory, { preserve = new Set() } = {}) {
+  const entries = (await fs.readdir(controlDirectory)).sort();
+  const archivedPaths = [];
+  for (const name of entries) {
+    if (preserve.has(name)) continue;
+    const entryPath = path.join(controlDirectory, name);
+    const archivePath = `${entryPath}.legacy-orphaned-${utcNow().replace(/[:.]/g, '-')}-${randomUUID()}`;
+    await fs.rename(entryPath, archivePath);
+    archivedPaths.push(archivePath);
+  }
+  return archivedPaths;
+}
+
+async function archiveLegacyJsonState(filePath, parentAuthority) {
+  const legacyPath = `${filePath.slice(0, -SQLITE_STATE_SUFFIX.length)}.json`;
+  let metadata;
+  try { metadata = await fs.lstat(legacyPath, { bigint: true }); }
+  catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+  if (metadata.isSymbolicLink() || !metadata.isFile()) throw new ControllerError(`Legacy controller state is not a regular file: ${legacyPath}`);
+  await verifyRegularDirectorySnapshot(parentAuthority, 'Controller state parent');
+  const archivePath = `${legacyPath}.legacy-orphaned-${utcNow().replace(/[:.]/g, '-')}-${randomUUID()}`;
+  await fs.rename(legacyPath, archivePath);
+  return archivePath;
+}
+
+async function archiveExistingSQLiteState(filePath, parentAuthority) {
+  let metadata;
+  try { metadata = await fs.lstat(filePath, { bigint: true }); }
+  catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+  if (metadata.isSymbolicLink() || !metadata.isFile()) throw new ControllerError(`SQLite controller state is not a regular file: ${filePath}`);
+  await verifyRegularDirectorySnapshot(parentAuthority, 'Controller state parent');
+  const archivePath = `${filePath}.legacy-orphaned-${utcNow().replace(/[:.]/g, '-')}-${randomUUID()}`;
+  await fs.rename(filePath, archivePath);
+  return archivePath;
+}
+
 async function ensureWorkspaceLeaseAuthority(workspace, { allowCreate = false, authorityParent = null } = {}) {
+  let legacyAuthorityArchivePath = null;
   try {
-    return await readWorkspaceLeaseAuthority(workspace);
+    const current = await readWorkspaceLeaseAuthority(workspace);
+    let registrySnapshot = null;
+    try { registrySnapshot = await readJsonSnapshot(current.record.registry_path, { label: 'Workspace lease', maxBytes: MAX_MANIFEST_BYTES }); }
+    catch (error) { if (!(error instanceof ControllerError && error.message.startsWith('Workspace lease does not exist:'))) throw error; }
+    if (!registrySnapshot || !Number.isSafeInteger(registrySnapshot.value?.version) || registrySnapshot.value.version < 1 || registrySnapshot.value.version >= WORKSPACE_LEASE_VERSION) return current;
+    await verifyJsonSnapshot(current.record.registry_path, registrySnapshot, 'Workspace lease');
+    legacyAuthorityArchivePath = `${current.authority_path}.legacy-registry-v${registrySnapshot.value.version}-${utcNow().replace(/[:.]/g, '-')}-${randomUUID()}`;
+    await fs.rename(current.authority_path, legacyAuthorityArchivePath);
   }
   catch (error) {
-    if (!(error instanceof ControllerError && (error.message.startsWith('JSON input does not exist:') || error.message.startsWith('Workspace lease authority does not exist:'))) && error.code !== 'ENOENT') throw error;
+    const authorityPath = workspaceLeaseAuthorityPath(workspace);
+    if (error instanceof ControllerError && error.message.startsWith('Unsupported workspace lease authority:')) {
+      const snapshot = await readJsonSnapshot(authorityPath, { label: 'Workspace lease authority', maxBytes: MAX_MANIFEST_BYTES });
+      if (!Number.isSafeInteger(snapshot.value?.version) || snapshot.value.version < 1 || snapshot.value.version >= WORKSPACE_LEASE_AUTHORITY_VERSION) throw error;
+      await verifyJsonSnapshot(authorityPath, snapshot, 'Workspace lease authority');
+      legacyAuthorityArchivePath = `${authorityPath}.legacy-v${snapshot.value.version}-${utcNow().replace(/[:.]/g, '-')}-${randomUUID()}`;
+      await fs.rename(authorityPath, legacyAuthorityArchivePath);
+    } else if (!(error instanceof ControllerError && (error.message.startsWith('JSON input does not exist:') || error.message.startsWith('Workspace lease authority does not exist:'))) && error.code !== 'ENOENT') throw error;
     if (!allowCreate) throw new ControllerError(`Workspace lease authority does not exist: ${workspaceLeaseAuthorityPath(workspace)}`);
   }
   if (!authorityParent) throw new ControllerError(`Workspace lease authority creation requires a caller-verified authority parent: ${workspaceLeaseAuthorityPath(workspace)}`);
   await verifyRegularDirectorySnapshot(authorityParent, 'Workspace authority parent');
   const control = await safeWorkspaceLeaseControlDirectory(workspace, { create: true });
   const leasePath = workspaceLeasePath(workspace);
+  let registryIdentity = null;
+  let legacyRegistryArchivePath = null;
   let registryExists = false;
   try {
-    const metadata = await fs.lstat(leasePath);
+    const metadata = await fs.lstat(leasePath, { bigint: true });
     if (metadata.isSymbolicLink() || !metadata.isFile()) throw new ControllerError(`Workspace lease is not a regular registry file: ${leasePath}`);
     registryExists = true;
+    const snapshot = await readJsonSnapshot(leasePath, { label: 'Workspace lease', maxBytes: MAX_MANIFEST_BYTES });
+    if (snapshot.value?.version === WORKSPACE_LEASE_VERSION) {
+      await validateWorkspaceLease(snapshot.value, leasePath);
+      registryIdentity = snapshot.object_identity;
+    } else {
+      legacyRegistryArchivePath = await recoverLegacyWorkspaceLease(leasePath, workspace);
+    }
   } catch (error) { if (error.code !== 'ENOENT') throw error; }
-  if (registryExists) throw new ControllerError(`Cannot create workspace lease authority for an existing registry: ${leasePath}`);
-  if (!control.created_control_directory && !registryExists) throw new ControllerError(`Cannot create workspace lease authority for an existing control directory without a registry: ${control.control_directory}`);
-  await atomicWrite(workspaceLeaseAuthorityPath(workspace), workspaceLeaseAuthorityRecord(workspace, control), MAX_MANIFEST_BYTES, { parentAuthority: authorityParent });
-  return readWorkspaceLeaseAuthority(workspace);
+  let orphanedControlEntries = [];
+  if (!registryIdentity) {
+    const preservedEntries = new Set();
+    if (legacyRegistryArchivePath) preservedEntries.add(path.basename(legacyRegistryArchivePath));
+    orphanedControlEntries = await archiveOrphanedWorkspaceControlEntries(control.control_directory, { preserve: preservedEntries });
+  }
+  await atomicWrite(workspaceLeaseAuthorityPath(workspace), workspaceLeaseAuthorityRecord(workspace, control, { registryIdentity }), MAX_MANIFEST_BYTES, { parentAuthority: authorityParent });
+  const authority = await readWorkspaceLeaseAuthority(workspace);
+  if (legacyAuthorityArchivePath || legacyRegistryArchivePath || orphanedControlEntries.length || (!registryExists && !control.created_control_directory) || registryIdentity) {
+    authority.recovery = {
+      mode: legacyAuthorityArchivePath || legacyRegistryArchivePath || orphanedControlEntries.length ? 'destructive_rebuild' : registryIdentity ? 'rebound_current_registry' : 'reinitialized_existing_control_directory',
+      legacy_authority_archive_path: legacyAuthorityArchivePath,
+      legacy_registry_archive_path: legacyRegistryArchivePath,
+      orphaned_control_entry_archive_paths: orphanedControlEntries,
+    };
+  }
+  return authority;
 }
 
 async function withWorkspaceLeaseLock(workspace, callback, { allowAuthorityCreation = false } = {}) {
@@ -1003,11 +1113,16 @@ async function withWorkspaceLeaseLock(workspace, callback, { allowAuthorityCreat
   const authorityParent = await snapshotRegularDirectory(path.dirname(authorityPath), 'Workspace authority parent');
   return withStateLock(authorityPath, async () => {
     await verifyRegularDirectorySnapshot(authorityParent, 'Workspace authority parent');
-    await recoverWorkspaceLeasePublication(workspace, { authorityParent });
     const authority = await ensureWorkspaceLeaseAuthority(workspace, { allowCreate: allowAuthorityCreation, authorityParent });
+    const legacyPublicationIntentArchivePath = await archiveLegacyWorkspaceLeasePublicationIntent(workspace);
+    await recoverWorkspaceLeasePublication(workspace, { authorityParent });
     const control = await safeWorkspaceLeaseControlDirectory(workspace);
+    const recovery = legacyPublicationIntentArchivePath
+      ? { ...(authority.recovery ?? { mode: 'destructive_rebuild', legacy_authority_archive_path: null, legacy_registry_archive_path: null, orphaned_control_entry_archive_paths: [] }), mode: 'destructive_rebuild', legacy_publication_intent_archive_path: legacyPublicationIntentArchivePath }
+      : authority.recovery ?? null;
     const context = {
       authority,
+      recovery,
       parent_authorities: {
         authority: authorityParent,
         registry: { path: control.control_directory, real_path: control.control_real_path, identity: control.control_identity },
@@ -1624,7 +1739,13 @@ function validateReviewTopology(nodes, assuranceLevel = null, routingSchemaVersi
   const expectedDependencies = allNodes.filter(node => !isReviewNode(node, schemaVersion)).map(node => node.id).sort();
   const actualDependencies = [...new Set(review.depends_on)].sort();
   if (expectedDependencies.length !== actualDependencies.length || expectedDependencies.some((id, index) => id !== actualDependencies[index])) {
-    throw new ControllerError('The review node must directly depend on every non-review node');
+    const missingDependencies = expectedDependencies.filter(id => !actualDependencies.includes(id));
+    const unexpectedDependencies = actualDependencies.filter(id => !expectedDependencies.includes(id));
+    const details = [
+      missingDependencies.length ? `missing direct dependencies: ${missingDependencies.join(', ')}` : null,
+      unexpectedDependencies.length ? `unexpected dependencies: ${unexpectedDependencies.join(', ')}` : null,
+    ].filter(Boolean);
+    throw new ControllerError(`Review node ${review.id} must directly depend on every non-review node${details.length ? `; ${details.join('; ')}` : ''}`);
   }
   if (allNodes.some(node => !isReviewNode(node, schemaVersion) && node.depends_on.includes(review.id))) {
     throw new ControllerError('No node may depend on a review node');
@@ -1690,6 +1811,16 @@ function workflowSnapshot(state) {
 function workflowSnapshotMatchesState(recorded, state) {
   if (!recorded || typeof recorded !== 'object' || Array.isArray(recorded)) return false;
   return recorded.digest_algorithm === 'sha256-stable-json-v2' && sameJson(recorded, workflowSnapshot(state));
+}
+
+function completeReviewDirectDependencies(nodes, routingSchemaVersion) {
+  const reviews = reviewNodes(nodes, routingSchemaVersion);
+  if (reviews.length !== 1) return [];
+  const review = reviews[0];
+  const expected = Object.values(nodes).filter(node => !isReviewNode(node, routingSchemaVersion)).map(node => node.id);
+  const missing = expected.filter(id => !review.depends_on.includes(id)).sort();
+  if (missing.length) review.depends_on = [...new Set([...review.depends_on, ...missing])].sort();
+  return missing;
 }
 
 export function sameJson(left, right) { return stableJson(left) === stableJson(right); }
@@ -1834,12 +1965,15 @@ async function makeState(manifest) {
     if (review) applyProtocolStage(review, reviewEntryStage);
   }
   validateNodes(nodes);
+  const normalizedReviewDependencies = completeReviewDirectDependencies(nodes, routingSchemaVersion);
   validateReviewTopology(nodes, assuranceLevel, routingSchemaVersion, reviewEntryStage);
   if (hasOwn(manifest, 'workspace_claims') && Object.values(nodes).some(node => !isReviewNode(node, routingSchemaVersion) && node.execution_risk !== 'read_only') && !workspaceClaims.some(claim => claim.mode === 'write')) {
     throw new ControllerError('workspace_claims requires at least one write claim for non-read-only work');
   }
   const created = utcNow();
-  const state = { version: VERSION, routing_schema_version: REVIEW_PROTOCOL_VERSION, assurance_level: assuranceLevel, assurance_assessment: assuranceAssessmentValue, review_protocol_version: REVIEW_PROTOCOL_VERSION, review_entry_stage: reviewEntryStage, review_context: reviewContext, task_id: taskId, workspace, workspace_claims: workspaceClaims, goal, requirements, scope: manifest.scope ?? [], non_goals: manifest.non_goals ?? [], nodes, participants: [], reviews: [], repair_records: [], max_review_charter: null, events: [{ at: created, type: 'task_initialized', workflow_revision: 0 }], workflow_revision: 0, closed_revision: null, closed_at: null, created_at: created, updated_at: created };
+  const events = [{ at: created, type: 'task_initialized', workflow_revision: 0 }];
+  if (normalizedReviewDependencies.length) events.push({ at: created, type: 'review_direct_dependencies_completed', node_id: reviewNodes(nodes, routingSchemaVersion)[0].id, added_dependencies: normalizedReviewDependencies, workflow_revision: 0 });
+  const state = { version: VERSION, routing_schema_version: REVIEW_PROTOCOL_VERSION, assurance_level: assuranceLevel, assurance_assessment: assuranceAssessmentValue, review_protocol_version: REVIEW_PROTOCOL_VERSION, review_entry_stage: reviewEntryStage, review_context: reviewContext, task_id: taskId, workspace, workspace_claims: workspaceClaims, goal, requirements, scope: manifest.scope ?? [], non_goals: manifest.non_goals ?? [], nodes, participants: [], reviews: [], repair_records: [], max_review_charter: null, events, workflow_revision: 0, closed_revision: null, closed_at: null, created_at: created, updated_at: created };
   return state;
 }
 
@@ -2238,17 +2372,32 @@ async function initTask(parameters) {
   const state = await makeState(manifest);
   const filePath = await configuredStatePath(parameters, state.task_id);
   const leasePath = workspaceLeasePath(state.workspace);
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
-  const parentAuthority = await snapshotRegularDirectory(path.dirname(filePath), 'Controller state parent');
-  state.workspace_lease = { registry_path: leasePath, state_path: filePath, state_parent_authority: parentAuthority, status: 'active', acquired_at: utcNow(), workspace_claims: state.workspace_claims };
+  let workspaceLeaseRecovery = null;
   await withWorkspaceLeaseLock(state.workspace, async (lockedLeasePath, authorityContext) => {
     if (lockedLeasePath !== leasePath) throw new ControllerError('Workspace lease authority path changed during initialization');
+    workspaceLeaseRecovery = authorityContext.recovery;
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    const parentAuthority = await snapshotRegularDirectory(path.dirname(filePath), 'Controller state parent');
+    state.workspace_lease = { registry_path: leasePath, state_path: filePath, state_parent_authority: parentAuthority, status: 'active', acquired_at: utcNow(), workspace_claims: state.workspace_claims };
     const lease = await loadWorkspaceLease(leasePath, state.workspace, { allowMissing: true, authorityContext });
     if (lease.active_tasks.length >= MAX_WORKSPACE_ACTIVE_TASKS) throw new ControllerError(`Workspace lease exceeds the ${MAX_WORKSPACE_ACTIVE_TASKS}-active-task limit`);
     const existingStatePath = lease.active_tasks.find(entry => sameStatePath(entry.state_path, filePath));
     if (existingStatePath) throw new ControllerError(`Workspace state path already has an active lease entry: ${filePath}; reconcile this exact workspace/task/state_dir entry before initializing again`);
     const conflict = lease.active_tasks.find(entry => claimsConflict(entry.workspace_claims, state.workspace_claims));
     if (conflict) throw new ControllerError(`Workspace claim conflicts with active workflow task: ${conflict.task_id} (${conflict.state_path})`);
+    const destructiveRebuild = workspaceLeaseRecovery?.mode === 'destructive_rebuild';
+    const archivedStatePaths = [];
+    if (destructiveRebuild) {
+      const archivedSQLiteState = await archiveExistingSQLiteState(filePath, parentAuthority);
+      if (archivedSQLiteState) archivedStatePaths.push(archivedSQLiteState);
+    }
+    if (destructiveRebuild || !(await stateExists(filePath))) {
+      const archivedLegacyState = await archiveLegacyJsonState(filePath, parentAuthority);
+      if (archivedLegacyState) archivedStatePaths.push(archivedLegacyState);
+    }
+    if (archivedStatePaths.length) {
+      workspaceLeaseRecovery = { ...(workspaceLeaseRecovery ?? { mode: 'destructive_rebuild', legacy_authority_archive_path: null, legacy_registry_archive_path: null, orphaned_control_entry_archive_paths: [] }), legacy_state_archive_paths: archivedStatePaths };
+    }
     await withStateLock(filePath, async () => {
       if (await stateExists(filePath)) throw new ControllerError(`Task already exists: ${state.task_id}`);
       const entry = { task_id: state.task_id, state_path: filePath, state_dir: path.dirname(filePath), state_parent_authority: parentAuthority, acquired_at: state.workspace_lease.acquired_at, phase: 'initializing', workspace_claims: state.workspace_claims };
@@ -2271,7 +2420,7 @@ async function initTask(parameters) {
       throw error;
     }
   }, { allowAuthorityCreation: true });
-  return { state_path: filePath, task: compactState(state) };
+  return { state_path: filePath, task: compactState(state), workspace_lease_recovery: workspaceLeaseRecovery };
 }
 
 async function reconcileWorkspace(parameters) {
@@ -3247,7 +3396,7 @@ function taskPruneEligibility(state, filePath, now) {
   if (!ASSURANCE_LEVELS.has(state.assurance_level)) return { eligible: false, reason: 'invalid assurance state' };
   try { requiredIdentifier(state.task_id, 'task_id'); requiredString(state.workspace, 'workspace'); requiredString(state.goal, 'goal'); }
   catch (error) { return { eligible: false, reason: `invalid task identity: ${error.message}` }; }
-  if (state.task_id !== path.basename(filePath, '.json')) return { eligible: false, reason: 'task_id does not match state path' };
+  if (state.task_id !== path.basename(filePath, SQLITE_STATE_SUFFIX)) return { eligible: false, reason: 'task_id does not match state path' };
   if (!path.isAbsolute(state.workspace) || path.resolve(state.workspace) !== state.workspace) return { eligible: false, reason: 'workspace is not canonical absolute path' };
   if (!Array.isArray(state.requirements) || !Array.isArray(state.scope) || !Array.isArray(state.non_goals) || !Array.isArray(state.participants) || !Array.isArray(state.reviews) || !Array.isArray(state.events) || !Array.isArray(state.repair_records)) return { eligible: false, reason: 'invalid state collection' };
   if (state.requirements.some(item => !item || typeof item !== 'object' || Array.isArray(item) || typeof item.id !== 'string' || !item.id.trim() || typeof item.text !== 'string' || !item.text.trim()) || state.participants.some(item => !item || typeof item !== 'object' || Array.isArray(item)) || state.reviews.some(item => !item || typeof item !== 'object' || Array.isArray(item)) || state.events.some(item => !item || typeof item !== 'object' || Array.isArray(item) || !validTimestamp(item.at) || typeof item.type !== 'string' || !item.type.trim())) return { eligible: false, reason: 'malformed state collection item' };
@@ -3291,7 +3440,7 @@ async function releasedLeaseEligibility(leasePath, state, filePath, authorityCon
   } catch (error) {
     if (error.code !== 'ENOENT') return { eligible: false, reason: `review artifact tree cannot be verified: ${error.message}` };
   }
-  const sourcePaths = [filePath, databasePath(filePath)];
+  const sourcePaths = [filePath];
   const activeOwner = await activeLeaseOwnerForSources(lease, sourcePaths, reviewSource);
   if (activeOwner) return { eligible: false, reason: `cleanup source overlaps an active workspace lease entry: ${activeOwner.task_id} (${activeOwner.state_path})` };
   return { eligible: true };
@@ -3355,7 +3504,7 @@ function quarantineEntryMatchesAuthority(errorPath, record) {
 }
 
 function logicalTaskIdFromStatePath(filePath) {
-  const taskId = path.basename(filePath, '.json');
+  const taskId = path.basename(filePath, SQLITE_STATE_SUFFIX);
   if (!validQuarantineTaskId(taskId)) throw new ControllerError(`State path does not contain a valid task identifier: ${filePath}`);
   return taskId;
 }
@@ -3451,7 +3600,7 @@ function quarantineMetadataIsValid(metadata, stateDir, errorPath) {
   if (!Array.isArray(metadata.files) || !metadata.files.length || metadata.files.some(name => typeof name !== 'string' || !name || path.basename(name) !== name) || new Set(metadata.files).size !== metadata.files.length) return false;
   const root = errorStateRoot(stateDir);
   if (!isDirectChild(root, errorPath) || path.resolve(metadata.error_path) !== path.resolve(errorPath)) return false;
-  if (path.dirname(path.resolve(metadata.original_state_path)) !== path.resolve(stateDir) || !metadata.original_state_path.endsWith('.json')) return false;
+  if (path.dirname(path.resolve(metadata.original_state_path)) !== path.resolve(stateDir) || !metadata.original_state_path.endsWith(SQLITE_STATE_SUFFIX)) return false;
   let logicalTaskId;
   try { logicalTaskId = logicalTaskIdFromStatePath(metadata.original_state_path); } catch { return false; }
   if (metadata.task_id !== logicalTaskId) return false;
@@ -3504,7 +3653,7 @@ function quarantineExpiryIsValid(expiry, stateDir, errorPath) {
   if (typeof expiry.original_state_path !== 'string' || !validTimestamp(expiry.quarantined_at) || !validTimestamp(expiry.delete_after)) return false;
   if (!Array.isArray(expiry.files) || !expiry.files.length || expiry.files.some(name => typeof name !== 'string' || !name || path.basename(name) !== name) || new Set(expiry.files).size !== expiry.files.length) return false;
   if (expiry.review_artifacts !== null && expiry.review_artifacts !== QUARANTINE_REVIEW_DIRECTORY) return false;
-  if (path.dirname(path.resolve(expiry.original_state_path)) !== path.resolve(stateDir) || !expiry.original_state_path.endsWith('.json')) return false;
+  if (path.dirname(path.resolve(expiry.original_state_path)) !== path.resolve(stateDir) || !expiry.original_state_path.endsWith(SQLITE_STATE_SUFFIX)) return false;
   let logicalTaskId;
   try { logicalTaskId = logicalTaskIdFromStatePath(expiry.original_state_path); } catch { return false; }
   if (expiry.task_id !== logicalTaskId) return false;
@@ -3647,7 +3796,7 @@ async function quarantineContentsAreSafe(errorPath, record) {
 }
 
 async function activeLeaseEntryOwnsSources(entry, sourcePaths, reviewArtifactSource) {
-  const protectedPaths = [entry.state_path, databasePath(entry.state_path)];
+  const protectedPaths = [entry.state_path];
   protectedPaths.push(await canonicalStateDirectory(reviewArtifactTaskPath(entry.state_dir, entry.task_id), 'active review artifact directory'));
   const candidates = [...sourcePaths];
   if (reviewArtifactSource !== null) candidates.push(await canonicalStateDirectory(reviewArtifactSource, 'candidate review artifact directory'));
@@ -3966,7 +4115,7 @@ async function listTaskStatePaths(stateDir) {
   for (const entry of entries) {
     if (!entry.isFile()) continue;
     if (entry.name.endsWith(SQLITE_STATE_SUFFIX)) {
-      paths.add(path.join(stateDir, `${entry.name.slice(0, -SQLITE_STATE_SUFFIX.length)}.json`));
+      paths.add(path.join(stateDir, entry.name));
     }
   }
   return [...paths].sort();

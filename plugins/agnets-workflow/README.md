@@ -37,7 +37,7 @@ CLI 会保存审查结果和受控日志；绑定工作流时使用控制器要�
 
 ## 状态目录
 
-建议将 `state_dir` 设为目标工作区的 `.codex/workflow-controller/`。状态库、租约、checkpoint 和审查制品属于控制数据，不应纳入业务改动或工作区指纹。
+建议将 `state_dir` 设为目标工作区的 `.codex/workflow-controller/`。每个 v3 任务的唯一运行状态是 `state_dir/<task_id>.sqlite`；manifest、审核输入和小型协调记录使用 JSON 接口，但不作为任务状态。状态库、租约、checkpoint 和审查制品属于控制数据，不应纳入业务改动或工作区指纹。
 
 控制器不是常驻服务，清理只会在后续控制器调用时触发。`workflow_doctor` 可检查状态和恢复前提；它不会替用户接管运行中的代理。未知或损坏状态不会静默删除，隔离和到期删除都必须经过控制器的保留周期。恢复、换绑和关卡失效处理见 [`workflow-controller`](skills/workflow-controller/SKILL.md)。
 
@@ -45,4 +45,4 @@ CLI 会保存审查结果和受控日志；绑定工作流时使用控制器要�
 
 ## MCP
 
-插件同时提供 `workflow-controller` MCP 服务。需要接入时使用插件自带的 `.mcp.json`；高频调度调用默认返回紧凑摘要，持续观察先从 `workflow_status` 取得 `cursor`，再用 `workflow_wait` 被动等待变化。排障或审计需要完整任务状态时使用 `workflow_status detail=full`。具体工具名称和输入字段以 MCP schema 与 [`workflow-controller`](skills/workflow-controller/SKILL.md) 为准。
+插件同时提供 `workflow-controller` MCP 服务。需要接入时使用插件自带的 `.mcp.json`；`workflow_init.manifest` 传普通 JSON 清单文件路径（可为相对路径），不传内联 JSON，`state_dir` 必须为绝对路径。高频调度调用默认返回紧凑摘要，持续观察先从 `workflow_status` 取得 `cursor`，再用 `workflow_wait` 被动等待变化。排障或审计需要完整任务状态时使用 `workflow_status detail=full`。具体工具名称和输入字段以 MCP schema 与 [`workflow-controller`](skills/workflow-controller/SKILL.md) 为准。

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -85,6 +86,14 @@ test('MCP serves v3 workflow state over stdio and releases a cancelled wait', as
 
     const initialized = await server.request({ method: 'initialize', params: {} });
     assert.equal(initialized.result.serverInfo.name, 'agnets-workflow');
+    const toolList = await server.request({ method: 'tools/list', params: {} });
+    const initTool = toolList.result.tools.find(tool => tool.name === 'workflow_init');
+    assert.match(initTool.inputSchema.properties.manifest.description, /JSON 文件路径/);
+    assert.match(initTool.inputSchema.properties.manifest.description, /不支持内联 JSON/);
+    const inline = await server.request({ method: 'tools/call', params: { name: 'workflow_init', arguments: { manifest: JSON.stringify(v3McpManifest(workspace)), state_dir: stateDir } } });
+    assert.equal(inline.result.isError, true);
+    assert.match(JSON.parse(inline.result.content[0].text).error, /manifest file path; inline JSON is not supported/);
+    assert.equal(existsSync(stateDir), false);
     const init = await server.request({ method: 'tools/call', params: { name: 'workflow_init', arguments: { manifest: manifestPath, state_dir: stateDir } } });
     assert.equal(JSON.parse(init.result.content[0].text).task.task_id, 'mcp-task');
 

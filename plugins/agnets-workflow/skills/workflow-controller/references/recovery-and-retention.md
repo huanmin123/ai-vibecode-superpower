@@ -1,6 +1,6 @@
 # 恢复与保留
 
-当前控制器仅支持 v3 SQLite task state。旧 JSON、旧租约和其他历史状态不会被迁移、恢复或执行；它们由维护者在控制器外部决定归档或删除。
+当前控制器仅支持 v3 SQLite task state。旧 JSON、旧租约和其他历史状态不会被迁移、恢复或执行。`workflow_init` 只会识别旧的 v1 authority/registry 以归档它们，并从空的 v3 SQLite 状态和租约重建；它不会读取旧任务、恢复旧 claim 或保留旧任务所有权。返回的 `workspace_lease_recovery` 会列出归档路径。
 
 `workflow_stale` 区分未激活与心跳过期。协调者必须先确认原执行者已经停止，才可调用 `workflow_requeue_stale`、`workflow_rescue` 或 `workflow_release_workspace`。`workflow_rebind_pending` 只用于从未启动的 pending 节点。
 
