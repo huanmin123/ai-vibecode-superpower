@@ -69,7 +69,7 @@ MCP 不是替代 Codex agent 的调度器；它把任务进度、依赖、checkp
 ### 前置条件
 
 - 已安装并可运行的 Codex CLI。
-- Node.js `>=20`。
+- Node.js `>=22.5.0`（工作流控制器使用原生 `node:sqlite`）。
 - macOS/Linux 还需要 `rg`（ripgrep）。
 - 关闭codex Desktop  必须否则配置会被覆盖回去
 

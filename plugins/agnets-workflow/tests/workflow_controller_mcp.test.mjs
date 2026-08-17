@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -15,11 +14,11 @@ function solAssessment() {
   return { impact: dimension('controlled'), recoverability: dimension('controlled'), uncertainty: dimension('unknown'), verifiability: dimension('controlled'), coupling: dimension('controlled'), selection_reason: 'The task requires a Sol quality gate.' };
 }
 
-function v3McpManifest(workspace) {
+function v3McpManifest(workspace, taskId = 'mcp-task') {
   return {
-    task_id: 'mcp-task', workspace, workspace_claims: [{ mode: 'read', prefix: '.' }], goal: 'Exercise the v3 MCP protocol.', requirements: [{ id: 'R1', text: 'MCP persists and reports current state.' }], scope: [], non_goals: [], routing_schema_version: 3,
+    task_id: taskId, workspace, workspace_claims: [{ mode: 'read', prefix: '.' }], goal: 'Exercise the v3 MCP protocol.', requirements: [{ id: 'R1', text: 'MCP persists and reports current state.' }], scope: [], non_goals: [], routing_schema_version: 3,
     assurance_level: 'sol', assurance_assessment: solAssessment(), review_context: { environment: 'isolated MCP test workspace', scenarios: ['stdio request and wait'], boundaries: 'declared workspace only' }, review_entry_stage: 'sol_high',
-    nodes: [{ id: 'total-review', kind: 'total_review', agent_type: 'avsp_sol_high', depends_on: [], execution_risk: 'read_only', routing_reason: 'independent final review', execution_owner: '/root/mcp-sol-review', integration_owner: '/root', quality_guard: 'validate MCP state response' }],
+    nodes: [{ id: 'total-review', kind: 'total_review', agent_type: 'avsp_sol_high', depends_on: [], execution_risk: 'read_only', routing_reason: 'independent final review', execution_owner: taskId === 'mcp-task' ? '/root/mcp-sol-review' : `/root/${taskId}-sol-review`, integration_owner: '/root', quality_guard: 'validate MCP state response' }],
   };
 }
 
@@ -69,6 +68,9 @@ async function closeMcp(child) {
 test('MCP exposes the v3 workflow contract without retired verification tooling', async () => {
   const source = await readFile(mcp, 'utf8');
   assert.match(source, /workflow_raise_assurance/);
+  assert.match(source, /workflow_acquire_write_lock/);
+  assert.match(source, /workflow_release_write_lock/);
+  assert.doesNotMatch(source, /workflow_recover_lock/);
   assert.doesNotMatch(source, /workflow_record_verification/);
   assert.doesNotMatch(source, /\.json\.legacy/);
 });
@@ -76,26 +78,26 @@ test('MCP exposes the v3 workflow contract without retired verification tooling'
 test('MCP serves v3 workflow state over stdio and releases a cancelled wait', async () => {
   const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-mcp-v3-'));
   const workspace = path.join(temp, 'workspace');
-  const stateDir = path.join(temp, 'state');
+  const stateDir = path.join(workspace, '.codex', 'workflow-controller');
   const manifestPath = path.join(temp, 'manifest.json');
   const server = startMcp();
   try {
     await mkdir(workspace, { recursive: true });
     await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
-    await writeFile(manifestPath, JSON.stringify(v3McpManifest(workspace)));
+    await writeFile(manifestPath, JSON.stringify(v3McpManifest(workspace, 'mcp-path-task')));
 
     const initialized = await server.request({ method: 'initialize', params: {} });
     assert.equal(initialized.result.serverInfo.name, 'agnets-workflow');
     const toolList = await server.request({ method: 'tools/list', params: {} });
     const initTool = toolList.result.tools.find(tool => tool.name === 'workflow_init');
-    assert.match(initTool.inputSchema.properties.manifest.description, /JSON 文件路径/);
-    assert.match(initTool.inputSchema.properties.manifest.description, /不支持内联 JSON/);
+    assert.match(initTool.inputSchema.properties.manifest.description, /清单对象/);
+    assert.deepEqual(initTool.inputSchema.properties.manifest.anyOf, [{ type: 'object' }, { type: 'string' }]);
     const inline = await server.request({ method: 'tools/call', params: { name: 'workflow_init', arguments: { manifest: JSON.stringify(v3McpManifest(workspace)), state_dir: stateDir } } });
-    assert.equal(inline.result.isError, true);
-    assert.match(JSON.parse(inline.result.content[0].text).error, /manifest file path; inline JSON is not supported/);
-    assert.equal(existsSync(stateDir), false);
+    assert.equal(JSON.parse(inline.result.content[0].text).task.task_id, 'mcp-task');
+    const objectInit = await server.request({ method: 'tools/call', params: { name: 'workflow_init', arguments: { manifest: v3McpManifest(workspace, 'mcp-object-task'), state_dir: stateDir } } });
+    assert.equal(JSON.parse(objectInit.result.content[0].text).task.task_id, 'mcp-object-task');
     const init = await server.request({ method: 'tools/call', params: { name: 'workflow_init', arguments: { manifest: manifestPath, state_dir: stateDir } } });
-    assert.equal(JSON.parse(init.result.content[0].text).task.task_id, 'mcp-task');
+    assert.equal(JSON.parse(init.result.content[0].text).task.task_id, 'mcp-path-task');
 
     const status = await server.request({ method: 'tools/call', params: { name: 'workflow_status', arguments: { task_id: 'mcp-task', state_dir: stateDir } } });
     const summary = JSON.parse(status.result.content[0].text);

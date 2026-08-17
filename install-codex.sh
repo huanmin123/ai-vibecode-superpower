@@ -110,6 +110,26 @@ install_managed_plugin() {
         printf '%s\n' 'Node.js is required for the agnets-workflow workflow-controller MCP server, but the node command was not found.' >&2
         return 1
     }
+    node_version=$(node -p 'process.versions.node') || {
+        printf '%s\n' 'Cannot determine the Node.js version required by the native SQLite workflow controller.' >&2
+        return 1
+    }
+    old_ifs=$IFS
+    IFS=.
+    set -- $node_version
+    IFS=$old_ifs
+    node_major=${1:-0}
+    node_minor=${2:-0}
+    case "$node_major:$node_minor" in
+        *[!0-9:]*|'')
+            printf '%s\n' "Cannot parse Node.js version: $node_version" >&2
+            return 1
+            ;;
+    esac
+    if [ "$node_major" -lt 22 ] || { [ "$node_major" -eq 22 ] && [ "$node_minor" -lt 5 ]; }; then
+        printf '%s\n' "Node.js 22.5.0 or newer is required for the native SQLite workflow controller; found $node_version" >&2
+        return 1
+    fi
     CODEX_HOME="$codex_home" codex plugin marketplace add "$script_dir"
     CODEX_HOME="$codex_home" codex plugin add "$managed_plugin_name@$managed_marketplace_name"
 }
@@ -647,11 +667,16 @@ assert_safe_toml_merge_input() {
                     sub(/^[[:space:]]*\[/, "", header)
                     sub(/\][[:space:]]*(#.*)?$/, "", header)
                 }
+                header = trim(header)
+                if (index(header, "\\") > 0 && header !~ /^[A-Za-z0-9_-]+[.]/) {
+                    fail("escaped table key is not supported")
+                    next
+                }
                 if (array_table && (header == "agents" || header == "features")) {
                     fail("managed table cannot be an array table")
                     next
                 }
-                if (header ~ /^("agents"|agents|"features"|features|"model"|model|"model_reasoning_effort"|model_reasoning_effort|"sandbox_mode"|sandbox_mode)(\.|$)/ && header != "agents" && header != "features") {
+                if (header ~ /^["\047]?(agents|features|model|model_reasoning_effort|sandbox_mode|approval_policy|approvals_reviewer)["\047]?[[:space:]]*([.]|$)/ && header != "agents" && header != "features") {
                     fail("managed namespace table is ambiguous")
                     next
                 }
@@ -676,7 +701,7 @@ assert_safe_toml_merge_input() {
                 next
             }
             if (key !~ /^[A-Za-z][A-Za-z0-9_-]*$/) {
-                if (section == "root" && key ~ /^("|\047)?(model|model_reasoning_effort|sandbox_mode|agents|features)/) {
+                if (section == "root" && (index(key, "\\") > 0 || key ~ /^["\047]?(model|model_reasoning_effort|sandbox_mode|approval_policy|approvals_reviewer|agents|features)["\047]?[[:space:]]*($|[.])/)) {
                     fail("quoted or dotted managed key")
                 } else if ((section == "agents" || section == "features") && key ~ /^("|\047)?(max_threads|max_depth|goals)/) {
                     fail("quoted or dotted managed key")
@@ -687,7 +712,7 @@ assert_safe_toml_merge_input() {
                 fail("managed table cannot be a root key")
                 next
             }
-            if (section == "root" && (key == "model" || key == "model_reasoning_effort" || key == "sandbox_mode")) {
+            if (section == "root" && (key == "model" || key == "model_reasoning_effort" || key == "sandbox_mode" || key == "approval_policy" || key == "approvals_reviewer")) {
                 managed_seen[section SUBSEP key]++
                 if (managed_seen[section SUBSEP key] != 1) {
                     fail("managed key is repeated")
@@ -725,14 +750,14 @@ merge_managed_config() {
             current = "root"
         }
         function managed_key(section, key) {
-            return (section == "root" && (key == "model" || key == "model_reasoning_effort" || key == "sandbox_mode")) ||
+            return (section == "root" && (key == "model" || key == "model_reasoning_effort" || key == "sandbox_mode" || key == "approval_policy" || key == "approvals_reviewer")) ||
                    (section == "agents" && (key == "max_threads" || key == "max_depth")) ||
                    (section == "features" && key == "goals")
         }
         function flush_missing(section,    key, position, count) {
             count = 0
             if (section == "root") {
-                order[1] = "model"; order[2] = "model_reasoning_effort"; order[3] = "sandbox_mode"; count = 3
+                order[1] = "model"; order[2] = "model_reasoning_effort"; order[3] = "sandbox_mode"; order[4] = "approval_policy"; order[5] = "approvals_reviewer"; count = 5
             } else if (section == "agents") {
                 order[1] = "max_threads"; order[2] = "max_depth"; count = 2
             } else if (section == "features") {
@@ -747,6 +772,10 @@ merge_managed_config() {
             }
         }
         FNR == NR {
+            if ($0 ~ /^[[:space:]]*\[\[[^]]+\]\][[:space:]]*(#.*)?$/) {
+                section = "other"
+                next
+            }
             if ($0 ~ /^[[:space:]]*\[[^]]+\][[:space:]]*(#.*)?$/) {
                 header = $0
                 sub(/^[[:space:]]*\[/, "", header)
@@ -766,6 +795,12 @@ merge_managed_config() {
             next
         }
         {
+            if ($0 ~ /^[[:space:]]*\[\[[^]]+\]\][[:space:]]*(#.*)?$/) {
+                flush_missing(current)
+                current = "other"
+                print
+                next
+            }
             if ($0 ~ /^[[:space:]]*\[[^]]+\][[:space:]]*(#.*)?$/) {
                 flush_missing(current)
                 header = $0
@@ -792,6 +827,8 @@ merge_managed_config() {
             required["root" SUBSEP "model"] = 1
             required["root" SUBSEP "model_reasoning_effort"] = 1
             required["root" SUBSEP "sandbox_mode"] = 1
+            required["root" SUBSEP "approval_policy"] = 1
+            required["root" SUBSEP "approvals_reviewer"] = 1
             required["agents" SUBSEP "max_threads"] = 1
             required["agents" SUBSEP "max_depth"] = 1
             required["features" SUBSEP "goals"] = 1

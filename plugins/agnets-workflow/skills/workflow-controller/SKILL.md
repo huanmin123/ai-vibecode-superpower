@@ -9,15 +9,16 @@ description: "使用本地工作流控制器持久化当前 v3 Codex 任务 DAG�
 
 ## 必经流程
 
-1. 创建 `routing_schema_version=3` 的 JSON 清单。必须包含 `task_id`、绝对路径 `workspace`、`workspace_claims`、`goal`、唯一 `requirements`、DAG `nodes`、完整路由字段、结构化 `assurance_assessment`、`assurance_level`、`review_context` 和 `review_entry_stage`。`workspace_claims` 为非空 `{mode:"read"|"write",prefix:"..."}` 数组。`assurance_level` 只能是 `terra` 或 `sol`；起点只能是 `terra_single`、`terra_cohort`、`sol_high` 或 `sol_xhigh`，不得直接进入 `sol_max`。
-2. 调用 `workflow_init`，再调用 `workflow_ready`。main/root 为每个就绪节点创建原生实例；实例开始首个回合后，以真实任务路径、role 和 `native_agent_started=true` 调用 `workflow_start`。未启动的预定实例在确认停止后使用 `workflow_rebind_pending` 更换 owner。运行节点使用 `workflow_heartbeat` 和 `workflow_checkpoint` 留下可恢复进度。
+1. 创建 `routing_schema_version=3` 的 JSON 清单。必须包含 `task_id`、绝对路径 `workspace`、`workspace_claims`、`goal`、唯一 `requirements`、DAG `nodes`、完整路由字段、结构化 `assurance_assessment`、`assurance_level`、`review_context` 和 `review_entry_stage`。`workspace_claims` 为非空 `{mode:"read"|"write",prefix:"..."}` 数组，优先最小可行范围；`write "."` 仅用于真正全工作区副作用，并且必须提供非空、不超过 2048 字符的 `global_write_justification`。`assurance_level` 只能是 `terra` 或 `sol`；起点只能是 `terra_single`、`terra_cohort`、`sol_high` 或 `sol_xhigh`，不得直接进入 `sol_max`。
+2. 调用 `workflow_init`，再调用 `workflow_ready`。main/root 为每个就绪节点创建原生实例；实例开始首个回合后，以真实任务路径、role 和 `native_agent_started=true` 调用 `workflow_start`。未启动的预定实例在确认停止后使用 `workflow_rebind_pending` 更换 owner。运行节点使用 `workflow_heartbeat` 和 `workflow_checkpoint` 留下可恢复进度。**即将修改工作区文件时**，该 running claim 先用 `workflow_acquire_write_lock` 对最小实际相对路径申请锁，完成这一原子写入组后立即用 `workflow_release_write_lock` 释放；不得因未来可能修改而预先锁定声明范围。节点完成、放弃、救援或重排队会自动清理该 claim 尚未释放的路径锁。
 3. 所有工作节点完成后，main/root 完成验证、清理派生产物并调用 `workflow_audit_context` 冻结证据，再进入唯一末端审核门。`terra_single` 失败后记录精确 repair，进入 `terra_cohort`；cohort 不通过后 repair 并升级 `sol_high`。Sol 审核单调升级到 high、xhigh、max initial 和 max closure。closure 有效失败进入 `scope_decision_required`，必须交由用户决定。
 4. 审核 JSON 必须含 `auditor_task`、`auditor_role`、`claim_id`、`verdict`、`requirement_coverage`、`workflow_snapshot`、`workspace_fingerprint`、`scope_and_regression`、`verification_gaps`、`residual_risk`、`independent_assessment`、`history_reconciliation` 和 `review_history_digest`。`fail` 必须含 blocking finding；`pass` 不得含 blocking finding。
 5. 审核代理记录审核并完成原生回合后，main/root 以匹配 claim 的 `completion_attestation=native_agent_finished` 调用 `workflow_complete`，再调用 `workflow_close_check`。只有 `close_allowed=true` 才能交付或发布。
 
 ## 控制器边界
 
-- 当前控制器只读取和写入 v3 SQLite 状态；其他清单或历史状态不会迁移、恢复或执行。
+- 当前控制器只读取和写入 v3 SQLite 状态。`workflow.sqlite` 保存工作区 claims/lease 协调，`<task_id>.sqlite` 保存任务状态；新任务以外的操作不会创建或重建前者。其他清单或历史状态不会迁移、恢复或执行；新的 `workflow_init` 会删除已识别的遗留 JSON 协调文件。
 - `read_only` 节点使用只读 role；Luna executor 只能认领完整 `delegable` 契约且 `execution_owner` 与真实任务路径一致。非审核 `protected` 节点由 Terra 执行；`quality_review` 只允许 `avsp_terra_xhigh`，`total_review` 使用 Sol role。
 - 控制器记录 agent 提供的任务路径和 claim，但不验证 Codex 身份。`workflow_start` 和 `workflow_complete` 的 lifecycle 字段是审计声明，不是宿主认证。
-- `state_dir` 必须是绝对路径。工作区 lease 通过 authority、registry 与 task state 的固定锁序保护；声明范围不冲突的任务可以并行。扩大 claims 需使用新 `task_id`。
+- `state_dir` 必须是绝对路径；每次新的 `workflow_init` 都要求它位于目标工作区内，并且除标准 `<workspace>/.codex/workflow-controller/` 外不得使用 `.git`、`node_modules`、`.venv` 等指纹排除目录。工作区 lease 通过 `workflow.sqlite` 的短 SQLite 写事务保护；任务执行本身不持有工作区写事务。`workspace_claims` 是可申请路径锁的不可变审计上界，不是初始化时的互斥锁：声明重叠的任务可以并行，实际路径相同或一方是另一方的祖先时才互斥。只读节点不得申请写锁；`workflow_status` 和 `workflow_stale` 可见当前工作区的实际锁，锁不会因时间自动释放。根目录写锁仅限真正全工作区副作用，并要提供具体 `purpose`；扩大 claims 仍需使用新 `task_id`。
+- `workflow_prune_expired` 与隔离恢复会移动或删除跨任务状态和审查制品，属于显式工作区维护窗口；它们可以串行校验工作区 lease。普通 `claim`、`heartbeat`、`checkpoint`、`complete` 和审核记录只锁定对应任务数据库。

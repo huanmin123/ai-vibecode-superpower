@@ -1,9 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createReadStream, promises as fs } from 'node:fs';
-import os from 'node:os';
+import { DatabaseSync } from 'node:sqlite';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { deleteTaskState, readTaskState, taskStateExists, writeTaskState } from './sqlite_task_store.mjs';
+import { deleteTaskState, readTaskState, taskStateExists, withTaskStateTransaction, writeTaskState } from './sqlite_task_store.mjs';
+import { createWorkspaceControl, readWorkspaceControl, withWorkspaceControlTransaction, workspaceControlExists } from './workspace_control_store.mjs';
 
 export const VERSION = 1;
 const REVIEW_PROTOCOL_VERSION = 3;
@@ -48,9 +50,10 @@ const READ_ONLY_FALLBACK_ROLE_SET = new Set([...READ_ONLY_FALLBACK_ROLES.values(
 const PROTECTED_EXECUTOR_ROLE = 'avsp_terra_high';
 const ROUTING_FIELDS = ['execution_risk', 'routing_reason', 'execution_owner', 'integration_owner', 'quality_guard'];
 const IGNORED_DIRECTORIES = new Set(['.git', '.codex', 'node_modules', '.venv']);
-const WORKSPACE_LEASE_AUTHORITY_FILENAME = '.codex-workflow-controller-authority.json';
-const WORKSPACE_LEASE_PUBLICATION_SUFFIX = '.publication.json';
-const WORKSPACE_LEASE_AUTHORITY_VERSION = 3;
+const WORKSPACE_CONTROL_FILENAME = 'workflow.sqlite';
+// Obsolete v1/v2 coordination files are removed before a new v3 control DB is created.
+const RETIRED_WORKSPACE_CONTROL_ROOT_FILENAME = '.codex-workflow-controller-authority.json';
+const RETIRED_WORKSPACE_CONTROL_PUBLICATION_SUFFIX = '.publication.json';
 const MAX_MANIFEST_BYTES = 1 * 1024 * 1024;
 const MAX_NODE_RESULT_BYTES = 64 * 1024;
 const MAX_REVIEW_BYTES = 128 * 1024;
@@ -78,36 +81,47 @@ const DEFAULT_TASK_RETENTION_DAYS = 7;
 const QUARANTINE_AFTER_DAYS = 30;
 const ERROR_STATE_RETENTION_DAYS = 365;
 const DAY_MS = 24 * 60 * 60 * 1000;
-const PRUNE_SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const MAX_PRUNE_REPORT_ENTRIES = 128;
-const PRUNE_SWEEP_FILENAME = '.workflow-prune-sweep.json';
 const SQLITE_STATE_SUFFIX = '.sqlite';
 const ERROR_STATE_DIRECTORY = '.workflow-errors';
-const ERROR_QUARANTINE_FILENAME = 'quarantine.json';
-const QUARANTINE_EXPIRY_FILENAME = '.quarantine-expiry.json';
+const QUARANTINE_DATABASE_FILENAME = 'quarantine.sqlite';
+const QUARANTINE_DATABASE_SCHEMA_VERSION = 1;
+const QUARANTINE_DATABASE_BUSY_TIMEOUT_MS = 5_000;
 const REVIEW_ARTIFACT_DIRECTORY = '.workflow-review-results';
 const QUARANTINE_REVIEW_DIRECTORY = 'review-results';
 const MAX_QUARANTINE_BYTES = 32 * 1024;
 const MAX_WINDOWS_PATH_LENGTH = 260;
-const READ_ONLY_COMMANDS = new Set(['audit-context', 'doctor', 'fingerprint', 'ready', 'stale', 'status']);
-
 export class ControllerError extends Error {}
+
+function asControllerError(error) {
+  if (error instanceof ControllerError) return error;
+  const wrapped = new ControllerError(error?.message ?? String(error));
+  wrapped.cause = error;
+  return wrapped;
+}
 
 const utcNow = () => new Date().toISOString();
 const hasOwn = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
-const DEFAULT_STALE_LOCK_SEC = 30;
+const pathIsWithin = (root, candidate) => {
+  const relative = path.relative(root, candidate);
+  return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
+};
 const DEFAULT_LEASE_SEC = 1800;
 const DEFAULT_ACTIVATION_TIMEOUT_SEC = 600;
 const WORKSPACE_LEASE_VERSION = 3;
 const WORKSPACE_CLAIM_MODES = new Set(['read', 'write']);
 const MAX_WORKSPACE_CLAIMS = 128;
 const MAX_WORKSPACE_CLAIM_PREFIX_LENGTH = 1024;
+const MAX_GLOBAL_WRITE_JUSTIFICATION_LENGTH = 2_048;
 const MAX_WORKSPACE_ACTIVE_TASKS = 64;
+const MAX_WORKSPACE_ACTIVE_WRITE_LOCKS = 512;
+const MAX_WRITE_LOCK_PREFIXES_PER_REQUEST = 64;
 const ROOT_RESCUE_ROLE = 'main/root';
 const NATIVE_AGENT_FINISHED = 'native_agent_finished';
 const ROOT_RESCUE_SELF_COMPLETION = 'root_rescue_self_completion';
 const NATIVE_AGENT_EXIT_CONFIRMED = 'native_agent_exit_confirmed';
 const NATIVE_AGENT_START_FAILED = 'native_agent_start_failed';
+const taskStateTransactionContext = new AsyncLocalStorage();
 
 function requiredString(value, name) {
   if (typeof value !== 'string' || !value.trim()) throw new ControllerError(`${name} must be a non-empty string`);
@@ -622,6 +636,25 @@ function statePath(stateDir, taskId) {
   return path.join(path.resolve(stateDir), `${taskId}${SQLITE_STATE_SUFFIX}`);
 }
 
+async function readManifest(value) {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    let serialized;
+    try { serialized = JSON.stringify(value); }
+    catch (error) { throw new ControllerError(`Manifest is not valid JSON: ${error.message}`); }
+    if (Buffer.byteLength(serialized, 'utf8') > MAX_MANIFEST_BYTES) throw new ControllerError(`Manifest exceeds the ${MAX_MANIFEST_BYTES}-byte limit`);
+    return value;
+  }
+  if (typeof value !== 'string' || !value.trim()) throw new ControllerError('Manifest must be a non-empty JSON object, inline JSON string, or file path');
+  const trimmed = value.trim();
+  if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return readJson(value, { label: 'Manifest', maxBytes: MAX_MANIFEST_BYTES });
+  let parsed;
+  try { parsed = JSON.parse(trimmed); }
+  catch (error) { throw new ControllerError(`Invalid inline Manifest JSON: ${error.message}`); }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new ControllerError('Inline Manifest JSON must be an object');
+  if (Buffer.byteLength(trimmed, 'utf8') > MAX_MANIFEST_BYTES) throw new ControllerError(`Manifest exceeds the ${MAX_MANIFEST_BYTES}-byte limit`);
+  return parsed;
+}
+
 function databasePath(filePath) {
   if (!filePath.endsWith(SQLITE_STATE_SUFFIX)) throw new ControllerError(`Invalid SQLite task state path: ${filePath}`);
   return filePath;
@@ -632,6 +665,13 @@ async function stateExists(filePath) {
 }
 
 async function writeState(filePath, state, { parentAuthority = null } = {}) {
+  const transaction = taskStateTransactionContext.getStore();
+  if (transaction?.filePath && sameStatePath(transaction.filePath, filePath)) {
+    const authority = parentAuthority ?? transaction.parentAuthority;
+    await verifyRegularDirectorySnapshot(authority, 'Controller state parent');
+    transaction.state = state;
+    return;
+  }
   const authority = parentAuthority ?? await stateParentAuthorityForState(state, filePath);
   await verifyRegularDirectorySnapshot(authority, 'Controller state parent');
   await writeTaskState(databasePath(filePath), state, { parentAuthority: authority });
@@ -657,10 +697,6 @@ async function canonicalWorkspace(workspaceValue) {
   try { metadata = await fs.stat(workspace); } catch { throw new ControllerError(`Workspace is not a directory: ${workspace}`); }
   if (!metadata.isDirectory()) throw new ControllerError(`Workspace is not a directory: ${workspace}`);
   return workspace;
-}
-
-function workspaceLeasePath(workspace) {
-  return path.join(workspace, '.codex', 'workflow-controller', 'workspace-lease.json');
 }
 
 async function readJsonSnapshot(filePath, { label = 'JSON input', maxBytes = MAX_MANIFEST_BYTES } = {}) {
@@ -717,12 +753,9 @@ async function verifyJsonSnapshot(filePath, snapshot, label = 'JSON input') {
   if (metadata.isSymbolicLink() || !metadata.isFile() || !sameFileIdentity(snapshot.identity, metadata)) throw new ControllerError(`${label} changed after it was read: ${filePath}`);
 }
 
-function workspaceLeaseAuthorityPath(workspace) { return path.join(workspace, WORKSPACE_LEASE_AUTHORITY_FILENAME); }
-function workspaceLeasePublicationIntentPath(workspace) { return `${workspaceLeaseAuthorityPath(workspace)}${WORKSPACE_LEASE_PUBLICATION_SUFFIX}`; }
-
 function isControllerWorkspaceRootFile(name) {
   const key = workspacePathKey(name);
-  const authority = workspacePathKey(WORKSPACE_LEASE_AUTHORITY_FILENAME);
+  const authority = workspacePathKey(RETIRED_WORKSPACE_CONTROL_ROOT_FILENAME);
   return key === authority || key.startsWith(`${authority}.`);
 }
 
@@ -741,31 +774,6 @@ function validPersistentFileObjectIdentity(identity) {
     && hasExactFields(identity, new Set(['dev', 'ino']))
     && typeof identity.dev === 'string' && /^-?\d+$/u.test(identity.dev)
     && typeof identity.ino === 'string' && /^-?\d+$/u.test(identity.ino);
-}
-
-async function safeWorkspaceLeaseControlDirectory(workspace, { create = false } = {}) {
-  const workspaceRealPath = await fs.realpath(workspace);
-  const workspaceMetadata = await fs.lstat(workspaceRealPath, { bigint: true });
-  if (workspaceMetadata.isSymbolicLink() || !workspaceMetadata.isDirectory()) throw new ControllerError(`Workspace authority root is not a regular directory: ${workspace}`);
-  let current = workspaceRealPath;
-  let createdControlDirectory = false;
-  for (const segment of ['.codex', 'workflow-controller']) {
-    current = path.join(current, segment);
-    let metadata;
-    try { metadata = await fs.lstat(current, { bigint: true }); }
-    catch (error) {
-      if (error.code !== 'ENOENT') throw error;
-      if (!create) throw new ControllerError(`Workspace lease control directory does not exist: ${current}`);
-      await fs.mkdir(current);
-      if (segment === 'workflow-controller') createdControlDirectory = true;
-      metadata = await fs.lstat(current, { bigint: true });
-    }
-    if (metadata.isSymbolicLink() || !metadata.isDirectory()) throw new ControllerError(`Workspace lease control path must not contain a symbolic link or reparse point: ${current}`);
-    const realPath = await fs.realpath(current);
-    if (!pathIsWithinPhysicalRoot(workspaceRealPath, realPath)) throw new ControllerError(`Workspace lease control path escapes the workspace: ${current}`);
-  }
-  const metadata = await fs.lstat(current, { bigint: true });
-  return { workspace_real_path: workspaceRealPath, workspace_identity: workspaceDirectoryIdentity(workspaceMetadata), control_directory: current, control_real_path: await fs.realpath(current), control_identity: workspaceDirectoryIdentity(metadata), created_control_directory: createdControlDirectory };
 }
 
 async function snapshotRegularDirectory(directory, label) {
@@ -814,105 +822,6 @@ async function attachStateParentAuthority(state, filePath, parentAuthority = nul
   return authority;
 }
 
-function workspaceLeaseAuthorityRecord(workspace, control, { registryIdentity = null, createdAt = utcNow(), registryBoundAt = null } = {}) {
-  return {
-    version: WORKSPACE_LEASE_AUTHORITY_VERSION,
-    workspace,
-    workspace_identity: control.workspace_identity,
-    control_directory: control.control_directory,
-    control_real_path: control.control_real_path,
-    control_identity: control.control_identity,
-    registry_path: workspaceLeasePath(workspace),
-    registry_initialized: registryIdentity !== null,
-    registry_identity: registryIdentity,
-    registry_bound_at: registryIdentity === null ? null : registryBoundAt ?? utcNow(),
-    created_at: createdAt,
-  };
-}
-
-function workspaceLeaseControlMatches(record, control) {
-  return sameWorkspaceDirectoryIdentity(record.workspace_identity, control.workspace_identity)
-    && sameWorkspaceDirectoryIdentity(record.control_identity, control.control_identity)
-    && sameStatePath(record.control_directory, control.control_directory)
-    && sameStatePath(record.control_real_path, control.control_real_path);
-}
-
-function workspaceLeaseControlFromRecord(record) {
-  return {
-    workspace_identity: record.workspace_identity,
-    control_directory: record.control_directory,
-    control_real_path: record.control_real_path,
-    control_identity: record.control_identity,
-  };
-}
-
-function validateWorkspaceLeaseAuthorityRecord(record, workspace, authorityPath) {
-  const baseFields = ['version', 'workspace', 'workspace_identity', 'control_directory', 'control_real_path', 'control_identity', 'registry_path', 'created_at'];
-  const fields = new Set([...baseFields, 'registry_initialized', 'registry_identity', 'registry_bound_at']);
-  const validRegistryBinding = (
-    typeof record.registry_initialized === 'boolean'
-    && (record.registry_initialized
-      ? validPersistentFileObjectIdentity(record.registry_identity) && validTimestamp(record.registry_bound_at)
-      : record.registry_identity === null && record.registry_bound_at === null)
-  );
-  if (!hasExactFields(record, fields) || record?.version !== WORKSPACE_LEASE_AUTHORITY_VERSION || !validRegistryBinding || record.workspace !== workspace || record.registry_path !== workspaceLeasePath(workspace)
-    || record.control_directory !== path.dirname(record.registry_path) || typeof record.control_real_path !== 'string' || !path.isAbsolute(record.control_real_path)
-    || !sameStatePath(record.control_real_path, record.control_directory) || !validTimestamp(record.created_at)
-    || !validPersistentFileObjectIdentity(record.workspace_identity)
-    || !validPersistentFileObjectIdentity(record.control_identity)) {
-    throw new ControllerError(`Unsupported workspace lease authority: ${authorityPath}`);
-  }
-}
-
-async function readWorkspaceLeaseAuthority(workspace) {
-  const authorityPath = workspaceLeaseAuthorityPath(workspace);
-  const snapshot = await readJsonSnapshot(authorityPath, { label: 'Workspace lease authority', maxBytes: MAX_MANIFEST_BYTES });
-  const record = snapshot.value;
-  validateWorkspaceLeaseAuthorityRecord(record, workspace, authorityPath);
-  const control = await safeWorkspaceLeaseControlDirectory(workspace);
-  if (!workspaceLeaseControlMatches(record, control)) throw new ControllerError(`Workspace lease control directory identity changed: ${record.control_directory}`);
-  return { authority_path: authorityPath, authority_identity: snapshot.identity, record };
-}
-
-async function verifyWorkspaceLeaseAuthoritySnapshot(snapshot) {
-  const metadata = await fs.lstat(snapshot.authority_path, { bigint: true });
-  if (metadata.isSymbolicLink() || !metadata.isFile() || !sameFileIdentity(snapshot.authority_identity, metadata)) throw new ControllerError(`Workspace lease authority changed: ${snapshot.authority_path}`);
-  const current = await readWorkspaceLeaseAuthority(snapshot.record.workspace);
-  if (!sameJson(current.record, snapshot.record)) throw new ControllerError(`Workspace lease authority changed: ${snapshot.authority_path}`);
-}
-
-function validateWorkspaceLeasePublicationIntent(intent, workspace) {
-  const authorityPath = workspaceLeaseAuthorityPath(workspace);
-  const fields = new Set(['version', 'workspace', 'authority_path', 'registry_path', 'prior_authority', 'lease']);
-  if (!hasExactFields(intent, fields) || intent.version !== 1 || intent.workspace !== workspace || intent.authority_path !== authorityPath
-    || intent.registry_path !== workspaceLeasePath(workspace)) throw new ControllerError(`Unsupported workspace lease publication intent: ${workspaceLeasePublicationIntentPath(workspace)}`);
-  validateWorkspaceLeaseAuthorityRecord(intent.prior_authority, workspace, authorityPath);
-  if (intent.prior_authority.version !== WORKSPACE_LEASE_AUTHORITY_VERSION || !intent.lease || typeof intent.lease !== 'object' || Array.isArray(intent.lease)) {
-    throw new ControllerError(`Unsupported workspace lease publication intent: ${workspaceLeasePublicationIntentPath(workspace)}`);
-  }
-}
-
-function isRecognizedLegacyWorkspaceLeasePublicationIntent(intent, workspace) {
-  return intent && typeof intent === 'object' && !Array.isArray(intent)
-    && intent.version === 1
-    && ((Number.isSafeInteger(intent.prior_authority?.version)
-      && intent.prior_authority.version >= 1 && intent.prior_authority.version < WORKSPACE_LEASE_AUTHORITY_VERSION)
-      || (Number.isSafeInteger(intent.lease?.version)
-        && intent.lease.version >= 1 && intent.lease.version < WORKSPACE_LEASE_VERSION));
-}
-
-async function archiveLegacyWorkspaceLeasePublicationIntent(workspace) {
-  const intentPath = workspaceLeasePublicationIntentPath(workspace);
-  let snapshot;
-  try { snapshot = await readJsonSnapshot(intentPath, { label: 'Workspace lease publication intent', maxBytes: MAX_MANIFEST_BYTES }); }
-  catch (error) { if (error instanceof ControllerError && error.message.startsWith('Workspace lease publication intent does not exist:')) return null; throw error; }
-  if (!isRecognizedLegacyWorkspaceLeasePublicationIntent(snapshot.value, workspace)) return null;
-  await verifyJsonSnapshot(intentPath, snapshot, 'Workspace lease publication intent');
-  const archivePath = `${intentPath}.legacy-v${snapshot.value.prior_authority.version}-${utcNow().replace(/[:.]/g, '-')}-${randomUUID()}`;
-  await fs.rename(intentPath, archivePath);
-  return archivePath;
-}
-
 async function unlinkOwnedFile(filePath, identity) {
   try {
     const metadata = await fs.lstat(filePath, { bigint: true });
@@ -932,247 +841,15 @@ async function verifyOwnedFile(filePath, identity, label) {
   }
 }
 
-async function recoverWorkspaceLeasePublication(workspace, { authorityParent } = {}) {
-  if (!authorityParent) throw new ControllerError(`Workspace lease publication recovery requires a caller-verified authority parent: ${workspace}`);
-  await verifyRegularDirectorySnapshot(authorityParent, 'Workspace authority parent');
-  const intentPath = workspaceLeasePublicationIntentPath(workspace);
-  let snapshot;
-  try { snapshot = await readJsonSnapshot(intentPath, { label: 'Workspace lease publication intent', maxBytes: MAX_MANIFEST_BYTES }); }
-  catch (error) { if (error instanceof ControllerError && error.message.startsWith('Workspace lease publication intent does not exist:')) return; throw error; }
-  const intent = snapshot.value;
-  validateWorkspaceLeasePublicationIntent(intent, workspace);
-  const current = await readWorkspaceLeaseAuthority(workspace);
-  let registrySnapshot;
-  try { registrySnapshot = await readJsonSnapshot(intent.registry_path, { label: 'Workspace lease', maxBytes: MAX_MANIFEST_BYTES }); }
-  catch (error) {
-    if (error instanceof ControllerError && error.message.startsWith('Workspace lease does not exist:')) return;
-    throw error;
-  }
-  await validateWorkspaceLease(registrySnapshot.value, intent.registry_path);
-  if (!sameJson(registrySnapshot.value, intent.lease)) {
-    // An interruption before registry publication leaves a harmless intent.
-    // A substituted registry remains fail-closed.
-    if (sameJson(current.record, intent.prior_authority) && current.record.registry_initialized
-      && sameFileObjectIdentity(current.record.registry_identity, registrySnapshot.object_identity)) {
-      await unlinkOwnedFile(intentPath, snapshot.object_identity);
-      return;
-    }
-    throw new ControllerError(`Workspace lease publication intent does not match the current registry: ${intentPath}`);
-  }
-  if (sameJson(current.record, intent.prior_authority)) {
-    const record = workspaceLeaseAuthorityRecord(workspace, workspaceLeaseControlFromRecord(current.record), {
-      registryIdentity: registrySnapshot.object_identity,
-      createdAt: current.record.created_at,
-      registryBoundAt: utcNow(),
-    });
-    await verifyWorkspaceLeaseAuthoritySnapshot(current);
-    await atomicWrite(intent.authority_path, record, MAX_MANIFEST_BYTES, { parentAuthority: authorityParent });
-  } else if (!current.record.registry_initialized || !sameFileObjectIdentity(current.record.registry_identity, registrySnapshot.object_identity)) {
-    throw new ControllerError(`Workspace lease publication intent does not match the current authority or registry: ${intentPath}`);
-  }
-  await unlinkOwnedFile(intentPath, snapshot.object_identity);
-}
-
-async function workspaceLeaseRegistryIdentity(leasePath) {
-  const metadata = await fs.lstat(leasePath, { bigint: true });
-  if (metadata.isSymbolicLink() || !metadata.isFile()) throw new ControllerError(`Workspace lease is not a regular registry file: ${leasePath}`);
-  const identity = persistentFileObjectIdentity(metadata);
-  if (!validPersistentFileObjectIdentity(identity)) throw new ControllerError(`Workspace lease registry has no stable file identity: ${leasePath}`);
-  return identity;
-}
-
-async function verifyWorkspaceLeaseRegistryBinding(snapshot, { allowUninitializedMissing = false } = {}) {
-  const record = snapshot.record;
-  if (record.version !== WORKSPACE_LEASE_AUTHORITY_VERSION) throw new ControllerError(`Workspace lease authority requires explicit migration: ${snapshot.authority_path}`);
-  let identity;
-  try { identity = await workspaceLeaseRegistryIdentity(record.registry_path); }
-  catch (error) {
-    if (error.code === 'ENOENT' && !record.registry_initialized && allowUninitializedMissing) return;
-    if (error.code === 'ENOENT') throw new ControllerError(`Workspace lease registry is missing after initialization: ${record.registry_path}`);
-    throw error;
-  }
-  if (!record.registry_initialized) throw new ControllerError(`Workspace lease registry exists without an initialized authority binding: ${record.registry_path}`);
-  if (!sameFileObjectIdentity(record.registry_identity, identity)) throw new ControllerError(`Workspace lease registry identity changed: ${record.registry_path}`);
-}
-
-async function recoverLegacyWorkspaceLease(leasePath, workspace) {
-  const snapshot = await readJsonSnapshot(leasePath, { label: 'Workspace lease', maxBytes: MAX_MANIFEST_BYTES });
-  const lease = snapshot.value;
-  if (!lease || typeof lease !== 'object' || Array.isArray(lease) || !Number.isSafeInteger(lease.version) || lease.version < 1 || lease.version >= WORKSPACE_LEASE_VERSION || lease.workspace !== workspace) {
-    throw new ControllerError(`Unsupported workspace lease version; destructive rebuild requires a recognized legacy registry: ${leasePath}`);
-  }
-  await verifyJsonSnapshot(leasePath, snapshot, 'Workspace lease');
-  const archivePath = `${leasePath}.legacy-v${lease.version}-${utcNow().replace(/[:.]/g, '-')}-${randomUUID()}`;
-  await fs.rename(leasePath, archivePath);
-  const archived = await fs.lstat(archivePath, { bigint: true });
-  if (archived.isSymbolicLink() || !archived.isFile() || !sameFileObjectIdentity(snapshot.object_identity, persistentFileObjectIdentity(archived))) {
-    throw new ControllerError(`Legacy workspace lease changed during archival: ${leasePath}`);
-  }
-  return archivePath;
-}
-
-async function archiveOrphanedWorkspaceControlEntries(controlDirectory, { preserve = new Set() } = {}) {
-  const entries = (await fs.readdir(controlDirectory)).sort();
-  const archivedPaths = [];
-  for (const name of entries) {
-    if (preserve.has(name)) continue;
-    const entryPath = path.join(controlDirectory, name);
-    const archivePath = `${entryPath}.legacy-orphaned-${utcNow().replace(/[:.]/g, '-')}-${randomUUID()}`;
-    await fs.rename(entryPath, archivePath);
-    archivedPaths.push(archivePath);
-  }
-  return archivedPaths;
-}
-
-async function archiveLegacyJsonState(filePath, parentAuthority) {
-  const legacyPath = `${filePath.slice(0, -SQLITE_STATE_SUFFIX.length)}.json`;
+async function removeRetiredJsonState(filePath, parentAuthority) {
+  const retiredPath = `${filePath.slice(0, -SQLITE_STATE_SUFFIX.length)}.json`;
   let metadata;
-  try { metadata = await fs.lstat(legacyPath, { bigint: true }); }
+  try { metadata = await fs.lstat(retiredPath, { bigint: true }); }
   catch (error) { if (error.code === 'ENOENT') return null; throw error; }
-  if (metadata.isSymbolicLink() || !metadata.isFile()) throw new ControllerError(`Legacy controller state is not a regular file: ${legacyPath}`);
+  if (metadata.isSymbolicLink() || !metadata.isFile()) throw new ControllerError(`Retired JSON controller state is not a regular file: ${retiredPath}`);
   await verifyRegularDirectorySnapshot(parentAuthority, 'Controller state parent');
-  const archivePath = `${legacyPath}.legacy-orphaned-${utcNow().replace(/[:.]/g, '-')}-${randomUUID()}`;
-  await fs.rename(legacyPath, archivePath);
-  return archivePath;
-}
-
-async function archiveExistingSQLiteState(filePath, parentAuthority) {
-  let metadata;
-  try { metadata = await fs.lstat(filePath, { bigint: true }); }
-  catch (error) { if (error.code === 'ENOENT') return null; throw error; }
-  if (metadata.isSymbolicLink() || !metadata.isFile()) throw new ControllerError(`SQLite controller state is not a regular file: ${filePath}`);
-  await verifyRegularDirectorySnapshot(parentAuthority, 'Controller state parent');
-  const archivePath = `${filePath}.legacy-orphaned-${utcNow().replace(/[:.]/g, '-')}-${randomUUID()}`;
-  await fs.rename(filePath, archivePath);
-  return archivePath;
-}
-
-async function ensureWorkspaceLeaseAuthority(workspace, { allowCreate = false, authorityParent = null } = {}) {
-  let legacyAuthorityArchivePath = null;
-  try {
-    const current = await readWorkspaceLeaseAuthority(workspace);
-    let registrySnapshot = null;
-    try { registrySnapshot = await readJsonSnapshot(current.record.registry_path, { label: 'Workspace lease', maxBytes: MAX_MANIFEST_BYTES }); }
-    catch (error) { if (!(error instanceof ControllerError && error.message.startsWith('Workspace lease does not exist:'))) throw error; }
-    if (!registrySnapshot || !Number.isSafeInteger(registrySnapshot.value?.version) || registrySnapshot.value.version < 1 || registrySnapshot.value.version >= WORKSPACE_LEASE_VERSION) return current;
-    await verifyJsonSnapshot(current.record.registry_path, registrySnapshot, 'Workspace lease');
-    legacyAuthorityArchivePath = `${current.authority_path}.legacy-registry-v${registrySnapshot.value.version}-${utcNow().replace(/[:.]/g, '-')}-${randomUUID()}`;
-    await fs.rename(current.authority_path, legacyAuthorityArchivePath);
-  }
-  catch (error) {
-    const authorityPath = workspaceLeaseAuthorityPath(workspace);
-    if (error instanceof ControllerError && error.message.startsWith('Unsupported workspace lease authority:')) {
-      const snapshot = await readJsonSnapshot(authorityPath, { label: 'Workspace lease authority', maxBytes: MAX_MANIFEST_BYTES });
-      if (!Number.isSafeInteger(snapshot.value?.version) || snapshot.value.version < 1 || snapshot.value.version >= WORKSPACE_LEASE_AUTHORITY_VERSION) throw error;
-      await verifyJsonSnapshot(authorityPath, snapshot, 'Workspace lease authority');
-      legacyAuthorityArchivePath = `${authorityPath}.legacy-v${snapshot.value.version}-${utcNow().replace(/[:.]/g, '-')}-${randomUUID()}`;
-      await fs.rename(authorityPath, legacyAuthorityArchivePath);
-    } else if (!(error instanceof ControllerError && (error.message.startsWith('JSON input does not exist:') || error.message.startsWith('Workspace lease authority does not exist:'))) && error.code !== 'ENOENT') throw error;
-    if (!allowCreate) throw new ControllerError(`Workspace lease authority does not exist: ${workspaceLeaseAuthorityPath(workspace)}`);
-  }
-  if (!authorityParent) throw new ControllerError(`Workspace lease authority creation requires a caller-verified authority parent: ${workspaceLeaseAuthorityPath(workspace)}`);
-  await verifyRegularDirectorySnapshot(authorityParent, 'Workspace authority parent');
-  const control = await safeWorkspaceLeaseControlDirectory(workspace, { create: true });
-  const leasePath = workspaceLeasePath(workspace);
-  let registryIdentity = null;
-  let legacyRegistryArchivePath = null;
-  let registryExists = false;
-  try {
-    const metadata = await fs.lstat(leasePath, { bigint: true });
-    if (metadata.isSymbolicLink() || !metadata.isFile()) throw new ControllerError(`Workspace lease is not a regular registry file: ${leasePath}`);
-    registryExists = true;
-    const snapshot = await readJsonSnapshot(leasePath, { label: 'Workspace lease', maxBytes: MAX_MANIFEST_BYTES });
-    if (snapshot.value?.version === WORKSPACE_LEASE_VERSION) {
-      await validateWorkspaceLease(snapshot.value, leasePath);
-      registryIdentity = snapshot.object_identity;
-    } else {
-      legacyRegistryArchivePath = await recoverLegacyWorkspaceLease(leasePath, workspace);
-    }
-  } catch (error) { if (error.code !== 'ENOENT') throw error; }
-  let orphanedControlEntries = [];
-  if (!registryIdentity) {
-    const preservedEntries = new Set();
-    if (legacyRegistryArchivePath) preservedEntries.add(path.basename(legacyRegistryArchivePath));
-    orphanedControlEntries = await archiveOrphanedWorkspaceControlEntries(control.control_directory, { preserve: preservedEntries });
-  }
-  await atomicWrite(workspaceLeaseAuthorityPath(workspace), workspaceLeaseAuthorityRecord(workspace, control, { registryIdentity }), MAX_MANIFEST_BYTES, { parentAuthority: authorityParent });
-  const authority = await readWorkspaceLeaseAuthority(workspace);
-  if (legacyAuthorityArchivePath || legacyRegistryArchivePath || orphanedControlEntries.length || (!registryExists && !control.created_control_directory) || registryIdentity) {
-    authority.recovery = {
-      mode: legacyAuthorityArchivePath || legacyRegistryArchivePath || orphanedControlEntries.length ? 'destructive_rebuild' : registryIdentity ? 'rebound_current_registry' : 'reinitialized_existing_control_directory',
-      legacy_authority_archive_path: legacyAuthorityArchivePath,
-      legacy_registry_archive_path: legacyRegistryArchivePath,
-      orphaned_control_entry_archive_paths: orphanedControlEntries,
-    };
-  }
-  return authority;
-}
-
-async function withWorkspaceLeaseLock(workspace, callback, { allowAuthorityCreation = false } = {}) {
-  const authorityPath = workspaceLeaseAuthorityPath(workspace);
-  const authorityParent = await snapshotRegularDirectory(path.dirname(authorityPath), 'Workspace authority parent');
-  return withStateLock(authorityPath, async () => {
-    await verifyRegularDirectorySnapshot(authorityParent, 'Workspace authority parent');
-    const authority = await ensureWorkspaceLeaseAuthority(workspace, { allowCreate: allowAuthorityCreation, authorityParent });
-    const legacyPublicationIntentArchivePath = await archiveLegacyWorkspaceLeasePublicationIntent(workspace);
-    await recoverWorkspaceLeasePublication(workspace, { authorityParent });
-    const control = await safeWorkspaceLeaseControlDirectory(workspace);
-    const recovery = legacyPublicationIntentArchivePath
-      ? { ...(authority.recovery ?? { mode: 'destructive_rebuild', legacy_authority_archive_path: null, legacy_registry_archive_path: null, orphaned_control_entry_archive_paths: [] }), mode: 'destructive_rebuild', legacy_publication_intent_archive_path: legacyPublicationIntentArchivePath }
-      : authority.recovery ?? null;
-    const context = {
-      authority,
-      recovery,
-      parent_authorities: {
-        authority: authorityParent,
-        registry: { path: control.control_directory, real_path: control.control_real_path, identity: control.control_identity },
-      },
-    };
-    const leasePath = workspaceLeasePath(workspace);
-    return withStateLock(leasePath, async () => {
-      await verifyWorkspaceLeaseAuthoritySnapshot(context.authority);
-      await verifyWorkspaceLeaseRegistryBinding(context.authority, { allowUninitializedMissing: true });
-      const result = await callback(leasePath, context);
-      await verifyWorkspaceLeaseAuthoritySnapshot(context.authority);
-      await verifyWorkspaceLeaseRegistryBinding(context.authority, { allowUninitializedMissing: true });
-      return result;
-    }, { createParent: false });
-  }, { createParent: false });
-}
-
-async function writeWorkspaceLeaseRegistry(context, leasePath, lease) {
-  await verifyWorkspaceLeaseAuthoritySnapshot(context.authority);
-  await verifyWorkspaceLeaseRegistryBinding(context.authority, { allowUninitializedMissing: true });
-  const prior = context.authority.record;
-  const control = await safeWorkspaceLeaseControlDirectory(prior.workspace);
-  if (!workspaceLeaseControlMatches(prior, control)) throw new ControllerError(`Workspace lease control directory identity changed during registry publication: ${prior.control_directory}`);
-  await verifyRegularDirectorySnapshot(context.parent_authorities.authority, 'Workspace authority parent');
-  await verifyRegularDirectorySnapshot(context.parent_authorities.registry, 'Workspace lease parent');
-  await verifyWorkspaceLeaseAuthoritySnapshot(context.authority);
-  const intentPath = workspaceLeasePublicationIntentPath(prior.workspace);
-  const publicationIntent = {
-    version: 1, workspace: prior.workspace, authority_path: context.authority.authority_path, registry_path: leasePath,
-    prior_authority: prior,
-    lease,
-  };
-  // The durable intent contains the exact registry payload. After a crash we
-  // can bind the newly published file object to the still-authoritative record.
-  await atomicWrite(intentPath, publicationIntent, MAX_MANIFEST_BYTES, { parentAuthority: context.parent_authorities.authority });
-  await atomicWrite(leasePath, lease, MAX_MANIFEST_BYTES, { parentAuthority: context.parent_authorities.registry });
-  const snapshot = await readJsonSnapshot(leasePath, { label: 'Workspace lease', maxBytes: MAX_MANIFEST_BYTES });
-  await validateWorkspaceLease(snapshot.value, leasePath);
-  if (!sameJson(snapshot.value, lease)) throw new ControllerError(`Workspace lease changed after write: ${leasePath}`);
-  const record = workspaceLeaseAuthorityRecord(prior.workspace, workspaceLeaseControlFromRecord(prior), {
-    registryIdentity: snapshot.object_identity,
-    createdAt: prior.created_at,
-    registryBoundAt: utcNow(),
-  });
-  await atomicWrite(context.authority.authority_path, record, MAX_MANIFEST_BYTES, { parentAuthority: context.parent_authorities.authority });
-  context.authority = await readWorkspaceLeaseAuthority(prior.workspace);
-  await verifyWorkspaceLeaseAuthoritySnapshot(context.authority);
-  await verifyWorkspaceLeaseRegistryBinding(context.authority);
-  const intentSnapshot = await readJsonSnapshot(intentPath, { label: 'Workspace lease publication intent', maxBytes: MAX_MANIFEST_BYTES });
-  await unlinkOwnedFile(intentPath, intentSnapshot.object_identity);
+  await fs.unlink(retiredPath);
+  return retiredPath;
 }
 
 function workspacePathKey(value) {
@@ -1261,22 +938,6 @@ function normalizeStoredWorkspaceClaims(rawClaims) {
   return normalized;
 }
 
-async function sleep(milliseconds) { await new Promise(resolve => setTimeout(resolve, milliseconds)); }
-
-async function lockDetails(lockPath) {
-  const [text, metadata] = await Promise.all([fs.readFile(lockPath, 'utf8'), fs.stat(lockPath, { bigint: true })]);
-  const values = Object.fromEntries(text.trim().split(/\s+/).map(part => part.split('=', 2)).filter(([key, value]) => key && value));
-  return {
-    lockPath,
-    pid: Number(values.pid),
-    hostname: values.hostname,
-    created: values.created,
-    createdMs: Date.parse(values.created),
-    ageMs: Date.now() - Number(metadata.mtimeMs),
-    identity: fileIdentity(metadata),
-  };
-}
-
 function sameFileIdentity(expected, metadata) {
   const expectedIdentity = typeof expected?.mtimeNs === 'bigint' && typeof expected?.ctimeNs === 'bigint' ? fileIdentity(expected) : expected;
   const current = fileIdentity(metadata);
@@ -1284,221 +945,24 @@ function sameFileIdentity(expected, metadata) {
     && expectedIdentity?.size === current.size && expectedIdentity?.mtimeNs === current.mtimeNs && expectedIdentity?.ctimeNs === current.ctimeNs;
 }
 
-async function processIsAlive(pid) {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
-  try { process.kill(pid, 0); return true; } catch (error) { if (error.code === 'ESRCH') return false; throw error; }
-}
-
-async function recoveryGuardExists(lockPath) {
-  try { await fs.access(`${lockPath}.recover`); return true; }
-  catch (error) { if (error.code === 'ENOENT') return false; throw error; }
-}
-
-async function tryReclaimStaleCoordinationFile(intentPath, staleAfterSec = DEFAULT_STALE_LOCK_SEC) {
-  let details;
-  try { details = await lockDetails(intentPath); } catch (error) { if (error.code === 'ENOENT') return { reclaimed: false, reason: 'does not exist' }; throw error; }
-  const staleAfterMs = positiveInteger(staleAfterSec, 'stale_after_sec', DEFAULT_STALE_LOCK_SEC) * 1000;
-  if (!details.hostname || !Number.isSafeInteger(details.pid) || details.pid <= 0 || !Number.isFinite(details.createdMs) || Math.abs(Number(BigInt(details.identity.mtimeNs) / 1_000_000n) - details.createdMs) > 5_000) return { reclaimed: false, reason: 'untrusted metadata', details };
-  if (details.hostname !== os.hostname()) return { reclaimed: false, reason: 'another host', details };
-  if (details.ageMs < staleAfterMs) return { reclaimed: false, reason: 'younger than stale threshold', details };
-  if (await processIsAlive(details.pid)) return { reclaimed: false, reason: 'owner is alive', details };
-  let latestMetadata;
-  try { latestMetadata = await fs.stat(intentPath, { bigint: true }); } catch (error) { if (error.code === 'ENOENT') return { reclaimed: false, reason: 'already removed' }; throw error; }
-  if (!sameFileIdentity(details.identity, latestMetadata)) return { reclaimed: false, reason: 'changed while recovering', details };
-  const recoveredPath = `${intentPath}.stale-${utcNow().replace(/[:.]/g, '-')}-${randomUUID()}`;
-  try { await fs.rename(intentPath, recoveredPath); }
-  catch (error) { if (error.code === 'ENOENT') return { reclaimed: false, reason: 'already removed' }; throw error; }
-  return { reclaimed: true, recovered_path: recoveredPath, prior_lock: details };
-}
-
-async function acquireReclaimGuard(intentPath) {
-  const guardPath = `${intentPath}.reclaim`;
-  try {
-    const handle = await fs.open(guardPath, 'wx');
-    await handle.writeFile(`pid=${process.pid} hostname=${os.hostname()} created=${utcNow()}\n`);
-    return { handle, guardPath };
-  } catch (error) {
-    if (error.code !== 'EEXIST') throw error;
-    const recovered = await tryReclaimStaleCoordinationFile(guardPath);
-    if (recovered.reclaimed) return acquireReclaimGuard(intentPath);
-    return null;
-  }
-}
-
-async function reclaimStaleCoordinationFile(intentPath, staleAfterSec = DEFAULT_STALE_LOCK_SEC) {
-  const guard = await acquireReclaimGuard(intentPath);
-  if (!guard) return { reclaimed: false, reason: 'recovery in progress' };
-  try { return await tryReclaimStaleCoordinationFile(intentPath, staleAfterSec); }
-  finally { await releaseIntent(guard.handle, guard.guardPath); }
-}
-
-async function ensureNoRecoveryGuard(lockPath) {
-  if (!await recoveryGuardExists(lockPath)) return;
-  const result = await reclaimStaleCoordinationFile(`${lockPath}.recover`);
-  if (result.reclaimed || !await recoveryGuardExists(lockPath)) return;
-  throw new ControllerError(`Task recovery is in progress: ${lockPath}`);
-}
-
-async function coordinationIntentExists(lockPath) {
-  for (const suffix of ['.writer', '.release']) {
-    try { await fs.access(`${lockPath}${suffix}`); return true; }
-    catch (error) { if (error.code !== 'ENOENT') throw error; }
-  }
-  return false;
-}
-
-async function waitForRecoveryGuardRelease(lockPath, deadline) {
-  while (await recoveryGuardExists(lockPath)) {
-    const reclaimed = await reclaimStaleCoordinationFile(`${lockPath}.recover`);
-    if (reclaimed.reclaimed) continue;
-    if (Date.now() >= deadline) throw new ControllerError(`Task recovery is still in progress: ${lockPath}`);
-    await sleep(25);
-  }
-}
-
-async function waitForCoordinationIntents(lockPath, deadline) {
-  while (await coordinationIntentExists(lockPath)) {
-    for (const suffix of ['.writer', '.release']) await reclaimStaleCoordinationFile(`${lockPath}${suffix}`);
-    if (!await coordinationIntentExists(lockPath)) return;
-    if (Date.now() >= deadline) throw new ControllerError(`Lock turnover is still in progress: ${lockPath}`);
-    await sleep(25);
-  }
-}
-
-async function acquireIntent(intentPath, deadline) {
-  let handle;
-  while (!handle) {
-    try { handle = await fs.open(intentPath, 'wx'); await handle.writeFile(`pid=${process.pid} hostname=${os.hostname()} created=${utcNow()}\n`); }
-    catch (error) {
-      if (error.code !== 'EEXIST') throw error;
-      const reclaimed = await reclaimStaleCoordinationFile(intentPath);
-      if (reclaimed.reclaimed) continue;
-      if (Date.now() >= deadline) throw new ControllerError(`Lock turnover is busy: ${intentPath}`);
-      await sleep(25);
-    }
-  }
-  return handle;
-}
-
-async function openHandleOwnsPath(handle, filePath) {
-  try {
-    const [handleMetadata, pathMetadata] = await Promise.all([handle.stat({ bigint: true }), fs.lstat(filePath, { bigint: true })]);
-    return !pathMetadata.isSymbolicLink() && pathMetadata.isFile()
-      && sameFileObjectIdentity(persistentFileObjectIdentity(handleMetadata), persistentFileObjectIdentity(pathMetadata));
-  } catch (error) {
-    if (error.code === 'ENOENT') return false;
-    throw error;
-  }
-}
-
-async function closeAndUnlinkOwnedPath(handle, filePath) {
-  const identity = persistentFileObjectIdentity(await handle.stat({ bigint: true }));
-  const ownedBeforeClose = await openHandleOwnsPath(handle, filePath);
-  await handle.close();
-  if (!ownedBeforeClose) return false;
-  let current;
-  try { current = await fs.lstat(filePath, { bigint: true }); }
-  catch (error) { if (error.code === 'ENOENT') return false; throw error; }
-  if (current.isSymbolicLink() || !current.isFile() || !sameFileObjectIdentity(identity, persistentFileObjectIdentity(current))) return false;
-  await fs.unlink(filePath).catch(error => { if (error.code !== 'ENOENT') throw error; });
-  return true;
-}
-
-async function releaseIntent(handle, intentPath) {
-  await closeAndUnlinkOwnedPath(handle, intentPath);
-}
-
-async function acquireRecoveryGuard(lockPath) {
-  const recoveryGuardPath = `${lockPath}.recover`;
-  try {
-    const handle = await fs.open(recoveryGuardPath, 'wx');
-    await handle.writeFile(`pid=${process.pid} hostname=${os.hostname()} created=${utcNow()}\n`);
-    return { handle, recoveryGuardPath };
-  } catch (error) {
-    if (error.code !== 'EEXIST') throw error;
-    const reclaimed = await reclaimStaleCoordinationFile(recoveryGuardPath);
-    if (reclaimed.reclaimed) return acquireRecoveryGuard(lockPath);
-    throw new ControllerError(`Stale-lock recovery is already in progress: ${lockPath}`);
-  }
-}
-
-async function recoverStaleLock(filePath, staleAfterSec, { parentAuthority = null } = {}) {
-  if (parentAuthority) await verifyRegularDirectorySnapshot(parentAuthority, 'Controller state parent');
-  const lockPath = `${filePath}.lock`;
-  const { handle: recoveryGuard, recoveryGuardPath } = await acquireRecoveryGuard(lockPath);
-  try {
-    if (parentAuthority) await verifyRegularDirectorySnapshot(parentAuthority, 'Controller state parent');
-    await waitForCoordinationIntents(lockPath, Date.now() + 10_000);
-    let details;
-    try { details = await lockDetails(lockPath); } catch (error) { if (error.code === 'ENOENT') return { recovered: false, reason: 'no lock exists' }; throw error; }
-    const recovered = await reclaimStaleCoordinationFile(lockPath, staleAfterSec);
-    if (!recovered.reclaimed) {
-      if (recovered.reason === 'another host') throw new ControllerError(`Cannot prove a lock from another host is stale: ${lockPath}`);
-      if (recovered.reason === 'younger than stale threshold') throw new ControllerError(`Lock is younger than stale_after_sec: ${lockPath}`);
-      if (recovered.reason === 'owner is alive') throw new ControllerError(`Lock owner is still alive: ${lockPath}`);
-      throw new ControllerError(`Cannot safely recover lock: ${lockPath} (${recovered.reason})`);
-    }
-    return { recovered: true, recovered_lock_path: recovered.recovered_path, prior_lock: details };
-  } finally {
-    await releaseIntent(recoveryGuard, recoveryGuardPath);
-  }
-}
-
-async function withStateLock(filePath, callback, { createParent = true, parentAuthority = null } = {}) {
+// Verify the task-state parent identity before a filesystem side effect. This
+// does not acquire a lock; SQLite transactions protect the state databases.
+async function withVerifiedStateParent(filePath, callback, { createParent = true, parentAuthority = null } = {}) {
   if (parentAuthority) {
     if (!validStateParentAuthority(parentAuthority, filePath)) throw new ControllerError(`Invalid task state parent authority: ${filePath}`);
     await verifyRegularDirectorySnapshot(parentAuthority, 'Controller state parent');
-  } else if (createParent) await fs.mkdir(path.dirname(filePath), { recursive: true });
-  else {
+  } else if (createParent) {
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+  } else {
     const parent = await fs.lstat(path.dirname(filePath));
-    if (parent.isSymbolicLink() || !parent.isDirectory()) throw new ControllerError(`Lock parent is not a regular directory: ${path.dirname(filePath)}`);
+    if (parent.isSymbolicLink() || !parent.isDirectory()) throw new ControllerError(`State parent is not a regular directory: ${path.dirname(filePath)}`);
   }
-  const lockPath = `${filePath}.lock`;
-  const deadline = Date.now() + 10_000;
-  let handle;
-  const writerIntentPath = `${lockPath}.writer`;
-  const writerIntent = await acquireIntent(writerIntentPath, deadline);
-  try {
-    await ensureNoRecoveryGuard(lockPath);
-    while (!handle) {
-      try {
-      handle = await fs.open(lockPath, 'wx');
-      await handle.writeFile(`pid=${process.pid} hostname=${os.hostname()} created=${utcNow()}\n`);
-      } catch (error) {
-        if (error.code !== 'EEXIST') throw error;
-        await ensureNoRecoveryGuard(lockPath);
-        if (Date.now() >= deadline) throw new ControllerError(`Task state is busy: ${filePath}`);
-        await sleep(100);
-      }
-    }
-  } finally {
-    await releaseIntent(writerIntent, writerIntentPath);
-  }
-  try {
-    if (parentAuthority) await verifyRegularDirectorySnapshot(parentAuthority, 'Controller state parent');
-    return await callback();
-  } finally {
-    if (!await openHandleOwnsPath(handle, lockPath)) {
-      await handle.close();
-    } else {
-      const releaseIntentPath = `${lockPath}.release`;
-      let releaseHandle = await acquireIntent(releaseIntentPath, Date.now() + 10_000);
-      try {
-        while (await recoveryGuardExists(lockPath)) {
-          await releaseIntent(releaseHandle, releaseIntentPath);
-          releaseHandle = null;
-          await waitForRecoveryGuardRelease(lockPath, Date.now() + 10_000);
-          releaseHandle = await acquireIntent(releaseIntentPath, Date.now() + 10_000);
-        }
-        await closeAndUnlinkOwnedPath(handle, lockPath);
-      } finally {
-        if (releaseHandle) await releaseIntent(releaseHandle, releaseIntentPath);
-      }
-    }
-  }
+  return callback();
 }
 
 async function loadState(filePath) {
+  const transaction = taskStateTransactionContext.getStore();
+  if (transaction?.filePath && sameStatePath(transaction.filePath, filePath)) return transaction.state;
   const state = await readTaskState(databasePath(filePath));
   if (state === null) throw new ControllerError(`Current SQLite controller state does not exist: ${filePath}`);
   if (!state || typeof state !== 'object' || state.version !== VERSION) throw new ControllerError(`Unsupported controller state: ${filePath}`);
@@ -1688,6 +1152,14 @@ function validateNodes(nodes) {
 
 function isReviewNode(node, routingSchemaVersion = null) {
   return routingSchemaVersion === REVIEW_PROTOCOL_VERSION && (node?.kind === 'total_review' || node?.kind === QUALITY_REVIEW_KIND);
+}
+
+function globalWriteJustification(manifest, workspaceClaims) {
+  if (!workspaceClaims.some(claim => claim.mode === 'write' && claim.prefix === '.')) return null;
+  if (!hasOwn(manifest, 'global_write_justification')) throw new ControllerError('global_write_justification is required for a workspace-wide write claim');
+  const justification = requiredString(manifest.global_write_justification, 'global_write_justification');
+  if (justification.length > MAX_GLOBAL_WRITE_JUSTIFICATION_LENGTH) throw new ControllerError('global_write_justification must be no longer than 2048 characters');
+  return justification;
 }
 
 function reviewNodes(nodes, routingSchemaVersion = null) {
@@ -1937,6 +1409,7 @@ async function makeState(manifest) {
   if (!hasOwn(manifest, 'workspace_claims')) throw new ControllerError('Current v3 manifests require workspace_claims');
   const workspace = await canonicalWorkspace(manifest.workspace);
   const workspaceClaims = await normalizeWorkspaceClaims(manifest.workspace_claims, workspace);
+  const globalWriteReason = globalWriteJustification(manifest, workspaceClaims);
   const goal = requiredString(manifest.goal, 'goal');
   await workspaceFingerprint(workspace, workspaceClaims);
   if (!Array.isArray(manifest.requirements) || !manifest.requirements.length || manifest.requirements.length > MAX_REQUIREMENTS) throw new ControllerError(`Manifest requires between 1 and ${MAX_REQUIREMENTS} requirements`);
@@ -1973,7 +1446,7 @@ async function makeState(manifest) {
   const created = utcNow();
   const events = [{ at: created, type: 'task_initialized', workflow_revision: 0 }];
   if (normalizedReviewDependencies.length) events.push({ at: created, type: 'review_direct_dependencies_completed', node_id: reviewNodes(nodes, routingSchemaVersion)[0].id, added_dependencies: normalizedReviewDependencies, workflow_revision: 0 });
-  const state = { version: VERSION, routing_schema_version: REVIEW_PROTOCOL_VERSION, assurance_level: assuranceLevel, assurance_assessment: assuranceAssessmentValue, review_protocol_version: REVIEW_PROTOCOL_VERSION, review_entry_stage: reviewEntryStage, review_context: reviewContext, task_id: taskId, workspace, workspace_claims: workspaceClaims, goal, requirements, scope: manifest.scope ?? [], non_goals: manifest.non_goals ?? [], nodes, participants: [], reviews: [], repair_records: [], max_review_charter: null, events, workflow_revision: 0, closed_revision: null, closed_at: null, created_at: created, updated_at: created };
+  const state = { version: VERSION, routing_schema_version: REVIEW_PROTOCOL_VERSION, assurance_level: assuranceLevel, assurance_assessment: assuranceAssessmentValue, review_protocol_version: REVIEW_PROTOCOL_VERSION, review_entry_stage: reviewEntryStage, review_context: reviewContext, task_id: taskId, workspace, workspace_claims: workspaceClaims, ...(globalWriteReason === null ? {} : { global_write_justification: globalWriteReason }), goal, requirements, scope: manifest.scope ?? [], non_goals: manifest.non_goals ?? [], nodes, participants: [], reviews: [], repair_records: [], max_review_charter: null, events, workflow_revision: 0, closed_revision: null, closed_at: null, created_at: created, updated_at: created };
   return state;
 }
 
@@ -2034,26 +1507,6 @@ function compactState(state) {
   return { task_id: state.task_id, workspace: state.workspace, workspace_claims: state.workspace_claims, workspace_lease: state.workspace_lease ?? null, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), assurance_assessment: state.assurance_assessment, review_protocol_version: state.review_protocol_version, review_entry_stage: state.review_entry_stage, review_context: state.review_context, goal: state.goal, nodes: Object.values(state.nodes), ready_nodes: readyNodes(state), stale_nodes: staleNodes(state), participants: state.participants, reviews: externallyVisibleReviews(state), repair_records: state.repair_records, workflow_revision: state.workflow_revision, updated_at: state.updated_at };
 }
 
-async function coordinationStatus(lockPath) {
-  const files = [];
-  for (const suffix of ['', '.writer', '.release', '.recover']) {
-    const candidate = `${lockPath}${suffix}`;
-    try {
-      const details = await lockDetails(candidate);
-      let owner_alive = null;
-      if (details.hostname === os.hostname()) {
-        try { owner_alive = await processIsAlive(details.pid); }
-        catch { owner_alive = null; }
-      }
-      files.push({ path: candidate, kind: suffix || '.lock', present: true, hostname: details.hostname || null, pid: Number.isSafeInteger(details.pid) ? details.pid : null, created_at: details.created || null, age_ms: details.ageMs, owner_alive });
-    } catch (error) {
-      if (error.code === 'ENOENT') continue;
-      files.push({ path: candidate, kind: suffix || '.lock', present: true, readable: false, error: error.message });
-    }
-  }
-  return files;
-}
-
 function doctorCheck(id, status, detail) { return { id, status, detail }; }
 
 async function unreadableDoctor(parameters, filePath, error) {
@@ -2065,7 +1518,6 @@ async function unreadableDoctor(parameters, filePath, error) {
   } catch (statError) {
     if (statError.code !== 'ENOENT') databaseDetail = { path: database, error: `${error.message}; ${statError.message}` };
   }
-  const coordinationFiles = await coordinationStatus(`${filePath}.lock`);
   return {
     task_id: requiredString(parameters.task_id, 'task_id'),
     workspace: null,
@@ -2073,7 +1525,6 @@ async function unreadableDoctor(parameters, filePath, error) {
     checks: [
       doctorCheck('state_database', 'fail', databaseDetail),
       doctorCheck('task_state', 'fail', { path: filePath, error: error.message }),
-      doctorCheck('coordination', coordinationFiles.length ? 'attention' : 'pass', { files: coordinationFiles }),
     ],
     recovery_candidates: [],
     close_status: { close_allowed: false, reasons: [`task state is unreadable: ${error.message}`] },
@@ -2081,7 +1532,6 @@ async function unreadableDoctor(parameters, filePath, error) {
 }
 
 async function quarantinedDoctor(parameters, filePath, metadata) {
-  const coordinationFiles = await coordinationStatus(`${filePath}.lock`);
   return {
     task_id: requiredString(parameters.task_id, 'task_id'),
     workspace: null,
@@ -2097,7 +1547,6 @@ async function quarantinedDoctor(parameters, filePath, metadata) {
         files: metadata.files,
         move_error: metadata.move_error,
       }),
-      doctorCheck('coordination', coordinationFiles.length ? 'attention' : 'pass', { files: coordinationFiles }),
     ],
     recovery_candidates: [],
     close_status: { close_allowed: false, reasons: [`task state is quarantined until ${metadata.delete_after}`] },
@@ -2146,6 +1595,7 @@ async function doctorTask(parameters) {
         path: state.workspace_lease.registry_path,
         task_status: state.workspace_lease.status,
         registry_active_tasks: lease.active_tasks.map(entry => ({ task_id: entry.task_id, state_path: entry.state_path, phase: entry.phase, workspace_claims: entry.workspace_claims })),
+        active_write_locks: lease.active_locks.map(lock => ({ lock_id: lock.lock_id, task_id: lock.task_id, node_id: lock.node_id, prefix: lock.prefix, acquired_at: lock.acquired_at })),
         reason: matches ? null : 'workspace lease does not match task state',
       }));
     } catch (error) {
@@ -2158,9 +1608,6 @@ async function doctorTask(parameters) {
     running: Object.values(state.nodes).filter(node => node.status === RUNNING).map(node => node.id),
     stale: stale.map(node => ({ id: node.id, reason: node.reason, claim_id: node.claim_id })),
   }));
-  const coordination_files = await coordinationStatus(`${filePath}.lock`);
-  checks.push(doctorCheck('coordination', coordination_files.length ? 'attention' : 'pass', { files: coordination_files }));
-
   let closeStatus;
   try {
     const closeReasonsList = await closeReasons(state);
@@ -2187,31 +1634,6 @@ async function doctorTask(parameters) {
   };
 }
 
-async function loadWorkspaceLease(leasePath, workspace, { allowMissing = false, authorityContext = null } = {}) {
-  if (leasePath !== workspaceLeasePath(workspace)) throw new ControllerError(`Workspace lease path does not match its canonical workspace authority: ${leasePath}`);
-  const authority = authorityContext?.authority ?? await ensureWorkspaceLeaseAuthority(workspace);
-  await verifyWorkspaceLeaseAuthoritySnapshot(authority);
-  try {
-    await verifyWorkspaceLeaseRegistryBinding(authority, { allowUninitializedMissing: allowMissing });
-    const snapshot = await readJsonSnapshot(leasePath, { label: 'Workspace lease', maxBytes: MAX_MANIFEST_BYTES });
-    if (!sameFileObjectIdentity(authority.record.registry_identity, snapshot.object_identity)) throw new ControllerError(`Workspace lease registry identity changed: ${leasePath}`);
-    const lease = snapshot.value;
-    if (!lease || typeof lease !== 'object' || Array.isArray(lease) || lease.workspace !== workspace || !validTimestamp(lease.updated_at)) throw new ControllerError(`Unsupported workspace lease: ${leasePath}`);
-    if (lease.version !== WORKSPACE_LEASE_VERSION) throw new ControllerError(`Unsupported workspace lease version: ${leasePath}`);
-    await validateWorkspaceLease(lease, leasePath);
-    await verifyWorkspaceLeaseAuthoritySnapshot(authority);
-    await verifyWorkspaceLeaseRegistryBinding(authority);
-    return lease;
-  } catch (error) {
-    if (allowMissing && authority.record.version === WORKSPACE_LEASE_AUTHORITY_VERSION && !authority.record.registry_initialized
-      && error instanceof ControllerError && (error.message.startsWith('Workspace lease does not exist:') || error.message.startsWith('Workspace lease registry is missing'))) {
-      await verifyWorkspaceLeaseAuthoritySnapshot(authority);
-      return { version: WORKSPACE_LEASE_VERSION, workspace, active_tasks: [], updated_at: utcNow() };
-    }
-    throw error;
-  }
-}
-
 async function validateWorkspaceLeaseEntry(entry, leasePath) {
   const fields = new Set(['task_id', 'state_path', 'state_dir', 'acquired_at', 'phase', 'workspace_claims']);
   const authorityFields = new Set([...fields, 'state_parent_authority']);
@@ -2227,8 +1649,61 @@ async function validateWorkspaceLeaseEntry(entry, leasePath) {
   entry.workspace_claims = normalizeStoredWorkspaceClaims(entry.workspace_claims);
 }
 
+function normalizeWorkspaceLeaseLocks(lease, leasePath) {
+  // The initial v3 SQLite control record did not have path locks. Adding an
+  // empty set is safe: it grants no access and preserves active task entries.
+  if (!hasOwn(lease, 'active_locks') && hasExactFields(lease, new Set(['version', 'workspace', 'active_tasks', 'updated_at']))) {
+    lease.active_locks = [];
+  }
+  if (!hasExactFields(lease, new Set(['version', 'workspace', 'active_tasks', 'active_locks', 'updated_at'])) || !Array.isArray(lease.active_locks) || lease.active_locks.length > MAX_WORKSPACE_ACTIVE_WRITE_LOCKS) {
+    throw new ControllerError(`Unsupported workspace lease: ${leasePath}`);
+  }
+}
+
+function workspaceWriteLockMatchesEntry(lock, entry) {
+  return lock.task_id === entry.task_id && sameStatePath(lock.state_path, entry.state_path);
+}
+
+function workspaceWriteLockMatchesOwner(lock, state, filePath, nodeId, claimId) {
+  return lock.task_id === state.task_id
+    && sameStatePath(lock.state_path, filePath)
+    && lock.node_id === nodeId
+    && lock.claim_id === claimId;
+}
+
+function sameWorkspaceWriteLockOwner(left, right) {
+  return left.task_id === right.task_id
+    && sameStatePath(left.state_path, right.state_path)
+    && left.node_id === right.node_id
+    && left.claim_id === right.claim_id;
+}
+
+function writeLocksConflict(left, right) {
+  return isClaimAncestor(left.prefix, right.prefix) || isClaimAncestor(right.prefix, left.prefix);
+}
+
+function validateWorkspaceWriteLock(lock, lease, leasePath) {
+  const fields = new Set(['lock_id', 'task_id', 'state_path', 'node_id', 'claim_id', 'prefix', 'purpose', 'acquired_at']);
+  if (!hasExactFields(lock, fields) || !validTimestamp(lock.acquired_at)) throw new ControllerError(`Unsupported workspace write lock: ${leasePath}`);
+  requiredString(lock.lock_id, 'workspace write lock lock_id');
+  requiredIdentifier(lock.task_id, 'workspace write lock task_id');
+  requiredIdentifier(lock.node_id, 'workspace write lock node_id');
+  requiredString(lock.claim_id, 'workspace write lock claim_id');
+  requiredWriteLockPurpose(lock.purpose);
+  if (typeof lock.state_path !== 'string') throw new ControllerError(`Invalid workspace write lock state path: ${leasePath}`);
+  lock.state_path = path.resolve(lock.state_path);
+  const normalized = normalizeStoredWorkspaceClaims([{ mode: 'write', prefix: lock.prefix }]);
+  if (normalized.length !== 1 || normalized[0].prefix !== lock.prefix) throw new ControllerError(`Invalid workspace write lock prefix: ${leasePath}`);
+  const owner = lease.active_tasks.find(entry => entry.phase === 'active' && workspaceWriteLockMatchesEntry(lock, entry));
+  if (!owner) throw new ControllerError(`Workspace write lock has no active task owner: ${leasePath}`);
+  if (!owner.workspace_claims.some(claim => claim.mode === 'write' && isClaimAncestor(claim.prefix, lock.prefix))) {
+    throw new ControllerError(`Workspace write lock exceeds its task write claims: ${leasePath}`);
+  }
+}
+
 async function validateWorkspaceLease(lease, leasePath) {
-  if (!hasExactFields(lease, new Set(['version', 'workspace', 'active_tasks', 'updated_at'])) || lease.version !== WORKSPACE_LEASE_VERSION || !Array.isArray(lease.active_tasks) || lease.active_tasks.length > MAX_WORKSPACE_ACTIVE_TASKS || !validTimestamp(lease.updated_at)) throw new ControllerError(`Unsupported workspace lease: ${leasePath}`);
+  normalizeWorkspaceLeaseLocks(lease, leasePath);
+  if (lease.version !== WORKSPACE_LEASE_VERSION || !Array.isArray(lease.active_tasks) || lease.active_tasks.length > MAX_WORKSPACE_ACTIVE_TASKS || !validTimestamp(lease.updated_at)) throw new ControllerError(`Unsupported workspace lease: ${leasePath}`);
   const identities = new Set();
   for (const entry of lease.active_tasks) {
     await validateWorkspaceLeaseEntry(entry, leasePath);
@@ -2238,9 +1713,240 @@ async function validateWorkspaceLease(lease, leasePath) {
   }
   for (let index = 0; index < lease.active_tasks.length; index++) {
     for (let other = index + 1; other < lease.active_tasks.length; other++) {
-      if (sameStatePath(lease.active_tasks[index].state_path, lease.active_tasks[other].state_path) || claimsConflict(lease.active_tasks[index].workspace_claims, lease.active_tasks[other].workspace_claims)) throw new ControllerError(`Conflicting workspace lease entries: ${leasePath}`);
+      if (sameStatePath(lease.active_tasks[index].state_path, lease.active_tasks[other].state_path)) throw new ControllerError(`Conflicting workspace lease entries: ${leasePath}`);
     }
   }
+  const lockIds = new Set();
+  for (const lock of lease.active_locks) {
+    validateWorkspaceWriteLock(lock, lease, leasePath);
+    if (lockIds.has(lock.lock_id)) throw new ControllerError(`Duplicate workspace write lock: ${leasePath}`);
+    lockIds.add(lock.lock_id);
+  }
+  for (let index = 0; index < lease.active_locks.length; index++) {
+    for (let other = index + 1; other < lease.active_locks.length; other++) {
+      const left = lease.active_locks[index]; const right = lease.active_locks[other];
+      if (!sameWorkspaceWriteLockOwner(left, right) && writeLocksConflict(left, right)) {
+        throw new ControllerError(`Conflicting active workspace write locks: ${leasePath}`);
+      }
+    }
+  }
+}
+
+// V3 control-plane state lives only in this workspace-local SQLite database.
+function workspaceLeasePath(workspace) {
+  return path.join(workspace, '.codex', 'workflow-controller', WORKSPACE_CONTROL_FILENAME);
+}
+
+function retiredWorkspaceControlPaths(workspace) {
+  const controlDirectory = path.dirname(workspaceLeasePath(workspace));
+  const authorityPath = path.join(workspace, RETIRED_WORKSPACE_CONTROL_ROOT_FILENAME);
+  return [
+    authorityPath,
+    `${authorityPath}${RETIRED_WORKSPACE_CONTROL_PUBLICATION_SUFFIX}`,
+    path.join(controlDirectory, 'workspace-lease.json'),
+  ];
+}
+
+async function removeRetiredWorkspaceControlFiles(workspace) {
+  const removed = [];
+  for (const sourcePath of retiredWorkspaceControlPaths(workspace)) {
+    let metadata;
+    try { metadata = await fs.lstat(sourcePath); }
+    catch (error) {
+      if (error.code === 'ENOENT') continue;
+      throw error;
+    }
+    if (metadata.isSymbolicLink() || !metadata.isFile()) {
+      throw new ControllerError(`Retired workspace control path is not a regular file: ${sourcePath}`);
+    }
+    await fs.unlink(sourcePath);
+    removed.push(sourcePath);
+  }
+  return removed;
+}
+
+async function currentTaskStatePaths(directory) {
+  let entries;
+  try { entries = await fs.readdir(directory, { withFileTypes: true }); }
+  catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+  const paths = [];
+  for (const entry of entries) {
+    if (!entry.name.endsWith(SQLITE_STATE_SUFFIX) || entry.name === WORKSPACE_CONTROL_FILENAME) continue;
+    const candidate = path.join(directory, entry.name);
+    const metadata = await fs.lstat(candidate);
+    if (metadata.isSymbolicLink() || !metadata.isFile()) throw new ControllerError(`Current SQLite task state is not a regular file: ${candidate}`);
+    paths.push(candidate);
+  }
+  return paths;
+}
+
+async function workspaceTaskStatePaths(workspace) {
+  const found = [];
+  const pending = [workspace];
+  let inspected = 0;
+  while (pending.length) {
+    const directory = pending.pop();
+    const entries = await fs.readdir(directory, { withFileTypes: true });
+    for (const entry of entries) {
+      inspected += 1;
+      if (inspected > MAX_FINGERPRINT_FILES) throw new ControllerError(`Workspace state discovery exceeds the ${MAX_FINGERPRINT_FILES}-entry limit: ${workspace}`);
+      const candidate = path.join(directory, entry.name);
+      if (entry.isSymbolicLink()) continue;
+      if (entry.isDirectory()) {
+        if (['.git', 'node_modules', '.venv', REVIEW_ARTIFACT_DIRECTORY, ERROR_STATE_DIRECTORY].includes(entry.name)) continue;
+        pending.push(candidate);
+        continue;
+      }
+      if (!entry.isFile() || !entry.name.endsWith(SQLITE_STATE_SUFFIX) || [WORKSPACE_CONTROL_FILENAME, QUARANTINE_DATABASE_FILENAME].includes(entry.name)) continue;
+      let state;
+      try { state = await readTaskState(candidate); }
+      catch (error) {
+        if (/has an unknown schema and was not modified/.test(error.message)) continue;
+        throw asControllerError(error);
+      }
+      if (state?.version === VERSION && state.workspace === workspace) found.push(candidate);
+    }
+  }
+  return found;
+}
+
+async function assertWorkspaceControlCreationIsSafe(workspace, stateDirectory) {
+  const controlDirectory = path.dirname(workspaceLeasePath(workspace));
+  assertStateDirectoryBoundary(workspace, stateDirectory);
+  let controlEntries = [];
+  try { controlEntries = await fs.readdir(controlDirectory, { withFileTypes: true }); }
+  catch (error) { if (error.code !== 'ENOENT') throw error; }
+  for (const entry of controlEntries) {
+    if (!entry.name.startsWith(`${WORKSPACE_CONTROL_FILENAME}.bootstrap-`)) continue;
+    const artifact = path.join(controlDirectory, entry.name);
+    const metadata = await fs.lstat(artifact);
+    if (metadata.isSymbolicLink() || !metadata.isFile()) throw new ControllerError(`Workspace control bootstrap artifact is not a regular file: ${artifact}`);
+    throw new ControllerError(`Workspace control database is missing but its bootstrap artifact remains; explicit destructive recovery is required: ${artifact}`);
+  }
+  const directories = [...new Set([controlDirectory, stateDirectory].filter(Boolean).map(value => path.resolve(value)))];
+  const statePaths = [];
+  for (const directory of directories) statePaths.push(...await currentTaskStatePaths(directory));
+  statePaths.push(...await workspaceTaskStatePaths(workspace));
+  if (statePaths.length) {
+    const uniqueStatePaths = [...new Set(statePaths.map(candidate => path.resolve(candidate)))];
+    throw new ControllerError(`Workspace control database is missing while current v3 task state exists; explicit destructive recovery is required: ${uniqueStatePaths.join(', ')}`);
+  }
+  for (const suffix of ['-wal', '-shm', '-journal']) {
+    const artifact = `${workspaceLeasePath(workspace)}${suffix}`;
+    try {
+      const metadata = await fs.lstat(artifact);
+      if (metadata.isSymbolicLink() || !metadata.isFile()) throw new ControllerError(`Workspace control database artifact is not a regular file: ${artifact}`);
+      throw new ControllerError(`Workspace control database is missing but its SQLite artifact remains; explicit destructive recovery is required: ${artifact}`);
+    } catch (error) {
+      if (error.code === 'ENOENT') continue;
+      throw error;
+    }
+  }
+}
+
+function assertStateDirectoryBoundary(workspace, stateDirectory) {
+  if (!stateDirectory) return;
+  const resolvedWorkspace = path.resolve(workspace);
+  const resolvedStateDirectory = path.resolve(stateDirectory);
+  if (!pathIsWithinPhysicalRoot(resolvedWorkspace, resolvedStateDirectory)) {
+    throw new ControllerError(`workflow_init state_dir must be inside its workspace: ${stateDirectory}`);
+  }
+  const canonicalControlDirectory = path.resolve(resolvedWorkspace, '.codex', 'workflow-controller');
+  if (pathIsWithinPhysicalRoot(canonicalControlDirectory, resolvedStateDirectory)) return;
+  const relative = path.relative(resolvedWorkspace, resolvedStateDirectory);
+  const segments = relative && relative !== '.' ? relative.split(path.sep) : [];
+  const controllerManagedDirectories = new Set([REVIEW_ARTIFACT_DIRECTORY, ERROR_STATE_DIRECTORY].map(value => workspacePathKey(value)));
+  if (segments.some(segment => isIgnoredFingerprintDirectory(segment) || controllerManagedDirectories.has(workspacePathKey(segment)))) {
+    throw new ControllerError(`workflow_init state_dir cannot be inside an ignored workspace directory: ${stateDirectory}`);
+  }
+}
+
+async function ensureWorkspaceControl(workspace, { allowCreate = false, stateDirectory = null } = {}) {
+  const databasePath = workspaceLeasePath(workspace);
+  if (workspaceControlExists(databasePath)) return databasePath;
+  if (!allowCreate) throw new ControllerError(`Workspace control database does not exist: ${databasePath}`);
+  await assertWorkspaceControlCreationIsSafe(workspace, stateDirectory);
+  await removeRetiredWorkspaceControlFiles(workspace);
+  const controlDirectory = path.dirname(databasePath);
+  await fs.mkdir(controlDirectory, { recursive: true });
+  const controlMetadata = await fs.lstat(controlDirectory);
+  if (controlMetadata.isSymbolicLink() || !controlMetadata.isDirectory()) {
+    throw new ControllerError(`Workspace control directory is not a regular directory: ${controlDirectory}`);
+  }
+  const controlRealPath = await fs.realpath(controlDirectory);
+  if (!pathIsWithin(workspace, controlRealPath)) {
+    throw new ControllerError(`Workspace control directory escapes its workspace: ${controlDirectory}`);
+  }
+  if (workspaceControlExists(databasePath)) return databasePath;
+  const lease = { version: WORKSPACE_LEASE_VERSION, workspace, active_tasks: [], active_locks: [], updated_at: utcNow() };
+  try {
+    createWorkspaceControl(databasePath, workspace, lease);
+  } catch (error) {
+    if (workspaceControlExists(databasePath)) return databasePath;
+    throw new ControllerError(`Cannot create workspace control database: ${databasePath}: ${error.message}`);
+  }
+  return databasePath;
+}
+
+async function withWorkspaceLeaseLock(workspace, callback, { allowAuthorityCreation = false, stateDirectory = null } = {}) {
+  let leasePath;
+  try { leasePath = await ensureWorkspaceControl(workspace, { allowCreate: allowAuthorityCreation, stateDirectory }); }
+  catch (error) { throw asControllerError(error); }
+  let result;
+  await withWorkspaceControlTransaction(leasePath, workspace, async (storedLease, save) => {
+    const lease = storedLease && typeof storedLease === 'object' && !Array.isArray(storedLease)
+      ? storedLease
+      : { version: WORKSPACE_LEASE_VERSION, workspace, active_tasks: [], active_locks: [], updated_at: utcNow() };
+    await validateWorkspaceLease(lease, leasePath);
+    const context = {
+      lease,
+      save,
+      authority: { record: { version: WORKSPACE_LEASE_VERSION, workspace, registry_path: leasePath, control_directory: path.dirname(leasePath) } },
+      recovery: null,
+      parent_authorities: null,
+    };
+    result = await callback(leasePath, context);
+    await validateWorkspaceLease(context.lease, leasePath);
+    save(context.lease);
+  }).catch(error => { throw asControllerError(error); });
+  return result;
+}
+
+async function loadWorkspaceLease(leasePath, workspace, { authorityContext = null } = {}) {
+  if (leasePath !== workspaceLeasePath(workspace)) throw new ControllerError(`Workspace control path does not match its canonical workspace: ${leasePath}`);
+  let lease;
+  try { lease = authorityContext?.lease ?? readWorkspaceControl(leasePath, workspace).payload; }
+  catch (error) { throw asControllerError(error); }
+  if (!lease || typeof lease !== 'object' || Array.isArray(lease)) throw new ControllerError(`Unsupported workspace control lease: ${leasePath}`);
+  await validateWorkspaceLease(lease, leasePath);
+  return lease;
+}
+
+function compactWorkspaceWriteLock(lock) {
+  return {
+    lock_id: lock.lock_id,
+    task_id: lock.task_id,
+    node_id: lock.node_id,
+    prefix: lock.prefix,
+    purpose: lock.purpose,
+    acquired_at: lock.acquired_at,
+  };
+}
+
+async function activeWorkspaceWriteLocks(state) {
+  if (!state.workspace_lease || state.workspace_lease.status !== 'active') return [];
+  const lease = await loadWorkspaceLease(state.workspace_lease.registry_path, state.workspace);
+  return lease.active_locks.map(compactWorkspaceWriteLock);
+}
+
+async function compactStateWithActiveWriteLocks(state) {
+  return { ...compactState(state), active_write_locks: await activeWorkspaceWriteLocks(state) };
+}
+
+async function writeWorkspaceLeaseRegistry(context, leasePath, lease) {
+  if (!context || typeof context !== 'object' || typeof context.save !== 'function') throw new ControllerError(`Workspace control transaction is required: ${leasePath}`);
+  await validateWorkspaceLease(lease, leasePath);
+  context.lease = lease;
 }
 
 function stateWorkspaceClaims(state) { return state.workspace_lease?.workspace_claims ?? state.workspace_claims; }
@@ -2268,8 +1974,148 @@ function workspaceLeasePeerOwners(lease, state, filePath) {
     .filter(entry => !workspaceLeaseEntryMatches(entry, state, filePath, { activeOnly: false }));
 }
 
-function claimsConflict(leftClaims, rightClaims) {
-  return leftClaims.some(left => rightClaims.some(right => (left.mode === 'write' || right.mode === 'write') && (isClaimAncestor(left.prefix, right.prefix) || isClaimAncestor(right.prefix, left.prefix))));
+async function normalizeRequestedWriteLockPrefixes(rawPrefixes, workspace) {
+  if (!Array.isArray(rawPrefixes) || !rawPrefixes.length) throw new ControllerError('write_prefixes must be a non-empty array of workspace-relative POSIX prefixes');
+  if (rawPrefixes.length > MAX_WRITE_LOCK_PREFIXES_PER_REQUEST) throw new ControllerError(`write_prefixes exceeds the ${MAX_WRITE_LOCK_PREFIXES_PER_REQUEST}-prefix limit`);
+  if (rawPrefixes.some(prefix => typeof prefix !== 'string')) throw new ControllerError('write_prefixes must contain only strings');
+  if (new Set(rawPrefixes).size !== rawPrefixes.length) throw new ControllerError('write_prefixes must not contain duplicates');
+  const normalized = await normalizeWorkspaceClaims(rawPrefixes.map(prefix => ({ mode: 'write', prefix })), workspace);
+  if (normalized.length !== rawPrefixes.length) {
+    throw new ControllerError('write_prefixes must not contain ancestor/descendant overlaps; acquire the smallest actual prefix once');
+  }
+  return normalized.map(claim => claim.prefix);
+}
+
+function requiredWriteLockPurpose(value) {
+  const purpose = requiredString(value, 'purpose');
+  if (purpose.length > MAX_GLOBAL_WRITE_JUSTIFICATION_LENGTH) throw new ControllerError(`purpose must be no longer than ${MAX_GLOBAL_WRITE_JUSTIFICATION_LENGTH} characters`);
+  return purpose;
+}
+
+function requestedWriteLockIds(value) {
+  if (!Array.isArray(value) || !value.length) throw new ControllerError('lock_ids must be a non-empty array');
+  if (value.length > MAX_WRITE_LOCK_PREFIXES_PER_REQUEST) throw new ControllerError(`lock_ids exceeds the ${MAX_WRITE_LOCK_PREFIXES_PER_REQUEST}-lock limit`);
+  const ids = value.map(lockId => requiredString(lockId, 'lock_ids item'));
+  if (new Set(ids).size !== ids.length) throw new ControllerError('lock_ids must not contain duplicates');
+  return ids;
+}
+
+function writeClaimCoversPrefix(claims, prefix) {
+  return claims.some(claim => claim.mode === 'write' && isClaimAncestor(claim.prefix, prefix));
+}
+
+function activeOrTerminalClaimForWriteLock(state, node, parameters) {
+  if (isCohortReviewNode(state, node)) {
+    const claimId = requiredString(parameters.claim_id, 'claim_id');
+    const lane = cohortLaneForClaim(node, claimId);
+    if (!lane || (lane.status !== RUNNING && !TERMINAL.has(lane.status))) throw new ControllerError(`Claim does not own an active or terminal Terra cohort lane: ${parameters.node_id}`);
+    return lane;
+  }
+  const claimId = requiredString(parameters.claim_id, 'claim_id');
+  if (!node || (node.status !== RUNNING && !TERMINAL.has(node.status)) || node.claim_id !== claimId) throw new ControllerError(`Claim does not own an active or terminal node: ${parameters.node_id}`);
+  return node;
+}
+
+async function currentWriteLockOwner(filePath, nodeId, parameters, { allowTerminal = false } = {}) {
+  const state = normalizeState(await loadState(filePath));
+  const node = state.nodes[nodeId];
+  const activeClaim = allowTerminal
+    ? activeOrTerminalClaimForWriteLock(state, node, parameters)
+    : activeClaimForOperation(state, node, parameters);
+  return { state, node, activeClaim };
+}
+
+async function acquireWorkspaceWriteLock(parameters) {
+  const [filePath, initialState] = await readTask(parameters);
+  const nodeId = requiredIdentifier(parameters.node_id, 'node_id');
+  const claimId = requiredString(parameters.claim_id, 'claim_id');
+  const writePrefixes = await normalizeRequestedWriteLockPrefixes(parameters.write_prefixes, initialState.workspace);
+  const purpose = requiredWriteLockPurpose(parameters.purpose);
+  if (writePrefixes.includes('.') && !initialState.workspace_claims.some(claim => claim.mode === 'write' && claim.prefix === '.')) {
+    throw new ControllerError('A workspace-wide write lock requires a declared workspace-wide write claim');
+  }
+  return withWorkspaceLeaseLock(initialState.workspace, async (leasePath, authorityContext) => {
+    const { state, node, activeClaim } = await currentWriteLockOwner(filePath, nodeId, parameters);
+    if (activeClaim.claim_id !== claimId) throw new ControllerError(`Claim does not own node: ${nodeId}`);
+    if (node.execution_risk === 'read_only') throw new ControllerError(`A read_only node cannot acquire a workspace write lock: ${nodeId}`);
+    if (state.workspace !== initialState.workspace || state.workspace_lease?.registry_path !== leasePath) throw new ControllerError('Task workspace lease authority changed while acquiring a write lock');
+    await requireActiveWorkspaceLease(state, filePath, authorityContext);
+    const entry = workspaceLeaseMatches(authorityContext.lease, state, filePath);
+    if (!entry) throw new ControllerError(`Workspace lease does not belong to this active task: ${leasePath}`);
+    const acquired = [];
+    const reused = [];
+    for (const prefix of writePrefixes) {
+      if (!writeClaimCoversPrefix(entry.workspace_claims, prefix)) {
+        throw new ControllerError(`Requested write lock is outside this task's declared write claims: ${prefix}`);
+      }
+      const owned = authorityContext.lease.active_locks.filter(lock => workspaceWriteLockMatchesOwner(lock, state, filePath, nodeId, claimId));
+      const covering = owned.find(lock => isClaimAncestor(lock.prefix, prefix));
+      if (covering) {
+        reused.push({ lock_id: covering.lock_id, prefix: covering.prefix });
+        continue;
+      }
+      const narrower = owned.find(lock => isClaimAncestor(prefix, lock.prefix));
+      if (narrower) throw new ControllerError(`Cannot widen write lock ${narrower.prefix} to ${prefix}; release ${narrower.lock_id} first`);
+      const conflict = authorityContext.lease.active_locks.find(lock => !workspaceWriteLockMatchesOwner(lock, state, filePath, nodeId, claimId) && writeLocksConflict(lock, { prefix }));
+      if (conflict) {
+        throw new ControllerError(`Requested write lock conflicts with active task ${conflict.task_id} node ${conflict.node_id} at ${conflict.prefix}`);
+      }
+      if (authorityContext.lease.active_locks.length >= MAX_WORKSPACE_ACTIVE_WRITE_LOCKS) {
+        throw new ControllerError(`Workspace write locks exceed the ${MAX_WORKSPACE_ACTIVE_WRITE_LOCKS}-lock limit`);
+      }
+      const lock = { lock_id: randomUUID(), task_id: state.task_id, state_path: filePath, node_id: nodeId, claim_id: claimId, prefix, purpose, acquired_at: utcNow() };
+      authorityContext.lease.active_locks.push(lock);
+      acquired.push({ lock_id: lock.lock_id, prefix: lock.prefix });
+    }
+    authorityContext.lease.updated_at = utcNow();
+    return { task_id: state.task_id, node_id: nodeId, claim_id: claimId, acquired, reused, active_lock_count: authorityContext.lease.active_locks.length };
+  }, { allowAuthorityCreation: false });
+}
+
+async function releaseWorkspaceWriteLock(parameters) {
+  const [filePath, initialState] = await readTask(parameters);
+  const nodeId = requiredIdentifier(parameters.node_id, 'node_id');
+  const claimId = requiredString(parameters.claim_id, 'claim_id');
+  const lockIds = requestedWriteLockIds(parameters.lock_ids);
+  return withWorkspaceLeaseLock(initialState.workspace, async (leasePath, authorityContext) => {
+    const { state, activeClaim } = await currentWriteLockOwner(filePath, nodeId, parameters, { allowTerminal: true });
+    if (activeClaim.claim_id !== claimId) throw new ControllerError(`Claim does not own node: ${nodeId}`);
+    if (state.workspace !== initialState.workspace || state.workspace_lease?.registry_path !== leasePath) throw new ControllerError('Task workspace lease authority changed while releasing a write lock');
+    await requireActiveWorkspaceLease(state, filePath, authorityContext);
+    const owned = authorityContext.lease.active_locks.filter(lock => workspaceWriteLockMatchesOwner(lock, state, filePath, nodeId, claimId));
+    const byId = new Map(owned.map(lock => [lock.lock_id, lock]));
+    const missing = lockIds.filter(lockId => !byId.has(lockId));
+    if (missing.length) throw new ControllerError(`Write lock is not owned by this claim: ${missing.join(', ')}`);
+    authorityContext.lease.active_locks = authorityContext.lease.active_locks.filter(lock => !lockIds.includes(lock.lock_id));
+    authorityContext.lease.updated_at = utcNow();
+    return { task_id: state.task_id, node_id: nodeId, claim_id: claimId, released: lockIds.map(lockId => ({ lock_id: lockId, prefix: byId.get(lockId).prefix })), active_lock_count: authorityContext.lease.active_locks.length };
+  }, { allowAuthorityCreation: false });
+}
+
+async function releaseWorkspaceWriteLocksForClaim(filePath, nodeId, claimId, reason) {
+  const state = normalizeState(await loadState(filePath));
+  if (!state.workspace_lease || state.workspace_lease.status !== 'active') return { released: [] };
+  return withWorkspaceLeaseLock(state.workspace, (leasePath, authorityContext) => {
+    if (leasePath !== state.workspace_lease.registry_path) throw new ControllerError('Task workspace lease authority changed while releasing write locks');
+    const released = authorityContext.lease.active_locks
+      .filter(lock => workspaceWriteLockMatchesOwner(lock, state, filePath, nodeId, claimId))
+      .map(lock => ({ lock_id: lock.lock_id, prefix: lock.prefix }));
+    if (released.length) {
+      authorityContext.lease.active_locks = authorityContext.lease.active_locks.filter(lock => !workspaceWriteLockMatchesOwner(lock, state, filePath, nodeId, claimId));
+      authorityContext.lease.updated_at = utcNow();
+    }
+    return { released, reason };
+  }, { allowAuthorityCreation: false });
+}
+
+async function releaseWriteLocksAfterNodeLifecycle(parameters, reason) {
+  const [filePath] = await readTask(parameters);
+  return releaseWorkspaceWriteLocksForClaim(
+    filePath,
+    requiredIdentifier(parameters.node_id, 'node_id'),
+    requiredString(parameters.claim_id, 'claim_id'),
+    reason,
+  );
 }
 
 async function requireActiveWorkspaceLease(state, filePath, authorityContext = null) {
@@ -2298,20 +2144,54 @@ async function withActiveWorkspaceStateLock(filePath, callback) {
   const parentAuthority = await stateParentAuthorityForState(initialState, filePath);
   await verifyRegularDirectorySnapshot(parentAuthority, 'Controller state parent');
   const expectedLeasePath = initialState.workspace_lease.registry_path;
-  return withWorkspaceLeaseLock(initialState.workspace, async (leasePath, authorityContext) => {
-    if (leasePath !== expectedLeasePath) throw new ControllerError('Workspace lease authority path changed before task-state mutation');
-    return withStateLock(filePath, async () => {
+  const leasePath = expectedLeasePath;
+  return withTaskStateTransaction(databasePath(filePath), { parentAuthority }, async (storedState, save) => {
+    if (storedState === null) throw new ControllerError(`Current SQLite controller state does not exist: ${filePath}`);
+    const state = normalizeState(storedState);
+    return taskStateTransactionContext.run({ filePath, state, parentAuthority }, async () => {
       await verifyRegularDirectorySnapshot(parentAuthority, 'Controller state parent');
-      const state = normalizeState(await loadState(filePath));
       if (state.workspace !== initialState.workspace || state.workspace_lease?.registry_path !== leasePath) throw new ControllerError('Task workspace lease authority changed while acquiring locks');
       const currentParentAuthority = await stateParentAuthorityForState(state, filePath);
       if (!sameStateParentAuthority(currentParentAuthority, parentAuthority)) throw new ControllerError(`Controller state parent authority changed: ${filePath}`);
       await attachStateParentAuthority(state, filePath, parentAuthority);
+      const authorityContext = { authority: { record: { version: WORKSPACE_LEASE_VERSION, workspace: state.workspace, registry_path: expectedLeasePath, control_directory: path.dirname(expectedLeasePath) } }, recovery: null, parent_authorities: null };
       const lease = await requireActiveWorkspaceLease(state, filePath, authorityContext);
       await bindStateParentAuthorityToWorkspaceLease(lease, state, filePath, authorityContext);
-      return callback(state, lease, authorityContext);
-    }, { parentAuthority });
-  }, { allowAuthorityCreation: true });
+      const result = await callback(state, lease, authorityContext);
+      await verifyRegularDirectorySnapshot(parentAuthority, 'Controller state parent');
+      save(taskStateTransactionContext.getStore().state);
+      return result;
+    });
+  });
+}
+
+function assertReleaseStateCanBeReleased(state, { closeAllowed, parameters }) {
+  state.workspace_claims = normalizeStoredWorkspaceClaims(state.workspace_claims);
+  if (state.workspace_lease) state.workspace_lease.workspace_claims = normalizeStoredWorkspaceClaims(state.workspace_lease.workspace_claims ?? state.workspace_claims);
+  if (!state.nodes || typeof state.nodes !== 'object' || Array.isArray(state.nodes) || !Object.keys(state.nodes).length) throw new ControllerError('Cannot release workspace lease: task nodes are unreadable or empty');
+  const unknownNodes = Object.values(state.nodes).filter(node => !node || typeof node !== 'object' || ![PENDING, RUNNING, ...TERMINAL].includes(node.status));
+  if (unknownNodes.length) throw new ControllerError('Cannot release workspace lease while node statuses are unknown');
+  const running = Object.values(state.nodes).filter(node => node.status === RUNNING).map(node => node.id);
+  if (running.length) throw new ControllerError(`Cannot release workspace lease while nodes are running: ${running.join(', ')}`);
+  if (!closeAllowed) trueValue(parameters.previous_agent_stopped, 'previous_agent_stopped');
+}
+
+async function removeReleasedWorkspaceLeaseEntry(state, filePath) {
+  const leasePath = state.workspace_lease?.registry_path;
+  if (typeof leasePath !== 'string') throw new ControllerError('Cannot remove workspace lease entry without a registry path');
+  return withWorkspaceLeaseLock(state.workspace, (lockedLeasePath, authorityContext) => {
+    if (lockedLeasePath !== leasePath) throw new ControllerError('Workspace lease authority path changed while removing a released entry');
+    const lease = authorityContext.lease;
+    const peerOwners = workspaceLeasePeerOwners(lease, state, filePath);
+    if (peerOwners.length) throw new ControllerError(`Cannot release workspace lease: state path belongs to another active task identity: ${peerOwners[0].task_id} (${peerOwners[0].state_path})`);
+    const matchingEntries = workspaceLeaseStatePathOwners(lease, filePath)
+      .filter(entry => workspaceLeaseEntryMatches(entry, state, filePath, { activeOnly: false }));
+    if (!matchingEntries.length) return { removed: false, lease_path: leasePath };
+    authorityContext.lease.active_tasks = authorityContext.lease.active_tasks.filter(entry => !workspaceLeaseEntryMatches(entry, state, filePath, { activeOnly: false }));
+    authorityContext.lease.active_locks = authorityContext.lease.active_locks.filter(lock => !sameStatePath(lock.state_path, filePath));
+    authorityContext.lease.updated_at = utcNow();
+    return { removed: true, lease_path: leasePath };
+  }, { allowAuthorityCreation: false });
 }
 
 async function releaseWorkspaceLease(parameters, { closeAllowed = false } = {}) {
@@ -2323,104 +2203,88 @@ async function releaseWorkspaceLease(parameters, { closeAllowed = false } = {}) 
     || typeof stateLease.registry_path !== 'string' || !path.isAbsolute(stateLease.registry_path)
     || path.resolve(stateLease.registry_path) !== workspaceLeasePath(initialState.workspace)
     || !sameStatePath(stateLease.state_path, filePath)) throw new ControllerError('Cannot release workspace lease: lease metadata is not a complete matching registry');
-  const parentAuthority = await stateParentAuthorityForState(initialState, filePath);
-  await verifyRegularDirectorySnapshot(parentAuthority, 'Controller state parent');
-  const leasePath = stateLease.registry_path;
-  return withWorkspaceLeaseLock(initialState.workspace, async (lockedLeasePath, authorityContext) => {
-    if (lockedLeasePath !== leasePath) throw new ControllerError('Cannot release workspace lease: registry authority path changed');
-    return withStateLock(filePath, async () => {
-    await verifyRegularDirectorySnapshot(parentAuthority, 'Controller state parent');
-    const state = normalizeState(await loadState(filePath));
-    const currentParentAuthority = await stateParentAuthorityForState(state, filePath);
-    if (!sameStateParentAuthority(currentParentAuthority, parentAuthority)) throw new ControllerError(`Controller state parent authority changed: ${filePath}`);
-    await attachStateParentAuthority(state, filePath, parentAuthority);
-    state.workspace_claims = normalizeStoredWorkspaceClaims(state.workspace_claims);
-    if (state.workspace_lease) state.workspace_lease.workspace_claims = normalizeStoredWorkspaceClaims(state.workspace_lease.workspace_claims ?? state.workspace_claims);
-    if (!state.nodes || typeof state.nodes !== 'object' || Array.isArray(state.nodes) || !Object.keys(state.nodes).length) throw new ControllerError('Cannot release workspace lease: task nodes are unreadable or empty');
-    const unknownNodes = Object.values(state.nodes).filter(node => !node || typeof node !== 'object' || ![PENDING, RUNNING, ...TERMINAL].includes(node.status));
-    if (unknownNodes.length) throw new ControllerError('Cannot release workspace lease while node statuses are unknown');
-    const running = Object.values(state.nodes).filter(node => node.status === RUNNING).map(node => node.id);
-    if (running.length) throw new ControllerError(`Cannot release workspace lease while nodes are running: ${running.join(', ')}`);
-    if (!closeAllowed) trueValue(parameters.previous_agent_stopped, 'previous_agent_stopped');
-    const lease = await loadWorkspaceLease(leasePath, state.workspace, { authorityContext });
-    await bindStateParentAuthorityToWorkspaceLease(lease, state, filePath, authorityContext);
-    const peerOwners = workspaceLeasePeerOwners(lease, state, filePath);
-    if (peerOwners.length) throw new ControllerError(`Cannot release workspace lease: state path belongs to another active task identity: ${peerOwners[0].task_id} (${peerOwners[0].state_path})`);
-    const matchingEntries = workspaceLeaseStatePathOwners(lease, filePath)
-      .filter(entry => workspaceLeaseEntryMatches(entry, state, filePath, { activeOnly: false }));
-    const matchingEntry = matchingEntries.find(entry => entry.phase === 'active') ?? null;
-    if (state.workspace_lease.status === 'released' && !matchingEntries.length) return { released: true, already_released: true, lease_path: leasePath };
-    if (state.workspace_lease.status === 'released') {
-      lease.active_tasks = lease.active_tasks.filter(entry => !workspaceLeaseEntryMatches(entry, state, filePath, { activeOnly: false })); lease.updated_at = utcNow(); await writeWorkspaceLeaseRegistry(authorityContext, leasePath, lease);
-      return { released: true, already_released: true, self_healed: true, lease_path: leasePath };
-    }
-    if (!matchingEntry) throw new ControllerError(`Workspace lease does not belong to this active task: ${leasePath}`);
-    if (state.workspace_lease.status !== 'released') {
-      state.workflow_revision ??= 0; state.events ??= []; state.updated_at = utcNow();
+  assertReleaseStateCanBeReleased(initialState, { closeAllowed, parameters });
+  const alreadyReleased = initialState.workspace_lease.status === 'released';
+  if (!alreadyReleased) {
+    await withActiveWorkspaceStateLock(filePath, async state => {
+      assertReleaseStateCanBeReleased(state, { closeAllowed, parameters });
+      state.workflow_revision ??= 0;
+      state.events ??= [];
+      state.updated_at = utcNow();
       state.workspace_lease.workspace_claims ??= state.workspace_claims;
-      state.workspace_lease.status = 'released'; state.workspace_lease.released_at = utcNow();
-      addEvent(state, 'workspace_lease_released', { close_allowed: closeAllowed }); await writeState(filePath, state);
-    }
-    lease.active_tasks = lease.active_tasks.filter(entry => !workspaceLeaseEntryMatches(entry, state, filePath, { activeOnly: false })); lease.updated_at = utcNow(); await writeWorkspaceLeaseRegistry(authorityContext, leasePath, lease);
-      return { released: true, lease_path: leasePath };
-    }, { parentAuthority });
-  }, { allowAuthorityCreation: true });
+      state.workspace_lease.status = 'released';
+      state.workspace_lease.released_at = utcNow();
+      addEvent(state, 'workspace_lease_released', { close_allowed: closeAllowed });
+    });
+  }
+  const releasedState = normalizeState(await loadState(filePath));
+  if (releasedState.workspace_lease?.status !== 'released') throw new ControllerError(`Cannot release workspace lease with unsupported task status: ${releasedState.workspace_lease?.status}`);
+  const removal = await removeReleasedWorkspaceLeaseEntry(releasedState, filePath);
+  return {
+    released: true,
+    ...(alreadyReleased ? { already_released: true } : {}),
+    ...(alreadyReleased && removal.removed ? { self_healed: true } : {}),
+    lease_path: removal.lease_path,
+  };
 }
 
 async function initTask(parameters) {
-  const manifest = await readJson(parameters.manifest, { label: 'Manifest', maxBytes: MAX_MANIFEST_BYTES });
+  const manifest = await readManifest(parameters.manifest);
   const state = await makeState(manifest);
   const filePath = await configuredStatePath(parameters, state.task_id);
+  assertStateDirectoryBoundary(state.workspace, path.dirname(filePath));
   const leasePath = workspaceLeasePath(state.workspace);
-  let workspaceLeaseRecovery = null;
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  const parentAuthority = await snapshotRegularDirectory(path.dirname(filePath), 'Controller state parent');
+  await verifyRegularDirectorySnapshot(parentAuthority, 'Controller state parent');
+  if (await stateExists(filePath)) throw new ControllerError(`Task already exists: ${state.task_id}`);
+  await removeRetiredJsonState(filePath, parentAuthority);
+  state.workspace_lease = { registry_path: leasePath, state_path: filePath, state_parent_authority: parentAuthority, status: 'active', acquired_at: utcNow(), workspace_claims: state.workspace_claims };
+  const entry = { task_id: state.task_id, state_path: filePath, state_dir: path.dirname(filePath), state_parent_authority: parentAuthority, acquired_at: state.workspace_lease.acquired_at, phase: 'initializing', workspace_claims: state.workspace_claims };
+
   await withWorkspaceLeaseLock(state.workspace, async (lockedLeasePath, authorityContext) => {
     if (lockedLeasePath !== leasePath) throw new ControllerError('Workspace lease authority path changed during initialization');
-    workspaceLeaseRecovery = authorityContext.recovery;
-    await fs.mkdir(path.dirname(filePath), { recursive: true });
-    const parentAuthority = await snapshotRegularDirectory(path.dirname(filePath), 'Controller state parent');
-    state.workspace_lease = { registry_path: leasePath, state_path: filePath, state_parent_authority: parentAuthority, status: 'active', acquired_at: utcNow(), workspace_claims: state.workspace_claims };
-    const lease = await loadWorkspaceLease(leasePath, state.workspace, { allowMissing: true, authorityContext });
+    const lease = authorityContext.lease;
     if (lease.active_tasks.length >= MAX_WORKSPACE_ACTIVE_TASKS) throw new ControllerError(`Workspace lease exceeds the ${MAX_WORKSPACE_ACTIVE_TASKS}-active-task limit`);
     const existingStatePath = lease.active_tasks.find(entry => sameStatePath(entry.state_path, filePath));
     if (existingStatePath) throw new ControllerError(`Workspace state path already has an active lease entry: ${filePath}; reconcile this exact workspace/task/state_dir entry before initializing again`);
-    const conflict = lease.active_tasks.find(entry => claimsConflict(entry.workspace_claims, state.workspace_claims));
-    if (conflict) throw new ControllerError(`Workspace claim conflicts with active workflow task: ${conflict.task_id} (${conflict.state_path})`);
-    const destructiveRebuild = workspaceLeaseRecovery?.mode === 'destructive_rebuild';
-    const archivedStatePaths = [];
-    if (destructiveRebuild) {
-      const archivedSQLiteState = await archiveExistingSQLiteState(filePath, parentAuthority);
-      if (archivedSQLiteState) archivedStatePaths.push(archivedSQLiteState);
+    lease.active_tasks.push(entry);
+    lease.updated_at = utcNow();
+  }, { allowAuthorityCreation: true, stateDirectory: path.dirname(filePath) });
+
+  try {
+    await writeState(filePath, state, { parentAuthority });
+  } catch (writeError) {
+    try {
+      await withWorkspaceLeaseLock(state.workspace, async (lockedLeasePath, authorityContext) => {
+        if (lockedLeasePath !== leasePath) throw new ControllerError('Workspace lease authority path changed while rolling back initialization');
+        authorityContext.lease.active_tasks = authorityContext.lease.active_tasks.filter(candidate => !workspaceLeaseEntryMatches(candidate, state, filePath, { activeOnly: false }));
+        authorityContext.lease.active_locks = authorityContext.lease.active_locks.filter(lock => !workspaceWriteLockMatchesEntry(lock, entry));
+        authorityContext.lease.updated_at = utcNow();
+      }, { allowAuthorityCreation: false });
+    } catch (cleanupError) {
+      const wrapped = new ControllerError(`Task state initialization failed and its initializing workspace entry could not be removed; run workflow_reconcile: ${writeError.message}; cleanup failed: ${cleanupError.message}`);
+      wrapped.cause = writeError;
+      throw wrapped;
     }
-    if (destructiveRebuild || !(await stateExists(filePath))) {
-      const archivedLegacyState = await archiveLegacyJsonState(filePath, parentAuthority);
-      if (archivedLegacyState) archivedStatePaths.push(archivedLegacyState);
-    }
-    if (archivedStatePaths.length) {
-      workspaceLeaseRecovery = { ...(workspaceLeaseRecovery ?? { mode: 'destructive_rebuild', legacy_authority_archive_path: null, legacy_registry_archive_path: null, orphaned_control_entry_archive_paths: [] }), legacy_state_archive_paths: archivedStatePaths };
-    }
-    await withStateLock(filePath, async () => {
-      if (await stateExists(filePath)) throw new ControllerError(`Task already exists: ${state.task_id}`);
-      const entry = { task_id: state.task_id, state_path: filePath, state_dir: path.dirname(filePath), state_parent_authority: parentAuthority, acquired_at: state.workspace_lease.acquired_at, phase: 'initializing', workspace_claims: state.workspace_claims };
-      lease.active_tasks.push(entry);
-      await validateWorkspaceLease(lease, leasePath);
-      lease.updated_at = utcNow(); await writeWorkspaceLeaseRegistry(authorityContext, leasePath, lease);
-      try { await writeState(filePath, state, { parentAuthority }); }
-      catch (error) {
-        lease.active_tasks = lease.active_tasks.filter(candidate => candidate !== entry); lease.updated_at = utcNow(); await writeWorkspaceLeaseRegistry(authorityContext, leasePath, lease);
-        throw error;
-      }
-    }, { parentAuthority });
-    const entry = lease.active_tasks.find(candidate => workspaceLeaseEntryMatches(candidate, state, filePath, { activeOnly: false }));
-    if (!entry) throw new ControllerError(`Initializing workspace lease disappeared: ${leasePath}`);
-    entry.phase = 'active'; lease.updated_at = utcNow();
-    try { await writeWorkspaceLeaseRegistry(authorityContext, leasePath, lease); }
-    catch (error) {
-      await deleteState(filePath, { parentAuthority });
-      lease.active_tasks = lease.active_tasks.filter(candidate => candidate !== entry); lease.updated_at = utcNow(); await writeWorkspaceLeaseRegistry(authorityContext, leasePath, lease);
-      throw error;
-    }
-  }, { allowAuthorityCreation: true });
-  return { state_path: filePath, task: compactState(state), workspace_lease_recovery: workspaceLeaseRecovery };
+    throw writeError;
+  }
+
+  try {
+    await withWorkspaceLeaseLock(state.workspace, async (lockedLeasePath, authorityContext) => {
+      if (lockedLeasePath !== leasePath) throw new ControllerError('Workspace lease authority path changed while activating initialization');
+      const reservedEntry = authorityContext.lease.active_tasks.find(candidate => workspaceLeaseEntryMatches(candidate, state, filePath, { activeOnly: false }));
+      if (!reservedEntry) throw new ControllerError(`Initializing workspace lease disappeared: ${leasePath}`);
+      if (reservedEntry.phase !== 'initializing' && reservedEntry.phase !== 'active') throw new ControllerError(`Initializing workspace lease has an unsupported phase: ${reservedEntry.phase}`);
+      reservedEntry.phase = 'active';
+      authorityContext.lease.updated_at = utcNow();
+    }, { allowAuthorityCreation: false });
+  } catch (activationError) {
+    const wrapped = new ControllerError(`Task state was written but workspace activation did not commit; run workflow_reconcile: ${activationError.message}`);
+    wrapped.cause = activationError;
+    throw wrapped;
+  }
+  return { state_path: filePath, task: compactState(state) };
 }
 
 async function reconcileWorkspace(parameters) {
@@ -2442,7 +2306,7 @@ async function reconcileWorkspace(parameters) {
     if (parentAuthority === undefined) throw new ControllerError(`Initializing workspace lease parent authority is missing; controlled recovery is required: ${leasePath}`);
     if (!validStateParentAuthority(parentAuthority, entry.state_path)) throw new ControllerError(`Invalid workspace lease state parent authority: ${leasePath}`);
     await verifyRegularDirectorySnapshot(parentAuthority, 'Controller state parent');
-    return withStateLock(entry.state_path, async () => {
+    return withVerifiedStateParent(entry.state_path, async () => {
       let state;
       try { state = normalizeState(await loadState(entry.state_path)); }
       catch (error) {
@@ -2464,7 +2328,7 @@ async function reconcileWorkspace(parameters) {
       entry.phase = 'active'; lease.updated_at = utcNow(); await writeWorkspaceLeaseRegistry(authorityContext, leasePath, lease);
       return { workspace, lease_path: leasePath, reconciled: true, action: 'activated_existing_initialization', active_task: entry };
     }, { parentAuthority });
-  }, { allowAuthorityCreation: true });
+  }, { allowAuthorityCreation: false });
 }
 
 async function addNode(parameters) {
@@ -3378,10 +3242,7 @@ const PRUNABLE_NODE_FIELDS = new Set(['id', 'kind', 'review_stage', 'agent_type'
 const PRUNABLE_LEASE_FIELDS = new Set(['version', 'workspace', 'active_tasks', 'updated_at']);
 const PRUNABLE_TASK_LEASE_FIELDS = new Set(['registry_path', 'state_path', 'status', 'acquired_at', 'released_at', 'workspace_claims']);
 const PRUNABLE_TASK_LEASE_AUTHORITY_FIELDS = new Set([...PRUNABLE_TASK_LEASE_FIELDS, 'state_parent_authority']);
-const PRUNE_SWEEP_FIELDS = new Set(['version', 'last_sweep_at', 'last_result']);
 const QUARANTINE_FIELDS = new Set(['version', 'status', 'task_id', 'original_state_path', 'error_path', 'reason', 'quarantined_at', 'delete_after', 'files', 'move_error', 'review_artifacts', 'workspace', 'registry_path', 'binding', 'authority_anchor']);
-const QUARANTINE_EXPIRY_FIELDS = new Set(['version', 'task_id', 'original_state_path', 'quarantined_at', 'delete_after', 'files', 'review_artifacts', 'workspace', 'registry_path', 'binding', 'authority_anchor']);
-const PRUNE_RESULT_FIELDS = new Set(['deleted_count', 'quarantined_count', 'retained_count', 'quarantine_deleted_count', 'quarantine_retained_count', 'report_truncated']);
 
 function hasExactFields(value, fields) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
@@ -3391,7 +3252,10 @@ function hasExactFields(value, fields) {
 function validTimestamp(value) { return typeof value === 'string' && Number.isFinite(Date.parse(value)); }
 
 function taskPruneEligibility(state, filePath, now) {
-  if (!hasExactFields(state, PRUNABLE_STATE_FIELDS)) return { eligible: false, reason: 'incomplete or unknown state fields' };
+  const allowedStateFields = hasOwn(state, 'global_write_justification')
+    ? new Set([...PRUNABLE_STATE_FIELDS, 'global_write_justification'])
+    : PRUNABLE_STATE_FIELDS;
+  if (!hasExactFields(state, allowedStateFields)) return { eligible: false, reason: 'incomplete or unknown state fields' };
   if (state.version !== VERSION || state.routing_schema_version !== REVIEW_PROTOCOL_VERSION) return { eligible: false, reason: 'unsupported state schema' };
   if (!ASSURANCE_LEVELS.has(state.assurance_level)) return { eligible: false, reason: 'invalid assurance state' };
   try { requiredIdentifier(state.task_id, 'task_id'); requiredString(state.workspace, 'workspace'); requiredString(state.goal, 'goal'); }
@@ -3482,10 +3346,96 @@ async function quarantineEligibility(state, filePath, now) {
 }
 
 function errorStateRoot(stateDir) { return path.join(path.resolve(stateDir), ERROR_STATE_DIRECTORY); }
-function errorQuarantinePath(errorPath) { return path.join(errorPath, ERROR_QUARANTINE_FILENAME); }
-function quarantineExpiryPath(errorPath) { return path.join(errorPath, QUARANTINE_EXPIRY_FILENAME); }
+function quarantineDatabasePath(stateDir) { return path.join(errorStateRoot(stateDir), QUARANTINE_DATABASE_FILENAME); }
 function reviewArtifactTaskPath(stateDir, taskId) { return path.join(path.resolve(stateDir), REVIEW_ARTIFACT_DIRECTORY, taskId); }
 function quarantineReviewArtifactPath(errorPath) { return path.join(errorPath, QUARANTINE_REVIEW_DIRECTORY); }
+
+function quarantineDatabaseFailure(message, cause = null) {
+  const error = new ControllerError(message);
+  if (cause) error.cause = cause;
+  return error;
+}
+
+function validateQuarantineDatabase(database, databasePath) {
+  const objects = database.prepare("SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name").all();
+  if (objects.length !== 1 || objects[0].type !== 'table' || objects[0].name !== 'quarantine_entry') {
+    throw quarantineDatabaseFailure(`Quarantine metadata database has an unknown schema and was not modified: ${databasePath}`);
+  }
+  const columns = database.prepare('PRAGMA table_info(quarantine_entry)').all();
+  const expected = [
+    ['error_path', 'TEXT', 1, 1],
+    ['schema_version', 'INTEGER', 1, 0],
+    ['payload', 'TEXT', 1, 0],
+    ['updated_at', 'TEXT', 1, 0],
+  ];
+  if (columns.length !== expected.length || columns.some((column, index) => column.name !== expected[index][0]
+    || String(column.type).toUpperCase() !== expected[index][1]
+    || column.notnull !== expected[index][2]
+    || column.pk !== expected[index][3])) {
+    throw quarantineDatabaseFailure(`Quarantine metadata database has an incompatible schema and was not modified: ${databasePath}`);
+  }
+  const sql = database.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'quarantine_entry'").get()?.sql;
+  if (typeof sql !== 'string' || !/error_path\s+text\s+not\s+null\s+primary\s+key/i.test(sql.replace(/\s+/g, ' '))) {
+    throw quarantineDatabaseFailure(`Quarantine metadata database has an incompatible schema and was not modified: ${databasePath}`);
+  }
+}
+
+async function withQuarantineDatabase(stateDir, { create = false } = {}, callback) {
+  const root = errorStateRoot(stateDir);
+  const databasePath = quarantineDatabasePath(stateDir);
+  let existed = true;
+  try {
+    const metadata = await fs.lstat(databasePath);
+    if (metadata.isSymbolicLink() || !metadata.isFile()) throw quarantineDatabaseFailure(`Quarantine metadata database is not a regular file: ${databasePath}`);
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    existed = false;
+  }
+  if (!existed && !create) return null;
+  if (!existed) {
+    await fs.mkdir(root, { recursive: true });
+    const rootMetadata = await fs.lstat(root);
+    if (rootMetadata.isSymbolicLink() || !rootMetadata.isDirectory()) throw quarantineDatabaseFailure(`Quarantine metadata directory is not a regular directory: ${root}`);
+  }
+  let database;
+  try {
+    database = new DatabaseSync(databasePath, { timeout: QUARANTINE_DATABASE_BUSY_TIMEOUT_MS });
+    database.exec(`PRAGMA busy_timeout = ${QUARANTINE_DATABASE_BUSY_TIMEOUT_MS}`);
+    if (!existed) {
+      database.exec('CREATE TABLE IF NOT EXISTS quarantine_entry (error_path TEXT NOT NULL PRIMARY KEY, schema_version INTEGER NOT NULL, payload TEXT NOT NULL, updated_at TEXT NOT NULL)');
+    }
+    validateQuarantineDatabase(database, databasePath);
+    return await callback(database, databasePath);
+  } catch (error) {
+    if (error instanceof ControllerError) throw error;
+    throw quarantineDatabaseFailure(`Cannot access quarantine metadata database: ${databasePath}: ${error.message}`, error);
+  } finally {
+    database?.close();
+  }
+}
+
+function decodeQuarantineMetadata(payload, errorPath, databasePath) {
+  if (typeof payload !== 'string' || Buffer.byteLength(payload, 'utf8') > MAX_QUARANTINE_BYTES) {
+    throw quarantineDatabaseFailure(`Quarantine metadata payload is invalid or exceeds the ${MAX_QUARANTINE_BYTES}-byte limit: ${databasePath}`);
+  }
+  try { return JSON.parse(payload); }
+  catch (error) { throw quarantineDatabaseFailure(`Quarantine metadata payload is invalid: ${databasePath}: ${error.message}`, error); }
+}
+
+async function writeQuarantineMetadata(stateDir, errorPath, metadata) {
+  if (!quarantineMetadataIsValid(metadata, stateDir, errorPath)) throw new ControllerError(`Quarantined workflow state metadata is invalid: ${errorPath}`);
+  const payload = JSON.stringify(metadata);
+  if (Buffer.byteLength(payload, 'utf8') > MAX_QUARANTINE_BYTES) throw new ControllerError(`Quarantined workflow state metadata exceeds the ${MAX_QUARANTINE_BYTES}-byte limit: ${errorPath}`);
+  await withQuarantineDatabase(stateDir, { create: true }, database => {
+    database.prepare('INSERT INTO quarantine_entry (error_path, schema_version, payload, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(error_path) DO UPDATE SET schema_version = excluded.schema_version, payload = excluded.payload, updated_at = excluded.updated_at')
+      .run(path.resolve(errorPath), QUARANTINE_DATABASE_SCHEMA_VERSION, payload, utcNow());
+  });
+}
+
+async function deleteQuarantineMetadata(stateDir, errorPath) {
+  const result = await withQuarantineDatabase(stateDir, { create: false }, database => database.prepare('DELETE FROM quarantine_entry WHERE error_path = ?').run(path.resolve(errorPath)));
+  if (result === null) throw new ControllerError(`Quarantine metadata database does not exist: ${quarantineDatabasePath(stateDir)}`);
+}
 function quarantineAuthorityAnchor(record) {
   return createHash('sha256').update(stableJson({
     schema: 'workflow-quarantine-authority-v1',
@@ -3573,14 +3523,8 @@ function assertWindowsQuarantinePathLimit(paths) {
 }
 
 async function assertQuarantineWritePaths(errorPath, components, artifactSource) {
-  const metadataPath = errorQuarantinePath(errorPath);
-  const expiryPath = quarantineExpiryPath(errorPath);
   const targets = [
     errorPath,
-    metadataPath,
-    expiryPath,
-    atomicTemporaryPath(metadataPath),
-    atomicTemporaryPath(expiryPath),
     ...components.files.map(component => path.join(errorPath, path.basename(component))),
   ];
   if (artifactSource) {
@@ -3647,27 +3591,7 @@ function quarantineExpiryFromMetadata(metadata) {
   };
 }
 
-function quarantineExpiryIsValid(expiry, stateDir, errorPath) {
-  const currentExpiry = hasExactFields(expiry, QUARANTINE_EXPIRY_FIELDS) && expiry.version === 3;
-  if (!currentExpiry) return false;
-  if (typeof expiry.original_state_path !== 'string' || !validTimestamp(expiry.quarantined_at) || !validTimestamp(expiry.delete_after)) return false;
-  if (!Array.isArray(expiry.files) || !expiry.files.length || expiry.files.some(name => typeof name !== 'string' || !name || path.basename(name) !== name) || new Set(expiry.files).size !== expiry.files.length) return false;
-  if (expiry.review_artifacts !== null && expiry.review_artifacts !== QUARANTINE_REVIEW_DIRECTORY) return false;
-  if (path.dirname(path.resolve(expiry.original_state_path)) !== path.resolve(stateDir) || !expiry.original_state_path.endsWith(SQLITE_STATE_SUFFIX)) return false;
-  let logicalTaskId;
-  try { logicalTaskId = logicalTaskIdFromStatePath(expiry.original_state_path); } catch { return false; }
-  if (expiry.task_id !== logicalTaskId) return false;
-  const allowedNames = new Set([databasePath(expiry.original_state_path)].map(candidate => path.basename(candidate)));
-  if (expiry.files.some(name => !allowedNames.has(name))) return false;
-  const expectedDeleteAfter = new Date(Date.parse(expiry.quarantined_at) + ERROR_STATE_RETENTION_DAYS * DAY_MS).toISOString();
-  if (expiry.delete_after !== expectedDeleteAfter || !isDirectChild(errorStateRoot(stateDir), errorPath)) return false;
-  if ((expiry.workspace === null) !== (expiry.registry_path === null)) return false;
-  if (expiry.workspace !== null && (typeof expiry.workspace !== 'string' || !path.isAbsolute(expiry.workspace) || path.resolve(expiry.workspace) !== expiry.workspace || typeof expiry.registry_path !== 'string' || path.resolve(expiry.registry_path) !== workspaceLeasePath(expiry.workspace))) return false;
-  if (!validQuarantineAnchor(expiry.authority_anchor) || expiry.authority_anchor !== quarantineAuthorityAnchor(expiry) || !quarantineEntryMatchesAuthority(errorPath, expiry)) return false;
-  return validQuarantineBinding(expiry.binding) && expiry.binding === quarantineBinding(expiry, errorPath);
-}
-
-function quarantineSidecarsMatch(metadata, expiry) {
+function quarantineRecordsMatch(metadata, expiry) {
   const fields = ['task_id', 'original_state_path', 'quarantined_at', 'delete_after', 'files'];
   if (!fields.every(field => sameJson(metadata[field], expiry[field])) || (metadata.review_artifacts ?? null) !== (expiry.review_artifacts ?? null)) return false;
   if (metadata.version === 4 && expiry.version === 3) {
@@ -3680,26 +3604,26 @@ function quarantineSidecarsMatch(metadata, expiry) {
 }
 
 async function readQuarantineExpiry(stateDir, errorPath) {
-  try {
-    const expiry = await readJson(quarantineExpiryPath(errorPath), { label: 'Quarantined workflow expiry metadata', maxBytes: MAX_QUARANTINE_BYTES });
-    if (!quarantineExpiryIsValid(expiry, stateDir, errorPath)) throw new ControllerError(`Quarantined workflow expiry metadata is invalid: ${quarantineExpiryPath(errorPath)}`);
-    return expiry;
-  } catch (error) {
-    if (error instanceof ControllerError && error.message.includes('does not exist:')) return null;
-    throw error;
-  }
+  const metadata = await readQuarantineMetadata(stateDir, errorPath);
+  return quarantineExpiryFromMetadata(metadata);
 }
 
 async function ensureQuarantineExpiry(stateDir, errorPath, metadata) {
   const existing = await readQuarantineExpiry(stateDir, errorPath);
-  if (!existing) throw new ControllerError(`Quarantined workflow expiry metadata is missing: ${quarantineExpiryPath(errorPath)}`);
-  if (!quarantineSidecarsMatch(metadata, existing)) throw new ControllerError(`Quarantine metadata and expiry binding do not match: ${errorPath}`);
+  if (!quarantineRecordsMatch(metadata, existing)) throw new ControllerError(`Quarantine metadata binding does not match the persisted record: ${errorPath}`);
   return existing;
 }
 
 async function readQuarantineMetadata(stateDir, errorPath) {
-  const metadata = await readJson(errorQuarantinePath(errorPath), { label: 'Quarantined workflow state metadata', maxBytes: MAX_QUARANTINE_BYTES });
-  if (!quarantineMetadataIsValid(metadata, stateDir, errorPath)) throw new ControllerError(`Quarantined workflow state metadata is invalid: ${errorQuarantinePath(errorPath)}`);
+  const databasePath = quarantineDatabasePath(stateDir);
+  const metadata = await withQuarantineDatabase(stateDir, { create: false }, (database, openedPath) => {
+    const row = database.prepare('SELECT schema_version, payload FROM quarantine_entry WHERE error_path = ?').get(path.resolve(errorPath));
+    if (!row) return null;
+    if (row.schema_version !== QUARANTINE_DATABASE_SCHEMA_VERSION) throw quarantineDatabaseFailure(`Quarantine metadata record has an incompatible schema version: ${openedPath}`);
+    return decodeQuarantineMetadata(row.payload, errorPath, openedPath);
+  });
+  if (metadata === null) throw new ControllerError(`Quarantined workflow state metadata does not exist in the SQLite control store: ${databasePath}`);
+  if (!quarantineMetadataIsValid(metadata, stateDir, errorPath)) throw new ControllerError(`Quarantined workflow state metadata is invalid: ${databasePath}`);
   return metadata;
 }
 
@@ -3707,7 +3631,7 @@ async function quarantineIfEligible(filePath, initialState, now) {
   const initial = await quarantineEligibility(initialState, filePath, now);
   if (!initial.eligible) return { quarantined: false, reason: initial.reason, task_id: initialState?.task_id ?? null };
   try {
-    const run = async (authorityContext = null) => withStateLock(filePath, async () => {
+    const run = async (authorityContext = null) => withVerifiedStateParent(filePath, async () => {
       let state;
       try { state = await loadState(filePath); } catch { state = null; }
       const current = await quarantineEligibility(state, filePath, now);
@@ -3757,25 +3681,24 @@ async function quarantineIfEligible(filePath, initialState, now) {
       await fs.mkdir(errorRoot, { recursive: true });
       await fs.mkdir(errorPath, { recursive: false });
       metadata.binding = quarantineBinding(metadata, errorPath);
-      await atomicWrite(errorQuarantinePath(errorPath), metadata, MAX_QUARANTINE_BYTES, { parentAuthority: await snapshotRegularDirectory(errorPath, 'Quarantine parent') });
-      await atomicWrite(quarantineExpiryPath(errorPath), quarantineExpiryFromMetadata(metadata), MAX_QUARANTINE_BYTES, { parentAuthority: await snapshotRegularDirectory(errorPath, 'Quarantine parent') });
+      await writeQuarantineMetadata(path.dirname(filePath), errorPath, metadata);
       try {
         for (const sourcePath of components.files) await fs.rename(sourcePath, path.join(errorPath, path.basename(sourcePath)));
         if (artifactSource) await fs.rename(artifactSource, quarantineReviewArtifactPath(errorPath));
       } catch (error) {
         metadata.move_error = error.message;
-        try { await atomicWrite(errorQuarantinePath(errorPath), metadata, MAX_QUARANTINE_BYTES, { parentAuthority: await snapshotRegularDirectory(errorPath, 'Quarantine parent') }); }
+        try { await writeQuarantineMetadata(path.dirname(filePath), errorPath, metadata); }
         catch (metadataError) { return { quarantined: false, reason: `quarantine move failed: ${error.message}; metadata update failed: ${metadataError.message}`, task_id: metadata.task_id, error_path: errorPath }; }
         return { quarantined: false, reason: `quarantine move failed: ${error.message}`, task_id: metadata.task_id, error_path: errorPath };
       }
       metadata.status = 'quarantined';
-      await atomicWrite(errorQuarantinePath(errorPath), metadata, MAX_QUARANTINE_BYTES, { parentAuthority: await snapshotRegularDirectory(errorPath, 'Quarantine parent') });
+      await writeQuarantineMetadata(path.dirname(filePath), errorPath, metadata);
       return { quarantined: true, task_id: metadata.task_id, error_path: errorPath, delete_after: metadata.delete_after };
     });
     return initial.lease_path ? await withWorkspaceLeaseLock(initialState.workspace, async (leasePath, authorityContext) => {
       if (leasePath !== initial.lease_path) throw new ControllerError('Workspace lease authority path changed before quarantine');
       return run(authorityContext);
-    }, { allowAuthorityCreation: true }) : await run();
+    }, { allowAuthorityCreation: false }) : await run();
   } catch (error) {
     if (error instanceof ControllerError) throw error;
     return { quarantined: false, reason: `quarantine lock unavailable: ${error.message}`, task_id: initialState?.task_id ?? null };
@@ -3788,7 +3711,7 @@ function validQuarantineTaskId(taskId) {
 
 async function quarantineContentsAreSafe(errorPath, record) {
   const contents = await fs.readdir(errorPath, { withFileTypes: true });
-  const expectedFiles = new Set([...record.files, ERROR_QUARANTINE_FILENAME, QUARANTINE_EXPIRY_FILENAME]);
+  const expectedFiles = new Set(record.files);
   if (record.review_artifacts) expectedFiles.add(record.review_artifacts);
   const unexpected = contents.filter(entry => !expectedFiles.has(entry.name) || (entry.name === record.review_artifacts ? !entry.isDirectory() : !entry.isFile()));
   if (contents.length !== expectedFiles.size || unexpected.length) return false;
@@ -3850,7 +3773,7 @@ async function withQuarantineSourceProtection(stateDir, errorPath, metadata, act
   return withWorkspaceLeaseLock(metadata.workspace, async (lockedRegistryPath, authorityContext) => {
     if (lockedRegistryPath !== registryPath) throw new ControllerError('Quarantine source registry authority path changed');
     await inspectRegistry(metadata, authorityContext);
-    return withStateLock(sourceStatePath, async () => {
+    return withVerifiedStateParent(sourceStatePath, async () => {
       const current = await readQuarantineMetadata(stateDir, errorPath);
       await ensureQuarantineExpiry(stateDir, errorPath, current);
       await inspectRegistry(current, authorityContext);
@@ -3911,16 +3834,16 @@ async function reconcileQuarantineEntry(stateDir, errorPath, metadata) {
       }
     } catch (error) {
       current = { ...current, status: 'quarantining', move_error: error.message };
-      await atomicWrite(errorQuarantinePath(errorPath), current, MAX_QUARANTINE_BYTES, { parentAuthority: await snapshotRegularDirectory(errorPath, 'Quarantine parent') });
+      await writeQuarantineMetadata(stateDir, errorPath, current);
       return { complete: false, metadata: current };
     }
     if (missing.length) {
       current = { ...current, status: 'quarantining', move_error: `quarantine transfer is missing: ${missing.join(', ')}` };
-      await atomicWrite(errorQuarantinePath(errorPath), current, MAX_QUARANTINE_BYTES, { parentAuthority: await snapshotRegularDirectory(errorPath, 'Quarantine parent') });
+      await writeQuarantineMetadata(stateDir, errorPath, current);
       return { complete: false, metadata: current };
     }
     current = { ...current, status: 'quarantined', move_error: null };
-    await atomicWrite(errorQuarantinePath(errorPath), current, MAX_QUARANTINE_BYTES, { parentAuthority: await snapshotRegularDirectory(errorPath, 'Quarantine parent') });
+    await writeQuarantineMetadata(stateDir, errorPath, current);
     return { complete: true, metadata: current };
   });
 }
@@ -3962,6 +3885,7 @@ async function deleteQuarantineEntry(stateDir, errorPath, { metadata = null, exp
         throw new ControllerError(`Quarantine deletion target changed during atomic isolation: ${errorPath}`);
       }
       await fs.rm(tombstone, { recursive: true, force: false }); isolated = false;
+      await deleteQuarantineMetadata(stateDir, errorPath);
     } catch (error) {
       if (isolated) {
         try { await fs.rename(tombstone, errorPath); }
@@ -3978,6 +3902,7 @@ async function pruneQuarantinedStates(stateDir, now) {
   try { entries = await fs.readdir(root, { withFileTypes: true }); }
   catch (error) { if (error.code === 'ENOENT') return { deleted, retained, deleted_count: deletedCount, retained_count: retainedCount }; throw error; }
   for (const entry of entries) {
+    if (entry.name === QUARANTINE_DATABASE_FILENAME && entry.isFile()) continue;
     const errorPath = path.join(root, entry.name);
     if (!entry.isDirectory() || !isDirectChild(root, errorPath)) {
       retainedCount++; retained.push({ error_path: errorPath, reason: 'unknown quarantine entry is not a direct regular directory' });
@@ -3986,20 +3911,7 @@ async function pruneQuarantinedStates(stateDir, now) {
     let metadata = null;
     try { metadata = await readQuarantineMetadata(stateDir, errorPath); }
     catch (metadataError) {
-      let expiry;
-      try { expiry = await readQuarantineExpiry(stateDir, errorPath); }
-      catch (expiryError) { retainedCount++; retained.push({ error_path: errorPath, reason: `${metadataError.message}; ${expiryError.message}` }); continue; }
-      if (!expiry) { retainedCount++; retained.push({ error_path: errorPath, reason: `${metadataError.message}; expiry metadata is unavailable` }); continue; }
-      if (now < Date.parse(expiry.delete_after)) {
-        retainedCount++; retained.push({ task_id: expiry.task_id, error_path: errorPath, delete_after: expiry.delete_after, reason: 'quarantine metadata is unreadable; expiry retention period has not elapsed' });
-        continue;
-      }
-      try {
-        await deleteQuarantineEntry(stateDir, errorPath, { expiry });
-        deletedCount++; deleted.push({ task_id: expiry.task_id, error_path: errorPath, quarantined_at: expiry.quarantined_at, delete_after: expiry.delete_after, recovered_from_invalid_metadata: true });
-      } catch (error) {
-        retainedCount++; retained.push({ task_id: expiry.task_id, error_path: errorPath, reason: `quarantined state deletion failed: ${error.message}` });
-      }
+      retainedCount++; retained.push({ error_path: errorPath, reason: metadataError.message });
       continue;
     }
     try {
@@ -4038,6 +3950,7 @@ async function reconcileQuarantinedStates(parameters) {
   try { entries = await fs.readdir(root, { withFileTypes: true }); }
   catch (error) { if (error.code === 'ENOENT') return { state_dir: stateDir, reconciled, retained, reconciled_count: 0, retained_count: 0 }; throw error; }
   for (const entry of entries) {
+    if (entry.name === QUARANTINE_DATABASE_FILENAME && entry.isFile()) continue;
     const errorPath = path.join(root, entry.name);
     if (!entry.isDirectory() || !isDirectChild(root, errorPath)) {
       retained.push({ error_path: errorPath, reason: 'unknown quarantine entry is not a direct regular directory' });
@@ -4083,6 +3996,7 @@ async function doctorStateDirectory(parameters) {
   try {
     const entries = await fs.readdir(root, { withFileTypes: true });
     for (const entry of entries) {
+      if (entry.name === QUARANTINE_DATABASE_FILENAME && entry.isFile()) continue;
       const errorPath = path.join(root, entry.name);
       if (!entry.isDirectory()) { invalidEntries.push({ path: errorPath, reason: 'entry is not a quarantine directory' }); continue; }
       try {
@@ -4096,7 +4010,7 @@ async function doctorStateDirectory(parameters) {
     if (error.code !== 'ENOENT') throw error;
   }
   const pruneSweep = await readPruneSweep(stateDir);
-  const attention = quarantinedStates.length > 0 || Boolean(pruneSweep.error);
+  const attention = quarantinedStates.length > 0;
   return {
     task_id: null,
     state_dir: stateDir,
@@ -4114,6 +4028,7 @@ async function listTaskStatePaths(stateDir) {
   const paths = new Set();
   for (const entry of entries) {
     if (!entry.isFile()) continue;
+    if (entry.name === WORKSPACE_CONTROL_FILENAME) continue;
     if (entry.name.endsWith(SQLITE_STATE_SUFFIX)) {
       paths.add(path.join(stateDir, entry.name));
     }
@@ -4125,34 +4040,9 @@ function appendPruneReport(reports, target, value) {
   if (Object.values(reports).reduce((count, entries) => count + entries.length, 0) < MAX_PRUNE_REPORT_ENTRIES) target.push(value);
 }
 
-function compactPruneResult(result) {
-  return {
-    deleted_count: result.deleted_count,
-    quarantined_count: result.quarantined_count,
-    retained_count: result.retained_count,
-    quarantine_deleted_count: result.quarantine_deleted_count,
-    quarantine_retained_count: result.quarantine_retained_count,
-    report_truncated: result.report_truncated,
-  };
-}
-
-function pruneSweepIsValid(value) {
-  return hasExactFields(value, PRUNE_SWEEP_FIELDS)
-    && value.version === 1
-    && validTimestamp(value.last_sweep_at)
-    && hasExactFields(value.last_result, PRUNE_RESULT_FIELDS)
-    && Object.values(value.last_result).every(item => typeof item === 'boolean' || (Number.isSafeInteger(item) && item >= 0));
-}
-
 async function readPruneSweep(stateDir) {
-  try {
-    const sweep = await readJson(path.join(stateDir, PRUNE_SWEEP_FILENAME), { label: 'Prune sweep state', maxBytes: 4096 });
-    if (!pruneSweepIsValid(sweep)) throw new ControllerError('Prune sweep state is invalid');
-    return { sweep, error: null };
-  } catch (error) {
-    if (error instanceof ControllerError && error.message.includes('does not exist:')) return { sweep: null, error: null };
-    return { sweep: null, error: error.message };
-  }
+  void stateDir;
+  return { sweep: null, error: null };
 }
 
 async function pruneExpiredTasks(parameters) {
@@ -4209,7 +4099,7 @@ async function pruneExpiredTasks(parameters) {
     try {
       const cleanup = async (lockedLeasePath, authorityContext) => {
         if (lockedLeasePath !== leasePath) throw new ControllerError('Workspace lease authority path changed before cleanup');
-        return withStateLock(filePath, async () => {
+        return withVerifiedStateParent(filePath, async () => {
         await verifyRegularDirectorySnapshot(parentAuthority, 'Controller state parent');
         let state;
         try { state = await loadState(filePath); }
@@ -4225,7 +4115,7 @@ async function pruneExpiredTasks(parameters) {
           return { deleted: true, task_id: state.task_id };
         }, { parentAuthority });
       };
-      const outcome = await withWorkspaceLeaseLock(initial.workspace, cleanup, { allowAuthorityCreation: true });
+      const outcome = await withWorkspaceLeaseLock(initial.workspace, cleanup, { allowAuthorityCreation: false });
       if (outcome.deleted) { deletedCount++; appendPruneReport(reports, reports.deleted, { task_id: outcome.task_id, state_path: filePath }); }
       else { retainedCount++; appendPruneReport(reports, reports.retained, { task_id: outcome.task_id ?? initial.task_id, state_path: filePath, reason: outcome.reason }); }
     } catch (error) {
@@ -4249,54 +4139,6 @@ async function pruneExpiredTasks(parameters) {
       || quarantinedStateCleanup.retained_count > reports.quarantine_retained.length,
     ...reports,
   };
-}
-
-async function maybePruneExpiredTasks(parameters, { parentAuthority = null } = {}) {
-  const stateDir = await canonicalStateDirectory(parameters.state_dir);
-  let authority = parentAuthority;
-  if (authority === null) {
-    try { authority = await snapshotRegularDirectory(stateDir, 'Sweep parent'); }
-    catch (error) { if (error.code === 'ENOENT') return; throw error; }
-  }
-  if (!validStateParentAuthority(authority, path.join(stateDir, PRUNE_SWEEP_FILENAME))) {
-    throw new ControllerError(`Invalid sweep parent authority: ${stateDir}`);
-  }
-  await verifyRegularDirectorySnapshot(authority, 'Sweep parent');
-  const sweepPath = path.join(stateDir, PRUNE_SWEEP_FILENAME);
-  await withStateLock(sweepPath, async () => {
-    await verifyRegularDirectorySnapshot(authority, 'Sweep parent');
-    const { sweep: prior } = await readPruneSweep(stateDir);
-    if (prior && Date.now() - Date.parse(prior.last_sweep_at) < PRUNE_SWEEP_INTERVAL_MS) return;
-    const result = await pruneExpiredTasks({ state_dir: stateDir });
-    await atomicWrite(sweepPath, { version: 1, last_sweep_at: utcNow(), last_result: compactPruneResult(result) }, MAX_STATE_BYTES, { parentAuthority: authority });
-  }, { parentAuthority: authority });
-}
-
-async function persistedStateParentAuthority(parameters) {
-  if (parameters?.task_id === undefined) return null;
-  const filePath = await configuredStatePath(parameters, requiredString(parameters.task_id, 'task_id'));
-  let state;
-  try { state = await loadState(filePath); }
-  catch (error) {
-    if (error instanceof ControllerError && error.message.startsWith('Current SQLite controller state does not exist:')) return null;
-    throw error;
-  }
-  if (!state.workspace_lease) return null;
-  const authority = await stateParentAuthorityForState(state, filePath);
-  await verifyRegularDirectorySnapshot(authority, 'Controller state parent');
-  return authority;
-}
-
-async function recoverTaskLock(parameters) {
-  const [filePath, state] = await readTask(parameters);
-  if (!state.workspace_lease) throw new ControllerError('Current task has no workspace lease and cannot recover its lock');
-  const parentAuthority = await stateParentAuthorityForState(state, filePath);
-  await verifyRegularDirectorySnapshot(parentAuthority, 'Controller state parent');
-  return withWorkspaceLeaseLock(state.workspace, async (leasePath, authorityContext) => {
-    if (leasePath !== state.workspace_lease.registry_path) throw new ControllerError('Workspace lease authority path changed before lock recovery');
-    await requireActiveWorkspaceLease(state, filePath, authorityContext);
-    return recoverStaleLock(filePath, parameters.stale_after_sec, { parentAuthority });
-  }, { allowAuthorityCreation: true });
 }
 
 async function auditContext(parameters) {
@@ -4541,37 +4383,43 @@ async function closeCheck(parameters) {
   const parentAuthority = await stateParentAuthorityForState(initialState, filePath);
   await verifyRegularDirectorySnapshot(parentAuthority, 'Controller state parent');
   const leasePath = initialState.workspace_lease.registry_path;
-  return withWorkspaceLeaseLock(initialState.workspace, async (lockedLeasePath, authorityContext) => {
-    if (lockedLeasePath !== leasePath) throw new ControllerError('Workspace lease authority path changed before close');
-    return withStateLock(filePath, async () => {
-    await verifyRegularDirectorySnapshot(parentAuthority, 'Controller state parent');
-    const state = normalizeState(await loadState(filePath));
-    const currentParentAuthority = await stateParentAuthorityForState(state, filePath);
-    if (!sameStateParentAuthority(currentParentAuthority, parentAuthority)) throw new ControllerError(`Controller state parent authority changed: ${filePath}`);
-    await attachStateParentAuthority(state, filePath, parentAuthority);
-    if (state.workspace_lease.status === 'released') {
-      const lease = await loadWorkspaceLease(leasePath, state.workspace, { authorityContext });
-      let selfHealed = false;
-      const peerOwners = workspaceLeasePeerOwners(lease, state, filePath);
-      if (peerOwners.length) {
-        const reasons = [...await closeReasons(state), `workspace lease has another active state-path owner: ${peerOwners[0].task_id}`];
-        return [{ task_id: state.task_id, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), close_allowed: false, reasons, workspace_lease: { released: false, reason: 'state path belongs to another active task identity', lease_path: leasePath } }, 2];
-      }
-      if (workspaceLeaseStatePathOwners(lease, filePath).some(entry => workspaceLeaseEntryMatches(entry, state, filePath, { activeOnly: false }))) {
-        lease.active_tasks = lease.active_tasks.filter(entry => !workspaceLeaseEntryMatches(entry, state, filePath, { activeOnly: false })); lease.updated_at = utcNow(); await writeWorkspaceLeaseRegistry(authorityContext, leasePath, lease); selfHealed = true;
-      }
-      const reasons = await closeReasons(state);
-      return [{ task_id: state.task_id, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), close_allowed: !reasons.length, reasons, workspace_lease: { released: true, already_released: true, self_healed: selfHealed, lease_path: leasePath } }, reasons.length ? 2 : 0];
-    }
-    const lease = await requireActiveWorkspaceLease(state, filePath, authorityContext);
+  if (initialState.workspace_lease.status === 'released') {
+    const removal = await removeReleasedWorkspaceLeaseEntry(initialState, filePath);
+    const reasons = await closeReasons(initialState);
+    return [{
+      task_id: initialState.task_id,
+      assurance_level: initialState.assurance_level,
+      effective_assurance_level: effectiveAssuranceLevel(initialState),
+      close_allowed: !reasons.length,
+      reasons,
+      workspace_lease: { released: true, already_released: true, self_healed: removal.removed, lease_path: removal.lease_path },
+    }, reasons.length ? 2 : 0];
+  }
+  if (initialState.workspace_lease.status !== 'active') throw new ControllerError(`Current task has an unsupported workspace lease status: ${initialState.workspace_lease.status}`);
+  let result;
+  await withActiveWorkspaceStateLock(filePath, async state => {
     const reasons = await closeReasons(state);
-    if (reasons.length) return [{ task_id: state.task_id, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), close_allowed: false, reasons }, 2];
-    state.workspace_lease.workspace_claims ??= state.workspace_claims; state.workspace_lease.status = 'released'; state.workspace_lease.released_at = utcNow(); state.closed_revision = state.workflow_revision; state.closed_at = utcNow();
-    addEvent(state, 'workspace_lease_released', { close_allowed: true }); await writeState(filePath, state);
-    lease.active_tasks = lease.active_tasks.filter(entry => !workspaceLeaseEntryMatches(entry, state, filePath, { activeOnly: false })); lease.updated_at = utcNow(); await writeWorkspaceLeaseRegistry(authorityContext, leasePath, lease);
-      return [{ task_id: state.task_id, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), close_allowed: true, reasons: [], workspace_lease: { released: true, lease_path: leasePath } }, 0];
-    }, { parentAuthority });
-  }, { allowAuthorityCreation: true });
+    result = {
+      task_id: state.task_id,
+      assurance_level: state.assurance_level,
+      effective_assurance_level: effectiveAssuranceLevel(state),
+      close_allowed: !reasons.length,
+      reasons,
+    };
+    if (reasons.length) return;
+    state.workspace_lease.workspace_claims ??= state.workspace_claims;
+    state.workspace_lease.status = 'released';
+    state.workspace_lease.released_at = utcNow();
+    state.closed_revision = state.workflow_revision;
+    state.closed_at = utcNow();
+    addEvent(state, 'workspace_lease_released', { close_allowed: true });
+  });
+  if (!result.close_allowed) return [result, 2];
+  const releasedState = normalizeState(await loadState(filePath));
+  if (releasedState.workspace_lease?.registry_path !== leasePath || releasedState.workspace_lease.status !== 'released') throw new ControllerError('Task workspace lease changed before close release');
+  const removal = await removeReleasedWorkspaceLeaseEntry(releasedState, filePath);
+  result.workspace_lease = { released: true, lease_path: removal.lease_path };
+  return [result, 0];
 }
 
 export async function dispatch(command, parameters) {
@@ -4580,24 +4428,44 @@ export async function dispatch(command, parameters) {
   }
   if (command === 'prune-expired') return [await pruneExpiredTasks(parameters), 0];
   if (command === 'reconcile-quarantine') return [await reconcileQuarantinedStates(parameters), 0];
-  // Diagnostic commands stay side-effect free; other operations lazily keep expired state bounded.
-  if (parameters && hasOwn(parameters, 'state_dir') && !READ_ONLY_COMMANDS.has(command)) {
-    const parentAuthority = await persistedStateParentAuthority(parameters);
-    await maybePruneExpiredTasks(parameters, { parentAuthority });
-  }
   switch (command) {
     case 'init': return [await initTask(parameters), 0]; case 'reconcile-workspace': return [await reconcileWorkspace(parameters), 0]; case 'add-node': return [await addNode(parameters), 0]; case 'raise-assurance': return [await raiseAssurance(parameters), 0]; case 'rebind-pending': return [await rebindPendingOwner(parameters), 0]; case 'invalidate-gate': return [await invalidateGate(parameters), 0];
     case 'ready': return [{ ready_nodes: readyNodes((await readTask(parameters))[1]) }, 0]; case 'claim': return [await claimNode(parameters), 0]; case 'start': return [await claimNode(parameters, true), 0];
-    case 'complete': return [await completeNode(parameters), 0]; case 'heartbeat': return [await heartbeatNode(parameters), 0]; case 'checkpoint': return [await checkpointNode(parameters), 0];
-    case 'abandon': return [await abandonNode(parameters), 0]; case 'retry': return [await retryNode(parameters), 0]; case 'requeue-stale': return [await requeueStaleNode(parameters), 0]; case 'rescue': return [await rescueNode(parameters), 0];
-    case 'recover-lock': return [await recoverTaskLock(parameters), 0]; case 'audit-context': return [await auditContext(parameters), 0];
+    case 'acquire-write-lock': return [await acquireWorkspaceWriteLock(parameters), 0]; case 'release-write-lock': return [await releaseWorkspaceWriteLock(parameters), 0];
+    case 'complete': {
+      const result = await completeNode(parameters);
+      await releaseWriteLocksAfterNodeLifecycle(parameters, 'node_completed');
+      return [result, 0];
+    }
+    case 'heartbeat': return [await heartbeatNode(parameters), 0]; case 'checkpoint': return [await checkpointNode(parameters), 0];
+    case 'abandon': {
+      const result = await abandonNode(parameters);
+      await releaseWriteLocksAfterNodeLifecycle(parameters, 'node_abandoned');
+      return [result, 0];
+    }
+    case 'retry': return [await retryNode(parameters), 0];
+    case 'requeue-stale': {
+      const result = await requeueStaleNode(parameters);
+      await releaseWriteLocksAfterNodeLifecycle(parameters, 'stale_node_requeued');
+      return [result, 0];
+    }
+    case 'rescue': {
+      const result = await rescueNode(parameters);
+      await releaseWriteLocksAfterNodeLifecycle(parameters, 'root_rescue');
+      return [result, 0];
+    }
+    case 'audit-context': return [await auditContext(parameters), 0];
     case 'record-review': return [await recordReview(parameters), 0]; case 'record-repair': return [await recordRepair(parameters), 0]; case 'close-check': return closeCheck(parameters);
     case 'release-workspace': return [await releaseWorkspaceLease(parameters), 0];
     case 'stale': {
       const [, state] = await readTask(parameters);
-      return [{ task_id: state.task_id, stale_nodes: staleNodes(state) }, 0];
+      return [{ task_id: state.task_id, stale_nodes: staleNodes(state), active_write_locks: await activeWorkspaceWriteLocks(state) }, 0];
     }
-    case 'status': return [compactState((await readTask(parameters))[1]), 0]; case 'doctor': return [await doctorTask(parameters), 0]; case 'fingerprint': return [{ workspace_fingerprint: await workspaceFingerprint(parameters.workspace, parameters.workspace_claims) }, 0];
+    case 'status': {
+      const [, state] = await readTask(parameters);
+      return [await compactStateWithActiveWriteLocks(state), 0];
+    }
+    case 'doctor': return [await doctorTask(parameters), 0]; case 'fingerprint': return [{ workspace_fingerprint: await workspaceFingerprint(parameters.workspace, parameters.workspace_claims) }, 0];
     default: throw new ControllerError(`Unknown command: ${command}`);
   }
 }

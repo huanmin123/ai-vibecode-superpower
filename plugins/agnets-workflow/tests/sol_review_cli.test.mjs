@@ -349,7 +349,7 @@ test('rejects an evidence package with more than the bounded number of directori
 
 test('closes a workflow-bound evidence validation failure as unavailable before spawning Sol', async () => {
   const item = await fixture();
-  const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(item.root, 'state'); const manifest = path.join(item.root, 'manifest.json'); const missingEvidence = path.join(item.root, 'missing-evidence');
+  const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(workspace, '.codex', 'workflow-controller'); const manifest = path.join(item.root, 'manifest.json'); const missingEvidence = path.join(item.root, 'missing-evidence');
   try {
     await mkdir(workspace);
     await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
@@ -382,7 +382,7 @@ test('closes a workflow-bound evidence validation failure as unavailable before 
 
 test('retains the pending artifact when automatic unavailable completion cannot finalize it', async () => {
   const item = await fixture();
-  const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(item.root, 'state'); const manifest = path.join(item.root, 'manifest.json'); const missingEvidence = path.join(item.root, 'missing-evidence');
+  const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(workspace, '.codex', 'workflow-controller'); const manifest = path.join(item.root, 'manifest.json'); const missingEvidence = path.join(item.root, 'missing-evidence');
   const originalRename = fsPromises.rename;
   try {
     await mkdir(workspace);
@@ -602,7 +602,7 @@ test('rejects a workflow review result directory containing a Windows junction b
 
 test('rejects a relative workflow state directory and completes through a Windows case alias', { skip: process.platform !== 'win32' }, async t => {
   const item = await fixture();
-  const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(item.root, 'state'); const manifest = path.join(item.root, 'manifest.json');
+  const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(workspace, '.codex', 'workflow-controller'); const manifest = path.join(item.root, 'manifest.json');
   try {
     await assert.rejects(runSolReview(['--workflow-state-dir', 'relative', '--workflow-task-id', 'review-task', '--workflow-node-id', 'total-review', '--workflow-claim-id', 'claim-1', '--', 'review'], { CODEX_HOME: item.codexHome }, 'win32'), /--workflow-state-dir must be an absolute path/);
     await mkdir(workspace); await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
@@ -660,7 +660,7 @@ test('does not use a shell for a native executable on Windows', async () => {
 
 test('derives the CLI reasoning effort from the active workflow total-review role', async () => {
   const item = await fixture();
-  const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(item.root, 'state'); const manifest = path.join(item.root, 'manifest.json');
+  const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(workspace, '.codex', 'workflow-controller'); const manifest = path.join(item.root, 'manifest.json');
   try {
     await mkdir(workspace);
     await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
@@ -687,7 +687,7 @@ test('derives the CLI reasoning effort from the active workflow total-review rol
 
 test('keeps a workflow-bound Sol review running past the soft deadline and saves the eventual result', async () => {
   const item = await fixture();
-  const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(item.root, 'state'); const manifest = path.join(item.root, 'manifest.json');
+  const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(workspace, '.codex', 'workflow-controller'); const manifest = path.join(item.root, 'manifest.json');
   try {
     await mkdir(workspace);
     await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
@@ -751,7 +751,7 @@ test('keeps a workflow-bound Sol review running past the soft deadline and saves
 
 test('marks an exit-zero workflow-bound review unavailable when no valid verdict was emitted', async () => {
   const item = await fixture();
-  const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(item.root, 'state'); const manifest = path.join(item.root, 'manifest.json');
+  const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(workspace, '.codex', 'workflow-controller'); const manifest = path.join(item.root, 'manifest.json');
   try {
     await mkdir(workspace);
     await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
@@ -927,7 +927,7 @@ test('rejects a finding identifier longer than the controller limit', async () =
 
 test('rejects inherited coverage for a workflow requirement named toString', async () => {
   const item = await fixture();
-  const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(item.root, 'state'); const manifest = path.join(item.root, 'manifest.json');
+  const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(workspace, '.codex', 'workflow-controller'); const manifest = path.join(item.root, 'manifest.json');
   try {
     await mkdir(workspace); await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
     await writeFile(manifest, JSON.stringify(v3ReviewManifest(workspace, { goal: 'Reject inherited coverage', requirements: [{ id: 'toString', text: 'coverage must be own' }], executionOwner: '/root/to-string-review' })));
@@ -957,7 +957,7 @@ test('rejects inherited coverage for a workflow requirement named toString', asy
 
 test('marks a structurally complete workflow review unavailable when its audit context is stale or mismatched', async () => {
   const item = await fixture();
-  const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(item.root, 'state'); const manifest = path.join(item.root, 'manifest.json');
+  const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(workspace, '.codex', 'workflow-controller'); const manifest = path.join(item.root, 'manifest.json');
   try {
     await mkdir(workspace);
     await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
@@ -993,7 +993,7 @@ test('marks a structurally complete workflow review unavailable when its audit c
 
 test('closes a workflow-bound unavailable Sol review with an explicit completion attestation', async () => {
   const item = await fixture();
-  const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(item.root, 'state'); const manifest = path.join(item.root, 'manifest.json');
+  const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(workspace, '.codex', 'workflow-controller'); const manifest = path.join(item.root, 'manifest.json');
   try {
     await mkdir(workspace);
     await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
@@ -1023,7 +1023,7 @@ test('closes a workflow-bound unavailable Sol review with an explicit completion
 
 test('records native_agent_start_failed when the workflow-bound Sol process cannot start', async () => {
   const item = await fixture();
-  const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(item.root, 'state'); const manifest = path.join(item.root, 'manifest.json');
+  const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(workspace, '.codex', 'workflow-controller'); const manifest = path.join(item.root, 'manifest.json');
   try {
     await mkdir(workspace);
     await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
@@ -1051,7 +1051,7 @@ test('records native_agent_start_failed when the workflow-bound Sol process cann
 
 test('records native_agent_exit_confirmed when a started Sol process later reports an error', async () => {
   const item = await fixture();
-  const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(item.root, 'state'); const manifest = path.join(item.root, 'manifest.json');
+  const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(workspace, '.codex', 'workflow-controller'); const manifest = path.join(item.root, 'manifest.json');
   try {
     await mkdir(workspace);
     await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
@@ -1077,7 +1077,7 @@ test('records native_agent_exit_confirmed when a started Sol process later repor
 
 test('records native_agent_start_failed when spawning synchronously throws', async () => {
   const item = await fixture();
-  const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(item.root, 'state'); const manifest = path.join(item.root, 'manifest.json');
+  const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(workspace, '.codex', 'workflow-controller'); const manifest = path.join(item.root, 'manifest.json');
   try {
     await mkdir(workspace);
     await writeFile(path.join(workspace, 'source.txt'), 'review target\n');

@@ -262,6 +262,8 @@ function Get-ManagedTomlSettings {
             'model' = $null
             'model_reasoning_effort' = $null
             'sandbox_mode' = $null
+            'approval_policy' = $null
+            'approvals_reviewer' = $null
         }
         'agents' = [ordered]@{
             'max_threads' = $null
@@ -273,13 +275,17 @@ function Get-ManagedTomlSettings {
     }
     $section = ''
     foreach ($line in Get-Content -LiteralPath $Path) {
-        if ($line -match '^\s*\[([^\]]+)\]\s*(?:#.*)?$') {
-            $section = $Matches[1]
+        if ($line -cmatch '^\s*\[\[[^\]]+\]\]\s*(?:#.*)?$') {
+            $section = '__other__'
             continue
         }
-        if ($settings.Contains($section) -and $line -match '^\s*([A-Za-z][A-Za-z0-9_-]*)\s*=\s*(.+)$') {
+        if ($line -cmatch '^\s*\[([^\]]+)\]\s*(?:#.*)?$') {
+            $section = $Matches[1].Trim()
+            continue
+        }
+        if (($settings.Keys -ccontains $section) -and $line -cmatch '^\s*([A-Za-z][A-Za-z0-9_-]*)\s*=\s*(.+)$') {
             $key = $Matches[1]
-            if ($settings[$section].Contains($key)) {
+            if ($settings[$section].Keys -ccontains $key) {
                 $settings[$section][$key] = $Matches[2].Trim()
             }
         }
@@ -312,7 +318,7 @@ function Merge-ManagedTomlSettings {
     function Add-MissingSettings {
         param([Parameter(Mandatory)][AllowEmptyString()][string]$Section)
 
-        if (-not $Settings.Contains($Section)) { return }
+        if (-not ($Settings.Keys -ccontains $Section)) { return }
         foreach ($key in $Settings[$Section].Keys) {
             if (-not $seenKeys[$Section].Contains($key)) {
                 $output.Add("$key = $($Settings[$Section][$key])")
@@ -324,16 +330,22 @@ function Merge-ManagedTomlSettings {
     $section = ''
     if (Test-Path -LiteralPath $ExistingPath -PathType Leaf) {
         foreach ($line in Get-Content -LiteralPath $ExistingPath) {
-            if ($line -match '^\s*\[([^\]]+)\]\s*(?:#.*)?$') {
+            if ($line -cmatch '^\s*\[\[[^\]]+\]\]\s*(?:#.*)?$') {
                 Add-MissingSettings -Section $section
-                $section = $Matches[1]
-                if ($Settings.Contains($section)) { [void]$seenSections.Add($section) }
+                $section = '__other__'
                 $output.Add($line)
                 continue
             }
-            if ($Settings.Contains($section) -and $line -match '^\s*([A-Za-z][A-Za-z0-9_-]*)\s*=') {
+            if ($line -cmatch '^\s*\[([^\]]+)\]\s*(?:#.*)?$') {
+                Add-MissingSettings -Section $section
+                $section = $Matches[1].Trim()
+                if ($Settings.Keys -ccontains $section) { [void]$seenSections.Add($section) }
+                $output.Add($line)
+                continue
+            }
+            if (($Settings.Keys -ccontains $section) -and $line -cmatch '^\s*([A-Za-z][A-Za-z0-9_-]*)\s*=') {
                 $key = $Matches[1]
-                if ($Settings[$section].Contains($key) -and -not $seenKeys[$section].Contains($key)) {
+                if (($Settings[$section].Keys -ccontains $key) -and -not $seenKeys[$section].Contains($key)) {
                     $output.Add("$key = $($Settings[$section][$key])")
                     [void]$seenKeys[$section].Add($key)
                     continue
@@ -368,20 +380,23 @@ function Assert-SafeTomlMergeInput {
             throw "Unsupported TOML syntax for safe merge at $Path`:$lineNumber (multiline strings)"
         }
         if ([string]::IsNullOrWhiteSpace($trimmed) -or $trimmed.StartsWith('#')) { continue }
-        if ($trimmed.StartsWith('[')) {
-            $arrayTable = $trimmed.StartsWith('[[')
+        if ($trimmed.StartsWith('[', [System.StringComparison]::Ordinal)) {
+            $arrayTable = $trimmed.StartsWith('[[', [System.StringComparison]::Ordinal)
             $headerPattern = if ($arrayTable) { '^\[\[([^\]]+)\]\]\s*(?:#.*)?$' } else { '^\[([^\]]+)\]\s*(?:#.*)?$' }
             if ($trimmed -notmatch $headerPattern) {
                 throw "Unsupported TOML syntax for safe merge at $Path`:$lineNumber (ambiguous table header)"
             }
-            $section = $Matches[1]
-            if ($arrayTable -and $section -in @('agents', 'features')) {
+            $section = $Matches[1].Trim()
+            if ($section.Contains('\') -and $section -cnotmatch '^[A-Za-z0-9_-]+\.') {
+                throw "Unsupported TOML syntax for safe merge at $Path`:$lineNumber (escaped table key)"
+            }
+            if ($arrayTable -and $section -cin @('agents', 'features')) {
                 throw "Unsupported TOML syntax for safe merge at $Path`:$lineNumber (managed table cannot be an array table)"
             }
-            if ($section -match '^("agents"|agents|"features"|features|"model"|model|"model_reasoning_effort"|model_reasoning_effort|"sandbox_mode"|sandbox_mode)(\.|$)' -and $section -notin @('agents', 'features')) {
+            if ($section -cmatch '^["'']?(agents|features|model|model_reasoning_effort|sandbox_mode|approval_policy|approvals_reviewer)["'']?\s*(?:[.]|$)' -and $section -cnotin @('agents', 'features')) {
                 throw "Unsupported TOML syntax for safe merge at $Path`:$lineNumber (managed namespace table)"
             }
-            if (-not $arrayTable -and $section -in @('agents', 'features')) {
+            if (-not $arrayTable -and $section -cin @('agents', 'features')) {
                 $tableSeen[$section] = 1 + ($tableSeen[$section] ?? 0)
                 if ($tableSeen[$section] -ne 1) { throw "Unsupported TOML syntax for safe merge at $Path`:$lineNumber (repeated managed table)" }
             }
@@ -417,19 +432,19 @@ function Assert-SafeTomlMergeInput {
         if ($inBasicString -or $inLiteralString -or $arrayDepth -ne 0 -or $tableDepth -ne 0) {
             throw "Unsupported TOML syntax for safe merge at $Path`:$lineNumber (cross-line or unclosed value)"
         }
-        if ($key -notmatch '^[A-Za-z][A-Za-z0-9_-]*$') {
-            if (($section -eq '' -and $key -match '^("|\x27)?(model|model_reasoning_effort|sandbox_mode|agents|features)') -or
-                ($section -in @('agents', 'features') -and $key -match '^("|\x27)?(max_threads|max_depth|goals)')) {
+        if ($key -cnotmatch '^[A-Za-z][A-Za-z0-9_-]*$') {
+            if (($section -ceq '' -and ($key.Contains('\') -or $key -cmatch '^["'']?(model|model_reasoning_effort|sandbox_mode|approval_policy|approvals_reviewer|agents|features)["'']?\s*(?:$|[.])')) -or
+                ($section -cin @('agents', 'features') -and $key -cmatch '^["'']?(max_threads|max_depth|goals)["'']?\s*(?:$|[.])')) {
                 throw "Unsupported TOML syntax for safe merge at $Path`:$lineNumber (quoted or dotted managed key)"
             }
             continue
         }
-        if ($section -eq '' -and $key -in @('agents', 'features')) {
+        if ($section -ceq '' -and $key -cin @('agents', 'features')) {
             throw "Unsupported TOML syntax for safe merge at $Path`:$lineNumber (managed table cannot be a root key)"
         }
-        $managed = ($section -eq '' -and $key -in @('model', 'model_reasoning_effort', 'sandbox_mode')) -or
-                   ($section -eq 'agents' -and $key -in @('max_threads', 'max_depth')) -or
-                   ($section -eq 'features' -and $key -eq 'goals')
+        $managed = ($section -ceq '' -and $key -cin @('model', 'model_reasoning_effort', 'sandbox_mode', 'approval_policy', 'approvals_reviewer')) -or
+                   ($section -ceq 'agents' -and $key -cin @('max_threads', 'max_depth')) -or
+                   ($section -ceq 'features' -and $key -ceq 'goals')
         if ($managed) {
             $managedKey = "$section/$key"
             $managedSeen[$managedKey] = 1 + ($managedSeen[$managedKey] ?? 0)
@@ -527,9 +542,17 @@ function Get-CodexCliPath {
 }
 
 function Assert-WorkflowControllerNode {
-    $node = Get-Command node -All -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -eq $node -or [string]::IsNullOrWhiteSpace($node.Source)) {
+    $nodeCommand = Get-Command node -All -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $nodeCommand -or [string]::IsNullOrWhiteSpace($nodeCommand.Source)) {
         throw 'Node.js is required for the agnets-workflow workflow-controller MCP server, but the node command was not found.'
+    }
+    $nodePath = $nodeCommand.Source
+    $nodeVersionText = (& $nodePath -p 'process.versions.node').Trim()
+    if ($LASTEXITCODE -ne 0) { throw "Cannot determine Node.js version from: $nodePath" }
+    try { $nodeVersion = [System.Version]::Parse($nodeVersionText) }
+    catch { throw "Cannot parse Node.js version '$nodeVersionText' from: $nodePath" }
+    if ($nodeVersion -lt [System.Version]'22.5.0') {
+        throw "Node.js 22.5.0 or newer is required for the native SQLite workflow controller; found $nodeVersionText at $nodePath"
     }
 }
 

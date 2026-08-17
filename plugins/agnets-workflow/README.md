@@ -6,7 +6,7 @@
 
 - 用任务 DAG 管理取证、设计、实现、集成、验证与任务末端质量门。
 - 持久化任务状态、节点产物、参与者、审核记录和按声明范围协调的工作区租约。
-- 在控制器被再次调用时惰性清理过期状态；完整已关闭任务按 7 天处理，可证明已失活的损坏状态在 30 天后隔离，无法验证 registry 或运行状态的任务保留给人工恢复，隔离完成后再保留 365 天。
+- 在控制器被再次调用时惰性清理过期状态；完整已关闭任务按 7 天处理，可证明已失活的损坏状态在 30 天后隔离，无法验证控制数据库或运行状态的任务保留给人工恢复，隔离完成后再保留 365 天。
 - 通过 MCP 或本地 CLI 提供初始化、派发、心跳、checkpoint、恢复、总审和关闭检查。
 - 用 `$agent-toolchain` 为目标项目接入或维护 CodeGraph/RTK；接入时在项目 `AGENTS.md` 中写入一个统一的 `## CodeGraph 与 RTK` 受管标题，日常开发直接遵守其中的规则。
 
@@ -37,12 +37,12 @@ CLI 会保存审查结果和受控日志；绑定工作流时使用控制器要�
 
 ## 状态目录
 
-建议将 `state_dir` 设为目标工作区的 `.codex/workflow-controller/`。每个 v3 任务的唯一运行状态是 `state_dir/<task_id>.sqlite`；manifest、审核输入和小型协调记录使用 JSON 接口，但不作为任务状态。状态库、租约、checkpoint 和审查制品属于控制数据，不应纳入业务改动或工作区指纹。
+每次新的 `workflow_init` 都要求 `state_dir` 位于目标工作区内，建议固定为 `<workspace>/.codex/workflow-controller/`；除该标准控制目录外，不得放在 `.git`、`node_modules`、`.venv` 等指纹排除目录中。工作区协调库为该目录下的 `workflow.sqlite`，每个 v3 任务状态为 `state_dir/<task_id>.sqlite`。`workflow_init` 是唯一允许创建工作区协调库的入口；创建前会扫描工作区中的现有 v3 任务状态及 SQLite/bootstrap 残留。已有任务后续遇到库缺失、损坏、路径替换或工作区不匹配会明确失败，不会通过更换 `state_dir` 静默重建并丢失互斥关系。新的 `workflow_init` 会删除已识别的旧 JSON 协调文件；它们不会被加载、迁移或执行。manifest、审核输入、checkpoint 与审查制品仍是外部 JSON/日志接口；它们不是控制器的协调状态。
 
-控制器不是常驻服务，清理只会在后续控制器调用时触发。`workflow_doctor` 可检查状态和恢复前提；它不会替用户接管运行中的代理。未知或损坏状态不会静默删除，隔离和到期删除都必须经过控制器的保留周期。恢复、换绑和关卡失效处理见 [`workflow-controller`](skills/workflow-controller/SKILL.md)。
+控制器不是常驻服务，也不会在 heartbeat、claim 或 complete 等高频命令前隐式执行全局清理。需要维护保留周期时显式调用 `workflow_prune_expired`；该命令及隔离恢复会移动或删除跨任务制品，因此是少数会串行校验工作区 lease 的维护操作，普通任务状态更新只使用本任务 SQLite 事务。`workflow_doctor` 只检查状态和恢复前提，不替用户接管运行中的代理。未知或损坏状态不会静默删除，隔离和到期删除都必须经过控制器的保留周期。恢复、换绑和关卡失效处理见 [`workflow-controller`](skills/workflow-controller/SKILL.md)。
 
-同一工作区可运行声明范围互不冲突的任务。清单必须提供非空 `workspace_claims`：`{mode:"read"|"write",prefix:"..."}` 数组。它是协调声明而非文件系统 ACL：末端审核仍须确认实际 diff 和产物仅落在 `write` claims。扩大范围时，先确认旧执行者停止并释放其 entry，再用 claims 超集和新的 `task_id` 初始化替代任务；共享或全局副作用使用根目录 `write` 独占。
+同一工作区可运行声明范围重叠的任务。清单必须提供非空 `workspace_claims`：`{mode:"read"|"write",prefix:"..."}` 数组；它是可申请写锁的不可变审计上界，而不是 `workflow_init` 时预占的锁，也不是文件系统 ACL。AI 仅在真正要改动文件前调用 `workflow_acquire_write_lock`，对最小实际相对路径申请短锁，并在该组写入完成后调用 `workflow_release_write_lock`；路径相同，或一方是另一方的祖先时才互斥。节点完成、放弃、救援或重排队会自动清理遗留锁。`workflow_status` 与 `workflow_stale` 会列出当前工作区的实际写锁；它们不会自动过期释放，协调者确认原执行者已停止后再使用相应的恢复或释放命令。末端审核仍须确认实际 diff 和产物仅落在 `write` claims。根目录 `write` 与根目录锁仅用于确实覆盖整个工作区的副作用，前者需 `global_write_justification`，后者需具体 `purpose`。扩大声明上界时，先确认旧执行者停止并释放其 entry，再用 claims 超集和新的 `task_id` 初始化替代任务。
 
 ## MCP
 
-插件同时提供 `workflow-controller` MCP 服务。需要接入时使用插件自带的 `.mcp.json`；`workflow_init.manifest` 传普通 JSON 清单文件路径（可为相对路径），不传内联 JSON，`state_dir` 必须为绝对路径。高频调度调用默认返回紧凑摘要，持续观察先从 `workflow_status` 取得 `cursor`，再用 `workflow_wait` 被动等待变化。排障或审计需要完整任务状态时使用 `workflow_status detail=full`。具体工具名称和输入字段以 MCP schema 与 [`workflow-controller`](skills/workflow-controller/SKILL.md) 为准。
+插件同时提供 `workflow-controller` MCP 服务。需要接入时使用插件自带的 `.mcp.json`；`workflow_init.manifest` 可直接传 v3 清单对象、内联 JSON 对象字符串或普通 JSON 文件路径，`state_dir` 必须为绝对路径。高频调度调用默认返回紧凑摘要，持续观察先从 `workflow_status` 取得 `cursor`，再用 `workflow_wait` 被动等待变化。排障或审计需要完整任务状态时使用 `workflow_status detail=full`。具体工具名称和输入字段以 MCP schema 与 [`workflow-controller`](skills/workflow-controller/SKILL.md) 为准。
