@@ -491,7 +491,9 @@ function Invoke-InstallRollback {
         [Parameter(Mandatory)][System.Collections.IEnumerable]$Targets,
         [AllowNull()][string]$BackupDirectory,
         [Parameter(Mandatory)][string]$AgentsTarget,
-        [Parameter(Mandatory)][bool]$AgentsParentCreated
+        [Parameter(Mandatory)][bool]$AgentsParentCreated,
+        [Parameter(Mandatory)][string]$SkillsTarget,
+        [Parameter(Mandatory)][bool]$SkillsParentCreated
     )
 
     $errors = [System.Collections.Generic.List[string]]::new()
@@ -504,7 +506,7 @@ function Invoke-InstallRollback {
             }
         }
     }
-    if ($null -ne $BackupDirectory) {
+    if (-not [string]::IsNullOrWhiteSpace($BackupDirectory)) {
         foreach ($target in $Targets) {
             $backupTarget = Join-Path $BackupDirectory $target.Name
             if ($target.BackedUp -and (Test-ExistingPath -Path $backupTarget)) {
@@ -526,6 +528,15 @@ function Invoke-InstallRollback {
             }
         } catch {
             $errors.Add("Could not remove newly created agents directory ${AgentsTarget}: $($_.Exception.Message)")
+        }
+    }
+    if ($SkillsParentCreated -and (Test-Path -LiteralPath $SkillsTarget -PathType Container)) {
+        try {
+            if (@(Get-ChildItem -LiteralPath $SkillsTarget -Force).Count -eq 0) {
+                Remove-Item -LiteralPath $SkillsTarget -Force
+            }
+        } catch {
+            $errors.Add("Could not remove newly created skills directory ${SkillsTarget}: $($_.Exception.Message)")
         }
     }
     return $errors
@@ -704,6 +715,7 @@ $stageRoot = $null
 $backupDirectory = $null
 $skillsTarget = Join-Path $codexHome 'skills'
 $agentsParentCreated = $false
+$skillsParentCreated = $false
 $transactionTargets = [System.Collections.Generic.List[object]]::new()
 
 try {
@@ -771,6 +783,10 @@ try {
         New-Item -ItemType Directory -Path $agentsTarget | Out-Null
         $agentsParentCreated = $true
     }
+    if (-not (Test-Path -LiteralPath $skillsTarget -PathType Container)) {
+        New-Item -ItemType Directory -Path $skillsTarget | Out-Null
+        $skillsParentCreated = $true
+    }
     if ($transactionTargets.Where({ $_.WasPresent }).Count -gt 0) {
         New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
         $backupDirectory = New-UniqueDirectory -Parent $backupRoot -Prefix 'backup-'
@@ -820,7 +836,7 @@ try {
     Write-Warning 'Restart Codex Desktop/CLI before starting a new workflow so newly installed agent roles are loaded.'
 }
 catch {
-    $rollbackErrors = Invoke-InstallRollback -Targets $transactionTargets -BackupDirectory $backupDirectory -AgentsTarget $agentsTarget -AgentsParentCreated $agentsParentCreated
+    $rollbackErrors = Invoke-InstallRollback -Targets $transactionTargets -BackupDirectory $backupDirectory -AgentsTarget $agentsTarget -AgentsParentCreated $agentsParentCreated -SkillsTarget $skillsTarget -SkillsParentCreated $skillsParentCreated
     foreach ($rollbackError in $rollbackErrors) {
         Write-Warning "$rollbackError Backup directory retained: $backupDirectory"
     }

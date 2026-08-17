@@ -1,10 +1,19 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+
+const isolatedCodexHome = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-mcp-codex-home-'));
+const previousCodexHome = process.env.CODEX_HOME;
+process.env.CODEX_HOME = isolatedCodexHome;
+test.after(async () => {
+  if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+  else process.env.CODEX_HOME = previousCodexHome;
+  await rm(isolatedCodexHome, { recursive: true, force: true });
+});
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const mcp = path.join(root, 'scripts', 'workflow_controller_mcp.mjs');
@@ -23,7 +32,7 @@ function v3McpManifest(workspace, taskId = 'mcp-task') {
 }
 
 function startMcp() {
-  const child = spawn(process.execPath, [mcp], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+  const child = spawn(process.execPath, [mcp], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, env: { ...process.env, CODEX_HOME: isolatedCodexHome } });
   const pending = new Map();
   let buffered = '';
   let nextId = 1;
@@ -90,10 +99,18 @@ test('MCP serves v3 workflow state over stdio and releases a cancelled wait', as
     assert.equal(initialized.result.serverInfo.name, 'agnets-workflow');
     const toolList = await server.request({ method: 'tools/list', params: {} });
     const initTool = toolList.result.tools.find(tool => tool.name === 'workflow_init');
+    const retryTool = toolList.result.tools.find(tool => tool.name === 'workflow_retry');
+    const invalidateTool = toolList.result.tools.find(tool => tool.name === 'workflow_invalidate_gate');
     assert.match(initTool.inputSchema.properties.manifest.description, /清单对象/);
     assert.deepEqual(initTool.inputSchema.properties.manifest.anyOf, [{ type: 'object' }, { type: 'string' }]);
+    assert.ok(retryTool.inputSchema.required.includes('replacement_agent_task_path'));
+    assert.ok(invalidateTool.inputSchema.required.includes('replacement_agent_task_path'));
     const inline = await server.request({ method: 'tools/call', params: { name: 'workflow_init', arguments: { manifest: JSON.stringify(v3McpManifest(workspace)), state_dir: stateDir } } });
-    assert.equal(JSON.parse(inline.result.content[0].text).task.task_id, 'mcp-task');
+    const inlineResult = JSON.parse(inline.result.content[0].text);
+    assert.equal(inlineResult.task.task_id, 'mcp-task');
+    assert.equal(inlineResult.database_path, inlineResult.state_path);
+    assert.deepEqual(inlineResult.task_key, { namespace: await realpath(stateDir), task_id: 'mcp-task' });
+    assert.equal(inlineResult.database_path, path.join(isolatedCodexHome, 'state', 'agnets-workflow', 'workflow.sqlite'));
     const objectInit = await server.request({ method: 'tools/call', params: { name: 'workflow_init', arguments: { manifest: v3McpManifest(workspace, 'mcp-object-task'), state_dir: stateDir } } });
     assert.equal(JSON.parse(objectInit.result.content[0].text).task.task_id, 'mcp-object-task');
     const init = await server.request({ method: 'tools/call', params: { name: 'workflow_init', arguments: { manifest: manifestPath, state_dir: stateDir } } });
@@ -101,7 +118,19 @@ test('MCP serves v3 workflow state over stdio and releases a cancelled wait', as
 
     const status = await server.request({ method: 'tools/call', params: { name: 'workflow_status', arguments: { task_id: 'mcp-task', state_dir: stateDir } } });
     const summary = JSON.parse(status.result.content[0].text);
+    assert.equal(summary.state_path, inlineResult.state_path);
+    assert.equal(summary.database_path, inlineResult.database_path);
+    assert.deepEqual(summary.task_key, inlineResult.task_key);
+    assert.equal(summary.workspace_lease.database_path, inlineResult.database_path);
+    assert.equal(summary.workspace_lease.state_path, inlineResult.state_path);
+    assert.deepEqual(summary.workspace_lease.task_key, inlineResult.task_key);
     assert.deepEqual(summary.status_counts, { pending: 1 });
+    const hintWait = server.request({ method: 'tools/call', params: { name: 'workflow_wait', arguments: { task_id: 'mcp-task', state_dir: stateDir, after_cursor: summary.cursor, timeout_sec: 1 } } });
+    const otherStarted = await server.request({ method: 'tools/call', params: { name: 'workflow_start', arguments: { task_id: 'mcp-object-task', node_id: 'total-review', agent_task_path: '/root/mcp-object-task-sol-review', agent_role: 'avsp_sol_high', native_agent_started: true, state_dir: stateDir } } });
+    const otherHint = JSON.parse((await hintWait).result.content[0].text);
+    assert.equal(otherHint.changed, false);
+    assert.equal(otherHint.cursor, summary.cursor);
+    await server.request({ method: 'tools/call', params: { name: 'workflow_heartbeat', arguments: { task_id: 'mcp-object-task', node_id: 'total-review', claim_id: JSON.parse(otherStarted.result.content[0].text).node.claim_id, state_dir: stateDir } } });
     const waiting = server.request({ method: 'tools/call', params: { name: 'workflow_wait', arguments: { task_id: 'mcp-task', state_dir: stateDir, after_cursor: summary.cursor, timeout_sec: 30 } } });
     const started = await server.request({ method: 'tools/call', params: { name: 'workflow_start', arguments: { task_id: 'mcp-task', node_id: 'total-review', agent_task_path: '/root/mcp-sol-review', agent_role: 'avsp_sol_high', native_agent_started: true, state_dir: stateDir } } });
     const startedNode = JSON.parse(started.result.content[0].text).node;

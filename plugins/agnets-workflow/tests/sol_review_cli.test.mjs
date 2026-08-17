@@ -7,7 +7,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { repairInvalidDenyReadAclState, resolveCodexHome, runSolReview } from '../scripts/sol_review_cli.mjs';
 import { dispatch } from '../scripts/workflow_controller.mjs';
-import { readTaskState } from '../scripts/sqlite_task_store.mjs';
+import { readGlobalTaskState as readTaskState } from '../scripts/global_workflow_store.mjs';
 
 async function fixture() {
   const root = await mkdtemp(path.join(os.tmpdir(), 'agnets-sol-cli-'));
@@ -17,6 +17,9 @@ async function fixture() {
   await mkdir(sandbox, { recursive: true });
   await mkdir(evidence);
   await writeFile(path.join(evidence, 'evidence-manifest.json'), JSON.stringify({ version: 1, allowed_files: [] }));
+  // Workflow dispatch and the simulated CLI must use the same user-level
+  // database; each test process receives an isolated Codex home.
+  process.env.CODEX_HOME = codexHome;
   return { root, codexHome, sandbox, evidence, state: path.join(sandbox, 'deny_read_acl_state.json') };
 }
 
@@ -35,6 +38,10 @@ function v3ReviewManifest(workspace, { goal, requirements, agentType = 'avsp_sol
     review_entry_stage: agentType === 'avsp_sol_xhigh' ? 'sol_xhigh' : 'sol_high',
     nodes: [{ id: 'total-review', kind: 'total_review', agent_type: agentType, depends_on: [], execution_risk: 'read_only', routing_reason: 'independent final quality gate', execution_owner: executionOwner, integration_owner: '/root', quality_guard: 'requirements and evidence review' }],
   };
+}
+
+async function workflowStatePath(stateDir) {
+  return path.join(await fsPromises.realpath(stateDir), 'review-task.sqlite');
 }
 
 test('repairs only an invalid Windows deny-read ACL state and keeps a backup', async () => {
@@ -109,6 +116,10 @@ test('uses the resolved current-account CODEX_HOME and preserves the Codex exit 
     assert.equal(invocation.options.shell, false);
     assert.equal(resolveCodexHome({ USERPROFILE: 'C:\\Users\\Administrator' }, 'win32'), path.join('C:\\Users\\Administrator', '.codex'));
   } finally { await rm(item.root, { recursive: true, force: true }); }
+});
+
+test('rejects a relative CODEX_HOME instead of resolving it under the current directory', () => {
+  assert.throws(() => resolveCodexHome({ CODEX_HOME: 'relative-codex-home' }, 'win32'), /CODEX_HOME must be an absolute path/);
 });
 
 test('selects the requested Sol reasoning effort and rejects unsupported review roles', async () => {
@@ -367,7 +378,7 @@ test('closes a workflow-bound evidence validation failure as unavailable before 
     assert.equal(result.workflow_completion.completed, true);
     const persisted = JSON.parse(await readFile(result.result_path, 'utf8'));
     assert.equal(persisted.workflow_completion.completed, true);
-    const state = await readTaskState(path.join(stateDir, 'review-task.sqlite'));
+    const state = await readTaskState(await workflowStatePath(stateDir));
     assert.equal(state.nodes['total-review'].status, 'unavailable');
     assert.deepEqual(persisted.workflow_completion, state.nodes['total-review'].result.workflow_completion);
     assert.equal(persisted.workflow_completion.completion, undefined);
@@ -407,17 +418,107 @@ test('retains the pending artifact when automatic unavailable completion cannot 
     assert.deepEqual(result.workflow_completion, { state: 'pending' });
     assert.match(result.workflow_completion_error, /injected unavailable finalization failure/);
     assert.deepEqual(JSON.parse(await readFile(result.result_path, 'utf8')).workflow_completion, { state: 'pending' });
-    assert.equal((await readTaskState(path.join(stateDir, 'review-task.sqlite'))).nodes['total-review'].status, 'running');
+    assert.equal((await readTaskState(await workflowStatePath(stateDir))).nodes['total-review'].status, 'running');
     fsPromises.rename = originalRename;
     const [completion] = await dispatch('complete', {
       state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', claim_id: claim.node.claim_id, status: 'unavailable', result: result.result_path, completion_attestation: 'native_agent_start_failed',
     });
     assert.equal(completion.workflow_outcome_completion.completed, true);
-    assert.equal((await readTaskState(path.join(stateDir, 'review-task.sqlite'))).nodes['total-review'].status, 'unavailable');
+    assert.equal((await readTaskState(await workflowStatePath(stateDir))).nodes['total-review'].status, 'unavailable');
   } finally {
     fsPromises.rename = originalRename;
     await rm(item.root, { recursive: true, force: true });
   }
+});
+
+test('keeps unavailable review evidence inside its verified artifact authority', async () => {
+  const item = await fixture();
+  const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(workspace, '.codex', 'workflow-controller'); const manifest = path.join(item.root, 'manifest.json');
+  const originalOpen = fsPromises.open;
+  const originalLstat = fsPromises.lstat;
+  try {
+    await mkdir(workspace);
+    await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
+    await writeFile(manifest, JSON.stringify(v3ReviewManifest(workspace, { goal: 'Reject replaced unavailable review evidence', requirements: [{ id: 'R1', text: 'artifact authority remains verified' }], executionOwner: '/root/unavailable-authority' })));
+    await dispatch('init', { state_dir: stateDir, manifest });
+    const [claim] = await dispatch('claim', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', agent_task_path: '/root/unavailable-authority', agent_role: 'avsp_sol_high' });
+    await dispatch('heartbeat', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', claim_id: claim.node.claim_id });
+    const resultDirectory = path.join(await fsPromises.realpath(stateDir), '.workflow-review-results', 'review-task', claim.node.claim_id);
+    const outcome = path.join(resultDirectory, 'outcome.json');
+    let authorityChanged = false;
+    fsPromises.open = async (target, flags, ...rest) => {
+      const handle = await originalOpen(target, flags, ...rest);
+      if (path.resolve(target) === path.resolve(outcome) && flags === 'r+') {
+        const close = handle.close.bind(handle);
+        handle.close = async (...closeArgs) => {
+          const value = await close(...closeArgs);
+          authorityChanged = true;
+          return value;
+        };
+      }
+      return handle;
+    };
+    fsPromises.lstat = async (target, ...rest) => {
+      if (authorityChanged && path.resolve(target) === path.resolve(resultDirectory)) {
+        const error = new Error('injected workflow artifact authority changed'); error.code = 'EIO'; throw error;
+      }
+      return originalLstat(target, ...rest);
+    };
+    const spawnProcess = () => {
+      const child = new EventEmitter(); child.pid = 4343; child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
+      queueMicrotask(() => child.emit('exit', 2, null));
+      return child;
+    };
+    const result = await runSolReview([
+      '--workflow-state-dir', stateDir, '--workflow-task-id', 'review-task', '--workflow-node-id', 'total-review', '--workflow-claim-id', claim.node.claim_id,
+      '--codex-bin', 'fake-codex', '--', 'review this frozen evidence package',
+    ], { CODEX_HOME: item.codexHome }, 'win32', spawnProcess);
+    assert.deepEqual(result.workflow_completion, { state: 'pending' });
+    assert.match(result.workflow_completion_error, /injected workflow artifact authority changed/);
+    assert.equal((await readTaskState(await workflowStatePath(stateDir))).nodes['total-review'].status, 'running');
+    await assert.rejects(readFile(path.join(resultDirectory, 'unavailable-review.json')), { code: 'ENOENT' });
+  } finally {
+    fsPromises.open = originalOpen;
+    fsPromises.lstat = originalLstat;
+    await rm(item.root, { recursive: true, force: true });
+  }
+});
+
+test('rejects a linked unavailable review target without writing outside the artifact directory', async t => {
+  const item = await fixture();
+  const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(workspace, '.codex', 'workflow-controller'); const manifest = path.join(item.root, 'manifest.json');
+  try {
+    await mkdir(workspace);
+    await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
+    await writeFile(manifest, JSON.stringify(v3ReviewManifest(workspace, { goal: 'Reject linked unavailable review evidence', requirements: [{ id: 'R1', text: 'linked evidence target is rejected' }], executionOwner: '/root/unavailable-linked-target' })));
+    await dispatch('init', { state_dir: stateDir, manifest });
+    const [claim] = await dispatch('claim', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', agent_task_path: '/root/unavailable-linked-target', agent_role: 'avsp_sol_high' });
+    await dispatch('heartbeat', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', claim_id: claim.node.claim_id });
+    const resultDirectory = path.join(await fsPromises.realpath(stateDir), '.workflow-review-results', 'review-task', claim.node.claim_id);
+    const linkedReview = path.join(resultDirectory, 'unavailable-review.json');
+    const outsideReview = path.join(item.root, 'outside-review.json');
+    await mkdir(resultDirectory, { recursive: true });
+    await writeFile(outsideReview, 'outside review must remain unchanged\n');
+    try { await symlink(outsideReview, linkedReview, 'file'); }
+    catch (error) {
+      if (error?.code === 'EPERM' || error?.code === 'EACCES') { t.skip(`symbolic links are unavailable: ${error.code}`); return; }
+      throw error;
+    }
+    const spawnProcess = () => {
+      const child = new EventEmitter(); child.pid = 4444; child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
+      queueMicrotask(() => child.emit('exit', 2, null));
+      return child;
+    };
+    const result = await runSolReview([
+      '--workflow-state-dir', stateDir, '--workflow-task-id', 'review-task', '--workflow-node-id', 'total-review', '--workflow-claim-id', claim.node.claim_id,
+      '--codex-bin', 'fake-codex', '--', 'review this frozen evidence package',
+    ], { CODEX_HOME: item.codexHome }, 'win32', spawnProcess);
+    assert.deepEqual(result.workflow_completion, { state: 'pending' });
+    assert.match(result.workflow_completion_error, /workflow artifact target must not be a symlink or junction/);
+    assert.equal(await readFile(outsideReview, 'utf8'), 'outside review must remain unchanged\n');
+    assert.equal((await fsPromises.lstat(linkedReview)).isSymbolicLink(), true);
+    assert.equal((await readTaskState(await workflowStatePath(stateDir))).nodes['total-review'].status, 'running');
+  } finally { await rm(item.root, { recursive: true, force: true }); }
 });
 
 test('uses codex.cmd by default on Windows to avoid an inaccessible Desktop codex.exe', async () => {
@@ -613,7 +714,7 @@ test('rejects a relative workflow state directory and completes through a Window
     const [claim] = await dispatch('start', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', agent_task_path: '/root/canonical-sol', agent_role: 'avsp_sol_high', native_agent_started: true });
     const result = await runSolReview(['--review-profile', 'bounded-external', '--evidence-dir', path.join(item.root, 'missing'), '--workflow-state-dir', alias, '--workflow-task-id', 'review-task', '--workflow-node-id', 'total-review', '--workflow-claim-id', claim.node.claim_id, '--codex-bin', 'fake-codex', '--', 'review'], { CODEX_HOME: item.codexHome }, 'win32', () => { throw new Error('spawn must not be called'); });
     assert.equal(result.workflow.state_dir, physical); assert.ok(result.result_path.startsWith(physical)); assert.equal(result.workflow_completion.completed, true);
-    assert.equal((await readTaskState(path.join(stateDir, 'review-task.sqlite'))).nodes['total-review'].status, 'unavailable');
+    assert.equal((await readTaskState(await workflowStatePath(stateDir))).nodes['total-review'].status, 'unavailable');
   } finally { await rm(item.root, { recursive: true, force: true }); }
 });
 
@@ -730,7 +831,7 @@ test('keeps a workflow-bound Sol review running past the soft deadline and saves
     assert.equal(artifact.deadline_reached, true);
     assert.match(await readFile(artifact.stdout.path, 'utf8'), /partial review output/);
     assert.match(await readFile(artifact.stderr.path, 'utf8'), /partial diagnostics/);
-    const state = await readTaskState(path.join(stateDir, 'review-task.sqlite'));
+    const state = await readTaskState(await workflowStatePath(stateDir));
     assert.equal(state.nodes['total-review'].status, 'running');
     assert.equal(state.nodes['total-review'].result, null);
     const review = path.join(item.root, 'review.json');
@@ -771,7 +872,7 @@ test('marks an exit-zero workflow-bound review unavailable when no valid verdict
     assert.equal(result.exit_code, 1);
     assert.deepEqual(result.review_verdict, { valid: false, reason: 'review output did not contain a JSON object' });
     assert.equal(result.workflow_completion.completed, true);
-    const state = await readTaskState(path.join(stateDir, 'review-task.sqlite'));
+    const state = await readTaskState(await workflowStatePath(stateDir));
     assert.equal(state.nodes['total-review'].status, 'unavailable');
   } finally { await rm(item.root, { recursive: true, force: true }); }
 });
@@ -986,7 +1087,7 @@ test('marks a structurally complete workflow review unavailable when its audit c
     assert.equal(result.workflow_completion.completed, true);
     const persisted = JSON.parse(await readFile(result.result_path, 'utf8'));
     assert.equal(persisted.workflow_completion.completed, true);
-    const state = await readTaskState(path.join(stateDir, 'review-task.sqlite'));
+    const state = await readTaskState(await workflowStatePath(stateDir));
     assert.equal(state.nodes['total-review'].status, 'unavailable');
   } finally { await rm(item.root, { recursive: true, force: true }); }
 });
@@ -1015,7 +1116,7 @@ test('closes a workflow-bound unavailable Sol review with an explicit completion
     ], { CODEX_HOME: item.codexHome }, 'win32', spawnProcess);
     assert.equal(result.exit_code, 2);
     assert.equal(result.workflow_completion.completed, true);
-    const state = await readTaskState(path.join(stateDir, 'review-task.sqlite'));
+    const state = await readTaskState(await workflowStatePath(stateDir));
     assert.equal(state.nodes['total-review'].status, 'unavailable');
     assert.ok(state.events.some(event => event.type === 'node_completed' && event.completion_attestation === 'native_agent_exit_confirmed'));
   } finally { await rm(item.root, { recursive: true, force: true }); }
@@ -1043,7 +1144,7 @@ test('records native_agent_start_failed when the workflow-bound Sol process cann
     assert.equal(result.exit_code, 1);
     assert.equal(result.spawn_error, 'test spawn failure');
     assert.equal(result.workflow_completion.completed, true);
-    const state = await readTaskState(path.join(stateDir, 'review-task.sqlite'));
+    const state = await readTaskState(await workflowStatePath(stateDir));
     assert.equal(state.nodes['total-review'].status, 'unavailable');
     assert.ok(state.events.some(event => event.type === 'node_completed' && event.completion_attestation === 'native_agent_start_failed'));
   } finally { await rm(item.root, { recursive: true, force: true }); }
@@ -1070,7 +1171,7 @@ test('records native_agent_exit_confirmed when a started Sol process later repor
     ], { CODEX_HOME: item.codexHome }, 'win32', spawnProcess);
     assert.equal(result.spawn_started, true);
     assert.equal(result.workflow_completion.completed, true);
-    const state = await readTaskState(path.join(stateDir, 'review-task.sqlite'));
+    const state = await readTaskState(await workflowStatePath(stateDir));
     assert.ok(state.events.some(event => event.type === 'node_completed' && event.completion_attestation === 'native_agent_exit_confirmed'));
   } finally { await rm(item.root, { recursive: true, force: true }); }
 });
@@ -1091,7 +1192,7 @@ test('records native_agent_start_failed when spawning synchronously throws', asy
     ], { CODEX_HOME: item.codexHome }, 'win32', () => { throw new Error('test synchronous spawn failure'); });
     assert.equal(result.spawn_started, false);
     assert.equal(result.workflow_completion.completed, true);
-    const state = await readTaskState(path.join(stateDir, 'review-task.sqlite'));
+    const state = await readTaskState(await workflowStatePath(stateDir));
     assert.ok(state.events.some(event => event.type === 'node_completed' && event.completion_attestation === 'native_agent_start_failed'));
   } finally { await rm(item.root, { recursive: true, force: true }); }
 });

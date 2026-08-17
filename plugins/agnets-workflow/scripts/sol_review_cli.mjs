@@ -52,7 +52,10 @@ const MAX_EVIDENCE_DIRECTORIES = 512;
 
 export function resolveCodexHome(environment = process.env, platform = process.platform) {
   const configured = environment.CODEX_HOME?.trim();
-  if (configured) return path.resolve(configured);
+  if (configured) {
+    if (!path.isAbsolute(configured)) throw new Error('CODEX_HOME must be an absolute path');
+    return path.resolve(configured);
+  }
   const home = platform === 'win32' ? environment.USERPROFILE : environment.HOME;
   if (!home?.trim()) throw new Error('CODEX_HOME is required when the current account home cannot be resolved');
   return path.join(path.resolve(home), '.codex');
@@ -526,6 +529,12 @@ async function writeAtomically(filePath, value, authority = null) {
   if (authority?.directories) {
     if (!sameFilesystemPath(path.dirname(filePath), authority.target_directory, authority.platform)) throw new Error(`workflow artifact path is outside its verified result directory: ${filePath}`);
     await verifyWorkflowArtifactAuthority(authority);
+    try {
+      const existing = await fs.lstat(filePath, { bigint: true });
+      if (existing.isSymbolicLink()) throw new Error(`workflow artifact target must not be a symlink or junction: ${filePath}`);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
   } else if (!authority) throw new Error(`Workflow artifact write requires a caller-verified authority: ${filePath}`);
   const parent = authority.directories?.at(-1) ?? authority;
   const temporary = `${filePath}.${randomUUID()}.tmp`;
@@ -883,10 +892,39 @@ async function persistWorkflowCompletion(stored, workflowCompletion, authority =
   await writeAtomically(stored.paths.result, `${JSON.stringify(stored.result, null, 2)}\n`, authority);
 }
 
-async function completeUnavailableWorkflowReview(workflow, resultPath, outcome) {
+async function recordUnavailableWorkflowReview(workflow, resultPath, authority = null) {
+  if (!workflow) return;
+  if (!authority?.directories) throw new Error('workflow unavailable review requires a verified artifact authority');
+  await dispatch('heartbeat', { state_dir: workflow.state_dir, task_id: workflow.task_id, node_id: workflow.node_id, claim_id: workflow.claim_id });
+  const [context] = await dispatch('audit-context', { state_dir: workflow.state_dir, task_id: workflow.task_id });
+  const node = context.nodes.find(candidate => candidate.id === workflow.node_id);
+  if (!node || node.claim_id !== workflow.claim_id || node.status !== 'running') throw new Error('workflow total-review claim is no longer active while recording unavailable review');
+  const review = {
+    auditor_task: node.agent_task_path,
+    auditor_role: node.agent_role,
+    claim_id: node.claim_id,
+    verdict: 'unavailable',
+    findings: [],
+    requirement_coverage: Object.fromEntries(context.requirements.map(requirement => [requirement.id, 'Reviewer unavailable before assessment.'])),
+    workflow_snapshot: context.workflow_snapshot,
+    workspace_fingerprint: context.workspace_fingerprint,
+    scope_and_regression: 'Unavailable before assessment.',
+    verification_gaps: 'The review process did not produce a usable verdict.',
+    residual_risk: 'Unassessed; the workflow remains retryable.',
+    independent_assessment: 'No independent assessment was produced.',
+    history_reconciliation: 'No review evidence was produced for this attempt.',
+    review_history_digest: context.review_history_digest,
+  };
+  const reviewPath = path.join(path.dirname(resultPath), 'unavailable-review.json');
+  await writeAtomically(reviewPath, `${JSON.stringify(review, null, 2)}\n`, authority);
+  await dispatch('record-review', { state_dir: workflow.state_dir, task_id: workflow.task_id, review: reviewPath });
+}
+
+async function completeUnavailableWorkflowReview(workflow, resultPath, outcome, authority = null) {
   if (!workflow || (!outcome.timed_out && outcome.exit_code === 0 && !outcome.signal && !outcome.spawn_error && outcome.review_verdict?.valid === true)) return null;
   if (outcome.timed_out && !outcome.termination?.confirmed) return { completed: false, reason: 'timed_out_process_exit_not_confirmed' };
   try {
+    await recordUnavailableWorkflowReview(workflow, resultPath, authority);
     const [completion] = await dispatch('complete', {
       state_dir: workflow.state_dir,
       task_id: workflow.task_id,
@@ -946,7 +984,7 @@ export async function runSolReview(argv = process.argv.slice(2), environment = p
     };
     const emptyCapture = { chunks: [], bytes: 0, truncated: false, drain_timed_out: false };
     const stored = await persistOutcome(resultPath, outcome, emptyCapture, emptyCapture, workflowArtifactAuthority);
-    const workflowCompletion = await completeUnavailableWorkflowReview(workflow, stored.paths.result, outcome);
+    const workflowCompletion = await completeUnavailableWorkflowReview(workflow, stored.paths.result, outcome, workflowArtifactAuthority);
     await persistWorkflowCompletion(stored, workflowCompletion, workflowArtifactAuthority);
     return { ...outcome, result_path: stored.paths.result, workflow_completion: workflowCompletion?.completed === true ? workflowCompletion : outcome.workflow_completion, workflow_completion_error: workflowCompletion?.completed === false ? workflowCompletion.reason : null };
   }
@@ -972,7 +1010,7 @@ export async function runSolReview(argv = process.argv.slice(2), environment = p
     };
     const emptyCapture = { chunks: [], bytes: 0, truncated: false, drain_timed_out: false };
     const stored = await persistOutcome(resultPath, outcome, emptyCapture, emptyCapture, workflowArtifactAuthority);
-    const workflowCompletion = await completeUnavailableWorkflowReview(workflow, stored.paths.result, outcome);
+    const workflowCompletion = await completeUnavailableWorkflowReview(workflow, stored.paths.result, outcome, workflowArtifactAuthority);
     await persistWorkflowCompletion(stored, workflowCompletion, workflowArtifactAuthority);
     return { ...outcome, result_path: stored.paths.result, workflow_completion: workflowCompletion?.completed === true ? workflowCompletion : outcome.workflow_completion, workflow_completion_error: workflowCompletion?.completed === false ? workflowCompletion.reason : null };
   }
@@ -1011,7 +1049,7 @@ export async function runSolReview(argv = process.argv.slice(2), environment = p
       };
       const emptyCapture = { chunks: [], bytes: 0, truncated: false, drain_timed_out: false };
       const stored = resultPath ? await persistOutcome(resultPath, outcome, emptyCapture, emptyCapture, artifactAuthority) : null;
-      const workflowCompletion = stored ? await completeUnavailableWorkflowReview(workflow, stored.paths.result, outcome) : null;
+      const workflowCompletion = stored ? await completeUnavailableWorkflowReview(workflow, stored.paths.result, outcome, workflowArtifactAuthority) : null;
       await persistWorkflowCompletion(stored, workflowCompletion, workflowArtifactAuthority);
       return { ...outcome, result_path: stored?.paths.result ?? null, workflow_completion: workflowCompletion?.completed === true ? workflowCompletion : outcome.workflow_completion, workflow_completion_error: workflowCompletion?.completed === false ? workflowCompletion.reason : null };
     }
@@ -1061,7 +1099,7 @@ export async function runSolReview(argv = process.argv.slice(2), environment = p
     };
     let stored = null;
     if (resultPath) stored = await persistOutcome(resultPath, outcome, stdout, stderr, artifactAuthority);
-    const workflowCompletion = stored ? await completeUnavailableWorkflowReview(workflow, stored.paths.result, outcome) : null;
+    const workflowCompletion = stored ? await completeUnavailableWorkflowReview(workflow, stored.paths.result, outcome, workflowArtifactAuthority) : null;
     await persistWorkflowCompletion(stored, workflowCompletion, workflowArtifactAuthority);
     return { ...outcome, result_path: stored?.paths.result ?? null, workflow_completion: workflowCompletion?.completed === true ? workflowCompletion : outcome.workflow_completion, workflow_completion_error: workflowCompletion?.completed === false ? workflowCompletion.reason : null };
   } finally {
