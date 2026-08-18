@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { copyFile, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { DatabaseSync } from 'node:sqlite';
 import os from 'node:os';
 import path from 'node:path';
@@ -18,7 +17,11 @@ test.after(async () => {
   await rm(isolatedCodexHome, { recursive: true, force: true });
 });
 const controller = path.join(root, 'scripts', 'workflow_controller.mjs');
-const sqljsRuntime = path.join(root, 'vendor', 'sqljs', 'sql-wasm.js');
+
+async function canonicalStateNamespace(stateDir) {
+  const { canonicalStateDirectory } = await import('../scripts/workflow_controller.mjs');
+  return canonicalStateDirectory(stateDir);
+}
 
 function assessment(level) {
   const dimension = (status) => ({ status, evidence: ['verified local evidence'], rationale: `risk is ${status}` });
@@ -34,51 +37,6 @@ function v3Manifest(workspace, overrides = {}) {
   };
 }
 
-function quarantinedMetadataFixture({ stateDir, taskId, errorRoot, stableJson }) {
-  const originalStatePath = path.join(stateDir, `${taskId}.sqlite`);
-  const quarantinedAt = '2025-01-01T00:00:00.000Z';
-  const metadata = {
-    version: 4,
-    status: 'quarantined',
-    task_id: taskId,
-    original_state_path: originalStatePath,
-    error_path: '',
-    reason: 'legacy state fixture is quarantined',
-    quarantined_at: quarantinedAt,
-    delete_after: '2026-01-01T00:00:00.000Z',
-    files: [path.basename(originalStatePath)],
-    move_error: null,
-    review_artifacts: null,
-    workspace: null,
-    registry_path: null,
-    binding: '',
-    authority_anchor: '',
-  };
-  metadata.authority_anchor = createHash('sha256').update(stableJson({
-    schema: 'workflow-quarantine-authority-v1',
-    workspace: metadata.workspace,
-    registry_path: metadata.registry_path,
-    task_id: metadata.task_id,
-    original_state_path: metadata.original_state_path,
-    files: metadata.files,
-    review_artifacts: metadata.review_artifacts,
-  })).digest('hex');
-  const errorPath = path.join(errorRoot, `${taskId}-${metadata.authority_anchor}-00000000-0000-4000-8000-000000000000`);
-  metadata.error_path = errorPath;
-  metadata.binding = createHash('sha256').update(stableJson({
-    schema: 'workflow-quarantine-binding-v2',
-    error_path: path.resolve(errorPath),
-    task_id: metadata.task_id,
-    original_state_path: metadata.original_state_path,
-    files: metadata.files,
-    review_artifacts: metadata.review_artifacts,
-    workspace: metadata.workspace,
-    registry_path: metadata.registry_path,
-    authority_anchor: metadata.authority_anchor,
-  })).digest('hex');
-  return { metadata, errorPath };
-}
-
 test('controller accepts only the current v3 manifest and SQLite state path', async () => {
   const source = await readFile(controller, 'utf8');
   assert.match(source, /routing_schema_version must be 3/);
@@ -88,7 +46,7 @@ test('controller accepts only the current v3 manifest and SQLite state path', as
   assert.match(source, /const initialState = normalizeState\(await loadState\(filePath\)\)/);
 });
 
-test('v3 requires an explicit justification for a workspace-wide write claim', { skip: !existsSync(sqljsRuntime) }, async () => {
+test('v3 requires an explicit justification for a workspace-wide write claim', async () => {
   const { ControllerError, dispatch } = await import('../scripts/workflow_controller.mjs');
   const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-claim-scope-'));
   const workspace = path.join(temp, 'workspace');
@@ -108,7 +66,7 @@ test('v3 requires an explicit justification for a workspace-wide write claim', {
   }
 });
 
-test('v3 requires every new task state directory to stay in a non-ignored workspace directory', { skip: !existsSync(sqljsRuntime) }, async () => {
+test('v3 requires every new task state directory to stay in a non-ignored workspace directory', async () => {
   const { ControllerError, dispatch } = await import('../scripts/workflow_controller.mjs');
   const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-state-boundary-'));
   const workspace = path.join(temp, 'workspace');
@@ -116,8 +74,7 @@ test('v3 requires every new task state directory to stay in a non-ignored worksp
   const externalStateDir = path.join(temp, 'external-state');
   const ignoredStateDirs = [
     path.join(workspace, '.git', 'workflow-state'),
-    path.join(workspace, '.workflow-errors', 'workflow-state'),
-    path.join(workspace, '.workflow-review-results', 'workflow-state'),
+    path.join(workspace, 'node_modules', 'workflow-state'),
   ];
   const manifestPath = path.join(temp, 'manifest.json');
   try {
@@ -143,7 +100,7 @@ test('v3 requires every new task state directory to stay in a non-ignored worksp
   }
 });
 
-test('v3 runtime initializes current manifests and rejects retired schema states', { skip: !existsSync(sqljsRuntime) }, async () => {
+test('v3 runtime initializes current manifests and rejects non-v3 schema states', async () => {
   const { ControllerError, dispatch } = await import('../scripts/workflow_controller.mjs');
   const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-'));
   const workspace = path.join(temp, 'workspace');
@@ -151,7 +108,6 @@ test('v3 runtime initializes current manifests and rejects retired schema states
   const manifestPath = path.join(temp, 'manifest.json');
   try {
     await mkdir(workspace, { recursive: true });
-    await mkdir(stateDir, { recursive: true });
     await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace)));
     const [initialized] = await dispatch('init', { manifest: manifestPath, state_dir: stateDir });
     assert.equal(initialized.task.task_id, 'feature');
@@ -169,7 +125,7 @@ test('v3 runtime initializes current manifests and rejects retired schema states
     assert.equal(raised.assurance_level, 'sol');
     assert.equal(raised.node.agent_type, 'avsp_sol_high');
 
-    await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace, { task_id: 'retired', routing_schema_version: 2 })));
+    await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace, { task_id: 'non-v3', routing_schema_version: 2 })));
     await assert.rejects(() => dispatch('init', { manifest: manifestPath, state_dir: stateDir }), error => error instanceof ControllerError && /routing_schema_version must be 3/.test(error.message));
 
     await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace, { task_id: 'controlled', assurance_assessment: assessment('controlled') })));
@@ -179,7 +135,44 @@ test('v3 runtime initializes current manifests and rejects retired schema states
   }
 });
 
-test('v3 writes workspace coordination only to the user-level SQLite store', { skip: !existsSync(sqljsRuntime) }, async () => {
+test('workflow payloads are inline and workspace-local JSON result paths are rejected', async () => {
+  const { ControllerError, dispatch } = await import('../scripts/workflow_controller.mjs');
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-inline-payloads-'));
+  const workspace = path.join(temp, 'workspace');
+  const stateDir = path.join(workspace, '.codex', 'workflow-controller');
+  const manifestPath = path.join(temp, 'manifest.json');
+  const localResultPath = path.join(stateDir, 'agent-result.json');
+  try {
+    await mkdir(workspace, { recursive: true });
+    await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace, { task_id: 'inline-payloads' })));
+    await dispatch('init', { manifest: manifestPath, state_dir: stateDir });
+    // Simulate an external/legacy producer attempting to use the logical
+    // namespace as a JSON spool.
+    await mkdir(stateDir, { recursive: true });
+    for (const [command, parameter] of [['checkpoint', 'checkpoint'], ['record-review', 'review'], ['record-repair', 'repair'], ['raise-assurance', 'assurance_assessment']]) {
+      const localPath = path.join(stateDir, `${parameter}.json`);
+      await writeFile(localPath, JSON.stringify({ forbidden: true }));
+      await assert.rejects(
+        () => dispatch(command, { task_id: 'inline-payloads', [parameter]: localPath, state_dir: stateDir }),
+        error => error instanceof ControllerError && /must be an inline JSON value; workspace-local JSON files are not workflow state/.test(error.message),
+      );
+    }
+    const [claimed] = await dispatch('claim', { task_id: 'inline-payloads', node_id: 'work', agent_task_path: '/root/work', agent_role: 'avsp_terra_high', state_dir: stateDir });
+    await dispatch('heartbeat', { task_id: 'inline-payloads', node_id: 'work', claim_id: claimed.claim_id, state_dir: stateDir });
+    await writeFile(localResultPath, JSON.stringify({ changed: true }));
+    await assert.rejects(
+      () => dispatch('complete', { task_id: 'inline-payloads', node_id: 'work', claim_id: claimed.claim_id, status: 'succeeded', result: localResultPath, completion_attestation: 'native_agent_finished', state_dir: stateDir }),
+      error => error instanceof ControllerError && /must be an inline JSON value; workspace-local JSON files are not workflow state/.test(error.message),
+    );
+    const [completed] = await dispatch('complete', { task_id: 'inline-payloads', node_id: 'work', claim_id: claimed.claim_id, status: 'succeeded', result: { changed: true }, completion_attestation: 'native_agent_finished', state_dir: stateDir });
+    assert.equal(completed.node.status, 'succeeded');
+    assert.equal(await readFile(localResultPath, 'utf8'), JSON.stringify({ changed: true }));
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test('v3 writes workspace coordination only to the user-level SQLite store', async () => {
   const { dispatch } = await import('../scripts/workflow_controller.mjs');
   const { globalWorkflowStorePath } = await import('../scripts/global_workflow_store.mjs');
   const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-sqlite-control-'));
@@ -191,14 +184,14 @@ test('v3 writes workspace coordination only to the user-level SQLite store', { s
     await mkdir(workspace, { recursive: true });
     await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace)));
     const [initialized] = await dispatch('init', { manifest: manifestPath, state_dir: stateDir });
-    const canonicalStateDir = await realpath(stateDir);
+    const canonicalStateDir = await canonicalStateNamespace(stateDir);
     assert.equal(initialized.database_path, globalWorkflowStorePath());
     assert.equal(initialized.state_path, globalWorkflowStorePath());
     assert.deepEqual(initialized.task_key, { namespace: canonicalStateDir, task_id: 'feature' });
     assert.equal(existsSync(controlPath), false);
     assert.equal(existsSync(path.join(stateDir, 'workspace-lease.json')), false);
     assert.equal(existsSync(path.join(workspace, '.codex-workflow-controller-authority.json')), false);
-    assert.deepEqual((await readdir(stateDir)).sort(), []);
+    assert.equal(existsSync(stateDir), false);
     const [status] = await dispatch('status', { task_id: 'feature', state_dir: stateDir });
     assert.equal(status.state_path, globalWorkflowStorePath());
     assert.equal(status.database_path, globalWorkflowStorePath());
@@ -228,43 +221,7 @@ test('v3 writes workspace coordination only to the user-level SQLite store', { s
   }
 });
 
-test('directory doctor reports quarantined legacy state by global database and task key', { skip: !existsSync(sqljsRuntime) }, async () => {
-  const { dispatch, stableJson } = await import('../scripts/workflow_controller.mjs');
-  const { globalWorkflowStorePath } = await import('../scripts/global_workflow_store.mjs');
-  const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-doctor-quarantine-'));
-  const workspace = path.join(temp, 'workspace');
-  const stateDir = path.join(workspace, '.codex', 'workflow-controller');
-  const errorRoot = path.join(stateDir, '.workflow-errors');
-  const taskId = 'legacy-task';
-  try {
-    await mkdir(errorRoot, { recursive: true });
-    const canonicalStateDir = await realpath(stateDir);
-    const canonicalErrorRoot = path.join(canonicalStateDir, '.workflow-errors');
-    const { metadata, errorPath } = quarantinedMetadataFixture({ stateDir: canonicalStateDir, taskId, errorRoot: canonicalErrorRoot, stableJson });
-    await mkdir(errorPath);
-    const database = new DatabaseSync(path.join(canonicalErrorRoot, 'quarantine.sqlite'));
-    try {
-      database.exec('CREATE TABLE quarantine_entry (error_path TEXT NOT NULL PRIMARY KEY, schema_version INTEGER NOT NULL, payload TEXT NOT NULL, updated_at TEXT NOT NULL)');
-      database.prepare('INSERT INTO quarantine_entry (error_path, schema_version, payload, updated_at) VALUES (?, ?, ?, ?)')
-        .run(path.resolve(errorPath), 1, JSON.stringify(metadata), metadata.quarantined_at);
-      assert.equal(database.prepare('SELECT schema_version FROM quarantine_entry WHERE error_path = ?').get(path.resolve(errorPath)).schema_version, 1);
-    } finally {
-      database.close();
-    }
-    const [doctor] = await dispatch('doctor', { state_dir: stateDir });
-    const entry = doctor.checks.find(check => check.id === 'quarantined_states').detail.entries[0];
-    assert.ok(entry, JSON.stringify(doctor.checks));
-    assert.equal(entry.state_path, globalWorkflowStorePath());
-    assert.equal(entry.database_path, globalWorkflowStorePath());
-    assert.deepEqual(entry.task_key, { namespace: canonicalStateDir, task_id: taskId });
-    assert.equal(entry.legacy_state_path, path.join(canonicalStateDir, `${taskId}.sqlite`));
-    assert.equal(entry.error_path, errorPath);
-  } finally {
-    await rm(temp, { recursive: true, force: true });
-  }
-});
-
-test('v3 permits independent write claims in one workspace without taking a whole-workspace claim', { skip: !existsSync(sqljsRuntime) }, async () => {
+test('v3 permits independent write claims in one workspace without taking a whole-workspace claim', async () => {
   const { dispatch } = await import('../scripts/workflow_controller.mjs');
   const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-disjoint-claims-'));
   const workspace = path.join(temp, 'workspace');
@@ -285,7 +242,7 @@ test('v3 permits independent write claims in one workspace without taking a whol
   }
 });
 
-test('v3 treats workspace claims as a write-lock envelope and locks only actual paths on demand', { skip: !existsSync(sqljsRuntime) }, async () => {
+test('v3 treats workspace claims as a write-lock envelope and locks only actual paths on demand', async () => {
   const { ControllerError, dispatch } = await import('../scripts/workflow_controller.mjs');
   const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-demand-locks-'));
   const workspace = path.join(temp, 'workspace');
@@ -337,80 +294,94 @@ test('v3 treats workspace claims as a write-lock envelope and locks only actual 
   }
 });
 
-test('v3 removes retired JSON coordination instead of loading or migrating it', { skip: !existsSync(sqljsRuntime) }, async () => {
-  const { dispatch } = await import('../scripts/workflow_controller.mjs');
-  const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-retired-control-'));
-  const workspace = path.join(temp, 'workspace');
-  const stateDir = path.join(workspace, '.codex', 'workflow-controller');
-  const manifestPath = path.join(temp, 'manifest.json');
-  const legacyLeasePath = path.join(stateDir, 'workspace-lease.json');
-  const legacyAuthorityPath = path.join(workspace, '.codex-workflow-controller-authority.json');
-  try {
-    await mkdir(stateDir, { recursive: true });
-    await writeFile(legacyLeasePath, '{legacy lease is intentionally unreadable}');
-    await writeFile(legacyAuthorityPath, '{legacy authority is intentionally unreadable}');
-    await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace)));
-    const [initialized] = await dispatch('init', { manifest: manifestPath, state_dir: stateDir });
-    assert.equal(initialized.task.task_id, 'feature');
-    assert.equal(existsSync(legacyLeasePath), false);
-    assert.equal(existsSync(legacyAuthorityPath), false);
-    assert.equal((await readdir(stateDir)).some(name => name.startsWith('workspace-lease.json.')), false);
-    assert.equal((await readdir(workspace)).some(name => name.startsWith('.codex-workflow-controller-authority.json.')), false);
-    assert.equal(existsSync(path.join(stateDir, 'workflow.sqlite')), false);
-  } finally {
-    await rm(temp, { recursive: true, force: true });
-  }
-});
-
-test('v3 initialization removes a retired JSON state before creating SQLite state', { skip: !existsSync(sqljsRuntime) }, async () => {
+test('new workflow initialization ignores a materialized state_dir without scanning or writing it', async () => {
   const { dispatch } = await import('../scripts/workflow_controller.mjs');
   const { globalWorkflowStorePath } = await import('../scripts/global_workflow_store.mjs');
-  const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-legacy-json-'));
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-unrecognized-local-state-'));
   const workspace = path.join(temp, 'workspace');
   const stateDir = path.join(workspace, '.codex', 'workflow-controller');
   const manifestPath = path.join(temp, 'manifest.json');
-  const legacyStatePath = path.join(stateDir, 'feature.json');
+  const localFiles = [
+    path.join(stateDir, 'feature.sqlite'),
+    path.join(stateDir, 'workflow.sqlite'),
+    path.join(stateDir, 'feature.json'),
+    path.join(stateDir, 'workspace-lease.json'),
+    path.join(workspace, '.codex-workflow-controller-authority.json'),
+  ];
   try {
-    await mkdir(workspace, { recursive: true });
     await mkdir(stateDir, { recursive: true });
-    await writeFile(legacyStatePath, JSON.stringify({ version: 1, task_id: 'feature', workspace }));
+    const contents = new Map();
+    for (const localPath of localFiles) {
+      const value = `unrecognized local state: ${path.basename(localPath)}`;
+      await writeFile(localPath, value);
+      contents.set(localPath, value);
+    }
     await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace)));
     const [initialized] = await dispatch('init', { manifest: manifestPath, state_dir: stateDir });
-    assert.equal(existsSync(legacyStatePath), false);
-    assert.equal(existsSync(path.join(stateDir, 'feature.sqlite')), false);
     assert.equal(initialized.state_path, globalWorkflowStorePath());
-    assert.equal(existsSync(initialized.database_path), true);
+    assert.equal(initialized.database_path, globalWorkflowStorePath());
+    for (const [localPath, value] of contents) assert.equal(await readFile(localPath, 'utf8'), value);
   } finally {
     await rm(temp, { recursive: true, force: true });
   }
 });
 
-test('v3 blocks legacy local task and workspace SQLite files without modifying them', { skip: !existsSync(sqljsRuntime) }, async () => {
+test('v3 blocks missing workspace control when global task state exists without scanning the workspace tree', async () => {
   const { ControllerError, dispatch } = await import('../scripts/workflow_controller.mjs');
-  const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-legacy-sqlite-'));
+  const { globalWorkflowStorePath } = await import('../scripts/global_workflow_store.mjs');
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-global-orphan-'));
   const workspace = path.join(temp, 'workspace');
   const stateDir = path.join(workspace, '.codex', 'workflow-controller');
   const manifestPath = path.join(temp, 'manifest.json');
-  const legacyPaths = [path.join(stateDir, 'feature.sqlite'), path.join(stateDir, 'workflow.sqlite')];
   try {
-    await mkdir(stateDir, { recursive: true });
-    for (const legacyPath of legacyPaths) {
-      await writeFile(legacyPath, `legacy bytes must remain untouched: ${path.basename(legacyPath)}`);
-      const before = await readFile(legacyPath);
-      await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace)));
-      await assert.rejects(
-        () => dispatch('init', { manifest: manifestPath, state_dir: stateDir }),
-        error => error instanceof ControllerError && /LEGACY_STATE_MIGRATION_REQUIRED/.test(error.message),
-      );
-      assert.deepEqual(await readFile(legacyPath), before);
-      await unlink(legacyPath);
+    await mkdir(workspace, { recursive: true });
+    await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace)));
+    const [initialized] = await dispatch('init', { manifest: manifestPath, state_dir: stateDir });
+    const store = new DatabaseSync(globalWorkflowStorePath());
+    try {
+      assert.equal(store.prepare('DELETE FROM workspace_control WHERE workspace = ?').run(initialized.task.workspace).changes, 1);
+    } finally {
+      store.close();
     }
+    await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace, { task_id: 'replacement' })));
+    await assert.rejects(
+      () => dispatch('init', { manifest: manifestPath, state_dir: stateDir }),
+      error => error instanceof ControllerError && /Workspace control database is missing while current v3 task state exists/.test(error.message),
+    );
   } finally {
     await rm(temp, { recursive: true, force: true });
   }
 });
 
-test('v3 retries an abandoned ordinary protocol review at the same stage with a new reviewer', { skip: !existsSync(sqljsRuntime) }, async () => {
+test('v3 ignores malformed global task state for another workspace when recreating missing control', async () => {
+  const { dispatch } = await import('../scripts/workflow_controller.mjs');
+  const { globalWorkflowStorePath } = await import('../scripts/global_workflow_store.mjs');
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-unrelated-corrupt-state-'));
+  const workspace = path.join(temp, 'workspace');
+  const stateDir = path.join(workspace, '.codex', 'workflow-controller');
+  const manifestPath = path.join(temp, 'manifest.json');
+  try {
+    await mkdir(workspace, { recursive: true });
+    await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace)));
+    const [initialized] = await dispatch('init', { manifest: manifestPath, state_dir: stateDir });
+    const store = new DatabaseSync(globalWorkflowStorePath());
+    try {
+      assert.equal(store.prepare('DELETE FROM workspace_control WHERE workspace = ?').run(initialized.task.workspace).changes, 1);
+      assert.equal(store.prepare("DELETE FROM task_state WHERE json_valid(payload) AND json_extract(payload, '$.workspace') = ?").run(initialized.task.workspace).changes, 1);
+      store.prepare('INSERT INTO task_state (namespace_key, task_id, payload, updated_at, prune_after, instance_id, change_counter) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        .run('unrelated-corrupt-namespace', 'unrelated-corrupt-task', '{not valid JSON', new Date().toISOString(), null, '00000000-0000-0000-0000-000000000001', 1);
+    } finally {
+      store.close();
+    }
+    await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace, { task_id: 'replacement' })));
+    const [replacement] = await dispatch('init', { manifest: manifestPath, state_dir: stateDir });
+    assert.equal(replacement.task.task_id, 'replacement');
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test('v3 retries an abandoned ordinary protocol review at the same stage with a new reviewer', async () => {
   const { dispatch } = await import('../scripts/workflow_controller.mjs');
   const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-abandoned-review-'));
   const workspace = path.join(temp, 'workspace');
@@ -437,7 +408,7 @@ test('v3 retries an abandoned ordinary protocol review at the same stage with a 
   }
 });
 
-test('v3 non-cohort review completion accepts only its exact recorded verdict/status pair', { skip: !existsSync(sqljsRuntime) }, async () => {
+test('v3 non-cohort review completion accepts only its exact recorded verdict/status pair', async () => {
   const { ControllerError, dispatch } = await import('../scripts/workflow_controller.mjs');
   const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-review-matrix-'));
   const workspace = path.join(temp, 'workspace');
@@ -501,7 +472,7 @@ test('v3 non-cohort review completion accepts only its exact recorded verdict/st
   }
 });
 
-test('v3 max closure abandon and stale requeue restore the frozen charter for a new reviewer', { skip: !existsSync(sqljsRuntime) }, async () => {
+test('v3 max closure abandon and stale requeue restore the frozen charter for a new reviewer', async () => {
   const { dispatch } = await import('../scripts/workflow_controller.mjs');
   const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-max-closure-'));
   const workspace = path.join(temp, 'workspace');
@@ -578,7 +549,7 @@ test('v3 max closure abandon and stale requeue restore the frozen charter for a 
   }
 });
 
-test('v3 initialization supports the documented workspace control state_dir', { skip: !existsSync(sqljsRuntime) }, async () => {
+test('v3 initialization supports the documented workspace control state_dir', async () => {
   const { dispatch } = await import('../scripts/workflow_controller.mjs');
   const { globalWorkflowStorePath } = await import('../scripts/global_workflow_store.mjs');
   const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-control-state-'));
@@ -591,7 +562,7 @@ test('v3 initialization supports the documented workspace control state_dir', { 
     const [initialized] = await dispatch('init', { manifest: manifestPath, state_dir: stateDir });
     assert.equal(initialized.database_path, globalWorkflowStorePath());
     assert.equal(initialized.state_path, globalWorkflowStorePath());
-    assert.deepEqual(initialized.task_key, { namespace: await realpath(stateDir), task_id: 'feature' });
+    assert.deepEqual(initialized.task_key, { namespace: await canonicalStateNamespace(stateDir), task_id: 'feature' });
     const [ready] = await dispatch('ready', { task_id: 'feature', state_dir: stateDir });
     assert.equal(ready.ready_nodes[0].id, 'work');
   } finally {
@@ -599,7 +570,7 @@ test('v3 initialization supports the documented workspace control state_dir', { 
   }
 });
 
-test('v3 initialization completes missing direct review dependencies', { skip: !existsSync(sqljsRuntime) }, async () => {
+test('v3 initialization completes missing direct review dependencies', async () => {
   const { dispatch } = await import('../scripts/workflow_controller.mjs');
   const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-review-topology-'));
   const workspace = path.join(temp, 'workspace');
@@ -617,7 +588,7 @@ test('v3 initialization completes missing direct review dependencies', { skip: !
   }
 });
 
-test('v3 state authority rejects a replaced state directory before a claim can mutate it', { skip: !existsSync(sqljsRuntime) }, async () => {
+test('v3 namespace authority rejects a replaced workspace before a claim can mutate it', async () => {
   const { dispatch } = await import('../scripts/workflow_controller.mjs');
   const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-authority-'));
   const workspace = path.join(temp, 'workspace');
@@ -627,20 +598,20 @@ test('v3 state authority rejects a replaced state directory before a claim can m
     await mkdir(workspace, { recursive: true });
     await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace)));
     await dispatch('init', { manifest: manifestPath, state_dir: stateDir });
-    const displaced = path.join(temp, 'displaced-state');
-    await rename(stateDir, displaced);
-    await mkdir(stateDir);
+    const displaced = path.join(temp, 'displaced-workspace');
+    await rename(workspace, displaced);
+    await mkdir(workspace);
     await assert.rejects(
       () => dispatch('claim', { task_id: 'feature', node_id: 'work', agent_task_path: '/root/work', agent_role: 'avsp_terra_high', state_dir: stateDir }),
-      /Controller state parent changed/,
+      /Controller namespace workspace anchor changed/,
     );
-    assert.equal(existsSync(path.join(stateDir, 'feature.sqlite')), false);
+    assert.equal(existsSync(stateDir), false);
   } finally {
     await rm(temp, { recursive: true, force: true });
   }
 });
 
-test('v3 release-only state is never pruned merely by age', { skip: !existsSync(sqljsRuntime) }, async () => {
+test('v3 release-only state is never pruned merely by age', async () => {
   const { dispatch } = await import('../scripts/workflow_controller.mjs');
   const { globalWorkflowStorePath } = await import('../scripts/global_workflow_store.mjs');
   const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-prune-'));
@@ -656,19 +627,19 @@ test('v3 release-only state is never pruned merely by age', { skip: !existsSync(
     assert.equal(activeCloseCheck.close_allowed, false);
     assert.equal(activeCloseCheck.state_path, globalWorkflowStorePath());
     assert.equal(activeCloseCheck.database_path, globalWorkflowStorePath());
-    assert.deepEqual(activeCloseCheck.task_key, { namespace: await realpath(stateDir), task_id: 'feature' });
+    assert.deepEqual(activeCloseCheck.task_key, { namespace: await canonicalStateNamespace(stateDir), task_id: 'feature' });
     const [released] = await dispatch('release-workspace', { task_id: 'feature', previous_agent_stopped: true, state_dir: stateDir });
     assert.equal(released.state_path, globalWorkflowStorePath());
     assert.equal(released.database_path, globalWorkflowStorePath());
-    assert.deepEqual(released.task_key, { namespace: await realpath(stateDir), task_id: 'feature' });
+    assert.deepEqual(released.task_key, { namespace: await canonicalStateNamespace(stateDir), task_id: 'feature' });
     assert.equal('lease_path' in released, false);
     const [closeCheck] = await dispatch('close-check', { task_id: 'feature', state_dir: stateDir });
     assert.equal(closeCheck.state_path, globalWorkflowStorePath());
     assert.equal(closeCheck.database_path, globalWorkflowStorePath());
-    assert.deepEqual(closeCheck.task_key, { namespace: await realpath(stateDir), task_id: 'feature' });
+    assert.deepEqual(closeCheck.task_key, { namespace: await canonicalStateNamespace(stateDir), task_id: 'feature' });
     assert.equal(closeCheck.workspace_lease.state_path, globalWorkflowStorePath());
     assert.equal(closeCheck.workspace_lease.database_path, globalWorkflowStorePath());
-    assert.deepEqual(closeCheck.workspace_lease.task_key, { namespace: await realpath(stateDir), task_id: 'feature' });
+    assert.deepEqual(closeCheck.workspace_lease.task_key, { namespace: await canonicalStateNamespace(stateDir), task_id: 'feature' });
     const [freshPrune] = await dispatch('prune-expired', { state_dir: stateDir });
     assert.equal(freshPrune.deleted_count, 0);
     const [expiredPrune] = await dispatch('prune-expired', { state_dir: stateDir });
@@ -678,9 +649,9 @@ test('v3 release-only state is never pruned merely by age', { skip: !existsSync(
   }
 });
 
-test('v3 prune deletes only fully closed released tasks and keeps corrupt or artifact-failed rows', { skip: !existsSync(sqljsRuntime) }, async () => {
+test('v3 prune deletes only fully closed released tasks and keeps corrupt or artifact-failed rows', async () => {
   const { dispatch } = await import('../scripts/workflow_controller.mjs');
-  const { globalTaskStateExists, globalWorkflowStorePath, readGlobalTaskState, taskNamespaceKey, writeGlobalTaskState } = await import('../scripts/global_workflow_store.mjs');
+  const { globalTaskStateExists, globalWorkflowArtifactTaskPath, globalWorkflowStorePath, readGlobalTaskState, taskNamespaceKey, writeGlobalTaskState } = await import('../scripts/global_workflow_store.mjs');
   const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-prune-contract-'));
   const workspace = path.join(temp, 'workspace');
   const stateDir = path.join(workspace, '.codex', 'workflow-controller');
@@ -715,8 +686,9 @@ test('v3 prune deletes only fully closed released tasks and keeps corrupt or art
     } finally {
       store.close();
     }
-    await mkdir(path.join(stateDir, '.workflow-review-results'), { recursive: true });
-    await writeFile(path.join(stateDir, '.workflow-review-results', 'artifact-failure'), 'not a directory, so artifact cleanup must fail');
+    const artifactFailurePath = globalWorkflowArtifactTaskPath(await canonicalStateNamespace(stateDir), 'artifact-failure');
+    await mkdir(path.dirname(artifactFailurePath), { recursive: true });
+    await writeFile(artifactFailurePath, 'not a directory, so artifact cleanup must fail');
     const [prune] = await dispatch('prune-expired', { state_dir: stateDir });
     assert.deepEqual(prune.deleted.map(item => item.task_id), ['eligible']);
     assert.equal(await globalTaskStateExists(eligible), false);
@@ -727,6 +699,66 @@ test('v3 prune deletes only fully closed released tasks and keeps corrupt or art
     assert.equal(await globalTaskStateExists(corrupt), true);
     assert.ok(prune.retained.some(item => item.task_id === 'artifact-failure' && /artifact cleanup/.test(item.reason)));
     assert.ok(prune.retained.some(item => item.task_id === 'corrupt' && /corrupt or unreadable/.test(item.reason)));
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test('v3 startup prune advances past a full retained batch to a later eligible task', async () => {
+  const { dispatch, pruneExpiredTasksAtMcpStartup } = await import('../scripts/workflow_controller.mjs');
+  const { globalTaskStateExists, globalWorkflowStorePath, readGlobalTaskState, taskNamespaceKey, writeGlobalTaskState } = await import('../scripts/global_workflow_store.mjs');
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-prune-progress-'));
+  const workspace = path.join(temp, 'workspace');
+  const stateDir = path.join(workspace, '.codex', 'workflow-controller');
+  const manifestPath = path.join(temp, 'manifest.json');
+  const old = '1970-01-01T00:00:00.000Z';
+  const validTaskId = 'zzz-valid';
+  try {
+    await mkdir(workspace, { recursive: true });
+    await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace, { task_id: validTaskId })));
+    const [initialized] = await dispatch('init', { manifest: manifestPath, state_dir: stateDir });
+    await dispatch('release-workspace', { task_id: validTaskId, previous_agent_stopped: true, state_dir: stateDir });
+    const validPath = path.join(initialized.task_key.namespace, `${validTaskId}.sqlite`);
+    const baseState = await readGlobalTaskState(validPath);
+    for (const node of Object.values(baseState.nodes)) node.status = 'succeeded';
+    baseState.closed_at = old;
+    baseState.closed_revision = baseState.workflow_revision;
+    baseState.updated_at = old;
+    await writeGlobalTaskState(validPath, baseState);
+
+    const retainedPaths = [];
+    for (let index = 0; index < 33; index++) {
+      const taskId = `retained-${String(index).padStart(2, '0')}`;
+      const logicalPath = path.join(initialized.task_key.namespace, `${taskId}.sqlite`);
+      const retainedState = structuredClone(baseState);
+      retainedState.task_id = taskId;
+      retainedState.workspace_lease.state_path = logicalPath;
+      await writeGlobalTaskState(logicalPath, retainedState);
+      retainedPaths.push(logicalPath);
+    }
+
+    const store = new DatabaseSync(globalWorkflowStorePath());
+    try {
+      const corrupt = store.prepare('UPDATE task_state SET payload = ? WHERE namespace_key = ? AND task_id = ?');
+      for (const logicalPath of retainedPaths) {
+        const taskId = path.basename(logicalPath, '.sqlite');
+        assert.equal(corrupt.run('{not valid JSON', taskNamespaceKey(logicalPath), taskId).changes, 1);
+      }
+    } finally {
+      store.close();
+    }
+
+    const prune = await pruneExpiredTasksAtMcpStartup({ max_batches: 2 });
+    assert.equal(prune.deleted_count, 1);
+    assert.equal(await globalTaskStateExists(validPath), false);
+    for (const logicalPath of retainedPaths) assert.equal(await globalTaskStateExists(logicalPath), true);
+
+    const inspected = new DatabaseSync(globalWorkflowStorePath(), { readOnly: true });
+    try {
+      assert.equal(inspected.prepare("SELECT count(*) AS count FROM task_prune_job WHERE namespace_key = ? AND phase = 'retry'").get(taskNamespaceKey(validPath)).count, retainedPaths.length);
+    } finally {
+      inspected.close();
+    }
   } finally {
     await rm(temp, { recursive: true, force: true });
   }

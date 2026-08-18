@@ -5,6 +5,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { canonicalStateDirectory, dispatch, sameJson } from './workflow_controller.mjs';
+import { globalWorkflowArtifactPathForHome, globalWorkflowArtifactRootForHome, globalWorkflowArtifactRoot } from './global_workflow_store.mjs';
 
 const STATE_FILE = 'deny_read_acl_state.json';
 const REPAIR_LOCK_WAIT_MS = 5_000;
@@ -29,8 +30,9 @@ const DIRECT_SOL_REVIEW_INSTRUCTIONS = [
   'Do not return a progress acknowledgement; inspect the supplied task and produce the final review JSON in this invocation.',
 ].join(' ');
 const TERMINATION_GRACE_MS = 15_000;
+const TERMINATION_REQUEST_TIMEOUT_MS = 1_000;
+const CLEANUP_TIMEOUT_MS = 5_000;
 const MAX_CAPTURE_BYTES = 256 * 1024;
-const WORKFLOW_RESULT_DIRECTORY = '.workflow-review-results';
 const REVIEW_VERDICTS = new Set(['pass', 'fail', 'unavailable']);
 const SOL_REVIEW_ROLE_EFFORTS = new Map([
   ['avsp_sol_high', 'high'],
@@ -465,7 +467,16 @@ async function resolveEvidenceDirectory(reviewProfile, evidenceDirectory, platfo
         }
       }
       await verifyDirectories();
-      return { source: absoluteDirectory, workspace: snapshotDirectory, cleanup: () => fs.rm(snapshotDirectory, { recursive: true, force: true }) };
+      let cleaned = false;
+      return {
+        source: absoluteDirectory,
+        workspace: snapshotDirectory,
+        cleanup: async () => {
+          if (cleaned) return;
+          cleaned = true;
+          await fs.rm(snapshotDirectory, { recursive: true, force: true });
+        },
+      };
     } catch (error) {
       await fs.rm(snapshotDirectory, { recursive: true, force: true });
       throw error;
@@ -492,13 +503,14 @@ function directoryIdentity(metadata) {
 }
 function sameDirectoryIdentity(left, right) { return left.dev === right.dev && left.ino === right.ino; }
 
-async function prepareWorkflowArtifactAuthority(workflow, resultPath, platform = process.platform) {
-  const root = workflow.state_dir;
+async function prepareWorkflowArtifactAuthority(workflow, resultPath, platform = process.platform, codexHome = null) {
+  const root = path.resolve(codexHome ? globalWorkflowArtifactRootForHome(codexHome) : globalWorkflowArtifactRoot());
   const targetDirectory = path.dirname(resultPath);
+  await fs.mkdir(root, { recursive: true });
   const relative = path.relative(root, targetDirectory);
-  if (!pathIsWithin(root, targetDirectory) || relative === '') throw new Error('workflow result directory must be a child of the canonical state directory');
+  if (!pathIsWithin(root, targetDirectory) || relative === '') throw new Error('workflow result directory must be a child of the global artifact root');
   const rootMetadata = await fs.lstat(root, { bigint: true });
-  if (rootMetadata.isSymbolicLink() || !rootMetadata.isDirectory()) throw new Error('--workflow-state-dir must resolve to a regular directory');
+  if (rootMetadata.isSymbolicLink() || !rootMetadata.isDirectory()) throw new Error('global workflow artifact root must resolve to a regular directory');
   const rootRealPath = await fs.realpath(root);
   const directories = [{ path: root, real_path: rootRealPath, identity: directoryIdentity(rootMetadata) }];
   let current = root;
@@ -510,7 +522,7 @@ async function prepareWorkflowArtifactAuthority(workflow, resultPath, platform =
     const metadata = await fs.lstat(current, { bigint: true });
     if (metadata.isSymbolicLink() || !metadata.isDirectory()) throw new Error(`workflow result directory must not contain a symlink or junction: ${current}`);
     const realPath = await fs.realpath(current);
-    if (!pathIsWithin(rootRealPath, realPath)) throw new Error(`workflow result directory escapes the canonical state directory: ${current}`);
+    if (!pathIsWithin(rootRealPath, realPath)) throw new Error(`workflow result directory escapes the global artifact root: ${current}`);
     directories.push({ path: current, real_path: realPath, identity: directoryIdentity(metadata) });
   }
   return { version: 1, platform, root_real_path: rootRealPath, target_directory: targetDirectory, target_real_path: directories.at(-1).real_path, directories };
@@ -578,32 +590,74 @@ async function writeAtomically(filePath, value, authority = null) {
 }
 
 function captureStream(stream, destination) {
-  const capture = { chunks: [], bytes: 0, truncated: false, drained: false, drain_timed_out: false };
+  const capture = { chunks: [], bytes: 0, truncated: false, drained: false, drain_timed_out: false, destination_error: null };
   if (!stream) { capture.done = Promise.resolve(); return capture; }
   let settle;
+  let sourceEnded = false;
+  let pendingDrain = false;
+  let stopped = false;
+  let drainListener = null;
   const done = new Promise(resolve => { settle = resolve; });
   const settleOnce = () => {
-    if (!settle) return;
+    if (!settle || !sourceEnded || pendingDrain) return;
     const resolve = settle; settle = null; resolve();
   };
-  stream.once('end', settleOnce);
-  stream.once('close', settleOnce);
-  stream.once('error', settleOnce);
-  stream.on('data', chunk => {
+  const clearDrainListener = () => {
+    if (!drainListener) return;
+    destination?.removeListener?.('drain', drainListener);
+    drainListener = null;
+    pendingDrain = false;
+  };
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    clearDrainListener();
+    stream.removeListener?.('data', onData);
+    // Resume without a data listener so the child pipe is drained and cannot
+    // keep the child blocked after the bounded capture has stopped.
+    stream.resume?.();
+    sourceEnded = true;
+    settleOnce();
+  };
+  const onSourceEnd = () => { sourceEnded = true; settleOnce(); };
+  const onData = chunk => {
+    if (stopped) return;
     const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
-    destination.write(bytes);
     if (capture.bytes >= MAX_CAPTURE_BYTES) { capture.truncated = true; return; }
     const available = MAX_CAPTURE_BYTES - capture.bytes;
-    capture.chunks.push(bytes.subarray(0, available)); capture.bytes += Math.min(bytes.byteLength, available);
+    const retained = bytes.subarray(0, available);
+    capture.chunks.push(retained); capture.bytes += retained.byteLength;
     if (bytes.byteLength > available) capture.truncated = true;
-  });
+    if (!retained.byteLength || !destination?.write) return;
+    let accepted;
+    try { accepted = destination.write(retained); }
+    catch (error) { capture.destination_error = error.message || String(error); capture.drain_timed_out = true; stop(); return; }
+    if (accepted || typeof stream.pause !== 'function' || typeof destination.once !== 'function') return;
+    pendingDrain = true;
+    stream.pause();
+    drainListener = () => {
+      clearDrainListener();
+      if (!stopped) stream.resume?.();
+      settleOnce();
+    };
+    destination.once('drain', drainListener);
+  };
+  stream.once('end', onSourceEnd);
+  stream.once('close', onSourceEnd);
+  stream.once('error', onSourceEnd);
+  stream.on('data', onData);
   capture.done = done;
+  capture.stop = stop;
   return capture;
 }
 
-function isTopLevelObject(text, end) {
-  let objectDepth = 0; let arrayDepth = 0; let inString = false; let escaped = false;
-  for (let index = 0; index < end; index++) {
+export function extractJsonObjects(text) {
+  const values = [];
+  const stack = [];
+  let candidateStart = -1;
+  let inString = false;
+  let escaped = false;
+  for (let index = 0; index < text.length; index++) {
     const character = text[index];
     if (inString) {
       if (escaped) escaped = false;
@@ -612,37 +666,27 @@ function isTopLevelObject(text, end) {
       continue;
     }
     if (character === '"') { inString = true; continue; }
-    if (character === '{') objectDepth += 1;
-    else if (character === '}') objectDepth -= 1;
-    else if (character === '[') arrayDepth += 1;
-    else if (character === ']') arrayDepth -= 1;
-    if (objectDepth < 0 || arrayDepth < 0) return false;
-  }
-  return objectDepth === 0 && arrayDepth === 0 && !inString && !escaped;
-}
-
-function extractJsonObjects(text) {
-  const values = [];
-  for (let start = text.lastIndexOf('{'); start >= 0; start = start === 0 ? -1 : text.lastIndexOf('{', start - 1)) {
-    let depth = 0; let inString = false; let escaped = false;
-    for (let index = start; index < text.length; index++) {
-      const character = text[index];
-      if (inString) {
-        if (escaped) escaped = false;
-        else if (character === '\\') escaped = true;
-        else if (character === '"') inString = false;
-        continue;
-      }
-      if (character === '"') { inString = true; continue; }
-      if (character === '{') depth += 1;
-      else if (character === '}' && --depth === 0) {
-        try {
-          const value = JSON.parse(text.slice(start, index + 1));
-          if (value && typeof value === 'object' && !Array.isArray(value) && isTopLevelObject(text, start)) values.push({ value, start, end: index });
-        } catch { /* Keep looking for the last complete JSON object. */ }
-        break;
-      }
+    if (character === '{' || character === '[') {
+      if (stack.length === 0 && character === '{') candidateStart = index;
+      stack.push(character);
+      continue;
     }
+    if (character !== '}' && character !== ']') continue;
+    const expected = character === '}' ? '{' : '[';
+    if (stack.at(-1) !== expected) {
+      // An unmatched close invalidates the lexical prefix. Do not let a later
+      // object bypass that malformed boundary.
+      return values;
+    }
+    stack.pop();
+    if (stack.length !== 0 || candidateStart < 0) continue;
+    const start = candidateStart;
+    candidateStart = -1;
+    if (character !== '}') continue;
+    try {
+      const value = JSON.parse(text.slice(start, index + 1));
+      if (value && typeof value === 'object' && !Array.isArray(value)) values.push({ value, start, end: index });
+    } catch { /* Keep looking for the next complete top-level object. */ }
   }
   return values;
 }
@@ -713,7 +757,9 @@ function validateReviewOutput(stdout, workflowContract) {
   const text = Buffer.concat(stdout.chunks).toString('utf8');
   const values = extractJsonObjects(text);
   if (!values.length) return { valid: false, reason: 'review output did not contain a JSON object' };
-  const terminal = values.filter(candidate => !text.slice(candidate.end + 1).trim());
+  let trailingEnd = text.length - 1;
+  while (trailingEnd >= 0 && /\s/.test(text[trailingEnd])) trailingEnd -= 1;
+  const terminal = values.filter(candidate => candidate.end === trailingEnd);
   if (!terminal.length) return { valid: false, reason: 'review output must end with a final JSON object' };
   const candidate = terminal.find(item => REVIEW_REQUIRED_FIELDS.every(field => Object.prototype.hasOwnProperty.call(item.value, field))) ?? terminal.at(-1);
   const value = candidate.value;
@@ -741,6 +787,8 @@ function waitForCaptureDrain(capture, milliseconds = 250) {
   return new Promise(resolve => {
     const timer = setTimeout(() => { capture.drain_timed_out = true; resolve(false); }, milliseconds);
     capture.done.then(() => { clearTimeout(timer); capture.drained = true; resolve(true); }, () => { clearTimeout(timer); capture.drained = true; resolve(true); });
+    const timeout = setTimeout(() => capture.stop?.(), milliseconds);
+    capture.done.then(() => clearTimeout(timeout), () => clearTimeout(timeout));
   });
 }
 
@@ -811,9 +859,23 @@ export async function terminateSolReviewProcess(child, platform = process.platfo
     return { method: 'process-group SIGTERM', pid: child.pid };
   }
   await new Promise((resolve, reject) => {
-    const terminator = spawnProcess('taskkill', ['/pid', String(child.pid), '/t', '/f'], { windowsHide: true, shell: false, stdio: 'ignore' });
-    terminator.once('error', reject);
-    terminator.once('exit', code => code === 0 ? resolve() : reject(new Error(`taskkill exited with ${code}`)));
+    let settled = false;
+    let timer;
+    const finish = (error = null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error); else resolve();
+    };
+    let terminator;
+    try { terminator = spawnProcess('taskkill', ['/pid', String(child.pid), '/t', '/f'], { windowsHide: true, shell: false, stdio: 'ignore' }); }
+    catch (error) { finish(error); return; }
+    terminator.once('error', error => finish(error));
+    terminator.once('exit', code => code === 0 ? finish() : finish(new Error(`taskkill exited with ${code}`)));
+    timer = setTimeout(() => {
+      terminator.kill?.();
+      finish(new Error(`taskkill timed out after ${TERMINATION_REQUEST_TIMEOUT_MS}ms`));
+    }, TERMINATION_REQUEST_TIMEOUT_MS);
   });
   return { method: 'taskkill /pid /t /f', pid: child.pid };
 }
@@ -849,7 +911,10 @@ async function waitForReviewOutcome(child, softTimeoutMs, hardTimeoutMs, platfor
   if (first?.kind === 'hard_deadline' || (first?.kind === 'soft_deadline' && hardDeadline)) {
     clearTimers();
     let termination;
-    try { termination = await terminateProcess(child, platform, spawnProcess); }
+    try {
+      termination = await waitForExitWithin(Promise.resolve().then(() => terminateProcess(child, platform, spawnProcess)), TERMINATION_REQUEST_TIMEOUT_MS);
+      if (!termination) throw new Error(`process termination request timed out after ${TERMINATION_REQUEST_TIMEOUT_MS}ms`);
+    }
     catch (error) {
       const naturallyCompleted = await waitForExitWithin(exit, TERMINATION_GRACE_MS);
       if (naturallyCompleted?.kind === 'exit') return { ...exitDetails(naturallyCompleted), timed_out: true, deadline_reached: first?.kind === 'soft_deadline', hard_timeout_reached: true, termination: { requested: false, confirmed: true, error: error.message, reason: 'child exited while termination was being requested' } };
@@ -945,24 +1010,23 @@ async function completeUnavailableWorkflowReview(workflow, resultPath, outcome, 
 export async function runSolReview(argv = process.argv.slice(2), environment = process.env, platform = process.platform, spawnProcess = spawn, terminateProcess = terminateSolReviewProcess) {
   const invocation = parseInvocation(argv, environment, platform);
   const { codexBin, timeoutSec, hardTimeoutSec, reviewProfile, evidenceDirectory, reviewRole: requestedReviewRole, reviewRoleExplicit, promptArgs } = invocation;
+  const codexHome = resolveCodexHome(environment, platform);
   let workflow = invocation.workflow;
   let resultPath = invocation.resultPath;
   let workflowArtifactAuthority = null;
-  let resultParentAuthority = null;
   if (workflow) {
     workflow = { ...workflow, state_dir: await canonicalStateDirectory(workflow.state_dir, '--workflow-state-dir') };
-    const expectedResultPath = path.join(workflow.state_dir, WORKFLOW_RESULT_DIRECTORY, workflow.task_id, workflow.claim_id, 'outcome.json');
+    const expectedResultPath = globalWorkflowArtifactPathForHome(workflow.state_dir, workflow.task_id, workflow.claim_id, 'outcome.json', codexHome);
     if (!resultPath) resultPath = expectedResultPath;
     if (path.resolve(resultPath) !== expectedResultPath) throw new Error(`--result must be exactly ${expectedResultPath} when workflow binding is used`);
-    workflowArtifactAuthority = await prepareWorkflowArtifactAuthority(workflow, resultPath, platform);
+    workflowArtifactAuthority = await prepareWorkflowArtifactAuthority(workflow, resultPath, platform, codexHome);
   } else if (resultPath) {
-    resultParentAuthority = await snapshotRegularDirectory(path.dirname(resultPath));
+    throw new Error('--result is only valid for a workflow-bound review; standalone reviews never persist JSON to a caller-selected path');
   }
-  const artifactAuthority = workflowArtifactAuthority ?? resultParentAuthority;
+  const artifactAuthority = workflowArtifactAuthority;
   const startedAt = new Date().toISOString(); const started = Date.now();
   const softDeadline = started + timeoutSec * 1000;
   const hardDeadline = hardTimeoutSec === null ? null : started + hardTimeoutSec * 1000;
-  const codexHome = resolveCodexHome(environment, platform);
   const repair = await repairInvalidDenyReadAclState(codexHome, platform);
   const childEnvironment = { ...environment, CODEX_HOME: codexHome };
   const initialWorkflowContract = workflow ? await readWorkflowReviewContract(workflow) : null;
@@ -1015,6 +1079,7 @@ export async function runSolReview(argv = process.argv.slice(2), environment = p
     return { ...outcome, result_path: stored.paths.result, workflow_completion: workflowCompletion?.completed === true ? workflowCompletion : outcome.workflow_completion, workflow_completion_error: workflowCompletion?.completed === false ? workflowCompletion.reason : null };
   }
   const reviewWorkspace = evidencePackage?.workspace ?? null;
+  let cleanupEvidence = true;
   const childArgs = ['exec', '--ephemeral', '--model', 'gpt-5.6-sol', '--config', `model_reasoning_effort="${reasoningEffort}"`, '--sandbox', 'read-only'];
   if (reviewWorkspace) childArgs.push('-C', reviewWorkspace, '--skip-git-repo-check');
   const usesWindowsCommandScript = platform === 'win32' && /\.(?:cmd|bat)$/i.test(codexBin);
@@ -1054,9 +1119,13 @@ export async function runSolReview(argv = process.argv.slice(2), environment = p
       return { ...outcome, result_path: stored?.paths.result ?? null, workflow_completion: workflowCompletion?.completed === true ? workflowCompletion : outcome.workflow_completion, workflow_completion_error: workflowCompletion?.completed === false ? workflowCompletion.reason : null };
     }
     const stdinWrite = usesWindowsCommandScript ? startWindowsPromptWrite(child.stdin, prompt) : null;
-    stdout = captureStream(child.stdout, process.stdout);
-    stderr = captureStream(child.stderr, process.stderr);
+    // Child stdout/stderr are machine-readable review evidence. Capture them
+    // for validation and artifact persistence, but never tee them into the
+    // caller's terminal where a host may render them as user-facing text.
+    stdout = captureStream(child.stdout);
+    stderr = captureStream(child.stderr);
     childOutcome = await waitForReviewOutcome(child, Math.max(0, softDeadline - Date.now()), hardDeadline === null ? null : Math.max(0, hardDeadline - Date.now()), platform, terminateProcess, spawnProcess);
+    if (childOutcome.timed_out && !childOutcome.termination?.confirmed) cleanupEvidence = false;
     await Promise.all([waitForCaptureDrain(stdout), waitForCaptureDrain(stderr)]);
     await stdinWrite?.wait();
     const stdinError = stdinWrite?.error ?? null;
@@ -1103,7 +1172,16 @@ export async function runSolReview(argv = process.argv.slice(2), environment = p
     await persistWorkflowCompletion(stored, workflowCompletion, workflowArtifactAuthority);
     return { ...outcome, result_path: stored?.paths.result ?? null, workflow_completion: workflowCompletion?.completed === true ? workflowCompletion : outcome.workflow_completion, workflow_completion_error: workflowCompletion?.completed === false ? workflowCompletion.reason : null };
   } finally {
-    await evidencePackage?.cleanup?.();
+    if (cleanupEvidence) {
+      try {
+        const cleaned = await waitForExitWithin(Promise.resolve().then(() => evidencePackage?.cleanup?.()), CLEANUP_TIMEOUT_MS);
+        if (cleaned === null) process.stderr.write(`[sol-review] evidence cleanup timed out after ${CLEANUP_TIMEOUT_MS}ms.\n`);
+      } catch (error) {
+        process.stderr.write(`[sol-review] evidence cleanup failed: ${error.message || error}\n`);
+      }
+    } else {
+      process.stderr.write('[sol-review] evidence cleanup skipped because child process exit was not confirmed.\n');
+    }
   }
 }
 

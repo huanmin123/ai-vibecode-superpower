@@ -74,6 +74,7 @@ MCP 不是替代 Codex agent 的调度器；它把任务进度、依赖、checkp
 - 关闭codex Desktop  必须否则配置会被覆盖回去
 
 安装目标优先使用非空的 `CODEX_HOME`；未设置时使用 `~/.codex`。
+安装器只在成功安装后清理自己生成的旧备份，并保留最近 5 份；名称不匹配、符号链接或 junction 内容不会删除。
 
 ### Windows（PowerShell 7）
 

@@ -254,6 +254,28 @@ function New-UniqueDirectory {
     return $candidate
 }
 
+function Remove-OldInstallBackups {
+    param(
+        [Parameter(Mandatory)][string]$BackupRoot,
+        [ValidateRange(1, 100)][int]$Keep = 5
+    )
+
+    if (-not (Test-Path -LiteralPath $BackupRoot -PathType Container)) { return }
+    Assert-InstallContainer -Path $BackupRoot
+    $managedBackups = @(
+        Get-ChildItem -LiteralPath $BackupRoot -Force -Directory |
+            Where-Object {
+                $_.Name -cmatch '^backup-[0-9]{8}-[0-9]{6}-[0-9a-f]{32}$' -and
+                ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0
+            } |
+            Sort-Object -Property Name -Descending
+    )
+    foreach ($backup in $managedBackups | Select-Object -Skip $Keep) {
+        Assert-NoReparsePointsInTree -Path $backup.FullName
+        Remove-Item -LiteralPath $backup.FullName -Recurse -Force
+    }
+}
+
 function Get-ManagedTomlSettings {
     param([Parameter(Mandatory)][string]$Path)
 
@@ -832,6 +854,11 @@ try {
         Write-Host "Backup directory: $backupDirectory"
     } else {
         Write-Host 'Backup directory: none (no managed targets existed)'
+    }
+    try {
+        Remove-OldInstallBackups -BackupRoot $backupRoot -Keep 5
+    } catch {
+        Write-Warning "Installed successfully, but old backup retention could not complete: $($_.Exception.Message)"
     }
     Write-Warning 'Restart Codex Desktop/CLI before starting a new workflow so newly installed agent roles are loaded.'
 }

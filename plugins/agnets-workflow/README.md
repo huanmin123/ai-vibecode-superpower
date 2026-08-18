@@ -6,7 +6,7 @@
 
 - 用任务 DAG 管理取证、设计、实现、集成、验证与任务末端质量门。
 - 持久化任务状态、节点产物、参与者、审核记录和按声明范围协调的工作区租约。
-- 仅在显式调用 `workflow_prune_expired` 时清理满足完整关闭不变量且已满 7 天的任务；释放但未完整关闭、活动、失败、阻塞、放弃、unavailable 或损坏状态永不按时间删除。
+- MCP 每次启动时会在后台清理满足完整关闭不变量且已满 7 天的任务；释放但未完整关闭、活动、失败、阻塞、放弃、unavailable 或损坏状态永不按时间删除。
 - 通过 MCP 或本地 CLI 提供初始化、派发、心跳、checkpoint、恢复、总审和关闭检查。
 - 用 `$agent-toolchain` 为目标项目接入或维护 CodeGraph/RTK；接入时在项目 `AGENTS.md` 中写入一个统一的 `## CodeGraph 与 RTK` 受管标题，日常开发直接遵守其中的规则。
 
@@ -33,16 +33,16 @@ node .\scripts\workflow_controller.mjs --state-dir "$pwd\.codex\workflow-control
 node .\scripts\sol_review_cli.mjs -- <prompt>
 ```
 
-CLI 会保存审查结果和受控日志；绑定工作流时使用控制器要求的同一结果制品完成收口。完整参数、总审绑定和验证流程见 [`orchestrate-model-workflow`](skills/orchestrate-model-workflow/SKILL.md)。
+绑定工作流时，CLI 会把审查结果和受控日志保存到用户级 `$CODEX_HOME/state/agnets-workflow/artifacts/<namespace-hash>/<task>/<claim>/`；子进程 stdout/stderr 只进入审查制品，不会转发到调用方终端。独立 CLI 只返回自身的 stdout 结果，不接受 `--result` 写入调用者指定路径；绑定工作流时使用全局结果制品完成收口，目标项目不会生成工作流审查 JSON。完整参数、总审绑定和验证流程见 [`orchestrate-model-workflow`](skills/orchestrate-model-workflow/SKILL.md)。
 
 ## 状态目录
 
-每次新的 `workflow_init` 都要求 `state_dir` 位于目标工作区内，建议固定为 `<workspace>/.codex/workflow-controller/`；除该标准控制目录外，不得放在 `.git`、`node_modules`、`.venv` 等指纹排除目录中。物理状态固定为用户级 `$CODEX_HOME/state/agnets-workflow/workflow.sqlite`；显式 `CODEX_HOME` 必须是绝对路径，未设置时使用平台用户目录中的 `.codex/state/agnets-workflow/workflow.sqlite`。`state_dir` 是 canonical namespace 和审查制品根目录，不会创建工作区 `workflow.sqlite`、任务 `<task_id>.sqlite` 或其 WAL/SHM/journal。相同 task_id 可位于不同 namespace；同 namespace 不可复用。发现旧本地 SQLite 时返回 `LEGACY_STATE_MIGRATION_REQUIRED`，不会读取、迁移或删除它。manifest、审核输入、checkpoint 与审查制品仍是外部 JSON/日志接口；它们不是控制器的协调状态。
+每次新的 `workflow_init` 都要求 `state_dir` 位于目标工作区内，建议固定为 `<workspace>/.codex/workflow-controller/`；它只是不可落地的逻辑 namespace。该路径无论不存在还是已经包含历史残留，控制器都不会创建、递归扫描、读取内容或写入；旧本地 JSON/SQLite/租约不会被迁移或兼容，直接按新 namespace 使用。除该标准逻辑路径外，不得放在 `.git`、`node_modules`、`.venv` 等指纹排除目录中。物理状态固定为用户级 `$CODEX_HOME/state/agnets-workflow/workflow.sqlite`；显式 `CODEX_HOME` 必须是绝对路径，未设置时使用平台用户目录中的 `.codex/state/agnets-workflow/workflow.sqlite`。`state_dir` 只用于 canonical namespace 标识，namespace 身份锚定到现有 workspace；审查制品固定写入 `$CODEX_HOME/state/agnets-workflow/artifacts/<namespace-hash>/<task>/<claim>/`，不会创建工作区 `workflow.sqlite`、任务 `<task_id>.sqlite`、审查结果 JSON 或其 WAL/SHM/journal。相同 task_id 可位于不同 namespace；同 namespace 不可复用。`workflow_complete`、`workflow_checkpoint`、`workflow_record_review`、`workflow_record_repair` 和 `workflow_raise_assurance` 的 JSON 载荷应以内联对象传入；工作区内 JSON 文件路径会被拒绝，外部文件路径只保留给 workspace 外的明确输入。它们不是控制器的协调状态。
 
-控制器不是常驻服务，也不会在 heartbeat、claim 或 complete 等高频命令前隐式清理。需要维护时显式调用 `workflow_prune_expired`；它在全局写事务中排队，只删除 closed_at 满 7 天、closed revision 与当前 revision 一致、全部节点 succeeded/skipped、lease 已释放且无活跃任务或锁的任务，并在 artifact 清理失败时保留 row。release-only、pending/running/failed/blocked/abandoned/unavailable 和损坏状态永不按时间删除。`workflow_doctor` 只检查状态和恢复前提，不替用户接管运行中的代理。恢复、换绑和关卡失效处理见 [`workflow-controller`](skills/workflow-controller/SKILL.md)。
+控制器不会在 heartbeat、claim 或 complete 等高频命令前隐式清理。每次 MCP 进程启动后会静默启动独立维护 worker，服务本身立即接收请求；worker 按到期索引用短事务认领 task instance，在事务外校验 namespace 物理身份并清理 artifact，再用短事务复核后删除 row。它只删除 closed_at 满 7 天、closed revision 与当前 revision 一致、全部节点 succeeded/skipped、lease 已释放且无活跃任务或锁的任务，并在 artifact 清理失败时保留 row。worker 还会执行被动 WAL checkpoint、查询规划优化和有界增量空间回收；全库和 namespace 任务数、payload 与数据库页数均有明确上限。该维护不作为 MCP 工具向用户暴露；release-only、pending/running/failed/blocked/abandoned/unavailable、身份不匹配和损坏状态永不按时间删除。`workflow_doctor` 只检查状态和恢复前提，不替用户接管运行中的代理。恢复、换绑和关卡失效处理见 [`workflow-controller`](skills/workflow-controller/SKILL.md)。
 
 同一工作区可运行声明范围重叠的任务。清单必须提供非空 `workspace_claims`：`{mode:"read"|"write",prefix:"..."}` 数组；它是可申请写锁的不可变审计上界，而不是 `workflow_init` 时预占的锁，也不是文件系统 ACL。AI 仅在真正要改动文件前调用 `workflow_acquire_write_lock`，对最小实际相对路径申请短锁，并在该组写入完成后调用 `workflow_release_write_lock`；路径相同，或一方是另一方的祖先时才互斥。节点完成、放弃、救援或重排队会自动清理遗留锁。`workflow_status` 与 `workflow_stale` 会列出当前工作区的实际写锁；它们不会自动过期释放，协调者确认原执行者已停止后再使用相应的恢复或释放命令。末端审核仍须确认实际 diff 和产物仅落在 `write` claims。根目录 `write` 与根目录锁仅用于确实覆盖整个工作区的副作用，前者需 `global_write_justification`，后者需具体 `purpose`。扩大声明上界时，先确认旧执行者停止并释放其 entry，再用 claims 超集和新的 `task_id` 初始化替代任务。
 
 ## MCP
 
-插件同时提供 `workflow-controller` MCP 服务。需要接入时使用插件自带的 `.mcp.json`；`workflow_init.manifest` 可直接传 v3 清单对象、内联 JSON 对象字符串或普通 JSON 文件路径，`state_dir` 必须为绝对路径。高频调度调用默认返回紧凑摘要，持续观察先从 `workflow_status` 取得 `cursor`，再用 `workflow_wait` 被动等待变化。排障或审计需要完整任务状态时使用 `workflow_status detail=full`。具体工具名称和输入字段以 MCP schema 与 [`workflow-controller`](skills/workflow-controller/SKILL.md) 为准。
+插件同时提供 `workflow-controller` MCP 服务。需要接入时使用插件自带的 `.mcp.json`；`workflow_init.manifest` 可直接传 v3 清单对象、内联 JSON 对象字符串或 workspace 外的普通 JSON 文件路径，`state_dir` 必须为绝对路径。节点结果、checkpoint、审核和修复记录优先直接传 JSON 对象；控制器拒绝把目标 workspace 内的 JSON 文件当作工作流载荷，从调用契约上切断“先落地 JSON 再交给主控”的路径。高频调度调用默认返回紧凑摘要，持续观察先从 `workflow_status` 取得 `cursor`，再用 `workflow_wait` 被动等待变化。排障或审计需要完整任务状态时使用 `workflow_status detail=full`。具体工具名称和输入字段以 MCP schema 与 [`workflow-controller`](skills/workflow-controller/SKILL.md) 为准。

@@ -162,6 +162,30 @@ remove_retired_workflow_plugin() {
     done
 }
 
+prune_old_install_backups() {
+    backup_root=$codex_home/backups
+    [ -d "$backup_root" ] || return 0
+    assert_directory_container "$backup_root"
+    backup_list=$stage_dir/managed-backups.txt
+    : > "$backup_list"
+    for candidate in "$backup_root"/backup-*; do
+        path_exists "$candidate" || continue
+        backup_name=${candidate##*/}
+        printf '%s\n' "$backup_name" | rg -q '^backup-[0-9]{8}-[0-9]{6}-[0-9]+\.[[:alnum:]]{6}$' || continue
+        if [ -L "$candidate" ] || [ ! -d "$candidate" ]; then
+            continue
+        fi
+        if [ -n "$(find "$candidate" -type l -print -quit)" ]; then
+            continue
+        fi
+        printf '%s\n' "$candidate" >> "$backup_list"
+    done
+    sort -r "$backup_list" | awk 'NR > 5' | while IFS= read -r candidate; do
+        [ -n "$candidate" ] || continue
+        rm -rf "$candidate"
+    done
+}
+
 path_exists() {
     [ -e "$1" ] || [ -L "$1" ]
 }
@@ -1056,5 +1080,8 @@ if [ -n "$backup_dir" ]; then
     printf '%s\n' "Backup directory: $backup_dir"
 else
     printf '%s\n' 'Backup directory: none (no managed targets existed)'
+fi
+if ! prune_old_install_backups; then
+    printf '%s\n' 'Installed successfully, but old backup retention could not complete.' >&2
 fi
 printf '%s\n' 'Restart Codex Desktop/CLI before starting a new workflow so newly installed agent roles are loaded.' >&2

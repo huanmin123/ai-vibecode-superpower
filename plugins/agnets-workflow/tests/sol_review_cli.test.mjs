@@ -5,9 +5,9 @@ import { promises as fsPromises } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { repairInvalidDenyReadAclState, resolveCodexHome, runSolReview } from '../scripts/sol_review_cli.mjs';
-import { dispatch } from '../scripts/workflow_controller.mjs';
-import { readGlobalTaskState as readTaskState } from '../scripts/global_workflow_store.mjs';
+import { extractJsonObjects, repairInvalidDenyReadAclState, resolveCodexHome, runSolReview, terminateSolReviewProcess } from '../scripts/sol_review_cli.mjs';
+import { canonicalStateDirectory, dispatch } from '../scripts/workflow_controller.mjs';
+import { globalWorkflowArtifactPath, globalWorkflowArtifactRoot, globalWorkflowArtifactTaskPath, readGlobalTaskState as readTaskState } from '../scripts/global_workflow_store.mjs';
 
 async function fixture() {
   const root = await mkdtemp(path.join(os.tmpdir(), 'agnets-sol-cli-'));
@@ -41,7 +41,13 @@ function v3ReviewManifest(workspace, { goal, requirements, agentType = 'avsp_sol
 }
 
 async function workflowStatePath(stateDir) {
-  return path.join(await fsPromises.realpath(stateDir), 'review-task.sqlite');
+  return path.join(await canonicalStateDirectory(stateDir), 'review-task.sqlite');
+}
+
+async function removeKnownJunction(junction) {
+  if (!junction) return;
+  try { await fsPromises.rmdir(junction); }
+  catch (error) { if (error?.code !== 'ENOENT') throw error; }
 }
 
 test('repairs only an invalid Windows deny-read ACL state and keeps a backup', async () => {
@@ -120,6 +126,16 @@ test('uses the resolved current-account CODEX_HOME and preserves the Codex exit 
 
 test('rejects a relative CODEX_HOME instead of resolving it under the current directory', () => {
   assert.throws(() => resolveCodexHome({ CODEX_HOME: 'relative-codex-home' }, 'win32'), /CODEX_HOME must be an absolute path/);
+});
+
+test('rejects a standalone --result path so the CLI cannot write project-local JSON', async () => {
+  const item = await fixture();
+  try {
+    await assert.rejects(
+      runSolReview(['--result', path.join(item.root, 'result.json'), '--', 'review prompt'], { CODEX_HOME: item.codexHome }, 'win32'),
+      /only valid for a workflow-bound review/,
+    );
+  } finally { await rm(item.root, { recursive: true, force: true }); }
 });
 
 test('selects the requested Sol reasoning effort and rejects unsupported review roles', async () => {
@@ -255,10 +271,11 @@ test('rejects a root junction passed as the evidence directory on Windows', asyn
 test('rejects a nested junction in an evidence package on Windows', async t => {
   if (process.platform !== 'win32') { t.skip('junction evidence requires Windows'); return; }
   const item = await fixture();
+  let junction = null;
   try {
     const outside = path.join(item.root, 'outside');
     await mkdir(outside);
-    const junction = path.join(item.evidence, 'linked-directory');
+    junction = path.join(item.evidence, 'linked-directory');
     try { await symlink(outside, junction, 'junction'); }
     catch (error) {
       if (['EPERM', 'EACCES', 'UNKNOWN'].includes(error?.code)) { t.skip(`junctions are unavailable: ${error.code}`); return; }
@@ -267,7 +284,10 @@ test('rejects a nested junction in an evidence package on Windows', async t => {
     await assert.rejects(runSolReview(['--review-profile', 'bounded-external', '--evidence-dir', item.evidence, '--', 'review prompt'], { CODEX_HOME: item.codexHome }, 'win32', () => {
       throw new Error('spawn must not be called');
     }), /evidence package cannot contain symlinks/);
-  } finally { await rm(item.root, { recursive: true, force: true }); }
+  } finally {
+    await removeKnownJunction(junction);
+    await rm(item.root, { recursive: true, force: true });
+  }
 });
 
 test('rejects a nested directory replacement during evidence snapshot', async () => {
@@ -377,6 +397,8 @@ test('closes a workflow-bound evidence validation failure as unavailable before 
     assert.match(result.review_verdict.reason, /evidence validation failed/);
     assert.equal(result.workflow_completion.completed, true);
     const persisted = JSON.parse(await readFile(result.result_path, 'utf8'));
+    await assert.rejects(fsPromises.lstat(stateDir), error => error?.code === 'ENOENT');
+    assert.ok(result.result_path.includes(`${path.sep}state${path.sep}agnets-workflow${path.sep}artifacts${path.sep}`));
     assert.equal(persisted.workflow_completion.completed, true);
     const state = await readTaskState(await workflowStatePath(stateDir));
     assert.equal(state.nodes['total-review'].status, 'unavailable');
@@ -402,7 +424,7 @@ test('retains the pending artifact when automatic unavailable completion cannot 
     await dispatch('init', { state_dir: stateDir, manifest });
     const [claim] = await dispatch('claim', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', agent_task_path: '/root/retryable-unavailable', agent_role: 'avsp_sol_high' });
     await dispatch('heartbeat', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', claim_id: claim.node.claim_id });
-    const outcome = path.join(await fsPromises.realpath(stateDir), '.workflow-review-results', 'review-task', claim.node.claim_id, 'outcome.json');
+    const outcome = globalWorkflowArtifactPath(await canonicalStateDirectory(stateDir), 'review-task', claim.node.claim_id, 'outcome.json');
     let outcomeRenames = 0;
     fsPromises.rename = async (source, destination) => {
       if (path.resolve(destination) === path.resolve(outcome) && ++outcomeRenames === 2) {
@@ -443,7 +465,7 @@ test('keeps unavailable review evidence inside its verified artifact authority',
     await dispatch('init', { state_dir: stateDir, manifest });
     const [claim] = await dispatch('claim', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', agent_task_path: '/root/unavailable-authority', agent_role: 'avsp_sol_high' });
     await dispatch('heartbeat', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', claim_id: claim.node.claim_id });
-    const resultDirectory = path.join(await fsPromises.realpath(stateDir), '.workflow-review-results', 'review-task', claim.node.claim_id);
+    const resultDirectory = path.dirname(globalWorkflowArtifactPath(await canonicalStateDirectory(stateDir), 'review-task', claim.node.claim_id, 'outcome.json'));
     const outcome = path.join(resultDirectory, 'outcome.json');
     let authorityChanged = false;
     fsPromises.open = async (target, flags, ...rest) => {
@@ -494,7 +516,7 @@ test('rejects a linked unavailable review target without writing outside the art
     await dispatch('init', { state_dir: stateDir, manifest });
     const [claim] = await dispatch('claim', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', agent_task_path: '/root/unavailable-linked-target', agent_role: 'avsp_sol_high' });
     await dispatch('heartbeat', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', claim_id: claim.node.claim_id });
-    const resultDirectory = path.join(await fsPromises.realpath(stateDir), '.workflow-review-results', 'review-task', claim.node.claim_id);
+    const resultDirectory = path.dirname(globalWorkflowArtifactPath(await canonicalStateDirectory(stateDir), 'review-task', claim.node.claim_id, 'outcome.json'));
     const linkedReview = path.join(resultDirectory, 'unavailable-review.json');
     const outsideReview = path.join(item.root, 'outside-review.json');
     await mkdir(resultDirectory, { recursive: true });
@@ -638,7 +660,7 @@ test('rejects a workflow-bound result path outside the review artifact directory
     );
     await assert.rejects(
       runSolReview([
-        '--result', path.join(item.root, 'state', '.workflow-review-results', 'other-task', 'other-claim', 'outcome.json'),
+        '--result', globalWorkflowArtifactPath(path.join(item.root, 'state'), 'other-task', 'other-claim', 'outcome.json'),
         '--workflow-state-dir', path.join(item.root, 'state'),
         '--workflow-task-id', 'review-task',
         '--workflow-node-id', 'total-review',
@@ -677,12 +699,15 @@ test('uses bigint evidence identities and distinguishes adjacent values above Nu
   }
 });
 
-test('rejects a workflow review result directory containing a Windows junction before spawning Sol', { skip: process.platform !== 'win32' }, async t => {
+test('rejects a global workflow artifact directory containing a Windows junction before spawning Sol', { skip: process.platform !== 'win32' }, async t => {
   const item = await fixture();
+  let junction = null;
   try {
     const stateDir = path.join(item.root, 'state'); const outside = path.join(item.root, 'outside-results');
-    await mkdir(path.join(stateDir, '.workflow-review-results'), { recursive: true }); await mkdir(outside);
-    try { await symlink(outside, path.join(stateDir, '.workflow-review-results', 'review-task'), 'junction'); }
+    const taskPath = globalWorkflowArtifactTaskPath(path.join(await fsPromises.realpath(item.root), 'state'), 'review-task');
+    await mkdir(path.dirname(taskPath), { recursive: true }); await mkdir(outside);
+    junction = taskPath;
+    try { await symlink(outside, junction, 'junction'); }
     catch (error) {
       if (['EPERM', 'EACCES', 'UNKNOWN'].includes(error.code)) return t.skip(`junction unavailable: ${error.code}`);
       throw error;
@@ -698,7 +723,10 @@ test('rejects a workflow review result directory containing a Windows junction b
       /must not contain a symlink or junction/,
     );
     assert.deepEqual(await readdir(outside), []);
-  } finally { await rm(item.root, { recursive: true, force: true }); }
+  } finally {
+    await removeKnownJunction(junction);
+    await rm(item.root, { recursive: true, force: true });
+  }
 });
 
 test('rejects a relative workflow state directory and completes through a Windows case alias', { skip: process.platform !== 'win32' }, async t => {
@@ -709,16 +737,19 @@ test('rejects a relative workflow state directory and completes through a Window
     await mkdir(workspace); await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
     await writeFile(manifest, JSON.stringify(v3ReviewManifest(workspace, { goal: 'canonical workflow state', requirements: [{ id: 'R1', text: 'canonical state binding' }], executionOwner: '/root/canonical-sol' })));
     await dispatch('init', { state_dir: stateDir, manifest });
-    const alias = stateDir.toUpperCase(); const physical = await fsPromises.realpath(stateDir);
-    if ((await fsPromises.realpath(alias)).toLocaleLowerCase('und') !== physical.toLocaleLowerCase('und')) return t.skip('the test volume is case-sensitive');
+    const alias = stateDir.toUpperCase(); const physical = await canonicalStateDirectory(stateDir);
+    if ((await canonicalStateDirectory(alias)).toLocaleLowerCase('und') !== physical.toLocaleLowerCase('und')) return t.skip('the test volume is case-sensitive');
     const [claim] = await dispatch('start', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', agent_task_path: '/root/canonical-sol', agent_role: 'avsp_sol_high', native_agent_started: true });
     const result = await runSolReview(['--review-profile', 'bounded-external', '--evidence-dir', path.join(item.root, 'missing'), '--workflow-state-dir', alias, '--workflow-task-id', 'review-task', '--workflow-node-id', 'total-review', '--workflow-claim-id', claim.node.claim_id, '--codex-bin', 'fake-codex', '--', 'review'], { CODEX_HOME: item.codexHome }, 'win32', () => { throw new Error('spawn must not be called'); });
-    assert.equal(result.workflow.state_dir, physical); assert.ok(result.result_path.startsWith(physical)); assert.equal(result.workflow_completion.completed, true);
+    const artifactRoot = await fsPromises.realpath(globalWorkflowArtifactRoot());
+    const artifactResult = await fsPromises.realpath(result.result_path);
+    const artifactRelative = path.relative(artifactRoot, artifactResult);
+    assert.equal(result.workflow.state_dir.toLocaleLowerCase('und'), physical.toLocaleLowerCase('und')); assert.ok(artifactRelative === '' || (!artifactRelative.startsWith(`..${path.sep}`) && artifactRelative !== '..' && !path.isAbsolute(artifactRelative))); assert.equal(result.workflow_completion.completed, true, JSON.stringify(result));
     assert.equal((await readTaskState(await workflowStatePath(stateDir))).nodes['total-review'].status, 'unavailable');
   } finally { await rm(item.root, { recursive: true, force: true }); }
 });
 
-test('drains output emitted immediately after child exit before saving the result', async () => {
+test('drains output emitted immediately after child exit without persisting a standalone result', async () => {
   const item = await fixture();
   try {
     let child;
@@ -732,14 +763,11 @@ test('drains output emitted immediately after child exit before saving the resul
       return child;
     };
     const result = await runSolReview([
-      '--result', path.join(item.root, 'result.json'), '--codex-bin', 'fake-codex', '--', 'review prompt',
+      '--codex-bin', 'fake-codex', '--', 'review prompt',
     ], { CODEX_HOME: item.codexHome }, 'win32', spawnProcess);
-    assert.match(await readFile(result.result_path.replace(/\.json$/, '.stdout.log'), 'utf8'), /tail after exit/);
-    const artifact = JSON.parse(await readFile(result.result_path, 'utf8'));
     assert.equal(result.exit_code, 1);
-    assert.deepEqual(artifact.review_verdict, { valid: false, reason: 'review output capture is incomplete' });
-    assert.equal(artifact.stdout.drain_timed_out, true);
-    assert.equal(artifact.stdout.truncated, true);
+    assert.equal(result.result_path, null);
+    assert.deepEqual(result.review_verdict, { valid: false, reason: 'review output capture is incomplete' });
   } finally { await rm(item.root, { recursive: true, force: true }); }
 });
 
@@ -1212,11 +1240,62 @@ test('only an explicit hard timeout terminates a still-running Sol review', asyn
     };
     const result = await runSolReview([
       '--timeout-sec', '10', '--hard-timeout-sec', '1',
-      '--result', path.join(item.root, 'result.json'), '--', 'review this evidence package',
+      '--', 'review this evidence package',
     ], { CODEX_HOME: item.codexHome }, 'win32', spawnProcess, terminateProcess);
     assert.equal(result.exit_code, 124);
     assert.equal(result.timed_out, true);
     assert.equal(result.hard_timeout_reached, true);
     assert.equal(result.termination.confirmed, true);
   } finally { await rm(item.root, { recursive: true, force: true }); }
+});
+
+test('extracts pathological stdout in one lexical pass without accepting nested objects', () => {
+  const pathological = `${'{'.repeat(100_000)}${'}'.repeat(100_000)}`;
+  const started = performance.now();
+  const values = extractJsonObjects(pathological);
+  const elapsed = performance.now() - started;
+  assert.deepEqual(values, []);
+  assert.deepEqual(extractJsonObjects(`}${JSON.stringify({ accepted: true })}`), []);
+  assert.ok(elapsed < 1_000, `pathological JSON scan took ${elapsed}ms`);
+});
+
+test('bounds a Windows taskkill request that never exits', async () => {
+  const started = performance.now();
+  await assert.rejects(
+    terminateSolReviewProcess({ pid: 4248 }, 'win32', () => {
+      const taskkill = new EventEmitter();
+      taskkill.kill = () => {};
+      return taskkill;
+    }),
+    /taskkill timed out after/,
+  );
+  assert.ok(performance.now() - started < 3_000);
+});
+
+test('does not forward child review output to the caller terminal', async () => {
+  const item = await fixture();
+  const originalStdoutWrite = process.stdout.write;
+  const originalStderrWrite = process.stderr.write;
+  try {
+    process.stdout.write = () => { throw new Error('child stdout must stay private'); };
+    process.stderr.write = () => { throw new Error('child stderr must stay private'); };
+    const spawnProcess = () => {
+      const child = new EventEmitter();
+      child.pid = 4249; child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
+      queueMicrotask(() => {
+        child.stdout.emit('data', Buffer.from('{"verdict":"pass","internal":true}\n'));
+        child.stderr.emit('data', Buffer.from('internal diagnostic\n'));
+        child.stdout.emit('end'); child.stderr.emit('end'); child.emit('exit', 0, null);
+      });
+      return child;
+    };
+    const result = await runSolReview(['--codex-bin', 'fake-codex', '--', 'review'], { CODEX_HOME: item.codexHome }, 'win32', spawnProcess);
+    assert.equal(result.exit_code, 1);
+    assert.equal(result.review_verdict.valid, false);
+    assert.equal(result.result_path, null);
+  } finally {
+    process.stdout.write = originalStdoutWrite;
+    process.stderr.write = originalStderrWrite;
+    await rm(item.root, { recursive: true, force: true });
+  }
 });

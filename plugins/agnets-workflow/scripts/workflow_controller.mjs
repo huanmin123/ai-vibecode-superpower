@@ -1,19 +1,24 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createReadStream, promises as fs } from 'node:fs';
-import { DatabaseSync } from 'node:sqlite';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-// v1/v2 local stores remain only as legacy inspectors for their focused tests.
-// Normal controller traffic is keyed into one user-level SQLite database.
 import {
   deleteGlobalTaskState as deleteTaskState,
   globalTaskStateExists as taskStateExists,
+  globalWorkflowArtifactPath,
+  globalWorkflowArtifactRoot,
+  globalWorkflowArtifactTaskPath,
   globalWorkflowStorePath,
   createGlobalWorkspaceControl as createWorkspaceControl,
   globalWorkspaceControlExists as workspaceControlExists,
+  ensureGlobalNamespaceIdentity,
+  listGlobalTaskStatesForWorkspace,
+  listGlobalTaskPruneCandidates,
+  claimGlobalTaskPruneJobs,
+  failGlobalTaskPruneJob,
+  finalizeGlobalTaskPruneJob,
   readGlobalTaskState as readTaskState,
-  withGlobalWorkflowStoreMaintenance,
   readGlobalWorkspaceControl as readWorkspaceControl,
   taskStoreKey,
   withGlobalTaskStateTransaction as withTaskStateTransaction,
@@ -65,9 +70,6 @@ const PROTECTED_EXECUTOR_ROLE = 'avsp_terra_high';
 const ROUTING_FIELDS = ['execution_risk', 'routing_reason', 'execution_owner', 'integration_owner', 'quality_guard'];
 const IGNORED_DIRECTORIES = new Set(['.git', '.codex', 'node_modules', '.venv']);
 const WORKSPACE_CONTROL_FILENAME = 'workflow.sqlite';
-// Obsolete v1/v2 coordination files are removed before a new v3 control DB is created.
-const RETIRED_WORKSPACE_CONTROL_ROOT_FILENAME = '.codex-workflow-controller-authority.json';
-const RETIRED_WORKSPACE_CONTROL_PUBLICATION_SUFFIX = '.publication.json';
 const MAX_MANIFEST_BYTES = 1 * 1024 * 1024;
 const MAX_NODE_RESULT_BYTES = 64 * 1024;
 const MAX_REVIEW_BYTES = 128 * 1024;
@@ -92,19 +94,9 @@ const COHORT_PHASES = new Set(['blind', 'cross_questioning', 'passed', 'failed']
 const MAX_CHECKPOINT_BYTES = 32 * 1024;
 const MAX_RECOVERY_RESULT_BYTES = 8 * 1024;
 const DEFAULT_TASK_RETENTION_DAYS = 7;
-const QUARANTINE_AFTER_DAYS = 30;
-const ERROR_STATE_RETENTION_DAYS = 365;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const MAX_PRUNE_REPORT_ENTRIES = 128;
 const SQLITE_STATE_SUFFIX = '.sqlite';
-const ERROR_STATE_DIRECTORY = '.workflow-errors';
-const QUARANTINE_DATABASE_FILENAME = 'quarantine.sqlite';
-const QUARANTINE_DATABASE_SCHEMA_VERSION = 1;
-const QUARANTINE_DATABASE_BUSY_TIMEOUT_MS = 5_000;
-const REVIEW_ARTIFACT_DIRECTORY = '.workflow-review-results';
-const QUARANTINE_REVIEW_DIRECTORY = 'review-results';
-const MAX_QUARANTINE_BYTES = 32 * 1024;
-const MAX_WINDOWS_PATH_LENGTH = 260;
 export class ControllerError extends Error {}
 
 function asControllerError(error) {
@@ -136,6 +128,10 @@ const ROOT_RESCUE_SELF_COMPLETION = 'root_rescue_self_completion';
 const NATIVE_AGENT_EXIT_CONFIRMED = 'native_agent_exit_confirmed';
 const NATIVE_AGENT_START_FAILED = 'native_agent_start_failed';
 const taskStateTransactionContext = new AsyncLocalStorage();
+
+function isWorkspaceControlFile(name) {
+  return workspacePathKey(name) === workspacePathKey(WORKSPACE_CONTROL_FILENAME);
+}
 
 function requiredString(value, name) {
   if (typeof value !== 'string' || !value.trim()) throw new ControllerError(`${name} must be a non-empty string`);
@@ -556,7 +552,7 @@ function requireMaxReviewCharter(state, node) {
   return state.max_review_charter;
 }
 
-async function freezeProtocolMaxReviewCharter(state, node, sourceReview) {
+async function freezeProtocolMaxReviewCharter(state, node, sourceReview, fingerprintPreflight) {
   const blockingFindings = sourceReview.findings.filter(finding => finding.severity === 'blocking');
   if (!blockingFindings.length) throw new ControllerError('A max closure charter requires blocking findings from the finalized max initial review');
   state.max_review_charter = {
@@ -566,7 +562,7 @@ async function freezeProtocolMaxReviewCharter(state, node, sourceReview) {
     source_review_claim_id: sourceReview.claim_id,
     pending_repair_source_claim_id: sourceReview.claim_id,
     workflow_snapshot: workflowSnapshot(state),
-    workspace_fingerprint: await workspaceFingerprint(state.workspace, state.workspace_claims),
+    workspace_fingerprint: workspaceFingerprintFromPreflight(state, fingerprintPreflight, 'Max review charter'),
     requirements: structuredClone(state.requirements),
     workspace_claims: structuredClone(state.workspace_claims),
     blocking_finding_ids: blockingFindings.map(finding => finding.id),
@@ -606,7 +602,6 @@ async function readJson(filePath, { label = 'JSON input', maxBytes = MAX_MANIFES
   }
 }
 
-// A short random suffix leaves room for durable quarantine names on Windows;
 // `wx` keeps an improbable collision explicit rather than overwriting data.
 function atomicTemporaryPath(filePath, nonce = randomUUID()) { return `${filePath}.${nonce.replaceAll('-', '').slice(0, 8)}.tmp`; }
 
@@ -650,10 +645,83 @@ function statePath(stateDir, taskId) {
   return path.join(path.resolve(stateDir), `${taskId}${SQLITE_STATE_SUFFIX}`);
 }
 
-// `statePath()` remains an internal, stable logical key while legacy task
-// paths are detected. It is never a project-local SQLite database in v3.
-// Keep all public results explicit about the single physical database so a
-// caller cannot mistake this logical key for a file that was created.
+// Workflow payloads are normally passed inline through the MCP request.  A
+// file path remains an explicit external-input escape hatch for manifests and
+// other non-workflow inputs, but a path inside the target workspace is never a
+// valid source of controller state.  This prevents agents from turning the
+// logical state_dir into a result/review JSON spool.
+async function physicalParentPath(value) {
+  const requested = path.resolve(value);
+  const missing = [];
+  let cursor = requested;
+  for (;;) {
+    try {
+      const physical = await fs.realpath(cursor);
+      return path.join(physical, ...missing.reverse());
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+      const parent = path.dirname(cursor);
+      if (parent === cursor) return requested;
+      missing.push(path.basename(cursor));
+      cursor = parent;
+    }
+  }
+}
+
+async function rejectWorkspaceLocalJsonPath(value, workspace, label) {
+  if (typeof value !== 'string' || !workspace) return;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.startsWith('{') || trimmed.startsWith('[')) return;
+  const candidate = path.resolve(trimmed);
+  const workspacePhysical = await physicalParentPath(workspace);
+  // Compare a canonicalized parent plus the requested basename so an existing
+  // file symlink cannot bypass the workspace boundary, while Windows 8.3
+  // aliases still resolve to the same physical workspace.
+  const candidatePhysicalParent = await physicalParentPath(path.dirname(candidate));
+  const candidateForBoundary = path.join(candidatePhysicalParent, path.basename(candidate));
+  if (pathIsWithinPhysicalRoot(workspacePhysical, candidateForBoundary)) {
+    throw new ControllerError(`${label} must be an inline JSON value; workspace-local JSON files are not workflow state: ${candidate}`);
+  }
+}
+
+async function readWorkflowJson(value, { label = 'JSON input', maxBytes = MAX_MANIFEST_BYTES, workspace = null, objectOnly = false } = {}) {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    let serialized;
+    try { serialized = JSON.stringify(value); }
+    catch (error) { throw new ControllerError(`${label} is not valid JSON: ${error.message}`); }
+    if (Buffer.byteLength(serialized, 'utf8') > maxBytes) throw new ControllerError(`${label} exceeds the ${maxBytes}-byte limit`);
+    return structuredClone(value);
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) throw new ControllerError(`${label} must be a non-empty inline JSON value`);
+    if (Buffer.byteLength(trimmed, 'utf8') <= maxBytes) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (typeof parsed === 'string') await rejectWorkspaceLocalJsonPath(parsed, workspace, label);
+        if (objectOnly && (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))) throw new ControllerError(`${label} must be a JSON object`);
+        return parsed;
+      } catch (error) {
+        if (trimmed.startsWith('{') || trimmed.startsWith('[') || error instanceof ControllerError) {
+          if (error instanceof ControllerError) throw error;
+          throw new ControllerError(`Invalid inline JSON in ${label}: ${error.message}`);
+        }
+      }
+    } else if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+      throw new ControllerError(`${label} exceeds the ${maxBytes}-byte limit`);
+    }
+    await rejectWorkspaceLocalJsonPath(trimmed, workspace, label);
+    const parsed = await readJson(trimmed, { label, maxBytes });
+    if (objectOnly && (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))) throw new ControllerError(`${label} must be a JSON object`);
+    return parsed;
+  }
+  if (value === undefined || value === null) throw new ControllerError(`${label} must be provided as an inline JSON value`);
+  if (objectOnly) throw new ControllerError(`${label} must be a JSON object`);
+  throw new ControllerError(`${label} must be an inline JSON value`);
+}
+
+// `statePath()` is an internal logical key. It is never a project-local
+// SQLite database in v3. Public results identify the single physical store.
 function publicTaskKey(filePath) {
   return {
     namespace: path.dirname(path.resolve(filePath)),
@@ -664,8 +732,8 @@ function publicTaskKey(filePath) {
 function publicTaskStoreReference(filePath) {
   const databasePath = globalWorkflowStorePath();
   return {
-    // `state_path` remains a compatibility field. It is deliberately the
-    // one physical global database, never the internal logical task key.
+    // `state_path` identifies the one physical global database, never the
+    // internal logical task key.
     state_path: databasePath,
     database_path: databasePath,
     task_key: publicTaskKey(filePath),
@@ -763,8 +831,9 @@ async function deleteState(filePath, { parentAuthority } = {}) {
   await verifyRegularDirectorySnapshot(parentAuthority, 'Controller state parent');
   const taskId = path.basename(filePath, SQLITE_STATE_SUFFIX);
   if (/^[A-Za-z][A-Za-z0-9._-]{0,79}$/.test(taskId)) {
-    // Remove review evidence first; if this fails, keep the task indexable for a later sweep.
-    await fs.rm(path.join(path.dirname(filePath), REVIEW_ARTIFACT_DIRECTORY, taskId), { recursive: true, force: true });
+    // Remove review evidence from the user-level artifact store first; if this
+    // fails, keep the task indexable for a later sweep.
+    await fs.rm(globalWorkflowArtifactTaskPath(path.dirname(filePath), taskId), { recursive: true, force: true });
   }
   await deleteTaskState(databasePath(filePath), { parentAuthority });
 }
@@ -834,12 +903,6 @@ async function verifyJsonSnapshot(filePath, snapshot, label = 'JSON input') {
   if (metadata.isSymbolicLink() || !metadata.isFile() || !sameFileIdentity(snapshot.identity, metadata)) throw new ControllerError(`${label} changed after it was read: ${filePath}`);
 }
 
-function isControllerWorkspaceRootFile(name) {
-  const key = workspacePathKey(name);
-  const authority = workspacePathKey(RETIRED_WORKSPACE_CONTROL_ROOT_FILENAME);
-  return key === authority || key.startsWith(`${authority}.`);
-}
-
 function exactFilesystemIdentity(metadata) {
   const dev = metadata?.dev;
   const ino = metadata?.ino;
@@ -864,10 +927,26 @@ async function snapshotRegularDirectory(directory, label) {
 }
 
 async function verifyRegularDirectorySnapshot(snapshot, label) {
-  const current = await snapshotRegularDirectory(snapshot.path, label);
+  // A controller namespace is logical.  Its anchor is the already-existing
+  // workspace directory, so verifying it must never materialize or inspect
+  // the logical state_dir itself.
+  const anchorPath = typeof snapshot?.real_path === 'string' ? snapshot.real_path : snapshot?.path;
+  const current = await snapshotRegularDirectory(anchorPath, label);
   if (!sameStatePath(current.real_path, snapshot.real_path) || !sameWorkspaceDirectoryIdentity(current.identity, snapshot.identity)) {
     throw new ControllerError(`${label} changed: ${snapshot.path}`);
   }
+}
+
+async function snapshotLogicalStateNamespace(stateDirectory, workspace) {
+  const workspaceAnchor = await snapshotRegularDirectory(workspace, 'Controller namespace workspace anchor');
+  return {
+    // `path` remains the stable logical namespace key consumed by the global
+    // store. `real_path` deliberately anchors that key to the workspace,
+    // rather than to a directory created under the workspace.
+    path: stateDirectory,
+    real_path: workspaceAnchor.real_path,
+    identity: workspaceAnchor.identity,
+  };
 }
 
 function validStateParentAuthority(value, filePath) {
@@ -892,6 +971,9 @@ async function stateParentAuthorityForState(state, filePath) {
   const stored = state.workspace_lease?.state_parent_authority;
   if (stored === undefined) throw new ControllerError(`Task state parent authority is missing; controlled recovery is required: ${filePath}`);
   if (!validStateParentAuthority(stored, filePath)) throw new ControllerError(`Invalid task state parent authority: ${filePath}`);
+  if (!sameStatePath(stored.real_path, state.workspace)) throw new ControllerError(`Controller namespace anchor does not match its workspace: ${filePath}`);
+  await verifyRegularDirectorySnapshot(stored, 'Controller namespace workspace anchor');
+  await ensureGlobalNamespaceIdentity(path.dirname(filePath), stored);
   return stored;
 }
 
@@ -920,17 +1002,6 @@ async function verifyOwnedFile(filePath, identity, label) {
   if (metadata.isSymbolicLink() || !metadata.isFile() || !sameFileObjectIdentity(identity, persistentFileObjectIdentity(metadata))) {
     throw new ControllerError(`${label} changed: ${filePath}`);
   }
-}
-
-async function removeRetiredJsonState(filePath, parentAuthority) {
-  const retiredPath = `${filePath.slice(0, -SQLITE_STATE_SUFFIX.length)}.json`;
-  let metadata;
-  try { metadata = await fs.lstat(retiredPath, { bigint: true }); }
-  catch (error) { if (error.code === 'ENOENT') return null; throw error; }
-  if (metadata.isSymbolicLink() || !metadata.isFile()) throw new ControllerError(`Retired JSON controller state is not a regular file: ${retiredPath}`);
-  await verifyRegularDirectorySnapshot(parentAuthority, 'Controller state parent');
-  await fs.unlink(retiredPath);
-  return retiredPath;
 }
 
 function workspacePathKey(value) {
@@ -987,7 +1058,7 @@ async function normalizeWorkspaceClaims(rawClaims, workspace) {
     if (prefix !== '.' && (prefix === '.' || prefix.includes('/./') || prefix.startsWith('./') || prefix.endsWith('/.'))) throw new ControllerError(`Invalid workspace_claim prefix: ${prefix}`);
     if (isUnsafeWorkspaceClaimPrefix(prefix)) throw new ControllerError(`workspace_claim prefix has an unsafe Windows path alias: ${prefix}`);
     const first = claimSegments(prefix)[0];
-    if (first && (isIgnoredFingerprintDirectory(first) || isControllerWorkspaceRootFile(first))) throw new ControllerError(`workspace_claims cannot include ignored or controller directory: ${prefix}`);
+    if (first && (isIgnoredFingerprintDirectory(first) || isWorkspaceControlFile(first))) throw new ControllerError(`workspace_claims cannot include ignored or controller directory: ${prefix}`);
     await assertClaimDoesNotTraverseLink(workspace, prefix);
     const key = workspacePathKey(prefix);
     const existing = byPrefix.get(key);
@@ -1009,7 +1080,7 @@ function normalizeStoredWorkspaceClaims(rawClaims) {
     if (!prefix || prefix.includes('\0') || prefix.includes('\\') || path.posix.isAbsolute(prefix) || path.win32.isAbsolute(prefix) || (prefix !== '.' && (prefix.endsWith('/') || prefix.split('/').some(segment => !segment || segment === '.' || segment === '..')))) throw new ControllerError(`Invalid stored workspace_claim prefix: ${prefix}`);
     if (isUnsafeWorkspaceClaimPrefix(prefix)) throw new ControllerError(`Stored workspace_claim prefix has an unsafe Windows path alias: ${prefix}`);
     const first = claimSegments(prefix)[0];
-    if (first && (isIgnoredFingerprintDirectory(first) || isControllerWorkspaceRootFile(first))) throw new ControllerError(`Stored workspace_claim targets ignored or controller directory: ${prefix}`);
+    if (first && (isIgnoredFingerprintDirectory(first) || isWorkspaceControlFile(first))) throw new ControllerError(`Stored workspace_claim targets ignored or controller directory: ${prefix}`);
     const key = workspacePathKey(prefix); const existing = byPrefix.get(key);
     if (!existing || claim.mode === 'write') byPrefix.set(key, { mode: claim.mode, prefix });
   }
@@ -1033,10 +1104,9 @@ async function withVerifiedStateParent(filePath, callback, { createParent = true
     if (!validStateParentAuthority(parentAuthority, filePath)) throw new ControllerError(`Invalid task state parent authority: ${filePath}`);
     await verifyRegularDirectorySnapshot(parentAuthority, 'Controller state parent');
   } else if (createParent) {
-    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    throw new ControllerError(`Controller namespace authority is required; state_dir is never materialized: ${path.dirname(filePath)}`);
   } else {
-    const parent = await fs.lstat(path.dirname(filePath));
-    if (parent.isSymbolicLink() || !parent.isDirectory()) throw new ControllerError(`State parent is not a regular directory: ${path.dirname(filePath)}`);
+    throw new ControllerError(`Controller namespace authority is required: ${path.dirname(filePath)}`);
   }
   return callback();
 }
@@ -1046,13 +1116,6 @@ async function loadState(filePath) {
   if (transaction?.filePath && sameStatePath(transaction.filePath, filePath)) return transaction.state;
   const state = await readTaskState(databasePath(filePath));
   if (state === null) {
-    try {
-      const legacy = await fs.lstat(filePath);
-      if (legacy.isFile() || legacy.isSymbolicLink()) throw new ControllerError(`LEGACY_STATE_MIGRATION_REQUIRED: local task SQLite exists and is not read or migrated automatically: ${filePath}`);
-    } catch (error) {
-      if (error instanceof ControllerError) throw error;
-      if (error?.code !== 'ENOENT') throw error;
-    }
     throw new ControllerError(`Current global controller state does not exist: ${taskKey(filePath)}`);
   }
   if (!state || typeof state !== 'object' || state.version !== VERSION) throw new ControllerError(`Unsupported controller state: ${filePath}`);
@@ -1108,7 +1171,6 @@ async function walkFiles(root, directory = root, files = []) {
       throw new ControllerError(`Workspace contains a symbolic link that cannot be fingerprinted safely: ${entryPath}`);
     } else if (entry.isFile()) {
       const relative = path.relative(root, path.join(directory, entry.name));
-      if (path.dirname(relative) === '.' && isControllerWorkspaceRootFile(entry.name)) continue;
       files.push(relative);
       if (files.length > MAX_FINGERPRINT_FILES) throw new ControllerError(`Workspace exceeds the ${MAX_FINGERPRINT_FILES}-file fingerprint limit`);
     }
@@ -1243,6 +1305,34 @@ function validateNodes(nodes) {
 
 function isReviewNode(node, routingSchemaVersion = null) {
   return routingSchemaVersion === REVIEW_PROTOCOL_VERSION && (node?.kind === 'total_review' || node?.kind === QUALITY_REVIEW_KIND);
+}
+
+// Filesystem traversal is deliberately outside the global task transaction.
+// The later short transaction checks this material snapshot before consuming
+// the result, so a concurrent task/claim change is surfaced as an explicit
+// retry rather than extending a BEGIN IMMEDIATE lock over workspace I/O.
+async function prepareWorkspaceFingerprint(filePath) {
+  const state = normalizeState(await loadState(filePath));
+  const parentAuthority = await stateParentAuthorityForState(state, filePath);
+  await verifyRegularDirectorySnapshot(parentAuthority, 'Controller state parent');
+  const snapshot = workflowSnapshot(state);
+  const fingerprint = await workspaceFingerprint(state.workspace, state.workspace_claims);
+  await verifyRegularDirectorySnapshot(parentAuthority, 'Controller state parent');
+  return {
+    workspace: state.workspace,
+    workspace_claims: structuredClone(state.workspace_claims),
+    workflow_snapshot: snapshot,
+    fingerprint,
+  };
+}
+
+function workspaceFingerprintFromPreflight(state, preflight, label) {
+  if (!preflight || !sameJson(preflight.workspace_claims, state.workspace_claims)
+    || preflight.workspace !== state.workspace
+    || !sameJson(preflight.workflow_snapshot, workflowSnapshot(state))) {
+    throw new ControllerError(`${label} task state changed while its workspace fingerprint was calculated; retry the operation`);
+  }
+  return preflight.fingerprint;
 }
 
 function globalWriteJustification(manifest, workspaceClaims) {
@@ -1473,7 +1563,7 @@ function normalizeState(state) {
     node.review_stage ??= node.kind === QUALITY_REVIEW_KIND ? 'terra' : node.kind === 'total_review' ? 'sol' : null;
     node.review_gate ??= null;
     if (isReviewNode(node, state.routing_schema_version)) {
-      if (!node.review_gate || typeof node.review_gate !== 'object' || !REVIEW_PROTOCOL_STAGES.has(node.review_gate.stage)) throw new ControllerError('A v3 review node requires an explicit review_gate; explicit migration is required');
+      if (!node.review_gate || typeof node.review_gate !== 'object' || !REVIEW_PROTOCOL_STAGES.has(node.review_gate.stage)) throw new ControllerError('A v3 review node requires an explicit review_gate');
       if (node.kind !== protocolNodeKind(node.review_gate.stage) || node.agent_type !== protocolNodeRole(node.review_gate.stage)) throw new ControllerError('A v3 review node does not match its review_gate stage');
       if (node.review_gate.stage === 'terra_cohort') {
         const cohort = node.review_gate.cohort;
@@ -1624,40 +1714,12 @@ async function unreadableDoctor(parameters, filePath, error) {
   };
 }
 
-async function quarantinedDoctor(parameters, filePath, metadata) {
-  const reference = publicTaskStoreReference(filePath);
-  return {
-    task_id: requiredString(parameters.task_id, 'task_id'),
-    workspace: null,
-    health: 'blocked',
-    checks: [
-      doctorCheck('quarantined_state', 'fail', {
-        ...reference,
-        legacy_state_path: metadata.original_state_path,
-        error_path: metadata.error_path,
-        reason: metadata.reason,
-        status: metadata.status,
-        quarantined_at: metadata.quarantined_at,
-        delete_after: metadata.delete_after,
-        files: metadata.files,
-        move_error: metadata.move_error,
-      }),
-    ],
-    recovery_candidates: [],
-    close_status: { close_allowed: false, reasons: [`task state is quarantined until ${metadata.delete_after}`] },
-  };
-}
-
 async function doctorTask(parameters) {
-  if (parameters.task_id === undefined || parameters.task_id === null) return doctorStateDirectory(parameters);
+  if (parameters.task_id === undefined || parameters.task_id === null) throw new ControllerError('workflow_doctor requires task_id');
   const filePath = await configuredStatePath(parameters, requiredString(parameters.task_id, 'task_id'));
   let state;
   try { state = normalizeState(await loadState(filePath)); }
-  catch (error) {
-    const metadata = await findQuarantinedState(path.dirname(filePath), filePath);
-    if (metadata) return quarantinedDoctor(parameters, filePath, metadata);
-    return unreadableDoctor(parameters, filePath, error);
-  }
+  catch (error) { return unreadableDoctor(parameters, filePath, error); }
   const checks = [];
   const database = globalWorkflowStorePath();
   const reference = publicTaskStoreReference(filePath);
@@ -1750,11 +1812,6 @@ async function validateWorkspaceLeaseEntry(entry, leasePath) {
 }
 
 function normalizeWorkspaceLeaseLocks(lease, leasePath) {
-  // The initial v3 SQLite control record did not have path locks. Adding an
-  // empty set is safe: it grants no access and preserves active task entries.
-  if (!hasOwn(lease, 'active_locks') && hasExactFields(lease, new Set(['version', 'workspace', 'active_tasks', 'updated_at']))) {
-    lease.active_locks = [];
-  }
   if (!hasExactFields(lease, new Set(['version', 'workspace', 'active_tasks', 'active_locks', 'updated_at'])) || !Array.isArray(lease.active_locks) || lease.active_locks.length > MAX_WORKSPACE_ACTIVE_WRITE_LOCKS) {
     throw new ControllerError(`Unsupported workspace lease: ${leasePath}`);
   }
@@ -1841,110 +1898,12 @@ function workspaceLeasePath(workspace) {
   return path.join(workspace, '.codex', 'workflow-controller', WORKSPACE_CONTROL_FILENAME);
 }
 
-function retiredWorkspaceControlPaths(workspace) {
-  const controlDirectory = path.dirname(workspaceLeasePath(workspace));
-  const authorityPath = path.join(workspace, RETIRED_WORKSPACE_CONTROL_ROOT_FILENAME);
-  return [
-    authorityPath,
-    `${authorityPath}${RETIRED_WORKSPACE_CONTROL_PUBLICATION_SUFFIX}`,
-    path.join(controlDirectory, 'workspace-lease.json'),
-  ];
-}
-
-async function removeRetiredWorkspaceControlFiles(workspace) {
-  const removed = [];
-  for (const sourcePath of retiredWorkspaceControlPaths(workspace)) {
-    let metadata;
-    try { metadata = await fs.lstat(sourcePath); }
-    catch (error) {
-      if (error.code === 'ENOENT') continue;
-      throw error;
-    }
-    if (metadata.isSymbolicLink() || !metadata.isFile()) {
-      throw new ControllerError(`Retired workspace control path is not a regular file: ${sourcePath}`);
-    }
-    await fs.unlink(sourcePath);
-    removed.push(sourcePath);
-  }
-  return removed;
-}
-
-async function currentTaskStatePaths(directory) {
-  let entries;
-  try { entries = await fs.readdir(directory, { withFileTypes: true }); }
-  catch (error) { if (error.code === 'ENOENT') return []; throw error; }
-  const paths = [];
-  for (const entry of entries) {
-    if (!entry.name.endsWith(SQLITE_STATE_SUFFIX) || entry.name === WORKSPACE_CONTROL_FILENAME) continue;
-    const candidate = path.join(directory, entry.name);
-    const metadata = await fs.lstat(candidate);
-    if (metadata.isSymbolicLink() || !metadata.isFile()) throw new ControllerError(`Current SQLite task state is not a regular file: ${candidate}`);
-    paths.push(candidate);
-  }
-  return paths;
-}
-
-async function workspaceTaskStatePaths(workspace) {
-  const found = [];
-  const pending = [workspace];
-  let inspected = 0;
-  while (pending.length) {
-    const directory = pending.pop();
-    const entries = await fs.readdir(directory, { withFileTypes: true });
-    for (const entry of entries) {
-      inspected += 1;
-      if (inspected > MAX_FINGERPRINT_FILES) throw new ControllerError(`Workspace state discovery exceeds the ${MAX_FINGERPRINT_FILES}-entry limit: ${workspace}`);
-      const candidate = path.join(directory, entry.name);
-      if (entry.isSymbolicLink()) continue;
-      if (entry.isDirectory()) {
-        if (['.git', 'node_modules', '.venv', REVIEW_ARTIFACT_DIRECTORY, ERROR_STATE_DIRECTORY].includes(entry.name)) continue;
-        pending.push(candidate);
-        continue;
-      }
-      if (!entry.isFile() || !entry.name.endsWith(SQLITE_STATE_SUFFIX) || [WORKSPACE_CONTROL_FILENAME, QUARANTINE_DATABASE_FILENAME].includes(entry.name)) continue;
-      let state;
-      try { state = await readTaskState(candidate); }
-      catch (error) {
-        if (/has an unknown schema and was not modified/.test(error.message)) continue;
-        throw asControllerError(error);
-      }
-      if (state?.version === VERSION && state.workspace === workspace) found.push(candidate);
-    }
-  }
-  return found;
-}
-
 async function assertWorkspaceControlCreationIsSafe(workspace, stateDirectory) {
-  const controlDirectory = path.dirname(workspaceLeasePath(workspace));
   assertStateDirectoryBoundary(workspace, stateDirectory);
-  let controlEntries = [];
-  try { controlEntries = await fs.readdir(controlDirectory, { withFileTypes: true }); }
-  catch (error) { if (error.code !== 'ENOENT') throw error; }
-  for (const entry of controlEntries) {
-    if (!entry.name.startsWith(`${WORKSPACE_CONTROL_FILENAME}.bootstrap-`)) continue;
-    const artifact = path.join(controlDirectory, entry.name);
-    const metadata = await fs.lstat(artifact);
-    if (metadata.isSymbolicLink() || !metadata.isFile()) throw new ControllerError(`Workspace control bootstrap artifact is not a regular file: ${artifact}`);
-    throw new ControllerError(`Workspace control database is missing but its bootstrap artifact remains; explicit destructive recovery is required: ${artifact}`);
-  }
-  const directories = [...new Set([controlDirectory, stateDirectory].filter(Boolean).map(value => path.resolve(value)))];
-  const statePaths = [];
-  for (const directory of directories) statePaths.push(...await currentTaskStatePaths(directory));
-  statePaths.push(...await workspaceTaskStatePaths(workspace));
-  if (statePaths.length) {
-    const uniqueStatePaths = [...new Set(statePaths.map(candidate => path.resolve(candidate)))];
+  const globalStates = await listGlobalTaskStatesForWorkspace(workspace);
+  if (globalStates.length) {
+    const uniqueStatePaths = [...new Set(globalStates.map(entry => entry.state.workspace_lease?.state_path ?? path.join(entry.namespace_key, `${entry.task_id}${SQLITE_STATE_SUFFIX}`)))];
     throw new ControllerError(`Workspace control database is missing while current v3 task state exists; explicit destructive recovery is required: ${uniqueStatePaths.join(', ')}`);
-  }
-  for (const suffix of ['-wal', '-shm', '-journal']) {
-    const artifact = `${workspaceLeasePath(workspace)}${suffix}`;
-    try {
-      const metadata = await fs.lstat(artifact);
-      if (metadata.isSymbolicLink() || !metadata.isFile()) throw new ControllerError(`Workspace control database artifact is not a regular file: ${artifact}`);
-      throw new ControllerError(`Workspace control database is missing but its SQLite artifact remains; explicit destructive recovery is required: ${artifact}`);
-    } catch (error) {
-      if (error.code === 'ENOENT') continue;
-      throw error;
-    }
   }
 }
 
@@ -1959,8 +1918,7 @@ function assertStateDirectoryBoundary(workspace, stateDirectory) {
   if (pathIsWithinPhysicalRoot(canonicalControlDirectory, resolvedStateDirectory)) return;
   const relative = path.relative(resolvedWorkspace, resolvedStateDirectory);
   const segments = relative && relative !== '.' ? relative.split(path.sep) : [];
-  const controllerManagedDirectories = new Set([REVIEW_ARTIFACT_DIRECTORY, ERROR_STATE_DIRECTORY].map(value => workspacePathKey(value)));
-  if (segments.some(segment => isIgnoredFingerprintDirectory(segment) || controllerManagedDirectories.has(workspacePathKey(segment)))) {
+  if (segments.some(segment => isIgnoredFingerprintDirectory(segment))) {
     throw new ControllerError(`workflow_init state_dir cannot be inside an ignored workspace directory: ${stateDirectory}`);
   }
 }
@@ -1970,17 +1928,6 @@ async function ensureWorkspaceControl(workspace, { allowCreate = false, stateDir
   if (await workspaceControlExists(databasePath)) return databasePath;
   if (!allowCreate) throw new ControllerError(`Workspace control database does not exist: ${databasePath}`);
   await assertWorkspaceControlCreationIsSafe(workspace, stateDirectory);
-  await removeRetiredWorkspaceControlFiles(workspace);
-  const controlDirectory = path.dirname(databasePath);
-  await fs.mkdir(controlDirectory, { recursive: true });
-  const controlMetadata = await fs.lstat(controlDirectory);
-  if (controlMetadata.isSymbolicLink() || !controlMetadata.isDirectory()) {
-    throw new ControllerError(`Workspace control directory is not a regular directory: ${controlDirectory}`);
-  }
-  const controlRealPath = await fs.realpath(controlDirectory);
-  if (!pathIsWithin(workspace, controlRealPath)) {
-    throw new ControllerError(`Workspace control directory escapes its workspace: ${controlDirectory}`);
-  }
   if (await workspaceControlExists(databasePath)) return databasePath;
   const lease = { version: WORKSPACE_LEASE_VERSION, workspace, active_tasks: [], active_locks: [], updated_at: utcNow() };
   try {
@@ -2242,14 +2189,14 @@ async function bindStateParentAuthorityToWorkspaceLease(lease, state, filePath, 
   void authorityContext;
 }
 
-async function withActiveWorkspaceStateLock(filePath, callback) {
+async function withActiveWorkspaceStateLock(filePath, callback, { cursorRelevant = true } = {}) {
   const initialState = normalizeState(await loadState(filePath));
   if (!initialState.workspace_lease) throw new ControllerError('Current task has no workspace lease and cannot change state');
   const parentAuthority = await stateParentAuthorityForState(initialState, filePath);
   await verifyRegularDirectorySnapshot(parentAuthority, 'Controller state parent');
   const expectedLeasePath = initialState.workspace_lease.registry_path;
   const leasePath = expectedLeasePath;
-  return withTaskStateTransaction(databasePath(filePath), { parentAuthority }, async (storedState, save) => {
+  return withTaskStateTransaction(databasePath(filePath), { parentAuthority, cursor_relevant: cursorRelevant }, async (storedState, save) => {
     if (storedState === null) throw new ControllerError(`Current SQLite controller state does not exist: ${filePath}`);
     const state = normalizeState(storedState);
     return taskStateTransactionContext.run({ filePath, state, parentAuthority }, async () => {
@@ -2336,19 +2283,10 @@ async function initTask(parameters) {
   const filePath = await configuredStatePath(parameters, state.task_id);
   assertStateDirectoryBoundary(state.workspace, path.dirname(filePath));
   const leasePath = workspaceLeasePath(state.workspace);
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
-  const parentAuthority = await snapshotRegularDirectory(path.dirname(filePath), 'Controller state parent');
+  const parentAuthority = await snapshotLogicalStateNamespace(path.dirname(filePath), state.workspace);
   await verifyRegularDirectorySnapshot(parentAuthority, 'Controller state parent');
-  for (const legacyPath of [filePath, leasePath]) {
-    try {
-      const metadata = await fs.lstat(legacyPath);
-      if (metadata.isFile() || metadata.isSymbolicLink()) throw new ControllerError(`LEGACY_STATE_MIGRATION_REQUIRED: local SQLite state exists and is not read or migrated automatically: ${legacyPath}`);
-    } catch (error) {
-      if (error?.code !== 'ENOENT') throw error;
-    }
-  }
   if (await stateExists(filePath)) throw new ControllerError(`Task already exists: ${state.task_id}`);
-  await removeRetiredJsonState(filePath, parentAuthority);
+  await ensureGlobalNamespaceIdentity(path.dirname(filePath), parentAuthority);
   state.workspace_lease = { registry_path: leasePath, state_path: filePath, task_key: taskKey(filePath), state_parent_authority: parentAuthority, status: 'active', acquired_at: utcNow(), workspace_claims: state.workspace_claims };
   const entry = { task_id: state.task_id, task_key: taskKey(filePath), state_path: filePath, state_dir: path.dirname(filePath), state_parent_authority: parentAuthority, acquired_at: state.workspace_lease.acquired_at, phase: 'initializing', workspace_claims: state.workspace_claims };
 
@@ -2454,9 +2392,9 @@ async function addNode(parameters) {
 }
 
 async function raiseAssurance(parameters) {
-  const rawAssessment = await readJson(parameters.assurance_assessment, { label: 'Assurance assessment', maxBytes: MAX_REVIEW_BYTES });
+  const [filePath, currentState] = await readTask(parameters);
+  const rawAssessment = await readWorkflowJson(parameters.assurance_assessment, { label: 'Assurance assessment', maxBytes: MAX_REVIEW_BYTES, workspace: currentState.workspace, objectOnly: true });
   const nextAssessment = assuranceAssessment(rawAssessment);
-  const [filePath] = await readTask(parameters);
   const targetLevel = requiredString(parameters.target_assurance_level, 'target_assurance_level');
   const reason = requiredString(parameters.reason, 'reason');
   const replacement = requiredString(parameters.replacement_agent_task_path, 'replacement_agent_task_path');
@@ -2527,8 +2465,10 @@ function gateInvalidationReasons(reasons) {
 async function invalidateGate(parameters) {
   const [filePath] = await readTask(parameters);
   const reason = requiredString(parameters.reason, 'reason');
+  const fingerprintPreflight = await prepareWorkspaceFingerprint(filePath);
   return withActiveWorkspaceStateLock(filePath, async state => {
-    const invalidationReasons = gateInvalidationReasons(await closeReasons(state));
+    const fingerprint = workspaceFingerprintFromPreflight(state, fingerprintPreflight, 'Review gate invalidation');
+    const invalidationReasons = gateInvalidationReasons(await closeReasons(state, { workspaceFingerprint: fingerprint }));
     if (!invalidationReasons.length) throw new ControllerError('The terminal assurance gate is not invalidated by a task or workspace change');
     const node = reviewNodesForState(state)[0];
     if (!node || node.status !== SUCCEEDED) {
@@ -2759,24 +2699,29 @@ function validWorkflowArtifactSegment(value) {
 
 function workflowArtifactResultPath(parameters) {
   if (!validWorkflowArtifactSegment(parameters.task_id) || !validWorkflowArtifactSegment(parameters.claim_id)) throw new ControllerError('Workflow artifact task_id and claim_id must be path-safe identifiers');
-  return path.join(path.resolve(parameters.state_dir), REVIEW_ARTIFACT_DIRECTORY, parameters.task_id, parameters.claim_id, 'outcome.json');
+  return globalWorkflowArtifactPath(path.resolve(parameters.state_dir), parameters.task_id, parameters.claim_id, 'outcome.json');
 }
 
 async function prepareWorkflowArtifactAuthority(parameters) {
   const stateDir = await canonicalStateDirectory(parameters.state_dir, 'workflow artifact state_dir');
   const targetDirectory = path.dirname(workflowArtifactResultPath({ ...parameters, state_dir: stateDir }));
-  const rootMetadata = await fs.lstat(stateDir, { bigint: true });
-  if (rootMetadata.isSymbolicLink() || !rootMetadata.isDirectory()) throw new ControllerError(`Workflow artifact state directory is unsafe: ${stateDir}`);
-  const rootRealPath = await fs.realpath(stateDir);
-  const directories = [{ path: stateDir, real_path: rootRealPath, identity: workspaceDirectoryIdentity(rootMetadata) }];
-  let current = stateDir;
-  for (const segment of [REVIEW_ARTIFACT_DIRECTORY, parameters.task_id, parameters.claim_id]) {
+  const root = path.resolve(globalWorkflowArtifactRoot());
+  await fs.mkdir(root, { recursive: true });
+  const rootMetadata = await fs.lstat(root, { bigint: true });
+  if (rootMetadata.isSymbolicLink() || !rootMetadata.isDirectory()) throw new ControllerError(`Global workflow artifact root is unsafe: ${root}`);
+  const rootRealPath = await fs.realpath(root);
+  const relative = path.relative(root, targetDirectory);
+  const segments = relative.split(path.sep).filter(Boolean);
+  if (!segments.length || segments.some(segment => segment === '.' || segment === '..' || segment.includes('\0'))) throw new ControllerError(`Global workflow artifact path escapes its root: ${targetDirectory}`);
+  const directories = [{ path: root, real_path: rootRealPath, identity: workspaceDirectoryIdentity(rootMetadata) }];
+  let current = root;
+  for (const segment of segments) {
     current = path.join(current, segment);
     try { await fs.mkdir(current); } catch (error) { if (error.code !== 'EEXIST') throw error; }
     const metadata = await fs.lstat(current, { bigint: true });
     if (metadata.isSymbolicLink() || !metadata.isDirectory()) throw new ControllerError(`Workflow artifact directory must not contain a symbolic link or reparse point: ${current}`);
     const realPath = await fs.realpath(current);
-    if (!pathIsWithinPhysicalRoot(rootRealPath, realPath)) throw new ControllerError(`Workflow artifact directory escapes the canonical state directory: ${current}`);
+    if (!pathIsWithinPhysicalRoot(rootRealPath, realPath)) throw new ControllerError(`Workflow artifact directory escapes the global artifact root: ${current}`);
     directories.push({ path: current, real_path: realPath, identity: workspaceDirectoryIdentity(metadata) });
   }
   return { version: 1, platform: process.platform, root_real_path: rootRealPath, target_directory: targetDirectory, target_real_path: directories.at(-1).real_path, directories };
@@ -2787,8 +2732,20 @@ async function validateWorkflowArtifactAuthority(authority, parameters, { result
   if (!hasExactFields(authority, fields) || authority.version !== 1 || authority.platform !== process.platform || !Array.isArray(authority.directories) || authority.directories.length !== 4) throw new ControllerError('Workflow artifact authority is missing or unsupported');
   const stateDir = await canonicalStateDirectory(parameters.state_dir, 'workflow artifact state_dir');
   const resultPath = workflowArtifactResultPath({ ...parameters, state_dir: stateDir });
-  const expectedDirectories = [stateDir, path.join(stateDir, REVIEW_ARTIFACT_DIRECTORY), path.join(stateDir, REVIEW_ARTIFACT_DIRECTORY, parameters.task_id), path.dirname(resultPath)];
-  if (!sameStatePath(authority.root_real_path, stateDir) || !sameStatePath(authority.target_directory, expectedDirectories.at(-1)) || !sameStatePath(authority.target_real_path, expectedDirectories.at(-1))) throw new ControllerError('Workflow artifact authority does not match the active claim directory');
+  const root = path.resolve(globalWorkflowArtifactRoot());
+  const targetDirectory = path.dirname(resultPath);
+  const relative = path.relative(root, targetDirectory);
+  const segments = relative.split(path.sep).filter(Boolean);
+  const expectedDirectories = [root];
+  let current = root;
+  for (const segment of segments) {
+    current = path.join(current, segment);
+    expectedDirectories.push(current);
+  }
+  if (segments.length !== 3) throw new ControllerError('Workflow artifact authority does not match the active global artifact directory');
+  const rootRealPath = await fs.realpath(root);
+  const targetRealPath = await fs.realpath(targetDirectory);
+  if (!sameStatePath(authority.root_real_path, rootRealPath) || !sameStatePath(authority.target_directory, targetDirectory) || !sameStatePath(authority.target_real_path, targetRealPath)) throw new ControllerError('Workflow artifact authority does not match the active global artifact directory');
   for (let index = 0; index < expectedDirectories.length; index++) {
     const expected = authority.directories[index];
     if (!hasExactFields(expected, new Set(['path', 'real_path', 'identity'])) || !hasExactFields(expected.identity, new Set(['dev', 'ino'])) || !sameStatePath(expected.path, expectedDirectories[index])) throw new ControllerError('Workflow artifact authority directory chain is invalid');
@@ -2854,8 +2811,7 @@ function workflowOutcomeDigest(result) {
 
 function workflowCompletionIntentResultDigest(intent) {
   if (typeof intent?.result_digest === 'string' && /^[a-f0-9]{64}$/.test(intent.result_digest)) return intent.result_digest;
-  // Older persisted intents predate result_digest but retain the pending result.
-  return intent?.result && typeof intent.result === 'object' ? workflowOutcomeDigest(intent.result) : null;
+  throw new ControllerError('A total_review completion intent is missing the current result_digest');
 }
 
 function isCompletedWorkflowOutcome(result, state, node) {
@@ -2901,9 +2857,10 @@ async function finalizeWorkflowOutcome(result, parameters, node, status, complet
     completion_attestation: completionAttestation,
   };
   const finalized = { ...result, workflow_completion: workflowCompletion };
-  await atomicWrite(parameters.result, finalized, MAX_NODE_RESULT_BYTES, { parentAuthority: await workflowArtifactTargetAuthority(finalized.workflow_artifact_authority, parameters) });
-  const finalizedSnapshot = await readJsonSnapshot(parameters.result, { label: 'Workflow outcome', maxBytes: MAX_NODE_RESULT_BYTES });
-  if (!sameJson(finalizedSnapshot.value, finalized)) throw new ControllerError(`Workflow outcome changed after finalization: ${parameters.result}`);
+  const resultPath = workflowArtifactResultPath(parameters);
+  await atomicWrite(resultPath, finalized, MAX_NODE_RESULT_BYTES, { parentAuthority: await workflowArtifactTargetAuthority(finalized.workflow_artifact_authority, parameters) });
+  const finalizedSnapshot = await readJsonSnapshot(resultPath, { label: 'Workflow outcome', maxBytes: MAX_NODE_RESULT_BYTES });
+  if (!sameJson(finalizedSnapshot.value, finalized)) throw new ControllerError(`Workflow outcome changed after finalization: ${resultPath}`);
   await validateWorkflowArtifactAuthority(finalized.workflow_artifact_authority, parameters, { resultSnapshot: finalizedSnapshot });
   Object.assign(result, finalized);
   return workflowCompletion;
@@ -2914,24 +2871,72 @@ function workflowCompletionIntentMatches(intent, parameters, status, completionA
     intent && typeof intent === 'object' && !Array.isArray(intent)
     && intent.claim_id === parameters.claim_id && intent.task_id === parameters.task_id && intent.node_id === parameters.node_id
     && intent.status === status && intent.completion_attestation === completionAttestation
-    && typeof intent.result_path === 'string' && path.resolve(intent.result_path) === path.resolve(parameters.result),
+    && typeof intent.result_path === 'string' && path.resolve(intent.result_path) === path.resolve(workflowArtifactResultPath(parameters)),
   );
+}
+
+function expectedCompletionAttestation(node, activeClaim, status, supplied) {
+  return node.rescue_role === ROOT_RESCUE_ROLE && activeClaim.agent_role === ROOT_RESCUE_ROLE
+    ? ROOT_RESCUE_SELF_COMPLETION
+    : node.kind === 'total_review' && status === 'unavailable' && [NATIVE_AGENT_EXIT_CONFIRMED, NATIVE_AGENT_START_FAILED].includes(supplied)
+      ? supplied
+      : NATIVE_AGENT_FINISHED;
 }
 
 async function completeNode(parameters) {
   const status = String(parameters.status); if (!COMPLETABLE.has(status)) throw new ControllerError(`Completion status must be one of: ${[...COMPLETABLE].sort().join(', ')}`);
-  const resultSnapshot = await readJsonSnapshot(parameters.result, { label: 'Node result', maxBytes: MAX_NODE_RESULT_BYTES });
+  const [filePath, initialState] = await readTask(parameters);
+  const resultInput = parameters.result;
+  const resultIsPath = typeof resultInput === 'string' && !resultInput.trim().startsWith('{') && !resultInput.trim().startsWith('[')
+    && (() => { try { JSON.parse(resultInput.trim()); return false; } catch { return true; } })();
+  let resultSnapshot = null;
+  let result;
+  if (resultIsPath) {
+    await rejectWorkspaceLocalJsonPath(resultInput, initialState.workspace, 'Node result');
+    resultSnapshot = await readJsonSnapshot(resultInput, { label: 'Node result', maxBytes: MAX_NODE_RESULT_BYTES });
+    await verifyJsonSnapshot(resultInput, resultSnapshot, 'Node result');
+    result = resultSnapshot.value;
+  } else {
+    result = await readWorkflowJson(resultInput, { label: 'Node result', maxBytes: MAX_NODE_RESULT_BYTES, workspace: initialState.workspace });
+  }
   let activeResultSnapshot = resultSnapshot;
-  let result = resultSnapshot.value; const [filePath] = await readTask(parameters); const nodeId = requiredIdentifier(parameters.node_id, 'node_id');
-  return withActiveWorkspaceStateLock(filePath, async state => {
+  const nodeId = requiredIdentifier(parameters.node_id, 'node_id');
+  const fingerprintPreflight = initialState.nodes[nodeId] && isCohortReviewNode(initialState, initialState.nodes[nodeId])
+    ? await prepareWorkspaceFingerprint(filePath)
+    : null;
+  let totalReviewPreparation = null;
+  if (initialState.nodes[nodeId]?.kind === 'total_review') {
+    const initialNode = initialState.nodes[nodeId];
+    const initialActiveClaim = initialNode.claim_id === parameters.claim_id ? initialNode : null;
+    if (!initialActiveClaim) throw new ControllerError('Node claim is no longer active');
+    const expectedAttestation = expectedCompletionAttestation(initialNode, initialActiveClaim, status, parameters.completion_attestation);
+    const canonicalResultPath = workflowArtifactResultPath(parameters);
+    if (hasWorkflowOutcomeMarker(result)) {
+      if (resultIsPath && !sameStatePath(parameters.result, canonicalResultPath)) throw new ControllerError(`A workflow-bound total_review result must be exactly ${canonicalResultPath}`);
+      const artifactSnapshot = resultIsPath
+        ? resultSnapshot
+        : await readJsonSnapshot(canonicalResultPath, { label: 'Workflow outcome', maxBytes: MAX_NODE_RESULT_BYTES });
+      if (!sameJson(artifactSnapshot.value, result)) throw new ControllerError(`Workflow outcome does not match the supplied result: ${canonicalResultPath}`);
+      await validateWorkflowArtifactAuthority(result.workflow_artifact_authority, parameters, { resultSnapshot: artifactSnapshot });
+      activeResultSnapshot = artifactSnapshot;
+      parameters = { ...parameters, result: canonicalResultPath };
+    } else {
+      const artifactAuthority = await prepareWorkflowArtifactAuthority(parameters);
+      parameters = { ...parameters, result: canonicalResultPath };
+      result = addWorkflowOutcomeEnvelope(result, parameters, artifactAuthority);
+      await atomicWrite(parameters.result, result, MAX_NODE_RESULT_BYTES, { parentAuthority: await workflowArtifactTargetAuthority(artifactAuthority, parameters) });
+      activeResultSnapshot = await readJsonSnapshot(parameters.result, { label: 'Workflow outcome', maxBytes: MAX_NODE_RESULT_BYTES });
+      if (!sameJson(activeResultSnapshot.value, result)) throw new ControllerError(`Workflow outcome changed after normalization: ${parameters.result}`);
+      await validateWorkflowArtifactAuthority(artifactAuthority, parameters, { resultSnapshot: activeResultSnapshot });
+    }
+    const pending = await isPendingWorkflowOutcome(result, parameters, initialNode, activeResultSnapshot);
+    const finalized = !pending && await isFinalizedWorkflowOutcome(result, parameters, initialNode, status, expectedAttestation, activeResultSnapshot);
+    totalReviewPreparation = { parameters, result, activeResultSnapshot, pending, finalized, expectedAttestation, initialNode };
+  }
+  const completed = await withActiveWorkspaceStateLock(filePath, async state => {
     const node = state.nodes[nodeId]; const activeClaim = activeClaimForOperation(state, node, parameters); const cohortNode = isCohortReviewNode(state, node);
-    await verifyJsonSnapshot(parameters.result, resultSnapshot, 'Node result');
     if (!activeClaim.activation_at || activeClaim.heartbeat_count < 1) throw new ControllerError('An unactivated node cannot be completed; the claiming agent must first call workflow_heartbeat or workflow_start');
-    const expectedAttestation = node.rescue_role === ROOT_RESCUE_ROLE && activeClaim.agent_role === ROOT_RESCUE_ROLE
-      ? ROOT_RESCUE_SELF_COMPLETION
-      : node.kind === 'total_review' && status === 'unavailable' && [NATIVE_AGENT_EXIT_CONFIRMED, NATIVE_AGENT_START_FAILED].includes(parameters.completion_attestation)
-        ? parameters.completion_attestation
-        : NATIVE_AGENT_FINISHED;
+    const expectedAttestation = expectedCompletionAttestation(node, activeClaim, status, parameters.completion_attestation);
     if (parameters.completion_attestation !== expectedAttestation) throw new ControllerError(`workflow_complete requires completion_attestation=${expectedAttestation}`);
     const reviewNode = isReviewNode(node, state.routing_schema_version);
     if (cohortNode) {
@@ -2971,7 +2976,7 @@ async function completeNode(parameters) {
           if (nonconverged) {
             findings.push({ id: 'cohort_nonconvergence', source_finding_id: 'cohort_nonconvergence', finding_ref: `C${createHash('sha256').update(`${cohort.round_id}:nonconvergence`).digest('hex').slice(0, 24)}`, severity: 'blocking', requirement_id: null, summary: 'The two Terra cross-review lanes reached different final verdicts.', evidence: 'The bounded cross-questioning round did not converge on a shared final position.' });
           }
-          cohort.aggregate = { source_review_claim_id: `cohort:${cohort.round_id}`, verdict, findings, review_claim_ids: finalReviews.map(review => review.claim_id), workspace_fingerprint: await workspaceFingerprint(state.workspace, state.workspace_claims), completed_at: utcNow(), history_digest: protocolReviewHistoryDigest(state) };
+          cohort.aggregate = { source_review_claim_id: `cohort:${cohort.round_id}`, verdict, findings, review_claim_ids: finalReviews.map(review => review.claim_id), workspace_fingerprint: workspaceFingerprintFromPreflight(state, fingerprintPreflight, 'Terra cohort completion'), completed_at: utcNow(), history_digest: protocolReviewHistoryDigest(state) };
           cohort.phase = verdict === 'pass' ? 'passed' : 'failed';
           node.status = verdict === 'pass' ? SUCCEEDED : 'failed';
           node.result = { summary: 'Terra cross-review cohort completed.', verdict, findings };
@@ -2992,24 +2997,12 @@ async function completeNode(parameters) {
     }
     let workflowOutcomeCompletion = null;
     if (node.kind === 'total_review') {
-      const canonicalResultPath = workflowArtifactResultPath(parameters);
-      if (hasWorkflowOutcomeMarker(result)) {
-        if (!sameStatePath(parameters.result, canonicalResultPath)) throw new ControllerError(`A workflow-bound total_review result must be exactly ${canonicalResultPath}`);
-        await verifyJsonSnapshot(canonicalResultPath, resultSnapshot, 'Workflow outcome');
-        await validateWorkflowArtifactAuthority(result.workflow_artifact_authority, parameters, { resultSnapshot: activeResultSnapshot });
-      } else {
-        const artifactAuthority = await prepareWorkflowArtifactAuthority(parameters);
-        parameters = { ...parameters, result: canonicalResultPath };
-        result = addWorkflowOutcomeEnvelope(result, parameters, artifactAuthority);
-        await atomicWrite(parameters.result, result, MAX_NODE_RESULT_BYTES, { parentAuthority: await workflowArtifactTargetAuthority(artifactAuthority, parameters) });
-        activeResultSnapshot = await readJsonSnapshot(parameters.result, { label: 'Workflow outcome', maxBytes: MAX_NODE_RESULT_BYTES });
-        if (!sameJson(activeResultSnapshot.value, result)) throw new ControllerError(`Workflow outcome changed after normalization: ${parameters.result}`);
-        await validateWorkflowArtifactAuthority(artifactAuthority, parameters, { resultSnapshot: activeResultSnapshot });
-      }
+      if (!totalReviewPreparation) throw new ControllerError('Total review completion preparation is missing');
+      ({ result, activeResultSnapshot } = totalReviewPreparation);
       if (node.workflow_completion_intent && !workflowCompletionIntentMatches(node.workflow_completion_intent, parameters, status, expectedAttestation)) {
         throw new ControllerError('A total_review completion is already pending for a different result, claim, or status');
       }
-      if (await isPendingWorkflowOutcome(result, parameters, node, activeResultSnapshot)) {
+      if (totalReviewPreparation.pending) {
         if (node.workflow_completion_intent && !sameJson(node.workflow_completion_intent.result, result)) throw new ControllerError('A total_review pending result does not match its persisted completion intent');
         if (!node.workflow_completion_intent) {
           node.workflow_completion_intent = {
@@ -3025,8 +3018,8 @@ async function completeNode(parameters) {
           };
           await writeState(filePath, state);
         }
-        workflowOutcomeCompletion = await finalizeWorkflowOutcome(result, parameters, node, status, expectedAttestation, activeResultSnapshot);
-      } else if (await isFinalizedWorkflowOutcome(result, parameters, node, status, expectedAttestation, activeResultSnapshot)) {
+        return { __workflow_finalize: true };
+      } else if (totalReviewPreparation.finalized) {
         if (!node.workflow_completion_intent) {
           throw new ControllerError('A finalized total_review result requires a persisted completion intent');
         }
@@ -3080,6 +3073,11 @@ async function completeNode(parameters) {
     await writeState(filePath, state);
     return { task_id: state.task_id, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), node, ready_nodes: readyNodes(state), workflow_outcome_completion: workflowOutcomeCompletion };
   });
+  if (completed?.__workflow_finalize) {
+    await finalizeWorkflowOutcome(totalReviewPreparation.result, totalReviewPreparation.parameters, totalReviewPreparation.initialNode, status, totalReviewPreparation.expectedAttestation, totalReviewPreparation.activeResultSnapshot);
+    return completeNode(totalReviewPreparation.parameters);
+  }
+  return completed;
 }
 
 async function heartbeatNode(parameters) {
@@ -3088,19 +3086,18 @@ async function heartbeatNode(parameters) {
     const node = state.nodes[nodeId]; const active = activeClaimForOperation(state, node, parameters);
     const now = utcNow(); active.activation_at ??= now; active.activation_deadline_at = null; active.heartbeat_at = now; active.heartbeat_count += 1; state.updated_at = now; await writeState(filePath, state);
     return { task_id: state.task_id, node };
-  });
+  }, { cursorRelevant: false });
 }
 
 async function checkpointNode(parameters) {
-  const checkpointPath = requiredString(parameters.checkpoint, 'checkpoint');
-  const checkpoint = await readJson(checkpointPath, { label: 'Node checkpoint', maxBytes: MAX_CHECKPOINT_BYTES });
-  if (!checkpoint || typeof checkpoint !== 'object' || Array.isArray(checkpoint)) throw new ControllerError('Node checkpoint must be a JSON object');
-  const [filePath] = await readTask(parameters); const nodeId = requiredIdentifier(parameters.node_id, 'node_id');
+  const [filePath, currentState] = await readTask(parameters);
+  const checkpoint = await readWorkflowJson(parameters.checkpoint, { label: 'Node checkpoint', maxBytes: MAX_CHECKPOINT_BYTES, workspace: currentState.workspace, objectOnly: true });
+  const nodeId = requiredIdentifier(parameters.node_id, 'node_id');
   return withActiveWorkspaceStateLock(filePath, async state => {
     const node = state.nodes[nodeId]; const active = activeClaimForOperation(state, node, parameters);
     active.checkpoint = checkpoint; active.checkpoint_at = utcNow(); active.activation_at ??= active.checkpoint_at; active.activation_deadline_at = null; active.heartbeat_at = active.checkpoint_at; active.heartbeat_count += 1; state.updated_at = active.checkpoint_at; await writeState(filePath, state);
     return { task_id: state.task_id, node_id: nodeId, checkpoint_at: active.checkpoint_at };
-  });
+  }, { cursorRelevant: false });
 }
 
 function compactRecoveryResult(result) {
@@ -3252,7 +3249,13 @@ async function abandonNode(parameters) {
 }
 
 async function retryNode(parameters) {
-  const [filePath] = await readTask(parameters); const nodeId = requiredIdentifier(parameters.node_id, 'node_id'); const reason = requiredString(parameters.reason, 'reason'); retryConfirmation(parameters);
+  const [filePath, initialState] = await readTask(parameters); const nodeId = requiredIdentifier(parameters.node_id, 'node_id'); const reason = requiredString(parameters.reason, 'reason'); retryConfirmation(parameters);
+  const initialNode = initialState.nodes[nodeId];
+  const initialNextRoute = initialNode && isReviewNode(initialNode, initialState.routing_schema_version) ? nextReviewRoute(initialState, initialNode) : null;
+  const fingerprintPreflight = initialNode && isReviewNode(initialNode, initialState.routing_schema_version)
+    && (protocolStageForNode(initialNode) === 'sol_max_initial' || initialNextRoute?.agent_type === 'avsp_sol_max')
+    ? await prepareWorkspaceFingerprint(filePath)
+    : null;
   return withActiveWorkspaceStateLock(filePath, async state => {
     const node = state.nodes[nodeId];
     const protocolNode = isReviewProtocolState(state) && protocolReviewNode(state) === node;
@@ -3323,7 +3326,7 @@ async function retryNode(parameters) {
       if (stage === 'sol_max_initial') {
         const sourceReview = protocolLatestFailedReview(state, node);
         if (!sourceReview) throw new ControllerError('Sol/max closure requires a finalized failed max initial review');
-        await freezeProtocolMaxReviewCharter(state, node, sourceReview);
+        await freezeProtocolMaxReviewCharter(state, node, sourceReview, fingerprintPreflight);
         clearRescueRouting(node); clearAttemptForRetry(node); applyProtocolStage(node, 'sol_max_closure');
         node.status = 'blocked';
         addEvent(state, 'max_initial_repair_required', { node_id: nodeId, source_review_claim_id: sourceReview.claim_id, reason, previous_agent_stopped: true });
@@ -3355,7 +3358,7 @@ async function retryNode(parameters) {
     if (nextReview?.agent_type === 'avsp_sol_max' && !isMaxReviewNode(node)) {
       const sourceReview = finalizedLatestReview(state, node);
       if (!sourceReview) throw new ControllerError('Escalation to max requires a finalized xhigh failure');
-      await freezeProtocolMaxReviewCharter(state, node, sourceReview);
+      await freezeProtocolMaxReviewCharter(state, node, sourceReview, fingerprintPreflight);
       node.kind = nextReview.kind;
       node.review_stage = nextReview.review_stage;
       node.agent_type = nextReview.agent_type;
@@ -3387,59 +3390,12 @@ async function retryNode(parameters) {
   });
 }
 
-const PRUNABLE_STATE_FIELDS = new Set(['version', 'routing_schema_version', 'assurance_level', 'assurance_assessment', 'review_protocol_version', 'review_entry_stage', 'review_context', 'task_id', 'workspace', 'workspace_claims', 'goal', 'requirements', 'scope', 'non_goals', 'nodes', 'participants', 'reviews', 'repair_records', 'max_review_charter', 'events', 'workflow_revision', 'closed_revision', 'closed_at', 'created_at', 'updated_at', 'workspace_lease']);
-const PRUNABLE_NODE_FIELDS = new Set(['id', 'kind', 'review_stage', 'agent_type', 'depends_on', 'execution_risk', 'routing_reason', 'execution_owner', 'integration_owner', 'quality_guard', 'rescue_role', 'rescue_reason', 'rescued_at', 'rescue_count', 'status', 'agent_task_path', 'agent_thread_id', 'agent_role', 'claim_id', 'claimed_at', 'activation_at', 'activation_deadline_at', 'heartbeat_at', 'heartbeat_count', 'lease_duration_sec', 'attempt', 'attempt_budget_used', 'unavailable_attempts', 'result', 'checkpoint', 'checkpoint_at', 'workflow_completion_intent', 'recovery_history', 'review_gate']);
-const PRUNABLE_LEASE_FIELDS = new Set(['version', 'workspace', 'active_tasks', 'updated_at']);
-const PRUNABLE_TASK_LEASE_FIELDS = new Set(['registry_path', 'state_path', 'status', 'acquired_at', 'released_at', 'workspace_claims']);
-const PRUNABLE_TASK_LEASE_AUTHORITY_FIELDS = new Set([...PRUNABLE_TASK_LEASE_FIELDS, 'state_parent_authority']);
-const QUARANTINE_FIELDS = new Set(['version', 'status', 'task_id', 'original_state_path', 'error_path', 'reason', 'quarantined_at', 'delete_after', 'files', 'move_error', 'review_artifacts', 'workspace', 'registry_path', 'binding', 'authority_anchor']);
-
 function hasExactFields(value, fields) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const keys = Object.keys(value);
   return keys.length === fields.size && keys.every(key => fields.has(key));
 }
 function validTimestamp(value) { return typeof value === 'string' && Number.isFinite(Date.parse(value)); }
-
-function taskPruneEligibility(state, filePath, now) {
-  const allowedStateFields = hasOwn(state, 'global_write_justification')
-    ? new Set([...PRUNABLE_STATE_FIELDS, 'global_write_justification'])
-    : PRUNABLE_STATE_FIELDS;
-  if (!hasExactFields(state, allowedStateFields)) return { eligible: false, reason: 'incomplete or unknown state fields' };
-  if (state.version !== VERSION || state.routing_schema_version !== REVIEW_PROTOCOL_VERSION) return { eligible: false, reason: 'unsupported state schema' };
-  if (!ASSURANCE_LEVELS.has(state.assurance_level)) return { eligible: false, reason: 'invalid assurance state' };
-  try { requiredIdentifier(state.task_id, 'task_id'); requiredString(state.workspace, 'workspace'); requiredString(state.goal, 'goal'); }
-  catch (error) { return { eligible: false, reason: `invalid task identity: ${error.message}` }; }
-  if (state.task_id !== path.basename(filePath, SQLITE_STATE_SUFFIX)) return { eligible: false, reason: 'task_id does not match state path' };
-  if (!path.isAbsolute(state.workspace) || path.resolve(state.workspace) !== state.workspace) return { eligible: false, reason: 'workspace is not canonical absolute path' };
-  if (!Array.isArray(state.requirements) || !Array.isArray(state.scope) || !Array.isArray(state.non_goals) || !Array.isArray(state.participants) || !Array.isArray(state.reviews) || !Array.isArray(state.events) || !Array.isArray(state.repair_records)) return { eligible: false, reason: 'invalid state collection' };
-  if (state.requirements.some(item => !item || typeof item !== 'object' || Array.isArray(item) || typeof item.id !== 'string' || !item.id.trim() || typeof item.text !== 'string' || !item.text.trim()) || state.participants.some(item => !item || typeof item !== 'object' || Array.isArray(item)) || state.reviews.some(item => !item || typeof item !== 'object' || Array.isArray(item)) || state.events.some(item => !item || typeof item !== 'object' || Array.isArray(item) || !validTimestamp(item.at) || typeof item.type !== 'string' || !item.type.trim())) return { eligible: false, reason: 'malformed state collection item' };
-  if (!state.nodes || typeof state.nodes !== 'object' || Array.isArray(state.nodes) || !Object.keys(state.nodes).length) return { eligible: false, reason: 'invalid node collection' };
-  for (const [id, node] of Object.entries(state.nodes)) {
-    if (!hasExactFields(node, PRUNABLE_NODE_FIELDS) || node.id !== id || (node.status !== PENDING && !TERMINAL.has(node.status))) return { eligible: false, reason: 'incomplete, unknown, or active node state' };
-    try { requiredIdentifier(node.id, 'node.id'); requiredString(node.kind, 'node.kind'); requiredString(node.execution_risk, 'node.execution_risk'); requiredString(node.routing_reason, 'node.routing_reason'); requiredString(node.execution_owner, 'node.execution_owner'); requiredString(node.integration_owner, 'node.integration_owner'); requiredString(node.quality_guard, 'node.quality_guard'); }
-    catch (error) { return { eligible: false, reason: `invalid node state: ${error.message}` }; }
-    const hasValidAttemptAccounting = Number.isSafeInteger(node.attempt_budget_used) && node.attempt_budget_used >= 0 && node.attempt_budget_used <= MAX_NODE_ATTEMPTS
-      && Number.isSafeInteger(node.unavailable_attempts) && node.unavailable_attempts >= 0 && node.unavailable_attempts <= MAX_UNAVAILABLE_ATTEMPTS
-      && node.attempt_budget_used + node.unavailable_attempts <= node.attempt;
-    if (!['read_only', 'delegable', 'protected'].includes(node.execution_risk) || !Array.isArray(node.depends_on) || node.depends_on.some(dependency => typeof dependency !== 'string') || !Number.isSafeInteger(node.attempt) || node.attempt < 0 || node.attempt > MAX_TOTAL_NODE_ATTEMPTS || !hasValidAttemptAccounting || !Number.isSafeInteger(node.heartbeat_count) || node.heartbeat_count < 0 || !Array.isArray(node.recovery_history)) return { eligible: false, reason: 'invalid node routing' };
-  }
-  try { validateNodes(state.nodes); validateReviewTopology(state.nodes, state.assurance_level, state.routing_schema_version, state.review_entry_stage); }
-  catch (error) { return { eligible: false, reason: `invalid task topology: ${error.message}` }; }
-  if (!Number.isSafeInteger(state.workflow_revision) || state.workflow_revision < 0 || !validTimestamp(state.created_at) || !validTimestamp(state.updated_at)) return { eligible: false, reason: 'invalid task timestamps or revision' };
-  const updatedAt = Date.parse(state.updated_at);
-  if (!Number.isFinite(updatedAt)) return { eligible: false, reason: 'invalid updated_at' };
-  if (now - updatedAt < DEFAULT_TASK_RETENTION_DAYS * DAY_MS) return { eligible: false, reason: 'younger than retention period' };
-  if (!state.workspace_lease || state.workspace_lease.status !== 'released') return { eligible: false, reason: 'workspace lease is not released' };
-  if (!hasExactFields(state.workspace_lease, PRUNABLE_TASK_LEASE_AUTHORITY_FIELDS)) return { eligible: false, reason: 'workspace lease is not a complete released state' };
-  if (Object.values(state.nodes).some(node => node.status === RUNNING)) return { eligible: false, reason: 'has running nodes' };
-  if (typeof state.workspace_lease.registry_path !== 'string' || !path.isAbsolute(state.workspace_lease.registry_path) || path.resolve(state.workspace_lease.registry_path) !== workspaceLeasePath(state.workspace)) return { eligible: false, reason: 'invalid workspace lease path' };
-  if (!sameStatePath(state.workspace_lease.state_path, filePath) || !validTimestamp(state.workspace_lease.acquired_at) || !validTimestamp(state.workspace_lease.released_at)) return { eligible: false, reason: 'invalid released workspace lease state' };
-  if (!validStateParentAuthority(state.workspace_lease.state_parent_authority, filePath)) return { eligible: false, reason: 'invalid released workspace lease state parent authority' };
-  try { normalizeStoredWorkspaceClaims(state.workspace_lease.workspace_claims); } catch (error) { return { eligible: false, reason: 'invalid released workspace lease claims' }; }
-  if (path.resolve(state.workspace_lease.registry_path) === path.resolve(filePath)) return { eligible: false, reason: 'state path conflicts with workspace lease path' };
-  return { eligible: true };
-}
 
 async function releasedLeaseEligibility(leasePath, state, filePath, authorityContext = null) {
   let lease;
@@ -3460,153 +3416,26 @@ async function releasedLeaseEligibility(leasePath, state, filePath, authorityCon
   return { eligible: true };
 }
 
-async function quarantineEligibility(state, filePath, now) {
-  let storageMetadata;
-  try { storageMetadata = await fs.stat(databasePath(filePath)); }
-  catch (error) {
-    if (error.code === 'ENOENT') return { eligible: false, reason: 'state database disappeared before quarantine' };
-    throw error;
-  }
-  const updatedAt = state && validTimestamp(state.updated_at) ? Date.parse(state.updated_at) : storageMetadata.mtimeMs;
-  if (now - updatedAt < QUARANTINE_AFTER_DAYS * DAY_MS) return { eligible: false, reason: 'younger than quarantine retention period' };
-  if (!state || typeof state !== 'object' || Array.isArray(state)) return { eligible: false, reason: 'state is unreadable and its workspace lease cannot be verified; manual recovery is required' };
-  if (state.workspace_lease && !validStateParentAuthority(state.workspace_lease.state_parent_authority, filePath)) return { eligible: false, reason: 'state parent authority is missing or invalid; controlled recovery is required' };
-  if (!state.nodes || typeof state.nodes !== 'object' || Array.isArray(state.nodes) || !Object.keys(state.nodes).length) return { eligible: false, reason: 'node collection is missing, empty, or not verifiable; manual recovery is required' };
-  if (state.nodes && Object.values(state.nodes).some(node => node?.status === RUNNING)) return { eligible: false, reason: 'has running nodes' };
-  if (state.nodes && Object.values(state.nodes).some(node => !node || typeof node !== 'object' || ![PENDING, ...TERMINAL].includes(node.status))) return { eligible: false, reason: 'node states are unknown; manual recovery is required' };
-  if (state.workspace_lease?.status === 'active') return { eligible: false, reason: 'state workspace lease is still active' };
-  const leasePath = state?.workspace_lease?.registry_path;
-  const canonicalLeasePath = typeof state.workspace === 'string' && path.isAbsolute(state.workspace) && path.resolve(state.workspace) === state.workspace
-    ? workspaceLeasePath(state.workspace)
-    : null;
-  const lockableLeasePath = typeof leasePath === 'string' && path.isAbsolute(leasePath) && canonicalLeasePath && path.resolve(leasePath) === canonicalLeasePath ? leasePath : null;
-  if (!lockableLeasePath) return { eligible: false, reason: 'state has no verifiable workspace lease; manual recovery is required' };
-  try {
-    const leaseMetadata = await fs.lstat(lockableLeasePath);
-    if (leaseMetadata.isSymbolicLink() || !leaseMetadata.isFile()) return { eligible: false, reason: 'workspace lease is not a regular registry file; manual recovery is required' };
-  } catch (error) {
-    if (error.code === 'ENOENT') return { eligible: false, reason: 'workspace lease registry is missing; manual recovery is required' };
-    return { eligible: false, reason: `workspace lease cannot be verified; manual recovery is required: ${error.message}` };
-  }
-  let lease;
-  try { lease = await loadWorkspaceLease(lockableLeasePath, state.workspace); }
-  catch (error) { return { eligible: false, reason: `workspace lease cannot be verified; manual recovery is required: ${error.message}` }; }
-  if (lease.active_tasks.some(entry => sameStatePath(entry.state_path, filePath))) return { eligible: false, reason: 'workspace lease still has this active state path' };
-  return { eligible: true, verified: true, lease_path: lockableLeasePath, reason: 'verified inactive workspace lease' };
-}
-
-function errorStateRoot(stateDir) { return path.join(path.resolve(stateDir), ERROR_STATE_DIRECTORY); }
-function quarantineDatabasePath(stateDir) { return path.join(errorStateRoot(stateDir), QUARANTINE_DATABASE_FILENAME); }
-function reviewArtifactTaskPath(stateDir, taskId) { return path.join(path.resolve(stateDir), REVIEW_ARTIFACT_DIRECTORY, taskId); }
-function quarantineReviewArtifactPath(errorPath) { return path.join(errorPath, QUARANTINE_REVIEW_DIRECTORY); }
-
-function quarantineDatabaseFailure(message, cause = null) {
-  const error = new ControllerError(message);
-  if (cause) error.cause = cause;
-  return error;
-}
-
-function validateQuarantineDatabase(database, databasePath) {
-  const objects = database.prepare("SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name").all();
-  if (objects.length !== 1 || objects[0].type !== 'table' || objects[0].name !== 'quarantine_entry') {
-    throw quarantineDatabaseFailure(`Quarantine metadata database has an unknown schema and was not modified: ${databasePath}`);
-  }
-  const columns = database.prepare('PRAGMA table_info(quarantine_entry)').all();
-  const expected = [
-    ['error_path', 'TEXT', 1, 1],
-    ['schema_version', 'INTEGER', 1, 0],
-    ['payload', 'TEXT', 1, 0],
-    ['updated_at', 'TEXT', 1, 0],
-  ];
-  if (columns.length !== expected.length || columns.some((column, index) => column.name !== expected[index][0]
-    || String(column.type).toUpperCase() !== expected[index][1]
-    || column.notnull !== expected[index][2]
-    || column.pk !== expected[index][3])) {
-    throw quarantineDatabaseFailure(`Quarantine metadata database has an incompatible schema and was not modified: ${databasePath}`);
-  }
-  const sql = database.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'quarantine_entry'").get()?.sql;
-  if (typeof sql !== 'string' || !/error_path\s+text\s+not\s+null\s+primary\s+key/i.test(sql.replace(/\s+/g, ' '))) {
-    throw quarantineDatabaseFailure(`Quarantine metadata database has an incompatible schema and was not modified: ${databasePath}`);
-  }
-}
-
-async function withQuarantineDatabase(stateDir, { create = false } = {}, callback) {
-  const root = errorStateRoot(stateDir);
-  const databasePath = quarantineDatabasePath(stateDir);
-  let existed = true;
-  try {
-    const metadata = await fs.lstat(databasePath);
-    if (metadata.isSymbolicLink() || !metadata.isFile()) throw quarantineDatabaseFailure(`Quarantine metadata database is not a regular file: ${databasePath}`);
-  } catch (error) {
-    if (error.code !== 'ENOENT') throw error;
-    existed = false;
-  }
-  if (!existed && !create) return null;
-  if (!existed) {
-    await fs.mkdir(root, { recursive: true });
-    const rootMetadata = await fs.lstat(root);
-    if (rootMetadata.isSymbolicLink() || !rootMetadata.isDirectory()) throw quarantineDatabaseFailure(`Quarantine metadata directory is not a regular directory: ${root}`);
-  }
-  let database;
-  try {
-    database = new DatabaseSync(databasePath, { timeout: QUARANTINE_DATABASE_BUSY_TIMEOUT_MS });
-    database.exec(`PRAGMA busy_timeout = ${QUARANTINE_DATABASE_BUSY_TIMEOUT_MS}`);
-    if (!existed) {
-      database.exec('CREATE TABLE IF NOT EXISTS quarantine_entry (error_path TEXT NOT NULL PRIMARY KEY, schema_version INTEGER NOT NULL, payload TEXT NOT NULL, updated_at TEXT NOT NULL)');
-    }
-    validateQuarantineDatabase(database, databasePath);
-    return await callback(database, databasePath);
-  } catch (error) {
-    if (error instanceof ControllerError) throw error;
-    throw quarantineDatabaseFailure(`Cannot access quarantine metadata database: ${databasePath}: ${error.message}`, error);
-  } finally {
-    database?.close();
-  }
-}
-
-function decodeQuarantineMetadata(payload, errorPath, databasePath) {
-  if (typeof payload !== 'string' || Buffer.byteLength(payload, 'utf8') > MAX_QUARANTINE_BYTES) {
-    throw quarantineDatabaseFailure(`Quarantine metadata payload is invalid or exceeds the ${MAX_QUARANTINE_BYTES}-byte limit: ${databasePath}`);
-  }
-  try { return JSON.parse(payload); }
-  catch (error) { throw quarantineDatabaseFailure(`Quarantine metadata payload is invalid: ${databasePath}: ${error.message}`, error); }
-}
-
-async function writeQuarantineMetadata(stateDir, errorPath, metadata) {
-  if (!quarantineMetadataIsValid(metadata, stateDir, errorPath)) throw new ControllerError(`Quarantined workflow state metadata is invalid: ${errorPath}`);
-  const payload = JSON.stringify(metadata);
-  if (Buffer.byteLength(payload, 'utf8') > MAX_QUARANTINE_BYTES) throw new ControllerError(`Quarantined workflow state metadata exceeds the ${MAX_QUARANTINE_BYTES}-byte limit: ${errorPath}`);
-  await withQuarantineDatabase(stateDir, { create: true }, database => {
-    database.prepare('INSERT INTO quarantine_entry (error_path, schema_version, payload, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(error_path) DO UPDATE SET schema_version = excluded.schema_version, payload = excluded.payload, updated_at = excluded.updated_at')
-      .run(path.resolve(errorPath), QUARANTINE_DATABASE_SCHEMA_VERSION, payload, utcNow());
-  });
-}
-
-async function deleteQuarantineMetadata(stateDir, errorPath) {
-  const result = await withQuarantineDatabase(stateDir, { create: false }, database => database.prepare('DELETE FROM quarantine_entry WHERE error_path = ?').run(path.resolve(errorPath)));
-  if (result === null) throw new ControllerError(`Quarantine metadata database does not exist: ${quarantineDatabasePath(stateDir)}`);
-}
-function quarantineAuthorityAnchor(record) {
-  return createHash('sha256').update(stableJson({
-    schema: 'workflow-quarantine-authority-v1',
-    workspace: record.workspace,
-    registry_path: record.registry_path,
-    task_id: record.task_id,
-    original_state_path: record.original_state_path,
-    files: record.files,
-    review_artifacts: record.review_artifacts ?? null,
-  })).digest('hex');
-}
-function quarantineEntryMatchesAuthority(errorPath, record) {
-  const prefix = `${record.task_id}-${record.authority_anchor}-`;
-  const uuid = path.basename(errorPath).slice(prefix.length);
-  return path.basename(errorPath).startsWith(prefix) && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(uuid);
-}
-
+function reviewArtifactTaskPath(stateDir, taskId) { return globalWorkflowArtifactTaskPath(path.resolve(stateDir), taskId); }
 function logicalTaskIdFromStatePath(filePath) {
   const taskId = path.basename(filePath, SQLITE_STATE_SUFFIX);
-  if (!validQuarantineTaskId(taskId)) throw new ControllerError(`State path does not contain a valid task identifier: ${filePath}`);
+  requiredIdentifier(taskId, 'task_id');
   return taskId;
+}
+
+async function activeLeaseEntryOwnsSources(entry, sourcePaths, reviewArtifactSource) {
+  const protectedPaths = [entry.state_path];
+  protectedPaths.push(reviewArtifactTaskPath(entry.state_dir, entry.task_id));
+  const candidates = [...sourcePaths];
+  if (reviewArtifactSource !== null) candidates.push(reviewArtifactSource);
+  return candidates.some(candidate => protectedPaths.some(protectedPath => statePathsOverlap(candidate, protectedPath)));
+}
+
+async function activeLeaseOwnerForSources(lease, sourcePaths, reviewArtifactSource) {
+  for (const entry of lease.active_tasks) {
+    if (await activeLeaseEntryOwnsSources(entry, sourcePaths, reviewArtifactSource)) return entry;
+  }
+  return null;
 }
 
 function pathIsWithinPhysicalRoot(root, candidate) {
@@ -3633,727 +3462,144 @@ async function reviewArtifactDirectoryIsSafe(directoryPath, rootPhysical = null)
   } catch { return false; }
 }
 
-function isDirectChild(parent, candidate) {
-  return path.dirname(path.resolve(candidate)) === path.resolve(parent);
-}
-
-async function stateFilesForQuarantine(filePath) {
-  const files = [];
-  for (const sourcePath of [databasePath(filePath)]) {
-    try {
-      const metadata = await fs.lstat(sourcePath);
-      if (!metadata.isFile()) return { files: null, reason: `state component is not a regular file: ${sourcePath}` };
-      files.push(sourcePath);
-    } catch (error) {
-      if (error.code !== 'ENOENT') throw error;
-    }
-  }
-  if (!files.length) return { files: null, reason: 'state disappeared before quarantine' };
-  return { files };
-}
-
-async function reviewArtifactRelativePaths(root, directory = root, paths = [], rootPhysical = null) {
-  const boundary = rootPhysical ?? await fs.realpath(root);
-  const entries = await fs.readdir(directory, { withFileTypes: true });
-  for (const entry of entries) {
-    const current = path.join(directory, entry.name);
-    const metadata = await fs.lstat(current);
-    if (metadata.isSymbolicLink() || (!metadata.isFile() && !metadata.isDirectory()) || !pathIsWithinPhysicalRoot(boundary, await fs.realpath(current))) throw new ControllerError(`Quarantine review artifact source is unsafe: ${current}`);
-    const relative = path.relative(root, current);
-    paths.push(relative);
-    if (metadata.isDirectory()) await reviewArtifactRelativePaths(root, current, paths, boundary);
-  }
-  return paths;
-}
-
-function assertWindowsQuarantinePathLimit(paths) {
-  if (process.platform !== 'win32') return;
-  const tooLong = paths.find(candidate => candidate.length >= MAX_WINDOWS_PATH_LENGTH);
-  if (tooLong) throw new ControllerError(`Quarantine path exceeds the Windows path limit: ${tooLong}`);
-}
-
-async function assertQuarantineWritePaths(errorPath, components, artifactSource) {
-  const targets = [
-    errorPath,
-    ...components.files.map(component => path.join(errorPath, path.basename(component))),
-  ];
-  if (artifactSource) {
-    const reviewRoot = quarantineReviewArtifactPath(errorPath);
-    targets.push(reviewRoot);
-    for (const relative of await reviewArtifactRelativePaths(artifactSource)) targets.push(path.join(reviewRoot, relative));
-  }
-  assertWindowsQuarantinePathLimit(targets);
-}
-
-function quarantineMetadataIsValid(metadata, stateDir, errorPath) {
-  const currentMetadata = hasExactFields(metadata, QUARANTINE_FIELDS) && metadata.version === 4;
-  if (!currentMetadata || !['quarantining', 'quarantined'].includes(metadata.status)) return false;
-  if (metadata.review_artifacts !== null && metadata.review_artifacts !== QUARANTINE_REVIEW_DIRECTORY) return false;
-  if (typeof metadata.original_state_path !== 'string' || typeof metadata.error_path !== 'string' || typeof metadata.reason !== 'string' || !metadata.reason.trim()) return false;
-  if (!validTimestamp(metadata.quarantined_at) || !validTimestamp(metadata.delete_after) || (metadata.move_error !== null && (typeof metadata.move_error !== 'string' || !metadata.move_error.trim()))) return false;
-  if (!Array.isArray(metadata.files) || !metadata.files.length || metadata.files.some(name => typeof name !== 'string' || !name || path.basename(name) !== name) || new Set(metadata.files).size !== metadata.files.length) return false;
-  const root = errorStateRoot(stateDir);
-  if (!isDirectChild(root, errorPath) || path.resolve(metadata.error_path) !== path.resolve(errorPath)) return false;
-  if (path.dirname(path.resolve(metadata.original_state_path)) !== path.resolve(stateDir) || !metadata.original_state_path.endsWith(SQLITE_STATE_SUFFIX)) return false;
-  let logicalTaskId;
-  try { logicalTaskId = logicalTaskIdFromStatePath(metadata.original_state_path); } catch { return false; }
-  if (metadata.task_id !== logicalTaskId) return false;
-  const allowedNames = new Set([databasePath(metadata.original_state_path)].map(candidate => path.basename(candidate)));
-  if (metadata.files.some(name => !allowedNames.has(name))) return false;
-  const expiry = Date.parse(metadata.quarantined_at) + ERROR_STATE_RETENTION_DAYS * DAY_MS;
-  if (metadata.delete_after !== new Date(expiry).toISOString()) return false;
-  if ((metadata.workspace === null) !== (metadata.registry_path === null)) return false;
-  if (metadata.workspace !== null && (typeof metadata.workspace !== 'string' || !path.isAbsolute(metadata.workspace) || path.resolve(metadata.workspace) !== metadata.workspace || typeof metadata.registry_path !== 'string' || path.resolve(metadata.registry_path) !== workspaceLeasePath(metadata.workspace))) return false;
-  if (!validQuarantineAnchor(metadata.authority_anchor) || metadata.authority_anchor !== quarantineAuthorityAnchor(metadata) || !quarantineEntryMatchesAuthority(errorPath, metadata)) return false;
-  return validQuarantineBinding(metadata.binding) && metadata.binding === quarantineBinding(metadata, errorPath);
-}
-
-function validQuarantineBinding(binding) { return typeof binding === 'string' && /^[a-f0-9]{64}$/u.test(binding); }
-function validQuarantineAnchor(anchor) { return typeof anchor === 'string' && /^[a-f0-9]{64}$/u.test(anchor); }
-
-function quarantineBinding(record, errorPath) {
-  return createHash('sha256').update(stableJson({
-    schema: 'workflow-quarantine-binding-v2',
-    error_path: path.resolve(errorPath),
-    task_id: record.task_id,
-    original_state_path: record.original_state_path,
-    files: record.files,
-    review_artifacts: record.review_artifacts,
-    workspace: record.workspace,
-    registry_path: record.registry_path,
-    authority_anchor: record.authority_anchor,
-  })).digest('hex');
-}
-
-function quarantineExpiryFromMetadata(metadata) {
+function authorityFromPruneClaim(claim) {
+  const identity = claim?.namespace_identity;
+  if (!identity || typeof identity !== 'object') throw new ControllerError('Prune claim has no namespace identity');
   return {
-    version: 3,
-    task_id: metadata.task_id,
-    original_state_path: metadata.original_state_path,
-    quarantined_at: metadata.quarantined_at,
-    delete_after: metadata.delete_after,
-    files: metadata.files,
-    review_artifacts: metadata.review_artifacts,
-    workspace: metadata.workspace,
-    registry_path: metadata.registry_path,
-    binding: metadata.binding,
-    authority_anchor: metadata.authority_anchor,
+    path: identity.canonical_path,
+    real_path: identity.real_path,
+    identity: { dev: identity.dev, ino: identity.ino },
   };
 }
 
-function quarantineRecordsMatch(metadata, expiry) {
-  const fields = ['task_id', 'original_state_path', 'quarantined_at', 'delete_after', 'files'];
-  if (!fields.every(field => sameJson(metadata[field], expiry[field])) || (metadata.review_artifacts ?? null) !== (expiry.review_artifacts ?? null)) return false;
-  if (metadata.version === 4 && expiry.version === 3) {
-    return metadata.workspace === expiry.workspace
-      && metadata.registry_path === expiry.registry_path
-      && metadata.binding === expiry.binding
-      && metadata.authority_anchor === expiry.authority_anchor;
-  }
-  return false;
-}
-
-async function readQuarantineExpiry(stateDir, errorPath) {
-  const metadata = await readQuarantineMetadata(stateDir, errorPath);
-  return quarantineExpiryFromMetadata(metadata);
-}
-
-async function ensureQuarantineExpiry(stateDir, errorPath, metadata) {
-  const existing = await readQuarantineExpiry(stateDir, errorPath);
-  if (!quarantineRecordsMatch(metadata, existing)) throw new ControllerError(`Quarantine metadata binding does not match the persisted record: ${errorPath}`);
-  return existing;
-}
-
-async function readQuarantineMetadata(stateDir, errorPath) {
-  const databasePath = quarantineDatabasePath(stateDir);
-  const metadata = await withQuarantineDatabase(stateDir, { create: false }, (database, openedPath) => {
-    const row = database.prepare('SELECT schema_version, payload FROM quarantine_entry WHERE error_path = ?').get(path.resolve(errorPath));
-    if (!row) return null;
-    if (row.schema_version !== QUARANTINE_DATABASE_SCHEMA_VERSION) throw quarantineDatabaseFailure(`Quarantine metadata record has an incompatible schema version: ${openedPath}`);
-    return decodeQuarantineMetadata(row.payload, errorPath, openedPath);
-  });
-  if (metadata === null) throw new ControllerError(`Quarantined workflow state metadata does not exist in the SQLite control store: ${databasePath}`);
-  if (!quarantineMetadataIsValid(metadata, stateDir, errorPath)) throw new ControllerError(`Quarantined workflow state metadata is invalid: ${databasePath}`);
-  return metadata;
-}
-
-async function quarantineIfEligible(filePath, initialState, now) {
-  const initial = await quarantineEligibility(initialState, filePath, now);
-  if (!initial.eligible) return { quarantined: false, reason: initial.reason, task_id: initialState?.task_id ?? null };
+async function pruneArtifactPath(stateDir, taskId) {
+  const root = path.resolve(globalWorkflowArtifactRoot());
+  const artifactPath = reviewArtifactTaskPath(stateDir, taskId);
+  if (!pathIsWithinPhysicalRoot(root, artifactPath)) throw new ControllerError(`Global workflow artifact path escapes its root: ${artifactPath}`);
   try {
-    const run = async (authorityContext = null) => withVerifiedStateParent(filePath, async () => {
-      let state;
-      try { state = await loadState(filePath); } catch { state = null; }
-      const current = await quarantineEligibility(state, filePath, now);
-      if (!current.eligible) return { quarantined: false, reason: current.reason, task_id: state?.task_id ?? null };
-      if (!current.verified || !current.lease_path) return { quarantined: false, reason: 'workspace lease was not verified for quarantine; manual recovery is required', task_id: state?.task_id ?? null };
-      const components = await stateFilesForQuarantine(filePath);
-      if (!components.files) return { quarantined: false, reason: components.reason, task_id: state?.task_id ?? null };
-      const taskId = logicalTaskIdFromStatePath(filePath);
-      const taskIdMismatch = state?.task_id !== undefined && state?.task_id !== taskId;
-      let artifactSource = null;
-      const candidate = reviewArtifactTaskPath(path.dirname(filePath), taskId);
-      try {
-        const artifactMetadata = await fs.lstat(candidate);
-        if (artifactMetadata.isSymbolicLink() || !artifactMetadata.isDirectory()) return { quarantined: false, reason: `review artifact path is not a regular directory: ${candidate}`, task_id: taskId };
-        artifactSource = candidate;
-      } catch (error) {
-        if (error.code !== 'ENOENT') throw error;
-      }
-      if (current.verified) {
-        const lease = await loadWorkspaceLease(current.lease_path, state.workspace, { authorityContext });
-        const reviewSource = artifactSource ? path.resolve(candidate) : null;
-        const activeEntry = await activeLeaseOwnerForSources(lease, components.files, reviewSource);
-        if (activeEntry) return { quarantined: false, reason: `quarantine source belongs to an active workspace lease entry: ${activeEntry.state_path}`, task_id: taskId };
-      }
-      const errorRoot = errorStateRoot(path.dirname(filePath));
-      const metadata = {
-        version: 4,
-        status: 'quarantining',
-        task_id: taskId,
-        original_state_path: filePath,
-        error_path: '',
-        reason: taskIdMismatch ? `state task_id does not match logical state path; ${current.verified ? 'verified inactive-lease quarantine gate' : current.reason}` : current.verified ? 'incomplete task state passed the verified inactive-lease quarantine gate' : current.reason,
-        quarantined_at: new Date(now).toISOString(),
-        delete_after: new Date(now + ERROR_STATE_RETENTION_DAYS * DAY_MS).toISOString(),
-        files: components.files.map(component => path.basename(component)),
-        move_error: null,
-        review_artifacts: artifactSource ? QUARANTINE_REVIEW_DIRECTORY : null,
-        workspace: current.verified ? state.workspace : null,
-        registry_path: current.verified ? current.lease_path : null,
-        binding: '',
-        authority_anchor: '',
-      };
-      metadata.authority_anchor = quarantineAuthorityAnchor(metadata);
-      const errorPath = path.join(errorRoot, `${taskId}-${metadata.authority_anchor}-${randomUUID()}`);
-      metadata.error_path = errorPath;
-      await assertQuarantineWritePaths(errorPath, components, artifactSource);
-      await fs.mkdir(errorRoot, { recursive: true });
-      await fs.mkdir(errorPath, { recursive: false });
-      metadata.binding = quarantineBinding(metadata, errorPath);
-      await writeQuarantineMetadata(path.dirname(filePath), errorPath, metadata);
-      try {
-        for (const sourcePath of components.files) await fs.rename(sourcePath, path.join(errorPath, path.basename(sourcePath)));
-        if (artifactSource) await fs.rename(artifactSource, quarantineReviewArtifactPath(errorPath));
-      } catch (error) {
-        metadata.move_error = error.message;
-        try { await writeQuarantineMetadata(path.dirname(filePath), errorPath, metadata); }
-        catch (metadataError) { return { quarantined: false, reason: `quarantine move failed: ${error.message}; metadata update failed: ${metadataError.message}`, task_id: metadata.task_id, error_path: errorPath }; }
-        return { quarantined: false, reason: `quarantine move failed: ${error.message}`, task_id: metadata.task_id, error_path: errorPath };
-      }
-      metadata.status = 'quarantined';
-      await writeQuarantineMetadata(path.dirname(filePath), errorPath, metadata);
-      return { quarantined: true, task_id: metadata.task_id, error_path: errorPath, delete_after: metadata.delete_after };
-    });
-    return initial.lease_path ? await withWorkspaceLeaseLock(initialState.workspace, async (leasePath, authorityContext) => {
-      if (leasePath !== initial.lease_path) throw new ControllerError('Workspace lease authority path changed before quarantine');
-      return run(authorityContext);
-    }, { allowAuthorityCreation: false }) : await run();
+    const rootMetadata = await fs.lstat(root);
+    if (rootMetadata.isSymbolicLink() || !rootMetadata.isDirectory()) throw new ControllerError(`Global workflow artifact root is not a regular directory: ${root}`);
+    const artifactMetadata = await fs.lstat(artifactPath);
+    if (artifactMetadata.isSymbolicLink() || !artifactMetadata.isDirectory()) throw new ControllerError(`Global workflow artifact task path is not a regular directory: ${artifactPath}`);
+    if (!pathIsWithinPhysicalRoot(await fs.realpath(root), await fs.realpath(artifactPath))) throw new ControllerError(`Global workflow artifact task path escapes its root: ${artifactPath}`);
   } catch (error) {
-    if (error instanceof ControllerError) throw error;
-    return { quarantined: false, reason: `quarantine lock unavailable: ${error.message}`, task_id: initialState?.task_id ?? null };
+    if (error?.code !== 'ENOENT') throw error;
+    return;
   }
+  await fs.rm(artifactPath, { recursive: true, force: true });
 }
 
-function validQuarantineTaskId(taskId) {
-  return typeof taskId === 'string' && /^[A-Za-z][A-Za-z0-9._-]{0,79}$/.test(taskId);
-}
-
-async function quarantineContentsAreSafe(errorPath, record) {
-  const contents = await fs.readdir(errorPath, { withFileTypes: true });
-  const expectedFiles = new Set(record.files);
-  if (record.review_artifacts) expectedFiles.add(record.review_artifacts);
-  const unexpected = contents.filter(entry => !expectedFiles.has(entry.name) || (entry.name === record.review_artifacts ? !entry.isDirectory() : !entry.isFile()));
-  if (contents.length !== expectedFiles.size || unexpected.length) return false;
-  return !record.review_artifacts || await reviewArtifactDirectoryIsSafe(quarantineReviewArtifactPath(errorPath));
-}
-
-async function activeLeaseEntryOwnsSources(entry, sourcePaths, reviewArtifactSource) {
-  const protectedPaths = [entry.state_path];
-  protectedPaths.push(await canonicalStateDirectory(reviewArtifactTaskPath(entry.state_dir, entry.task_id), 'active review artifact directory'));
-  const candidates = [...sourcePaths];
-  if (reviewArtifactSource !== null) candidates.push(await canonicalStateDirectory(reviewArtifactSource, 'candidate review artifact directory'));
-  return candidates.some(candidate => protectedPaths.some(protectedPath => statePathsOverlap(candidate, protectedPath)));
-}
-
-async function activeLeaseOwnerForSources(lease, sourcePaths, reviewArtifactSource) {
-  for (const entry of lease.active_tasks) {
-    if (await activeLeaseEntryOwnsSources(entry, sourcePaths, reviewArtifactSource)) return entry;
-  }
-  return null;
-}
-
-function quarantineSourceAuthority(metadata, errorPath) {
-  return stableJson({
-    quarantine_entry: path.resolve(errorPath),
-    binding: metadata.binding,
-    workspace: metadata.workspace,
-    registry_path: metadata.registry_path,
-    original_state_path: metadata.original_state_path,
-    files: metadata.files,
-    review_artifacts: metadata.review_artifacts,
-  });
-}
-
-async function withQuarantineSourceProtection(stateDir, errorPath, metadata, action) {
-  if (metadata.version !== 4 || metadata.workspace === null || metadata.registry_path === null || !quarantineEntryMatchesAuthority(errorPath, metadata)) {
-    throw new ControllerError('Quarantine source transfer lacks a trusted workspace registry binding');
-  }
-  const canonicalSourceStatePath = await canonicalStatePath(metadata.original_state_path, 'quarantine original_state_path');
-  if (!sameStatePath(canonicalSourceStatePath, metadata.original_state_path) || canonicalSourceStatePath !== metadata.original_state_path) {
-    throw new ControllerError('Quarantine source transfer has a non-canonical state-path authority');
-  }
-  const canonicalRegistryPath = path.resolve(metadata.registry_path);
-  if (canonicalRegistryPath !== metadata.registry_path) throw new ControllerError('Quarantine source transfer has a non-canonical registry authority');
-  const authority = quarantineSourceAuthority(metadata, errorPath);
-  const registryPath = canonicalRegistryPath;
-  const sourceStatePath = canonicalSourceStatePath;
-  const sourceDirectory = path.dirname(sourceStatePath);
-  const reviewArtifactSource = metadata.review_artifacts === QUARANTINE_REVIEW_DIRECTORY
-    ? path.resolve(reviewArtifactTaskPath(sourceDirectory, logicalTaskIdFromStatePath(metadata.original_state_path)))
-    : null;
-  const inspectRegistry = async (candidate, authorityContext) => {
-    if (quarantineSourceAuthority(candidate, errorPath) !== authority) throw new ControllerError('Quarantine source authority changed while acquiring locks');
-    const registryMetadata = await fs.lstat(registryPath);
-    if (registryMetadata.isSymbolicLink() || !registryMetadata.isFile()) throw new ControllerError(`Quarantine source registry is not a regular file: ${registryPath}`);
-    const lease = await loadWorkspaceLease(registryPath, metadata.workspace, { authorityContext });
-    const activeEntry = await activeLeaseOwnerForSources(lease, metadata.files.map(name => path.join(sourceDirectory, name)), reviewArtifactSource);
-    if (activeEntry) throw new ControllerError(`Quarantine source belongs to an active workspace lease entry: ${activeEntry.state_path}`);
-  };
-  return withWorkspaceLeaseLock(metadata.workspace, async (lockedRegistryPath, authorityContext) => {
-    if (lockedRegistryPath !== registryPath) throw new ControllerError('Quarantine source registry authority path changed');
-    await inspectRegistry(metadata, authorityContext);
-    return withVerifiedStateParent(sourceStatePath, async () => {
-      const current = await readQuarantineMetadata(stateDir, errorPath);
-      await ensureQuarantineExpiry(stateDir, errorPath, current);
-      await inspectRegistry(current, authorityContext);
-      return action(current);
-    });
-  }, { allowAuthorityCreation: false });
-}
-
-async function reconcileQuarantineEntry(stateDir, errorPath, metadata) {
-  let current = metadata;
-  await ensureQuarantineExpiry(stateDir, errorPath, current);
-  if (current.status === 'quarantined' && current.move_error === null) return { complete: true, metadata: current };
-  return withQuarantineSourceProtection(stateDir, errorPath, current, async lockedCurrent => {
-    // This value was checked against the registry lock selection immediately
-    // before the transfer. Never derive source paths from a later sidecar read.
-    current = lockedCurrent;
-    if (current.status === 'quarantined' && current.move_error === null) return { complete: true, metadata: current };
-    const sourceDirectory = path.dirname(current.original_state_path);
-    const missing = [];
-    try {
-      for (const name of current.files) {
-        const destination = path.join(errorPath, name);
-        try {
-          const target = await fs.lstat(destination);
-          if (target.isSymbolicLink() || !target.isFile()) throw new ControllerError(`Quarantine destination is not a regular file: ${destination}`);
-          continue;
-        } catch (error) {
-          if (error.code !== 'ENOENT') throw error;
-        }
-        const source = path.join(sourceDirectory, name);
-        try {
-          const sourceMetadata = await fs.lstat(source);
-          if (sourceMetadata.isSymbolicLink() || !sourceMetadata.isFile()) throw new ControllerError(`Quarantine source is not a regular file: ${source}`);
-          await fs.rename(source, destination);
-        } catch (error) {
-          if (error.code === 'ENOENT') missing.push(name);
-          else throw error;
-        }
-      }
-      if (current.review_artifacts) {
-        const destination = quarantineReviewArtifactPath(errorPath);
-        try {
-          const target = await fs.lstat(destination);
-          if (target.isSymbolicLink() || !target.isDirectory() || !await reviewArtifactDirectoryIsSafe(destination)) throw new ControllerError(`Quarantine review artifact destination is unsafe: ${destination}`);
-        } catch (error) {
-          if (error.code !== 'ENOENT') throw error;
-          const taskId = logicalTaskIdFromStatePath(current.original_state_path);
-          const source = reviewArtifactTaskPath(sourceDirectory, taskId);
-          try {
-            const sourceMetadata = await fs.lstat(source);
-            if (sourceMetadata.isSymbolicLink() || !sourceMetadata.isDirectory() || !await reviewArtifactDirectoryIsSafe(source)) throw new ControllerError(`Quarantine review artifact source is unsafe: ${source}`);
-            await fs.rename(source, destination);
-          } catch (sourceError) {
-            if (sourceError.code === 'ENOENT') missing.push(QUARANTINE_REVIEW_DIRECTORY);
-            else throw sourceError;
-          }
-        }
-      }
-    } catch (error) {
-      current = { ...current, status: 'quarantining', move_error: error.message };
-      await writeQuarantineMetadata(stateDir, errorPath, current);
-      return { complete: false, metadata: current };
-    }
-    if (missing.length) {
-      current = { ...current, status: 'quarantining', move_error: `quarantine transfer is missing: ${missing.join(', ')}` };
-      await writeQuarantineMetadata(stateDir, errorPath, current);
-      return { complete: false, metadata: current };
-    }
-    current = { ...current, status: 'quarantined', move_error: null };
-    await writeQuarantineMetadata(stateDir, errorPath, current);
-    return { complete: true, metadata: current };
-  });
-}
-
-async function deleteQuarantineEntry(stateDir, errorPath, { metadata = null, expiry }) {
-  const authorityRecord = metadata ?? expiry;
-  if (!authorityRecord || typeof authorityRecord.workspace !== 'string' || typeof authorityRecord.registry_path !== 'string'
-    || typeof authorityRecord.authority_anchor !== 'string' || !quarantineEntryMatchesAuthority(errorPath, authorityRecord)) {
-    throw new ControllerError('Quarantine deletion lacks a trusted workspace registry binding');
-  }
-  const workspace = await canonicalWorkspace(authorityRecord.workspace);
-  if (!sameStatePath(workspace, authorityRecord.workspace) || authorityRecord.registry_path !== workspaceLeasePath(workspace)) {
-    throw new ControllerError('Quarantine deletion has a non-canonical workspace registry binding');
-  }
-  return withWorkspaceLeaseLock(workspace, async (leasePath, authorityContext) => {
-    if (leasePath !== authorityRecord.registry_path) throw new ControllerError('Quarantine deletion registry authority path changed');
-    const currentExpiry = await readQuarantineExpiry(stateDir, errorPath);
-    if (!currentExpiry || !sameJson(currentExpiry, expiry)) throw new ControllerError('Quarantine expiry authority changed while acquiring locks');
-    let currentRecord = currentExpiry;
-    if (metadata) {
-      const currentMetadata = await readQuarantineMetadata(stateDir, errorPath);
-      if (!sameJson(currentMetadata, metadata)) throw new ControllerError('Quarantine metadata authority changed while acquiring locks');
-      await ensureQuarantineExpiry(stateDir, errorPath, currentMetadata);
-      currentRecord = currentMetadata;
-    }
-    const lease = await loadWorkspaceLease(leasePath, workspace, { authorityContext });
-    const activeEntry = await activeLeaseOwnerForSources(lease, [errorPath], null);
-    if (activeEntry) throw new ControllerError(`Quarantine deletion overlaps an active workspace lease entry: ${activeEntry.task_id} (${activeEntry.state_path})`);
-    if (!await quarantineContentsAreSafe(errorPath, currentRecord)) throw new ControllerError('Quarantine contains unexpected files and requires manual recovery');
-    const before = await fs.lstat(errorPath, { bigint: true });
-    if (before.isSymbolicLink() || !before.isDirectory()) throw new ControllerError(`Quarantine deletion target is not a regular directory: ${errorPath}`);
-    const beforeIdentity = persistentFileObjectIdentity(before);
-    const tombstone = `${errorPath}.delete-${randomUUID()}`;
-    let isolated = false;
-    try {
-      await fs.rename(errorPath, tombstone); isolated = true;
-      const moved = await fs.lstat(tombstone, { bigint: true });
-      if (moved.isSymbolicLink() || !moved.isDirectory() || !sameFileObjectIdentity(beforeIdentity, persistentFileObjectIdentity(moved))) {
-        throw new ControllerError(`Quarantine deletion target changed during atomic isolation: ${errorPath}`);
-      }
-      await fs.rm(tombstone, { recursive: true, force: false }); isolated = false;
-      await deleteQuarantineMetadata(stateDir, errorPath);
-    } catch (error) {
-      if (isolated) {
-        try { await fs.rename(tombstone, errorPath); }
-        catch (restoreError) { throw new ControllerError(`Quarantine deletion failed: ${error.message}; restore failed: ${restoreError.message}`); }
-      }
-      throw error;
-    }
-  }, { allowAuthorityCreation: false });
-}
-
-async function pruneQuarantinedStates(stateDir, now) {
-  const root = errorStateRoot(stateDir); const deleted = []; const retained = []; let deletedCount = 0; let retainedCount = 0;
-  let entries;
-  try { entries = await fs.readdir(root, { withFileTypes: true }); }
-  catch (error) { if (error.code === 'ENOENT') return { deleted, retained, deleted_count: deletedCount, retained_count: retainedCount }; throw error; }
-  for (const entry of entries) {
-    if (entry.name === QUARANTINE_DATABASE_FILENAME && entry.isFile()) continue;
-    const errorPath = path.join(root, entry.name);
-    if (!entry.isDirectory() || !isDirectChild(root, errorPath)) {
-      retainedCount++; retained.push({ error_path: errorPath, reason: 'unknown quarantine entry is not a direct regular directory' });
-      continue;
-    }
-    let metadata = null;
-    try { metadata = await readQuarantineMetadata(stateDir, errorPath); }
-    catch (metadataError) {
-      retainedCount++; retained.push({ error_path: errorPath, reason: metadataError.message });
-      continue;
-    }
-    try {
-      const reconciled = await reconcileQuarantineEntry(stateDir, errorPath, metadata);
-      metadata = reconciled.metadata;
-      if (!reconciled.complete) {
-        retainedCount++; retained.push({ task_id: metadata.task_id, error_path: errorPath, reason: 'quarantine transfer is incomplete and will be retried by a later cleanup' });
-        continue;
-      }
-    } catch (error) {
-      retainedCount++; retained.push({ task_id: metadata.task_id, error_path: errorPath, reason: `quarantine reconciliation failed: ${error.message}` });
-      continue;
-    }
-    let expiry;
-    try { expiry = await ensureQuarantineExpiry(stateDir, errorPath, metadata); }
-    catch (error) { retainedCount++; retained.push({ task_id: metadata.task_id, error_path: errorPath, reason: `quarantine expiry metadata failed: ${error.message}` }); continue; }
-    if (now < Date.parse(expiry.delete_after)) {
-      retainedCount++; retained.push({ task_id: metadata.task_id, error_path: errorPath, delete_after: expiry.delete_after, reason: 'quarantined state retention period has not elapsed' });
-      continue;
-    }
-    try {
-      await deleteQuarantineEntry(stateDir, errorPath, { metadata, expiry });
-      deletedCount++; deleted.push({ task_id: metadata.task_id, error_path: errorPath, quarantined_at: metadata.quarantined_at, delete_after: metadata.delete_after });
-    } catch (error) {
-      retainedCount++; retained.push({ task_id: metadata.task_id, error_path: errorPath, reason: `quarantined state deletion failed: ${error.message}` });
-    }
-  }
-  return { deleted, retained, deleted_count: deletedCount, retained_count: retainedCount };
-}
-
-async function reconcileQuarantinedStates(parameters) {
-  const stateDir = await canonicalStateDirectory(parameters.state_dir);
-  const root = errorStateRoot(stateDir);
-  const reconciled = []; const retained = [];
-  let entries;
-  try { entries = await fs.readdir(root, { withFileTypes: true }); }
-  catch (error) { if (error.code === 'ENOENT') return { state_dir: stateDir, reconciled, retained, reconciled_count: 0, retained_count: 0 }; throw error; }
-  for (const entry of entries) {
-    if (entry.name === QUARANTINE_DATABASE_FILENAME && entry.isFile()) continue;
-    const errorPath = path.join(root, entry.name);
-    if (!entry.isDirectory() || !isDirectChild(root, errorPath)) {
-      retained.push({ error_path: errorPath, reason: 'unknown quarantine entry is not a direct regular directory' });
-      continue;
-    }
-    let metadata;
-    try { metadata = await readQuarantineMetadata(stateDir, errorPath); }
-    catch (error) { retained.push({ error_path: errorPath, reason: error.message }); continue; }
-    try {
-      const outcome = await reconcileQuarantineEntry(stateDir, errorPath, metadata);
-      if (outcome.complete) reconciled.push({ task_id: outcome.metadata.task_id, error_path: errorPath, status: outcome.metadata.status });
-      else retained.push({ task_id: outcome.metadata.task_id, error_path: errorPath, reason: outcome.metadata.move_error ?? 'quarantine transfer is incomplete' });
-    } catch (error) {
-      retained.push({ task_id: metadata.task_id, error_path: errorPath, reason: error.message });
-    }
-  }
-  return { state_dir: stateDir, reconciled, retained, reconciled_count: reconciled.length, retained_count: retained.length };
-}
-
-async function findQuarantinedState(stateDir, filePath) {
-  const root = errorStateRoot(stateDir);
-  let entries;
-  try { entries = await fs.readdir(root, { withFileTypes: true }); }
-  catch (error) { if (error.code === 'ENOENT') return null; throw error; }
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
-    const errorPath = path.join(root, entry.name);
-    try {
-      const metadata = await readQuarantineMetadata(stateDir, errorPath);
-      if (sameStatePath(metadata.original_state_path, filePath)) return metadata;
-    } catch {
-      // Malformed entries are intentionally left in place and are not attributed to a task.
-    }
-  }
-  return null;
-}
-
-async function doctorStateDirectory(parameters) {
-  const stateDir = await canonicalStateDirectory(parameters.state_dir);
-  const root = errorStateRoot(stateDir);
-  const quarantinedStates = [];
-  const invalidEntries = [];
+async function processGlobalPruneClaim(claim, now = Date.now()) {
   try {
-    const entries = await fs.readdir(root, { withFileTypes: true });
-    for (const entry of entries) {
-      if (entry.name === QUARANTINE_DATABASE_FILENAME && entry.isFile()) continue;
-      const errorPath = path.join(root, entry.name);
-      if (!entry.isDirectory()) { invalidEntries.push({ path: errorPath, reason: 'entry is not a quarantine directory' }); continue; }
-      try {
-        const metadata = await readQuarantineMetadata(stateDir, errorPath);
-        quarantinedStates.push({ ...publicTaskStoreReference(metadata.original_state_path), legacy_state_path: metadata.original_state_path, error_path: errorPath, status: metadata.status, delete_after: metadata.delete_after, review_artifacts: metadata.review_artifacts ?? null });
-      } catch (error) {
-        invalidEntries.push({ path: errorPath, reason: error.message });
-      }
+    if (claim.parse_error) {
+      await failGlobalTaskPruneJob(claim, new ControllerError(`corrupt or unreadable global state is retained: ${claim.parse_error}`));
+      return { task_id: claim.task_id, deleted: false, retained: true, reason: `corrupt or unreadable global state is retained: ${claim.parse_error}` };
     }
+    const parentAuthority = authorityFromPruneClaim(claim);
+    await verifyRegularDirectorySnapshot(parentAuthority, 'Controller state parent');
+    const logicalPath = statePath(parentAuthority.path, claim.task_id);
+    const state = normalizeState(claim.state);
+    const storedAuthority = await stateParentAuthorityForState(state, logicalPath);
+    if (!sameStateParentAuthority(storedAuthority, parentAuthority)) throw new ControllerError(`STATE_NAMESPACE_IDENTITY_CHANGED: ${parentAuthority.path}`);
+    const nodesClosed = Object.values(state.nodes).every(node => [SUCCEEDED, 'skipped'].includes(node.status));
+    const closedAt = Date.parse(state.closed_at ?? '');
+    const fullyClosed = state.task_id === claim.task_id
+      && state.workspace_lease?.status === 'released'
+      && sameStatePath(state.workspace_lease?.state_path, logicalPath)
+      && state.closed_revision === state.workflow_revision
+      && nodesClosed
+      && Number.isFinite(closedAt)
+      && now - closedAt >= DEFAULT_TASK_RETENTION_DAYS * DAY_MS;
+    if (!fullyClosed) {
+      await failGlobalTaskPruneJob(claim, new ControllerError('task is not a fully closed released workflow revision'));
+      return { task_id: claim.task_id, deleted: false, retained: true, reason: 'task is not a fully closed released workflow revision' };
+    }
+    const leaseEligibility = await releasedLeaseEligibility(state.workspace_lease.registry_path, state, logicalPath);
+    if (!leaseEligibility.eligible) {
+      await failGlobalTaskPruneJob(claim, new ControllerError(`artifact cleanup cannot be verified: ${leaseEligibility.reason}`));
+      return { task_id: claim.task_id, deleted: false, retained: true, reason: `artifact cleanup cannot be verified: ${leaseEligibility.reason}` };
+    }
+    await pruneArtifactPath(parentAuthority.path, claim.task_id);
+    await finalizeGlobalTaskPruneJob(claim);
+    return { task_id: claim.task_id, deleted: true, retained: false };
   } catch (error) {
-    if (error.code !== 'ENOENT') throw error;
-  }
-  const pruneSweep = await readPruneSweep(stateDir);
-  const attention = quarantinedStates.length > 0;
-  return {
-    task_id: null,
-    state_dir: stateDir,
-    health: invalidEntries.length ? 'blocked' : attention ? 'attention' : 'healthy',
-    checks: [
-      doctorCheck('quarantined_states', invalidEntries.length ? 'fail' : quarantinedStates.length ? 'attention' : 'pass', { entries: quarantinedStates, invalid_entries: invalidEntries }),
-      doctorCheck('prune_sweep', pruneSweep.error ? 'attention' : 'pass', pruneSweep.error ? { error: pruneSweep.error } : pruneSweep.sweep ?? { last_sweep_at: null, last_result: null }),
-    ],
-    close_status: { close_allowed: false, reasons: ['directory-level diagnosis does not represent a task close gate'] },
-  };
-}
-
-async function listTaskStatePaths(stateDir) {
-  const entries = await fs.readdir(stateDir, { withFileTypes: true });
-  const paths = new Set();
-  for (const entry of entries) {
-    if (!entry.isFile()) continue;
-    if (entry.name === WORKSPACE_CONTROL_FILENAME) continue;
-    if (entry.name.endsWith(SQLITE_STATE_SUFFIX)) {
-      paths.add(path.join(stateDir, entry.name));
+    try { await failGlobalTaskPruneJob(claim, error); }
+    catch (jobError) {
+      return { task_id: claim.task_id, deleted: false, retained: true, reason: `prune artifact cleanup failed: ${error.message}; retry job update failed: ${jobError.message}` };
     }
+    return { task_id: claim.task_id, deleted: false, retained: true, reason: `prune artifact cleanup failed: ${error.message}` };
   }
-  return [...paths].sort();
 }
 
-function appendPruneReport(reports, target, value) {
-  if (Object.values(reports).reduce((count, entries) => count + entries.length, 0) < MAX_PRUNE_REPORT_ENTRIES) target.push(value);
-}
-
-async function readPruneSweep(stateDir) {
-  void stateDir;
-  return { sweep: null, error: null };
+async function runGlobalPruneSweep({ namespace = null, limit = 32 } = {}) {
+  const claims = await claimGlobalTaskPruneJobs(new Date().toISOString(), { limit, ...(namespace ? { namespace_key: namespace } : {}) });
+  const deleted = [];
+  const retained = [];
+  for (const claim of claims) {
+    const outcome = await processGlobalPruneClaim(claim);
+    if (outcome.deleted) deleted.push({ task_id: outcome.task_id });
+    else retained.push({ task_id: outcome.task_id, reason: outcome.reason });
+  }
+  return { candidate_count: claims.length, deleted, retained };
 }
 
 async function pruneExpiredTasks(parameters) {
   const stateDir = await canonicalStateDirectory(parameters.state_dir);
-  const now = Date.now();
-  const deleted = [];
-  const retained = [];
-  const eligible = [];
-  return withGlobalWorkflowStoreMaintenance(stateDir, async maintenance => {
-  for (const { task_id: taskId, state, parse_error: parseError } of maintenance.rows) {
-    try {
-      if (parseError) throw parseError;
-      const normalized = normalizeState(state);
-      const age = Date.parse(normalized.closed_at ?? '');
-      const nodesClosed = Object.values(normalized.nodes).every(node => [SUCCEEDED, 'skipped'].includes(node.status));
-      const invariantClosed = normalized.closed_revision === normalized.workflow_revision;
-      const leaseReleased = normalized.workspace_lease?.status === 'released';
-      if (!Number.isFinite(age) || now - age < DEFAULT_TASK_RETENTION_DAYS * DAY_MS) {
-        retained.push({ task_id: taskId, reason: 'closed state is younger than the explicit 7-day retention period or has no valid closed_at' });
-      } else if (!invariantClosed || !nodesClosed || !leaseReleased) {
-        retained.push({ task_id: taskId, reason: 'task is not a fully closed released workflow revision' });
-      } else {
-        let lease;
-        try { lease = await loadWorkspaceLease(normalized.workspace_lease.registry_path, normalized.workspace); }
-        catch (error) { retained.push({ task_id: taskId, reason: `workspace control cannot prove release: ${error.message}` }); continue; }
-        const logicalPath = statePath(stateDir, taskId);
-        if (workspaceLeaseStatePathOwners(lease, logicalPath).length || lease.active_locks.some(lock => lock.task_key === taskKey(logicalPath))) {
-          retained.push({ task_id: taskId, reason: 'task still has an active workspace lease entry or write lock' });
-        } else eligible.push(taskId);
-      }
-    } catch (error) {
-      retained.push({ task_id: taskId, reason: `corrupt or unreadable global state is retained: ${error.message}` });
-    }
-  }
-  for (const taskId of eligible) {
-    try {
-      // Keep the row recoverable if controlled artifact removal fails.
-      const reviewRoot = path.join(stateDir, REVIEW_ARTIFACT_DIRECTORY);
-      try {
-        const reviewRootMetadata = await fs.lstat(reviewRoot);
-        if (reviewRootMetadata.isSymbolicLink() || !reviewRootMetadata.isDirectory()) throw new ControllerError(`Review artifact root is not a regular directory: ${reviewRoot}`);
-      } catch (error) {
-        if (error?.code !== 'ENOENT') throw error;
-      }
-      const artifactPath = path.join(reviewRoot, taskId);
-      try {
-        const artifactMetadata = await fs.lstat(artifactPath);
-        if (artifactMetadata.isSymbolicLink() || !artifactMetadata.isDirectory()) throw new ControllerError(`Review artifact task path is not a regular directory: ${artifactPath}`);
-      } catch (error) {
-        if (error?.code !== 'ENOENT') throw error;
-      }
-      await fs.rm(artifactPath, { recursive: true, force: true });
-      maintenance.deleteTask(taskId);
-      deleted.push({ task_id: taskId });
-    } catch (error) {
-      retained.push({ task_id: taskId, reason: `prune retained task state because review artifact cleanup or row deletion failed: ${error.message}` });
-    }
-  }
+  const sweep = await runGlobalPruneSweep({ namespace: stateDir });
   return {
     state_dir: stateDir,
     store_path: globalWorkflowStorePath(),
     retention_days: DEFAULT_TASK_RETENTION_DAYS,
-    deleted_count: deleted.length,
-    retained_count: retained.length,
-    deleted,
-    retained,
+    deleted_count: sweep.deleted.length,
+    retained_count: sweep.retained.length,
+    deleted: sweep.deleted,
+    retained: sweep.retained,
   };
-  });
-  /* Legacy local-state quarantine code remains below for explicit forensic
-     maintenance compatibility. New global tasks never create those files. */
-  /* c8 ignore start */
-  const reports = { deleted: [], quarantined: [], retained: [], quarantine_deleted: [], quarantine_retained: [] };
-  const quarantinedStateCleanup = await pruneQuarantinedStates(stateDir, now);
-  for (const entry of quarantinedStateCleanup.deleted) appendPruneReport(reports, reports.quarantine_deleted, entry);
-  for (const entry of quarantinedStateCleanup.retained) appendPruneReport(reports, reports.quarantine_retained, entry);
-  let filePaths;
-  try { filePaths = await listTaskStatePaths(stateDir); }
-  catch (error) {
-    if (error.code === 'ENOENT') return {
-      state_dir: stateDir,
-      retention_days: DEFAULT_TASK_RETENTION_DAYS,
-      quarantine_after_days: QUARANTINE_AFTER_DAYS,
-      error_retention_days: ERROR_STATE_RETENTION_DAYS,
-      deleted_count: 0,
-      quarantined_count: 0,
-      retained_count: 0,
-      quarantine_deleted_count: quarantinedStateCleanup.deleted_count,
-      quarantine_retained_count: quarantinedStateCleanup.retained_count,
-      report_truncated: quarantinedStateCleanup.deleted_count > reports.quarantine_deleted.length || quarantinedStateCleanup.retained_count > reports.quarantine_retained.length,
-      ...reports,
-    };
-    throw error;
+}
+
+async function bindDueNamespaceIdentities(pruneDueBefore) {
+  const candidates = await listGlobalTaskPruneCandidates(pruneDueBefore);
+  const errors = [];
+  const seen = new Set();
+  for (const candidate of candidates) {
+    if (seen.has(candidate.namespace_key)) continue;
+    seen.add(candidate.namespace_key);
+    const logicalPath = statePath(candidate.namespace_key, candidate.task_id);
+    try {
+      const state = normalizeState(await readTaskState(logicalPath));
+      const authority = await stateParentAuthorityForState(state, logicalPath);
+      await verifyRegularDirectorySnapshot(authority, 'Controller state parent');
+      await ensureGlobalNamespaceIdentity(path.dirname(logicalPath), authority);
+    } catch (error) {
+      if (errors.length < MAX_PRUNE_REPORT_ENTRIES) errors.push({ namespace: candidate.namespace_key, error: error.message });
+    }
   }
-  let deletedCount = 0; let quarantinedCount = 0; let retainedCount = 0;
-  for (const filePath of filePaths) {
-    let initial;
-    try { initial = await loadState(filePath); }
-    catch (error) {
-      const quarantine = await quarantineIfEligible(filePath, null, now);
-      if (quarantine.quarantined) { quarantinedCount++; appendPruneReport(reports, reports.quarantined, { task_id: quarantine.task_id, state_path: filePath, error_path: quarantine.error_path, delete_after: quarantine.delete_after }); }
-      else { retainedCount++; appendPruneReport(reports, reports.retained, { state_path: filePath, reason: `unreadable state: ${error.message}; ${quarantine.reason}` }); }
-      continue;
-    }
-    const initialEligibility = taskPruneEligibility(initial, filePath, now);
-    if (!initialEligibility.eligible) {
-      const quarantine = await quarantineIfEligible(filePath, initial, now);
-      if (quarantine.quarantined) { quarantinedCount++; appendPruneReport(reports, reports.quarantined, { task_id: quarantine.task_id, state_path: filePath, error_path: quarantine.error_path, delete_after: quarantine.delete_after }); }
-      else { retainedCount++; appendPruneReport(reports, reports.retained, { task_id: initial.task_id ?? null, state_path: filePath, reason: quarantine.reason === 'younger than quarantine retention period' ? initialEligibility.reason : `${initialEligibility.reason}; ${quarantine.reason}` }); }
-      continue;
-    }
-    const leasePath = initial.workspace_lease.registry_path;
-    let parentAuthority;
-    try {
-      parentAuthority = await stateParentAuthorityForState(initial, filePath);
-      await verifyRegularDirectorySnapshot(parentAuthority, 'Controller state parent');
-    } catch (error) {
-      retainedCount++; appendPruneReport(reports, reports.retained, { task_id: initial.task_id, state_path: filePath, reason: `cleanup failed: ${error.message}` });
-      continue;
-    }
-    try {
-      const cleanup = async (lockedLeasePath, authorityContext) => {
-        if (lockedLeasePath !== leasePath) throw new ControllerError('Workspace lease authority path changed before cleanup');
-        return withVerifiedStateParent(filePath, async () => {
-        await verifyRegularDirectorySnapshot(parentAuthority, 'Controller state parent');
-        let state;
-        try { state = await loadState(filePath); }
-        catch (error) { if (error instanceof ControllerError && error.message.startsWith('Current SQLite controller state does not exist:')) return { deleted: false, reason: 'state disappeared before cleanup' }; throw error; }
-        const currentParentAuthority = await stateParentAuthorityForState(state, filePath);
-        if (!sameStateParentAuthority(currentParentAuthority, parentAuthority)) throw new ControllerError(`Controller state parent authority changed: ${filePath}`);
-        await attachStateParentAuthority(state, filePath, parentAuthority);
-        const eligibility = taskPruneEligibility(state, filePath, now);
-        if (!eligibility.eligible) return { deleted: false, reason: eligibility.reason, task_id: state.task_id };
-        const leaseEligibility = await releasedLeaseEligibility(leasePath, state, filePath, authorityContext);
-        if (!leaseEligibility.eligible) return { deleted: false, reason: leaseEligibility.reason, task_id: state.task_id };
-          await deleteState(filePath, { parentAuthority });
-          return { deleted: true, task_id: state.task_id };
-        }, { parentAuthority });
-      };
-      const outcome = await withWorkspaceLeaseLock(initial.workspace, cleanup, { allowAuthorityCreation: false });
-      if (outcome.deleted) { deletedCount++; appendPruneReport(reports, reports.deleted, { task_id: outcome.task_id, state_path: filePath }); }
-      else { retainedCount++; appendPruneReport(reports, reports.retained, { task_id: outcome.task_id ?? initial.task_id, state_path: filePath, reason: outcome.reason }); }
-    } catch (error) {
-      retainedCount++; appendPruneReport(reports, reports.retained, { task_id: initial.task_id, state_path: filePath, reason: `cleanup failed: ${error.message}` });
-    }
+  return { candidate_count: candidates.length, namespace_count: seen.size, errors };
+}
+
+// MCP starts serving first. A separate worker invokes this sweep so recursive
+// artifact deletion and synchronous node:sqlite calls cannot block stdio.
+export async function pruneExpiredTasksAtMcpStartup({ max_batches = 8 } = {}) {
+  if (!Number.isSafeInteger(max_batches) || max_batches < 1 || max_batches > 8) throw new ControllerError('max_batches must be an integer between 1 and 8');
+  const pruneDueBefore = new Date().toISOString();
+  const bound = await bindDueNamespaceIdentities(pruneDueBefore);
+  const deleted = [];
+  const retained = [];
+  let processedCandidates = 0;
+  for (let batch = 0; batch < max_batches; batch++) {
+    const sweep = await runGlobalPruneSweep({ limit: 32 });
+    processedCandidates += sweep.candidate_count;
+    deleted.push(...sweep.deleted);
+    retained.push(...sweep.retained);
+    if (sweep.candidate_count < 32) break;
   }
   return {
-    state_dir: stateDir,
-    retention_days: DEFAULT_TASK_RETENTION_DAYS,
-    quarantine_after_days: QUARANTINE_AFTER_DAYS,
-    error_retention_days: ERROR_STATE_RETENTION_DAYS,
-    deleted_count: deletedCount,
-    quarantined_count: quarantinedCount,
-    retained_count: retainedCount,
-    quarantine_deleted_count: quarantinedStateCleanup.deleted_count,
-    quarantine_retained_count: quarantinedStateCleanup.retained_count,
-    report_truncated: deletedCount > reports.deleted.length
-      || quarantinedCount > reports.quarantined.length
-      || retainedCount > reports.retained.length
-      || quarantinedStateCleanup.deleted_count > reports.quarantine_deleted.length
-      || quarantinedStateCleanup.retained_count > reports.quarantine_retained.length,
-    ...reports,
+    namespace_count: bound.namespace_count,
+    candidate_count: Math.max(bound.candidate_count, processedCandidates),
+    deleted_count: deleted.length,
+    retained_count: retained.length,
+    namespace_error_count: bound.errors.length,
+    namespace_errors: bound.errors,
   };
 }
 
@@ -4375,9 +3621,9 @@ function unfinishedMaterialNodes(state) {
 }
 
 async function recordRepair(parameters) {
-  const repair = await readJson(parameters.repair, { label: 'Terra repair record', maxBytes: MAX_REVIEW_BYTES });
-  if (!repair || typeof repair !== 'object' || Array.isArray(repair)) throw new ControllerError('Terra repair record must be a JSON object');
-  const [filePath] = await readTask(parameters);
+  const [filePath, currentState] = await readTask(parameters);
+  const repair = await readWorkflowJson(parameters.repair, { label: 'Terra repair record', maxBytes: MAX_REVIEW_BYTES, workspace: currentState.workspace, objectOnly: true });
+  const fingerprintPreflight = await prepareWorkspaceFingerprint(filePath);
   return withActiveWorkspaceStateLock(filePath, async state => {
     const reviewNode = reviewNodesForState(state)[0];
     if (isReviewProtocolState(state) && reviewNode && isCohortReviewNode(state, reviewNode) && reviewNode.status === 'failed') {
@@ -4389,7 +3635,7 @@ async function recordRepair(parameters) {
       const repairedBy = requiredString(repair.repaired_by, 'repaired_by');
       const addressedFindings = addressedReviewFindings(syntheticSource, repair.addressed_findings);
       const verificationEvidence = requiredReviewValue(repair.verification_evidence, 'verification_evidence');
-      const fingerprint = await workspaceFingerprint(state.workspace, state.workspace_claims);
+      const fingerprint = workspaceFingerprintFromPreflight(state, fingerprintPreflight, 'Terra cohort repair');
       if (!sameJson(repair.workspace_fingerprint, fingerprint)) throw new ControllerError('Terra cohort repair fingerprint does not match the current workspace');
       const stored = { source_review_claim_id: sourceClaimId, source_review_auditor_task: 'terra_cohort', source_workspace_fingerprint: aggregate.workspace_fingerprint ?? fingerprint, repaired_by: repairedBy, addressed_findings: addressedFindings, verification_evidence: verificationEvidence, workflow_snapshot: workflowSnapshot(state), workspace_fingerprint: fingerprint, workspace_changed: true, recorded_at: utcNow(), terra_cohort: true };
       state.repair_records.push(stored);
@@ -4405,7 +3651,7 @@ async function recordRepair(parameters) {
       const repairedBy = requiredString(repair.repaired_by, 'repaired_by');
       const addressedFindings = addressedReviewFindings(sourceReview, repair.addressed_findings);
       const verificationEvidence = requiredReviewValue(repair.verification_evidence, 'verification_evidence');
-      const fingerprint = await workspaceFingerprint(state.workspace, state.workspace_claims);
+      const fingerprint = workspaceFingerprintFromPreflight(state, fingerprintPreflight, 'Terra repair');
       if (!sameJson(repair.workspace_fingerprint, fingerprint)) throw new ControllerError('Terra repair fingerprint does not match the current workspace');
       const stored = { source_review_claim_id: sourceClaimId, source_review_auditor_task: sourceReview.auditor_task, source_workspace_fingerprint: sourceReview.workspace_fingerprint, repaired_by: repairedBy, addressed_findings: addressedFindings, verification_evidence: verificationEvidence, workflow_snapshot: workflowSnapshot(state), workspace_fingerprint: fingerprint, workspace_changed: !sameJson(fingerprint, sourceReview.workspace_fingerprint), recorded_at: utcNow(), terra_stage: 'terra_single' };
       state.repair_records.push(stored);
@@ -4421,7 +3667,7 @@ async function recordRepair(parameters) {
       const repairedBy = requiredString(repair.repaired_by, 'repaired_by');
       const addressedFindings = addressedReviewFindings(sourceReview, repair.addressed_findings);
       const verificationEvidence = requiredReviewValue(repair.verification_evidence, 'verification_evidence');
-      const fingerprint = await workspaceFingerprint(state.workspace, state.workspace_claims);
+      const fingerprint = workspaceFingerprintFromPreflight(state, fingerprintPreflight, 'Sol repair');
       if (!sameJson(repair.workspace_fingerprint, fingerprint)) throw new ControllerError('Sol repair fingerprint does not match the current workspace');
       const stored = { source_review_claim_id: sourceClaimId, source_review_auditor_task: sourceReview.auditor_task, source_workspace_fingerprint: sourceReview.workspace_fingerprint, repaired_by: repairedBy, addressed_findings: addressedFindings, verification_evidence: verificationEvidence, workflow_snapshot: workflowSnapshot(state), workspace_fingerprint: fingerprint, workspace_changed: !sameJson(fingerprint, sourceReview.workspace_fingerprint), recorded_at: utcNow(), sol_stage: protocolStageForNode(reviewNode) };
       state.repair_records.push(stored);
@@ -4443,7 +3689,7 @@ async function recordRepair(parameters) {
       const repairedBy = requiredString(repair.repaired_by, 'repaired_by');
       const addressedFindings = addressedReviewFindings({ findings: charter.blocking_findings }, repair.addressed_findings);
       const verificationEvidence = requiredReviewValue(repair.verification_evidence, 'verification_evidence');
-      const fingerprint = await workspaceFingerprint(state.workspace, state.workspace_claims);
+      const fingerprint = workspaceFingerprintFromPreflight(state, fingerprintPreflight, 'Max repair');
       if (!sameJson(repair.workspace_fingerprint, fingerprint)) throw new ControllerError('Max repair fingerprint does not match the current workspace');
       if (state.repair_records.length >= MAX_REPAIR_RECORDS) throw new ControllerError(`Task exceeded the ${MAX_REPAIR_RECORDS}-repair record limit; create a replacement workflow task`);
       const workspaceChanged = !sameJson(fingerprint, sourceReview.workspace_fingerprint);
@@ -4458,12 +3704,13 @@ async function recordRepair(parameters) {
       return { task_id: state.task_id, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), repair_record: stored, max_review_charter: charter };
     }
     throw new ControllerError('A repair record requires a failed current-protocol review');
-  });
+  }, { cursorRelevant: false });
 }
 
 async function recordReview(parameters) {
-  const review = await readJson(parameters.review, { label: 'Review', maxBytes: MAX_REVIEW_BYTES }); if (!review || typeof review !== 'object') throw new ControllerError('Review must be a JSON object');
-  const [filePath] = await readTask(parameters);
+  const [filePath, currentState] = await readTask(parameters);
+  const review = await readWorkflowJson(parameters.review, { label: 'Review', maxBytes: MAX_REVIEW_BYTES, workspace: currentState.workspace, objectOnly: true });
+  const fingerprintPreflight = await prepareWorkspaceFingerprint(filePath);
   return withActiveWorkspaceStateLock(filePath, async state => {
     const auditor = String(review.auditor_task ?? ''); const role = String(review.auditor_role ?? ''); const verdict = String(review.verdict ?? '');
     const reviewNode = Object.values(state.nodes).find(node => isReviewNode(node, state.routing_schema_version) && (node.status === RUNNING || isCohortReviewNode(state, node)) && (node.agent_task_path === auditor || activeCohortLaneForTask(node, auditor)));
@@ -4488,7 +3735,7 @@ async function recordReview(parameters) {
     if (!sameJson(review.workflow_snapshot, snapshot)) throw new ControllerError('Review workflow_snapshot does not match the current task state');
     const unfinished = unfinishedMaterialNodes(state);
     if (unfinished.length) throw new ControllerError(`Review cannot be recorded before all work nodes finish: ${unfinished.map(node => node.id).join(', ')}`);
-    const fingerprint = await workspaceFingerprint(state.workspace, state.workspace_claims);
+    const fingerprint = workspaceFingerprintFromPreflight(state, fingerprintPreflight, 'Review');
     if (!sameJson(review.workspace_fingerprint, fingerprint)) throw new ControllerError('Review fingerprint does not match the current workspace');
     const scopeAndRegression = requiredReviewValue(review.scope_and_regression, 'scope_and_regression');
     const verificationGaps = requiredReviewValue(review.verification_gaps, 'verification_gaps');
@@ -4536,7 +3783,7 @@ async function recordReview(parameters) {
   });
 }
 
-async function closeReasons(state) {
+async function closeReasons(state, { workspaceFingerprint: precomputedFingerprint = null } = {}) {
   const incomplete = Object.entries(state.nodes).filter(([, node]) => ![SUCCEEDED, 'skipped'].includes(node.status)).map(([id]) => id);
   const reasons = incomplete.length ? [`incomplete nodes: ${incomplete.join(', ')}`] : [];
   const reviewNode = reviewNodesForState(state)[0] ?? null;
@@ -4554,10 +3801,11 @@ async function closeReasons(state) {
     if (cohort?.phase !== 'passed' || aggregate?.verdict !== 'pass') reasons.push('Terra cohort did not reach a passing cross-review conclusion');
     const finalReviews = currentCohortReviews(state, reviewNode, 'cross_questioning').filter(review => review.verdict === 'pass' && reviewCompletion(state, review).status === SUCCEEDED);
     if (finalReviews.length !== COHORT_SLOTS.length || new Set(finalReviews.map(review => review.reviewer_slot)).size !== COHORT_SLOTS.length) reasons.push('Terra cohort is missing a completed passing cross-questioning review from each lane');
-    if (aggregate && !sameJson(aggregate.workspace_fingerprint, await workspaceFingerprint(state.workspace, state.workspace_claims))) reasons.push('workspace changed after Terra cohort cross-review');
+    const currentFingerprint = precomputedFingerprint ?? await workspaceFingerprint(state.workspace, state.workspace_claims);
+    if (aggregate && !sameJson(aggregate.workspace_fingerprint, currentFingerprint)) reasons.push('workspace changed after Terra cohort cross-review');
     for (const review of finalReviews) {
       if (!workflowSnapshotMatchesState(review.workflow_snapshot, state)) reasons.push('task state changed after Terra cohort cross-review');
-      if (!sameJson(review.workspace_fingerprint, await workspaceFingerprint(state.workspace, state.workspace_claims))) reasons.push('workspace changed after Terra cohort cross-review');
+      if (!sameJson(review.workspace_fingerprint, currentFingerprint)) reasons.push('workspace changed after Terra cohort cross-review');
     }
     return reasons;
   }
@@ -4566,13 +3814,15 @@ async function closeReasons(state) {
     if (review.verdict !== 'pass') reasons.push(`latest review verdict is ${review.verdict}`);
     if (!reviewNode || review.node_id !== reviewNode.id || review.claim_id !== reviewNode.claim_id || review.auditor_task !== reviewNode.agent_task_path || review.auditor_role !== reviewNode.agent_role) reasons.push(`latest review does not belong to the succeeded ${reviewDescription} node`);
     if (!workflowSnapshotMatchesState(review.workflow_snapshot, state)) reasons.push(`task state changed after ${reviewDescription}`);
-    if (!sameJson(review.workspace_fingerprint, await workspaceFingerprint(state.workspace, state.workspace_claims))) reasons.push(`workspace changed after ${reviewDescription}`);
+    const currentFingerprint = precomputedFingerprint ?? await workspaceFingerprint(state.workspace, state.workspace_claims);
+    if (!sameJson(review.workspace_fingerprint, currentFingerprint)) reasons.push(`workspace changed after ${reviewDescription}`);
   }
   return reasons;
 }
 
 async function closeCheck(parameters) {
   const [filePath, initialState] = await readTask(parameters);
+  const fingerprintPreflight = await prepareWorkspaceFingerprint(filePath);
   const storage = publicTaskStoreReference(filePath);
   if (!initialState.workspace_lease) throw new ControllerError('Current task state requires a workspace lease');
   const parentAuthority = await stateParentAuthorityForState(initialState, filePath);
@@ -4580,7 +3830,8 @@ async function closeCheck(parameters) {
   const leasePath = initialState.workspace_lease.registry_path;
   if (initialState.workspace_lease.status === 'released') {
     const removal = await removeReleasedWorkspaceLeaseEntry(initialState, filePath);
-    const reasons = await closeReasons(initialState);
+    const fingerprint = workspaceFingerprintFromPreflight(initialState, fingerprintPreflight, 'Close check');
+    const reasons = await closeReasons(initialState, { workspaceFingerprint: fingerprint });
     return [{
       ...storage,
       task_id: initialState.task_id,
@@ -4594,7 +3845,8 @@ async function closeCheck(parameters) {
   if (initialState.workspace_lease.status !== 'active') throw new ControllerError(`Current task has an unsupported workspace lease status: ${initialState.workspace_lease.status}`);
   let result;
   await withActiveWorkspaceStateLock(filePath, async state => {
-    const reasons = await closeReasons(state);
+    const fingerprint = workspaceFingerprintFromPreflight(state, fingerprintPreflight, 'Close check');
+    const reasons = await closeReasons(state, { workspaceFingerprint: fingerprint });
     result = {
       ...storage,
       task_id: state.task_id,
@@ -4624,7 +3876,6 @@ export async function dispatch(command, parameters) {
     parameters = { ...parameters, state_dir: await canonicalStateDirectory(parameters.state_dir) };
   }
   if (command === 'prune-expired') return [await pruneExpiredTasks(parameters), 0];
-  if (command === 'reconcile-quarantine') return [await reconcileQuarantinedStates(parameters), 0];
   switch (command) {
     case 'init': return [await initTask(parameters), 0]; case 'reconcile-workspace': return [await reconcileWorkspace(parameters), 0]; case 'add-node': return [await addNode(parameters), 0]; case 'raise-assurance': return [await raiseAssurance(parameters), 0]; case 'rebind-pending': return [await rebindPendingOwner(parameters), 0]; case 'invalidate-gate': return [await invalidateGate(parameters), 0];
     case 'ready': return [{ ready_nodes: readyNodes((await readTask(parameters))[1]) }, 0]; case 'claim': return [await claimNode(parameters), 0]; case 'start': return [await claimNode(parameters, true), 0];

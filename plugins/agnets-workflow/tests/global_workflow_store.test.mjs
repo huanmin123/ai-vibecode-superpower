@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdtemp, mkdir, readdir, rm, readFile } from 'node:fs/promises';
+import { lstat, mkdtemp, mkdir, readdir, realpath, rm, readFile, symlink, unlink } from 'node:fs/promises';
 import { DatabaseSync } from 'node:sqlite';
 import os from 'node:os';
 import path from 'node:path';
@@ -11,8 +11,11 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   globalTaskStateExists,
   globalWorkflowStorePath,
+  claimGlobalTaskPruneJobs,
+  ensureGlobalNamespaceIdentity,
+  finalizeGlobalTaskPruneJob,
   readGlobalTaskState,
-  withGlobalWorkflowStoreMaintenance,
+  taskNamespaceKey,
   withGlobalTaskStateTransaction,
   writeGlobalTaskState,
 } from '../scripts/global_workflow_store.mjs';
@@ -56,8 +59,13 @@ test('global workflow store publishes one fully initialized database for concurr
     for (const [index, statePath] of states.entries()) assert.equal((await readGlobalTaskState(statePath)).child, String(index));
     const store = globalWorkflowStorePath();
     const database = new DatabaseSync(store, { readOnly: true });
+    assert.equal(String(database.prepare('PRAGMA journal_mode').get().journal_mode).toLowerCase(), 'wal');
+    assert.equal(Number(database.prepare('PRAGMA auto_vacuum').get().auto_vacuum), 2);
+    assert.ok(Number(database.prepare('PRAGMA max_page_count').get().max_page_count) >= 131072);
     assert.equal(database.prepare("SELECT count(*) AS count FROM store_meta WHERE key IN ('schema_version', 'store_id')").get().count, 2);
     assert.equal(database.prepare('SELECT count(*) AS count FROM task_state').get().count, states.length);
+    assert.deepEqual(database.prepare('PRAGMA index_info(task_state_prune_after_idx)').all().map(row => row.name), ['prune_after', 'namespace_key', 'task_id']);
+    assert.deepEqual(database.prepare('PRAGMA index_info(task_prune_job_due_idx)').all().map(row => row.name), ['phase', 'retry_after', 'lease_deadline_at', 'namespace_key', 'task_id']);
     database.close();
 
     const shared = path.join(root, 'workspace', 'preheated', 'shared.sqlite');
@@ -140,32 +148,52 @@ test('global workflow store rejects a relative CODEX_HOME before touching the cw
   }
 });
 
-test('global maintenance transaction queues a same-task replacement behind its delete', async () => {
+test('global workflow store validates existing parent links before creating any descendant', async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'agnets-global-parent-link-'));
+  const previousHome = process.env.CODEX_HOME;
+  const codexHome = path.join(root, 'codex-home');
+  const linkedStateTarget = path.join(root, 'linked-state-target');
+  const stateLink = path.join(codexHome, 'state');
+  try {
+    await mkdir(codexHome);
+    await mkdir(linkedStateTarget);
+    try { await symlink(linkedStateTarget, stateLink, process.platform === 'win32' ? 'junction' : 'dir'); }
+    catch (error) {
+      if (['EPERM', 'EACCES', 'ENOTSUP'].includes(error?.code)) { t.skip(`directory links are unavailable: ${error.code}`); return; }
+      throw error;
+    }
+    process.env.CODEX_HOME = codexHome;
+    await assert.rejects(
+      () => writeGlobalTaskState(path.join(root, 'workspace', 'state', 'task.sqlite'), { version: 1, updated_at: new Date().toISOString() }),
+      /parent is not a regular directory/,
+    );
+    assert.equal(existsSync(path.join(linkedStateTarget, 'agnets-workflow')), false);
+    assert.equal(existsSync(path.join(linkedStateTarget, 'agnets-workflow', 'workflow.sqlite')), false);
+  } finally {
+    if (previousHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = previousHome;
+    try { await unlink(stateLink); } catch (error) { if (error?.code !== 'ENOENT') throw error; }
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('global prune claim blocks a same-task replacement until finalization', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'agnets-global-maintenance-'));
   const previousHome = process.env.CODEX_HOME;
   const codexHome = path.join(root, 'codex-home');
   const namespace = path.join(root, 'workspace', 'state');
   const statePath = path.join(namespace, 'race.sqlite');
-  let releaseMaintenance;
   try {
     process.env.CODEX_HOME = codexHome;
-    await writeGlobalTaskState(statePath, { version: 1, generation: 'old', updated_at: new Date().toISOString() });
-    let entered;
-    const enteredMaintenance = new Promise(resolve => { entered = resolve; });
-    const maintenance = withGlobalWorkflowStoreMaintenance(namespace, async store => {
-      assert.equal(store.rows.find(row => row.task_id === 'race').state.generation, 'old');
-      entered();
-      await new Promise(resolve => { releaseMaintenance = resolve; });
-      store.deleteTask('race');
-    });
-    await enteredMaintenance;
-    const replacement = writeGlobalTaskState(statePath, { version: 1, generation: 'new', updated_at: new Date().toISOString() });
-    let replacementSettled = false;
-    void replacement.then(() => { replacementSettled = true; });
-    await new Promise(resolve => setTimeout(resolve, 25));
-    assert.equal(replacementSettled, false);
-    releaseMaintenance();
-    await Promise.all([maintenance, replacement]);
+    await mkdir(namespace, { recursive: true });
+    const metadata = await lstat(namespace, { bigint: true });
+    await ensureGlobalNamespaceIdentity(namespace, { path: namespace, real_path: await realpath(namespace), identity: { dev: metadata.dev.toString(), ino: metadata.ino.toString() } });
+    await writeGlobalTaskState(statePath, { version: 1, generation: 'old', workflow_revision: 1, closed_revision: 1, closed_at: '1970-01-01T00:00:00.000Z', updated_at: '1970-01-01T00:00:00.000Z', workspace_lease: { status: 'released' }, nodes: { node: { status: 'succeeded' } } });
+    const [claim] = await claimGlobalTaskPruneJobs(new Date().toISOString(), { namespace_key: namespace });
+    assert.ok(claim);
+    await assert.rejects(() => writeGlobalTaskState(statePath, { version: 1, generation: 'new', updated_at: new Date().toISOString() }), /reserved for retention cleanup/);
+    await finalizeGlobalTaskPruneJob(claim);
+    await writeGlobalTaskState(statePath, { version: 1, generation: 'new', updated_at: new Date().toISOString() });
     assert.equal((await readGlobalTaskState(statePath)).generation, 'new');
   } finally {
     if (previousHome === undefined) delete process.env.CODEX_HOME;
