@@ -19,7 +19,7 @@ const MAX_DATABASE_BYTES = 512 * 1024 * 1024;
 const DEFAULT_PAGE_SIZE = 4_096;
 const MAX_DATABASE_PAGES = Math.floor(MAX_DATABASE_BYTES / DEFAULT_PAGE_SIZE);
 const APPLICATION_ID = 0x41475746; // "AGWF"
-const USER_VERSION = 3;
+const USER_VERSION = 4;
 const GLOBAL_ARTIFACT_DIRECTORY = 'artifacts';
 const PRUNE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const PRUNE_INDEX_NAME = 'task_state_prune_after_idx';
@@ -108,8 +108,9 @@ export function taskStoreKey(logicalStatePath) {
   return `${taskNamespaceKey(logicalStatePath)}\u0000${path.basename(logicalStatePath, '.sqlite')}`;
 }
 
-function workspaceKeyFromControlPath(databasePath) {
-  return pathKey(path.dirname(path.dirname(path.dirname(databasePath))));
+function workspaceKey(workspace) {
+  if (typeof workspace !== 'string' || !path.isAbsolute(workspace)) throw storeError('Workspace control requires an absolute canonical workspace path');
+  return pathKey(workspace);
 }
 
 function payload(value, label) {
@@ -660,9 +661,9 @@ export async function readGlobalTaskState(databasePath) {
   });
 }
 
-export async function readGlobalTaskChangeToken(databasePath, controlPath = null) {
+export async function readGlobalTaskChangeToken(databasePath, workspace = null) {
   const identity = taskIdentity(databasePath);
-  const controlKey = controlPath ? workspaceKeyFromControlPath(controlPath) : null;
+  const controlKey = workspace ? workspaceKey(workspace) : null;
   return withReadOnly(database => {
     if (!database) return null;
     const task = database.prepare('SELECT instance_id, change_counter FROM task_state WHERE namespace_key = ? AND task_id = ?').get(identity.namespaceKey, identity.taskId);
@@ -859,43 +860,43 @@ export async function deleteGlobalTaskStatesForNamespace(logicalStateDirectory, 
   });
 }
 
-export async function globalWorkspaceControlExists(databasePath) {
+export async function globalWorkspaceControlExists(workspace) {
   const active = transactionContext.getStore();
-  const key = workspaceKeyFromControlPath(databasePath);
+  const key = workspaceKey(workspace);
   if (active) return Boolean(active.database.prepare('SELECT 1 AS present FROM workspace_control WHERE workspace_key = ?').get(key)?.present);
   return withReadOnly(database => Boolean(database?.prepare('SELECT 1 AS present FROM workspace_control WHERE workspace_key = ?').get(key)?.present));
 }
 
-export async function createGlobalWorkspaceControl(databasePath, workspace, initialPayload = {}) {
-  const key = workspaceKeyFromControlPath(databasePath);
+export async function createGlobalWorkspaceControl(workspace, initialPayload = {}) {
+  const key = workspaceKey(workspace);
   return withWriter(database => {
-    if (database.prepare('SELECT 1 AS present FROM workspace_control WHERE workspace_key = ?').get(key)?.present) throw storeError(`Workspace control already exists: ${databasePath}`);
+    if (database.prepare('SELECT 1 AS present FROM workspace_control WHERE workspace_key = ?').get(key)?.present) throw storeError(`Workspace control already exists: ${workspace}`);
     database.prepare('INSERT INTO workspace_control (workspace_key, workspace, payload, updated_at, change_counter) VALUES (?, ?, ?, ?, 0)').run(key, workspace, payload(initialPayload, 'Global workspace control'), new Date().toISOString());
   });
 }
 
-export async function readGlobalWorkspaceControl(databasePath, workspace) {
-  const key = workspaceKeyFromControlPath(databasePath);
+export async function readGlobalWorkspaceControl(workspace) {
+  const key = workspaceKey(workspace);
   const active = transactionContext.getStore();
   const read = database => {
     const row = database.prepare('SELECT workspace, payload, updated_at, change_counter FROM workspace_control WHERE workspace_key = ?').get(key);
-    if (!row) throw storeError(`Workspace control does not exist: ${databasePath}`);
-    if (row.workspace !== workspace) throw storeError(`Workspace control workspace mismatch: ${databasePath}`);
+    if (!row) throw storeError(`Workspace control does not exist: ${workspace}`);
+    if (row.workspace !== workspace) throw storeError(`Workspace control workspace mismatch: ${workspace}`);
     return { payload: parsePayload(row.payload, `Global workspace control ${workspace}`), updated_at: row.updated_at, change_counter: row.change_counter };
   };
   if (active) return read(active.database);
   return withReadOnly(database => {
-    if (!database) throw storeError(`Workspace control does not exist: ${databasePath}`);
+    if (!database) throw storeError(`Workspace control does not exist: ${workspace}`);
     return read(database);
   });
 }
 
-export async function withGlobalWorkspaceControlTransaction(databasePath, workspace, callback) {
-  const key = workspaceKeyFromControlPath(databasePath);
+export async function withGlobalWorkspaceControlTransaction(workspace, callback) {
+  const key = workspaceKey(workspace);
   return withWriter(async database => {
     const row = database.prepare('SELECT workspace, payload, change_counter FROM workspace_control WHERE workspace_key = ?').get(key);
-    if (!row) throw storeError(`Workspace control does not exist: ${databasePath}`);
-    if (row.workspace !== workspace) throw storeError(`Workspace control workspace mismatch: ${databasePath}`);
+    if (!row) throw storeError(`Workspace control does not exist: ${workspace}`);
+    if (row.workspace !== workspace) throw storeError(`Workspace control workspace mismatch: ${workspace}`);
     const current = parsePayload(row.payload, `Global workspace control ${workspace}`);
     let saved = false;
     const save = value => {

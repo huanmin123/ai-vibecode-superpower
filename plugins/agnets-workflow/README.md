@@ -18,13 +18,14 @@
 
 ## 快速开始
 
-先按 [`workflow-controller`](skills/workflow-controller/SKILL.md) 准备完整任务 manifest，并为任务固定一个 `state_dir`。新任务的清单结构、质量门评估和节点字段以该文档为准。
+先按 [`workflow-controller`](skills/workflow-controller/SKILL.md) 准备完整任务 manifest。`workflow_init` 会从 `manifest.workspace` 自动派生并返回全局 `state_dir`；后续命令必须原样复用该返回值。新任务的清单结构、质量门评估和节点字段以该文档为准。
 
 在插件目录运行：
 
 ```powershell
-node .\scripts\workflow_controller.mjs --state-dir "$pwd\.codex\workflow-controller" init --manifest .\task.json
-node .\scripts\workflow_controller.mjs --state-dir "$pwd\.codex\workflow-controller" ready --task-id payments-refactor
+node .\scripts\workflow_controller.mjs init --manifest .\task.json
+# 从 init 输出复制 state_dir 后：
+node .\scripts\workflow_controller.mjs --state-dir "<workflow_init 返回的全局 state_dir>" ready --task-id payments-refactor
 ```
 
 需要独立复核时可使用插件入口：
@@ -33,11 +34,11 @@ node .\scripts\workflow_controller.mjs --state-dir "$pwd\.codex\workflow-control
 node .\scripts\sol_review_cli.mjs -- <prompt>
 ```
 
-绑定工作流时，CLI 会把审查结果和受控日志保存到用户级 `$CODEX_HOME/state/agnets-workflow/artifacts/<namespace-hash>/<task>/<claim>/`；子进程 stdout/stderr 只进入审查制品，不会转发到调用方终端。独立 CLI 只返回自身的 stdout 结果，不接受 `--result` 写入调用者指定路径；绑定工作流时使用全局结果制品完成收口，目标项目不会生成工作流审查 JSON。完整参数、总审绑定和验证流程见 [`orchestrate-model-workflow`](skills/orchestrate-model-workflow/SKILL.md)。
+绑定工作流时，CLI 会把审查结果和受控日志保存到用户级 Codex home 的 `state/agnets-workflow/artifacts/<namespace-hash>/<task>/<claim>/`；子进程 stdout/stderr 只进入审查制品，不会转发到调用方终端。独立 CLI 只返回自身的 stdout 结果，不接受 `--result` 写入调用者指定路径；绑定工作流时使用全局结果制品完成收口，目标项目不会生成工作流审查 JSON。完整参数、总审绑定和验证流程见 [`orchestrate-model-workflow`](skills/orchestrate-model-workflow/SKILL.md)。
 
 ## 状态目录
 
-每次新的 `workflow_init` 都要求 `state_dir` 位于目标工作区内，建议固定为 `<workspace>/.codex/workflow-controller/`；它只是不可落地的逻辑 namespace。该路径无论不存在还是已经包含历史残留，控制器都不会创建、递归扫描、读取内容或写入；旧本地 JSON/SQLite/租约不会被迁移或兼容，直接按新 namespace 使用。除该标准逻辑路径外，不得放在 `.git`、`node_modules`、`.venv` 等指纹排除目录中。物理状态固定为用户级 `$CODEX_HOME/state/agnets-workflow/workflow.sqlite`；显式 `CODEX_HOME` 必须是绝对路径，未设置时使用平台用户目录中的 `.codex/state/agnets-workflow/workflow.sqlite`。`state_dir` 只用于 canonical namespace 标识，namespace 身份锚定到现有 workspace；审查制品固定写入 `$CODEX_HOME/state/agnets-workflow/artifacts/<namespace-hash>/<task>/<claim>/`，不会创建工作区 `workflow.sqlite`、任务 `<task_id>.sqlite`、审查结果 JSON 或其 WAL/SHM/journal。相同 task_id 可位于不同 namespace；同 namespace 不可复用。`workflow_complete`、`workflow_checkpoint`、`workflow_record_review`、`workflow_record_repair` 和 `workflow_raise_assurance` 的 JSON 载荷应以内联对象传入；工作区内 JSON 文件路径会被拒绝，外部文件路径只保留给 workspace 外的明确输入。它们不是控制器的协调状态。
+`workflow_init` 从 canonical `manifest.workspace` 派生唯一的全局 namespace：`<Codex home>/state/agnets-workflow/namespaces/<workspace-sha256>`，并在响应中返回 `state_dir`。调用方不能选择它；项目内不会出现 `.codex/workflow-controller`、`workflow.sqlite`、任务 SQLite、WAL/SHM/journal、租约或审核 JSON。控制器不会扫描、读取、迁移或兼容任何旧本地 JSON/SQLite/租约。物理状态固定为用户级 Codex home 的 `state/agnets-workflow/workflow.sqlite`；显式 `CODEX_HOME` 仍必须是绝对路径，未设置时使用平台用户目录中的 `.codex/state/agnets-workflow/workflow.sqlite`。namespace 以 workspace 的 canonical 路径和物理身份锚定；审查制品固定写入全局 `state/agnets-workflow/artifacts/<namespace-hash>/<task>/<claim>/`。相同 task_id 可位于不同 workspace namespace；同 namespace 不可复用。`workflow_complete`、`workflow_checkpoint`、`workflow_record_review`、`workflow_record_repair` 和 `workflow_raise_assurance` 的 JSON 载荷应以内联对象传入；工作区内 JSON 文件路径会被拒绝，外部文件路径只保留给 workspace 外的明确输入。它们不是控制器的协调状态。
 
 控制器不会在 heartbeat、claim 或 complete 等高频命令前隐式清理。每次 MCP 进程启动后会静默启动独立维护 worker，服务本身立即接收请求；worker 按到期索引用短事务认领 task instance，在事务外校验 namespace 物理身份并清理 artifact，再用短事务复核后删除 row。它只删除 closed_at 满 7 天、closed revision 与当前 revision 一致、全部节点 succeeded/skipped、lease 已释放且无活跃任务或锁的任务，并在 artifact 清理失败时保留 row。worker 还会执行被动 WAL checkpoint、查询规划优化和有界增量空间回收；全库和 namespace 任务数、payload 与数据库页数均有明确上限。该维护不作为 MCP 工具向用户暴露；release-only、pending/running/failed/blocked/abandoned/unavailable、身份不匹配和损坏状态永不按时间删除。`workflow_doctor` 只检查状态和恢复前提，不替用户接管运行中的代理。恢复、换绑和关卡失效处理见 [`workflow-controller`](skills/workflow-controller/SKILL.md)。
 
@@ -45,4 +46,4 @@ node .\scripts\sol_review_cli.mjs -- <prompt>
 
 ## MCP
 
-插件同时提供 `workflow-controller` MCP 服务。需要接入时使用插件自带的 `.mcp.json`；`workflow_init.manifest` 可直接传 v3 清单对象、内联 JSON 对象字符串或 workspace 外的普通 JSON 文件路径，`state_dir` 必须为绝对路径。节点结果、checkpoint、审核和修复记录优先直接传 JSON 对象；控制器拒绝把目标 workspace 内的 JSON 文件当作工作流载荷，从调用契约上切断“先落地 JSON 再交给主控”的路径。高频调度调用默认返回紧凑摘要，持续观察先从 `workflow_status` 取得 `cursor`，再用 `workflow_wait` 被动等待变化。排障或审计需要完整任务状态时使用 `workflow_status detail=full`。具体工具名称和输入字段以 MCP schema 与 [`workflow-controller`](skills/workflow-controller/SKILL.md) 为准。
+插件同时提供 `workflow-controller` MCP 服务。需要接入时使用插件自带的 `.mcp.json`；`workflow_init.manifest` 可直接传 v3 清单对象、内联 JSON 对象字符串或 workspace 外的普通 JSON 文件路径。`workflow_init` 返回的 `state_dir` 是后续操作唯一可接受的绝对全局 namespace。节点结果、checkpoint、审核和修复记录优先直接传 JSON 对象；控制器拒绝把目标 workspace 内的 JSON 文件当作工作流载荷，从调用契约上切断“先落地 JSON 再交给主控”的路径。高频调度调用默认返回紧凑摘要，持续观察先从 `workflow_status` 取得 `cursor`，再用 `workflow_wait` 被动等待变化。排障或审计需要完整任务状态时使用 `workflow_status detail=full`。具体工具名称和输入字段以 MCP schema 与 [`workflow-controller`](skills/workflow-controller/SKILL.md) 为准。

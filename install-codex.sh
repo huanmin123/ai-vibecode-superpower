@@ -605,6 +605,30 @@ has_state() {
 assert_managed_agent_role_manifest "$source_agent_role_manifest"
 assert_managed_agent_role_directory "$source_agent_roles"
 
+expand_codex_home_placeholders() {
+    stage_root=$1
+    codex_home_value=$2
+    node -e '
+const fs = require("node:fs");
+const path = require("node:path");
+const root = process.argv[1];
+const codexHome = process.argv[2];
+const extensions = new Set([".md", ".toml", ".txt"]);
+function visit(directory) {
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    const target = path.join(directory, entry.name);
+    if (entry.isDirectory()) visit(target);
+    else if (extensions.has(path.extname(entry.name).toLowerCase())) {
+      const content = fs.readFileSync(target, "utf8");
+      const expanded = content.replaceAll("<CODEX_HOME>", codexHome).replaceAll("$CODEX_HOME", codexHome);
+      if (expanded !== content) fs.writeFileSync(target, expanded, "utf8");
+    }
+  }
+}
+visit(root);
+' "$stage_root" "$codex_home_value"
+}
+
 assert_safe_toml_merge_input() {
     config_path=$1
 
@@ -990,6 +1014,7 @@ for skill_name in $managed_standalone_skill_names; do
         exit 1
     fi
 done
+expand_codex_home_placeholders "$stage_dir" "$codex_home"
 assert_managed_agent_role_directory "$stage_dir/agents/ai-vibecode-superpower"
 
 manifest=$stage_dir/targets.tsv

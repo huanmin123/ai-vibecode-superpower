@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { createReadStream, promises as fs } from 'node:fs';
+import { createReadStream, realpathSync, promises as fs } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
@@ -155,30 +155,37 @@ function requiredStateDirectory(value) {
   return path.resolve(stateDir);
 }
 
+function globalWorkflowStateRoot() {
+  return path.dirname(globalWorkflowStorePath());
+}
+
+function globalNamespaceHash(workspace) {
+  let canonical = path.resolve(workspace);
+  try { canonical = (realpathSync.native ?? realpathSync)(canonical); } catch { /* init will report a workspace error */ }
+  return createHash('sha256').update(workspacePathKey(canonical), 'utf8').digest('hex');
+}
+
+// A workspace gets one globally-managed logical namespace. This path is never
+// created in, inspected in, or written to the workspace itself.
+export function globalStateDirectoryForWorkspace(workspace) {
+  return path.join(globalWorkflowStateRoot(), 'namespaces', globalNamespaceHash(workspace));
+}
+
 // State directories are security identities, not display strings. Resolve the
 // existing physical prefix, then append only the as-yet-missing tail so a
 // junction, symlink, or Windows case alias cannot obtain a second lock.
 export async function canonicalStateDirectory(value, label = 'state_dir') {
   const requested = requiredStateDirectory(value);
-  const missing = [];
-  let cursor = requested;
-  for (;;) {
-    try {
-      const physical = await fs.realpath(cursor);
-      const metadata = await fs.stat(physical);
-      if (!metadata.isDirectory()) throw new ControllerError(`${label} must name a directory: ${requested}`);
-      return path.normalize(path.join(physical, ...missing));
-    } catch (error) {
-      if (error instanceof ControllerError) throw error;
-      if (error.code !== 'ENOENT') throw new ControllerError(`Cannot resolve ${label} physical identity: ${requested}: ${error.message}`);
-      const parent = path.dirname(cursor);
-      if (parent === cursor) throw new ControllerError(`Cannot resolve ${label} physical identity: ${requested}`);
-      const segment = path.basename(cursor);
-      if (!segment || segment === '.' || segment === '..') throw new ControllerError(`Cannot resolve ${label} physical identity: ${requested}`);
-      missing.unshift(segment);
-      cursor = parent;
-    }
+  const namespaceRoot = path.join(globalWorkflowStateRoot(), 'namespaces');
+  const relative = path.relative(namespaceRoot, requested);
+  if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)
+    || relative.split(path.sep).length !== 1 || !/^[a-f0-9]{64}$/i.test(relative)) {
+    throw new ControllerError(`${label} must be the global namespace returned by workflow_init; project-local and arbitrary paths are not valid`);
   }
+  // The namespace is derived under the configured Codex home. Keep the
+  // configured spelling stable (including Windows 8.3 aliases) because it is
+  // a logical key; workspace physical identity is verified separately.
+  return requested;
 }
 
 async function canonicalStatePath(value, label = 'state_path') {
@@ -1504,7 +1511,7 @@ function validateAgentType(kind, executionRisk, agentType) {
   }
   if (agentType == null) return;
   if (kind === QUALITY_REVIEW_KIND) {
-    if (executionRisk !== 'read_only') throw new ControllerError('A quality_review node must be read_only');
+    if (executionRisk !== 'read_only') throw new ControllerError('A quality_review node must be read_only; set execution_risk="read_only" and use avsp_terra_xhigh because an independent review must not write the reviewed workspace');
     if (agentType !== TERRA_REVIEW_ROLE) throw new ControllerError('A quality_review node requires avsp_terra_xhigh');
     return;
   }
@@ -1892,14 +1899,13 @@ async function validateWorkspaceLease(lease, leasePath) {
   }
 }
 
-// This is an internal logical locator for the workspace-control row in the
-// single user-level global store; it is not a workspace-local SQLite file.
+// This is an internal global locator for the workspace-control row in the
+// single user-level global store; no project-local controller path is used.
 function workspaceLeasePath(workspace) {
-  return path.join(workspace, '.codex', 'workflow-controller', WORKSPACE_CONTROL_FILENAME);
+  return path.join(globalWorkflowStateRoot(), 'workspace-controls', globalNamespaceHash(workspace), 'control', 'state', WORKSPACE_CONTROL_FILENAME);
 }
 
 async function assertWorkspaceControlCreationIsSafe(workspace, stateDirectory) {
-  assertStateDirectoryBoundary(workspace, stateDirectory);
   const globalStates = await listGlobalTaskStatesForWorkspace(workspace);
   if (globalStates.length) {
     const uniqueStatePaths = [...new Set(globalStates.map(entry => entry.state.workspace_lease?.state_path ?? path.join(entry.namespace_key, `${entry.task_id}${SQLITE_STATE_SUFFIX}`)))];
@@ -1907,33 +1913,17 @@ async function assertWorkspaceControlCreationIsSafe(workspace, stateDirectory) {
   }
 }
 
-function assertStateDirectoryBoundary(workspace, stateDirectory) {
-  if (!stateDirectory) return;
-  const resolvedWorkspace = path.resolve(workspace);
-  const resolvedStateDirectory = path.resolve(stateDirectory);
-  if (!pathIsWithinPhysicalRoot(resolvedWorkspace, resolvedStateDirectory)) {
-    throw new ControllerError(`workflow_init state_dir must be inside its workspace: ${stateDirectory}`);
-  }
-  const canonicalControlDirectory = path.resolve(resolvedWorkspace, '.codex', 'workflow-controller');
-  if (pathIsWithinPhysicalRoot(canonicalControlDirectory, resolvedStateDirectory)) return;
-  const relative = path.relative(resolvedWorkspace, resolvedStateDirectory);
-  const segments = relative && relative !== '.' ? relative.split(path.sep) : [];
-  if (segments.some(segment => isIgnoredFingerprintDirectory(segment))) {
-    throw new ControllerError(`workflow_init state_dir cannot be inside an ignored workspace directory: ${stateDirectory}`);
-  }
-}
-
 async function ensureWorkspaceControl(workspace, { allowCreate = false, stateDirectory = null } = {}) {
   const databasePath = workspaceLeasePath(workspace);
-  if (await workspaceControlExists(databasePath)) return databasePath;
+  if (await workspaceControlExists(workspace)) return databasePath;
   if (!allowCreate) throw new ControllerError(`Workspace control database does not exist: ${databasePath}`);
   await assertWorkspaceControlCreationIsSafe(workspace, stateDirectory);
-  if (await workspaceControlExists(databasePath)) return databasePath;
+  if (await workspaceControlExists(workspace)) return databasePath;
   const lease = { version: WORKSPACE_LEASE_VERSION, workspace, active_tasks: [], active_locks: [], updated_at: utcNow() };
   try {
-    await createWorkspaceControl(databasePath, workspace, lease);
+    await createWorkspaceControl(workspace, lease);
   } catch (error) {
-    if (await workspaceControlExists(databasePath)) return databasePath;
+    if (await workspaceControlExists(workspace)) return databasePath;
     throw new ControllerError(`Cannot create workspace control database: ${databasePath}: ${error.message}`);
   }
   return databasePath;
@@ -1944,7 +1934,7 @@ async function withWorkspaceLeaseLock(workspace, callback, { allowAuthorityCreat
   try { leasePath = await ensureWorkspaceControl(workspace, { allowCreate: allowAuthorityCreation, stateDirectory }); }
   catch (error) { throw asControllerError(error); }
   let result;
-  await withWorkspaceControlTransaction(leasePath, workspace, async (storedLease, save) => {
+  await withWorkspaceControlTransaction(workspace, async (storedLease, save) => {
     const lease = storedLease && typeof storedLease === 'object' && !Array.isArray(storedLease)
       ? storedLease
       : { version: WORKSPACE_LEASE_VERSION, workspace, active_tasks: [], active_locks: [], updated_at: utcNow() };
@@ -1966,7 +1956,7 @@ async function withWorkspaceLeaseLock(workspace, callback, { allowAuthorityCreat
 async function loadWorkspaceLease(leasePath, workspace, { authorityContext = null } = {}) {
   if (leasePath !== workspaceLeasePath(workspace)) throw new ControllerError(`Workspace control path does not match its canonical workspace: ${leasePath}`);
   let lease;
-  try { lease = authorityContext?.lease ?? (await readWorkspaceControl(leasePath, workspace)).payload; }
+  try { lease = authorityContext?.lease ?? (await readWorkspaceControl(workspace)).payload; }
   catch (error) { throw asControllerError(error); }
   if (!lease || typeof lease !== 'object' || Array.isArray(lease)) throw new ControllerError(`Unsupported workspace control lease: ${leasePath}`);
   await validateWorkspaceLease(lease, leasePath);
@@ -2280,8 +2270,9 @@ async function releaseWorkspaceLease(parameters, { closeAllowed = false } = {}) 
 async function initTask(parameters) {
   const manifest = await readManifest(parameters.manifest);
   const state = await makeState(manifest);
-  const filePath = await configuredStatePath(parameters, state.task_id);
-  assertStateDirectoryBoundary(state.workspace, path.dirname(filePath));
+  const stateDirectory = await canonicalStateDirectory(globalStateDirectoryForWorkspace(state.workspace), 'derived global state_dir');
+  if (parameters.state_dir !== undefined) throw new ControllerError('workflow_init derives state_dir from manifest.workspace; do not provide state_dir');
+  const filePath = statePath(stateDirectory, state.task_id);
   const leasePath = workspaceLeasePath(state.workspace);
   const parentAuthority = await snapshotLogicalStateNamespace(path.dirname(filePath), state.workspace);
   await verifyRegularDirectorySnapshot(parentAuthority, 'Controller state parent');
@@ -2333,7 +2324,7 @@ async function initTask(parameters) {
     throw wrapped;
   }
   const storage = publicTaskStoreReference(filePath);
-  return { ...storage, task: compactState(state) };
+  return { ...storage, state_dir: stateDirectory, task: compactState(state) };
 }
 
 async function reconcileWorkspace(parameters) {
@@ -2588,7 +2579,7 @@ async function claimNode(parameters, activateImmediately = false) {
 function requireActiveClaim(node, parameters) {
   const claimId = requiredString(parameters.claim_id, 'claim_id');
   if (!node || node.status !== RUNNING) throw new ControllerError(`Only a running node accepts this operation: ${parameters.node_id}`);
-  if (!node.claim_id || node.claim_id !== claimId) throw new ControllerError(`Claim does not own node: ${parameters.node_id}`);
+  if (!node.claim_id || node.claim_id !== claimId) throw new ControllerError(`Claim does not own node: ${parameters.node_id}; do not guess claim_id—use the exact value returned by workflow_start or workflow_status`);
   return claimId;
 }
 
@@ -2937,12 +2928,14 @@ async function completeNode(parameters) {
     const node = state.nodes[nodeId]; const activeClaim = activeClaimForOperation(state, node, parameters); const cohortNode = isCohortReviewNode(state, node);
     if (!activeClaim.activation_at || activeClaim.heartbeat_count < 1) throw new ControllerError('An unactivated node cannot be completed; the claiming agent must first call workflow_heartbeat or workflow_start');
     const expectedAttestation = expectedCompletionAttestation(node, activeClaim, status, parameters.completion_attestation);
-    if (parameters.completion_attestation !== expectedAttestation) throw new ControllerError(`workflow_complete requires completion_attestation=${expectedAttestation}`);
+    if (parameters.completion_attestation !== expectedAttestation) {
+      throw new ControllerError(`workflow_complete requires completion_attestation=${expectedAttestation}; main/root must use the active claim returned by workflow_start and only declare native_agent_finished after confirming the native agent is Completed`);
+    }
     const reviewNode = isReviewNode(node, state.routing_schema_version);
     if (cohortNode) {
       if (status === 'skipped' || status === 'blocked') throw new ControllerError('A Terra cohort lane can only succeed, fail, or be unavailable');
       const recordedReview = state.reviews.find(review => review.node_id === node.id && review.claim_id === activeClaim.claim_id);
-      if (!recordedReview) throw new ControllerError('A Terra cohort lane requires a recorded review for its active claim');
+      if (!recordedReview) throw new ControllerError('A Terra cohort lane requires a recorded review for its active claim; main/root must first call workflow_record_review with the review JSON and this exact claim_id');
       if ((status === SUCCEEDED && recordedReview.verdict !== 'pass') || (status === 'failed' && recordedReview.verdict !== 'fail') || (status === 'unavailable' && recordedReview.verdict !== 'unavailable')) {
         throw new ControllerError('Terra cohort completion status must match the recorded review verdict');
       }
@@ -2989,7 +2982,7 @@ async function completeNode(parameters) {
     if (reviewNode && status === 'skipped') throw new ControllerError('A review node cannot be skipped');
     if (reviewNode) {
       const recordedReview = state.reviews.find(review => review.node_id === node.id && review.claim_id === node.claim_id);
-      if (!recordedReview) throw new ControllerError('A non-cohort review node requires a recorded review for its active claim');
+      if (!recordedReview) throw new ControllerError('A non-cohort review node requires a recorded review for its active claim; main/root must first call workflow_record_review with the reviewer JSON and this exact claim_id, then call workflow_complete after the reviewer is Completed');
       if (recordedReview) {
         const expectedStatus = recordedReview.verdict === 'pass' ? SUCCEEDED : recordedReview.verdict === 'fail' ? 'failed' : recordedReview.verdict === 'unavailable' ? 'unavailable' : null;
         if (status !== expectedStatus) throw new ControllerError('Non-cohort review completion status must match the recorded review verdict');
@@ -3872,7 +3865,7 @@ async function closeCheck(parameters) {
 }
 
 export async function dispatch(command, parameters) {
-  if (parameters && hasOwn(parameters, 'state_dir')) {
+  if (command !== 'init' && parameters && hasOwn(parameters, 'state_dir')) {
     parameters = { ...parameters, state_dir: await canonicalStateDirectory(parameters.state_dir) };
   }
   if (command === 'prune-expired') return [await pruneExpiredTasks(parameters), 0];

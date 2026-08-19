@@ -254,6 +254,23 @@ function New-UniqueDirectory {
     return $candidate
 }
 
+function Expand-CodexHomePlaceholders {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$CodexHome
+    )
+
+    $textExtensions = @('.md', '.toml', '.txt')
+    foreach ($file in Get-ChildItem -LiteralPath $Root -File -Recurse -Force) {
+        if ($textExtensions -notcontains $file.Extension.ToLowerInvariant()) { continue }
+        $content = [System.IO.File]::ReadAllText($file.FullName)
+        $expanded = $content.Replace('<CODEX_HOME>', $CodexHome).Replace('$CODEX_HOME', $CodexHome)
+        if ($expanded -ne $content) {
+            [System.IO.File]::WriteAllText($file.FullName, $expanded, [System.Text.UTF8Encoding]::new($false))
+        }
+    }
+}
+
 function Remove-OldInstallBackups {
     param(
         [Parameter(Mandatory)][string]$BackupRoot,
@@ -605,8 +622,17 @@ function Install-ManagedPlugin {
         $env:CODEX_HOME = $CodexHome
         & $codexCli plugin marketplace add $MarketplaceRoot
         if ($LASTEXITCODE -ne 0) { throw "Could not register plugin marketplace: $MarketplaceRoot" }
+        $marketplaceOutput = (& $codexCli plugin marketplace list 2>&1 | Out-String)
+        if ($LASTEXITCODE -ne 0 -or $marketplaceOutput -notmatch ('(?m)^\s*' + [System.Text.RegularExpressions.Regex]::Escape($MarketplaceName) + '\s+')) {
+            throw "Codex did not retain marketplace registration after add: $MarketplaceName. Output: $marketplaceOutput"
+        }
         & $codexCli plugin add "$PluginName@$MarketplaceName"
         if ($LASTEXITCODE -ne 0) { throw "Could not install managed plugin: $PluginName@$MarketplaceName" }
+        $pluginIdentity = "$PluginName@$MarketplaceName"
+        $pluginOutput = (& $codexCli plugin list 2>&1 | Out-String)
+        if ($LASTEXITCODE -ne 0 -or $pluginOutput -notmatch [System.Text.RegularExpressions.Regex]::Escape($pluginIdentity)) {
+            throw "Codex did not retain managed plugin installation after add: $pluginIdentity. Output: $pluginOutput"
+        }
     } finally {
         if ($hadCodexHome) {
             $env:CODEX_HOME = $previousCodexHome
@@ -756,6 +782,7 @@ try {
     foreach ($skillName in $managedStandaloneSkillNames) {
         Copy-Item -LiteralPath (Join-Path $sourceStandaloneSkills $skillName) -Destination (Join-Path $stagedStandaloneSkills $skillName) -Recurse -Force
     }
+    Expand-CodexHomePlaceholders -Root $stageRoot -CodexHome $codexHome
     foreach ($name in @('AGENTS.md', 'template-config.toml', 'docs', (Join-Path 'agents' $managedAgentRoleDirectoryName))) {
         if (-not (Test-ExistingPath -Path (Join-Path $stageRoot $name))) { throw "Staging failed for: $name" }
     }

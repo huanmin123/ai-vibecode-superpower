@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { mkdirSync } from 'node:fs';
 import { mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { promises as fsPromises } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { extractJsonObjects, repairInvalidDenyReadAclState, resolveCodexHome, runSolReview, terminateSolReviewProcess } from '../scripts/sol_review_cli.mjs';
-import { canonicalStateDirectory, dispatch } from '../scripts/workflow_controller.mjs';
+import { canonicalStateDirectory, dispatch, globalStateDirectoryForWorkspace } from '../scripts/workflow_controller.mjs';
 import { globalWorkflowArtifactPath, globalWorkflowArtifactRoot, globalWorkflowArtifactTaskPath, readGlobalTaskState as readTaskState } from '../scripts/global_workflow_store.mjs';
 
 async function fixture() {
@@ -22,6 +23,8 @@ async function fixture() {
   process.env.CODEX_HOME = codexHome;
   return { root, codexHome, sandbox, evidence, state: path.join(sandbox, 'deny_read_acl_state.json') };
 }
+
+const stateDirFor = workspace => { mkdirSync(workspace, { recursive: true }); return globalStateDirectoryForWorkspace(workspace); };
 
 function solAssessment() {
   const dimension = status => ({ status, evidence: ['workflow review requires an independent Sol gate'], rationale: `risk is ${status}` });
@@ -380,12 +383,12 @@ test('rejects an evidence package with more than the bounded number of directori
 
 test('closes a workflow-bound evidence validation failure as unavailable before spawning Sol', async () => {
   const item = await fixture();
-  const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(workspace, '.codex', 'workflow-controller'); const manifest = path.join(item.root, 'manifest.json'); const missingEvidence = path.join(item.root, 'missing-evidence');
+  const workspace = path.join(item.root, 'workspace'); const stateDir = stateDirFor(workspace); const manifest = path.join(item.root, 'manifest.json'); const missingEvidence = path.join(item.root, 'missing-evidence');
   try {
-    await mkdir(workspace);
+    await mkdir(workspace, { recursive: true });
     await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
     await writeFile(manifest, JSON.stringify(v3ReviewManifest(workspace, { goal: 'Persist evidence preflight failure', requirements: [{ id: 'R1', text: 'preflight failure is visible' }], executionOwner: '/root/evidence-preflight' })));
-    await dispatch('init', { state_dir: stateDir, manifest });
+    await dispatch('init', { manifest });
     const [claim] = await dispatch('claim', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', agent_task_path: '/root/evidence-preflight', agent_role: 'avsp_sol_high' });
     await dispatch('heartbeat', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', claim_id: claim.node.claim_id });
     const result = await runSolReview([
@@ -415,13 +418,13 @@ test('closes a workflow-bound evidence validation failure as unavailable before 
 
 test('retains the pending artifact when automatic unavailable completion cannot finalize it', async () => {
   const item = await fixture();
-  const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(workspace, '.codex', 'workflow-controller'); const manifest = path.join(item.root, 'manifest.json'); const missingEvidence = path.join(item.root, 'missing-evidence');
+  const workspace = path.join(item.root, 'workspace'); const stateDir = stateDirFor(workspace); const manifest = path.join(item.root, 'manifest.json'); const missingEvidence = path.join(item.root, 'missing-evidence');
   const originalRename = fsPromises.rename;
   try {
-    await mkdir(workspace);
+    await mkdir(workspace, { recursive: true });
     await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
     await writeFile(manifest, JSON.stringify(v3ReviewManifest(workspace, { goal: 'Keep unavailable review retryable', requirements: [{ id: 'R1', text: 'artifact failure remains visible' }], executionOwner: '/root/retryable-unavailable' })));
-    await dispatch('init', { state_dir: stateDir, manifest });
+    await dispatch('init', { manifest });
     const [claim] = await dispatch('claim', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', agent_task_path: '/root/retryable-unavailable', agent_role: 'avsp_sol_high' });
     await dispatch('heartbeat', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', claim_id: claim.node.claim_id });
     const outcome = globalWorkflowArtifactPath(await canonicalStateDirectory(stateDir), 'review-task', claim.node.claim_id, 'outcome.json');
@@ -455,14 +458,14 @@ test('retains the pending artifact when automatic unavailable completion cannot 
 
 test('keeps unavailable review evidence inside its verified artifact authority', async () => {
   const item = await fixture();
-  const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(workspace, '.codex', 'workflow-controller'); const manifest = path.join(item.root, 'manifest.json');
+  const workspace = path.join(item.root, 'workspace'); const stateDir = stateDirFor(workspace); const manifest = path.join(item.root, 'manifest.json');
   const originalOpen = fsPromises.open;
   const originalLstat = fsPromises.lstat;
   try {
-    await mkdir(workspace);
+    await mkdir(workspace, { recursive: true });
     await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
     await writeFile(manifest, JSON.stringify(v3ReviewManifest(workspace, { goal: 'Reject replaced unavailable review evidence', requirements: [{ id: 'R1', text: 'artifact authority remains verified' }], executionOwner: '/root/unavailable-authority' })));
-    await dispatch('init', { state_dir: stateDir, manifest });
+    await dispatch('init', { manifest });
     const [claim] = await dispatch('claim', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', agent_task_path: '/root/unavailable-authority', agent_role: 'avsp_sol_high' });
     await dispatch('heartbeat', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', claim_id: claim.node.claim_id });
     const resultDirectory = path.dirname(globalWorkflowArtifactPath(await canonicalStateDirectory(stateDir), 'review-task', claim.node.claim_id, 'outcome.json'));
@@ -508,12 +511,12 @@ test('keeps unavailable review evidence inside its verified artifact authority',
 
 test('rejects a linked unavailable review target without writing outside the artifact directory', async t => {
   const item = await fixture();
-  const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(workspace, '.codex', 'workflow-controller'); const manifest = path.join(item.root, 'manifest.json');
+  const workspace = path.join(item.root, 'workspace'); const stateDir = stateDirFor(workspace); const manifest = path.join(item.root, 'manifest.json');
   try {
-    await mkdir(workspace);
+    await mkdir(workspace, { recursive: true });
     await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
     await writeFile(manifest, JSON.stringify(v3ReviewManifest(workspace, { goal: 'Reject linked unavailable review evidence', requirements: [{ id: 'R1', text: 'linked evidence target is rejected' }], executionOwner: '/root/unavailable-linked-target' })));
-    await dispatch('init', { state_dir: stateDir, manifest });
+    await dispatch('init', { manifest });
     const [claim] = await dispatch('claim', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', agent_task_path: '/root/unavailable-linked-target', agent_role: 'avsp_sol_high' });
     await dispatch('heartbeat', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', claim_id: claim.node.claim_id });
     const resultDirectory = path.dirname(globalWorkflowArtifactPath(await canonicalStateDirectory(stateDir), 'review-task', claim.node.claim_id, 'outcome.json'));
@@ -647,10 +650,11 @@ test('records a Windows stdin bridge error instead of accepting the review', asy
 test('rejects a workflow-bound result path outside the review artifact directory', async () => {
   const item = await fixture();
   try {
+    const stateDir = path.join(item.codexHome, 'state', 'agnets-workflow', 'namespaces', 'a'.repeat(64));
     await assert.rejects(
       runSolReview([
         '--result', path.join(item.root, 'state.sqlite'),
-        '--workflow-state-dir', path.join(item.root, 'state'),
+        '--workflow-state-dir', stateDir,
         '--workflow-task-id', 'review-task',
         '--workflow-node-id', 'total-review',
         '--workflow-claim-id', 'claim-1',
@@ -660,8 +664,8 @@ test('rejects a workflow-bound result path outside the review artifact directory
     );
     await assert.rejects(
       runSolReview([
-        '--result', globalWorkflowArtifactPath(path.join(item.root, 'state'), 'other-task', 'other-claim', 'outcome.json'),
-        '--workflow-state-dir', path.join(item.root, 'state'),
+        '--result', globalWorkflowArtifactPath(stateDir, 'other-task', 'other-claim', 'outcome.json'),
+        '--workflow-state-dir', stateDir,
         '--workflow-task-id', 'review-task',
         '--workflow-node-id', 'total-review',
         '--workflow-claim-id', 'claim-1',
@@ -703,8 +707,8 @@ test('rejects a global workflow artifact directory containing a Windows junction
   const item = await fixture();
   let junction = null;
   try {
-    const stateDir = path.join(item.root, 'state'); const outside = path.join(item.root, 'outside-results');
-    const taskPath = globalWorkflowArtifactTaskPath(path.join(await fsPromises.realpath(item.root), 'state'), 'review-task');
+    const stateDir = path.join(item.codexHome, 'state', 'agnets-workflow', 'namespaces', 'b'.repeat(64)); const outside = path.join(item.root, 'outside-results');
+    const taskPath = globalWorkflowArtifactTaskPath(stateDir, 'review-task');
     await mkdir(path.dirname(taskPath), { recursive: true }); await mkdir(outside);
     junction = taskPath;
     try { await symlink(outside, junction, 'junction'); }
@@ -731,12 +735,12 @@ test('rejects a global workflow artifact directory containing a Windows junction
 
 test('rejects a relative workflow state directory and completes through a Windows case alias', { skip: process.platform !== 'win32' }, async t => {
   const item = await fixture();
-  const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(workspace, '.codex', 'workflow-controller'); const manifest = path.join(item.root, 'manifest.json');
+  const workspace = path.join(item.root, 'workspace'); const stateDir = stateDirFor(workspace); const manifest = path.join(item.root, 'manifest.json');
   try {
     await assert.rejects(runSolReview(['--workflow-state-dir', 'relative', '--workflow-task-id', 'review-task', '--workflow-node-id', 'total-review', '--workflow-claim-id', 'claim-1', '--', 'review'], { CODEX_HOME: item.codexHome }, 'win32'), /--workflow-state-dir must be an absolute path/);
-    await mkdir(workspace); await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
+    await mkdir(workspace, { recursive: true }); await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
     await writeFile(manifest, JSON.stringify(v3ReviewManifest(workspace, { goal: 'canonical workflow state', requirements: [{ id: 'R1', text: 'canonical state binding' }], executionOwner: '/root/canonical-sol' })));
-    await dispatch('init', { state_dir: stateDir, manifest });
+    await dispatch('init', { manifest });
     const alias = stateDir.toUpperCase(); const physical = await canonicalStateDirectory(stateDir);
     if ((await canonicalStateDirectory(alias)).toLocaleLowerCase('und') !== physical.toLocaleLowerCase('und')) return t.skip('the test volume is case-sensitive');
     const [claim] = await dispatch('start', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', agent_task_path: '/root/canonical-sol', agent_role: 'avsp_sol_high', native_agent_started: true });
@@ -789,12 +793,12 @@ test('does not use a shell for a native executable on Windows', async () => {
 
 test('derives the CLI reasoning effort from the active workflow total-review role', async () => {
   const item = await fixture();
-  const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(workspace, '.codex', 'workflow-controller'); const manifest = path.join(item.root, 'manifest.json');
+  const workspace = path.join(item.root, 'workspace'); const stateDir = stateDirFor(workspace); const manifest = path.join(item.root, 'manifest.json');
   try {
-    await mkdir(workspace);
+    await mkdir(workspace, { recursive: true });
     await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
     await writeFile(manifest, JSON.stringify(v3ReviewManifest(workspace, { goal: 'Use xhigh review', requirements: [{ id: 'R1', text: 'role is derived' }], agentType: 'avsp_sol_xhigh', executionOwner: '/root/xhigh-review' })));
-    await dispatch('init', { state_dir: stateDir, manifest });
+    await dispatch('init', { manifest });
     const [claim] = await dispatch('claim', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', agent_task_path: '/root/xhigh-review', agent_role: 'avsp_sol_xhigh' });
     await dispatch('heartbeat', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', claim_id: claim.node.claim_id });
     let invocation;
@@ -816,12 +820,12 @@ test('derives the CLI reasoning effort from the active workflow total-review rol
 
 test('keeps a workflow-bound Sol review running past the soft deadline and saves the eventual result', async () => {
   const item = await fixture();
-  const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(workspace, '.codex', 'workflow-controller'); const manifest = path.join(item.root, 'manifest.json');
+  const workspace = path.join(item.root, 'workspace'); const stateDir = stateDirFor(workspace); const manifest = path.join(item.root, 'manifest.json');
   try {
-    await mkdir(workspace);
+    await mkdir(workspace, { recursive: true });
     await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
     await writeFile(manifest, JSON.stringify(v3ReviewManifest(workspace, { goal: 'Verify timeout closure', requirements: [{ id: 'R1', text: 'timeout result is persisted' }], executionOwner: '/root/timeout-review' })));
-    await dispatch('init', { state_dir: stateDir, manifest });
+    await dispatch('init', { manifest });
     const [claim] = await dispatch('claim', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', agent_task_path: '/root/timeout-review', agent_role: 'avsp_sol_high' });
     await dispatch('heartbeat', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', claim_id: claim.node.claim_id });
     const [auditContext] = await dispatch('audit-context', { state_dir: stateDir, task_id: 'review-task' });
@@ -880,12 +884,12 @@ test('keeps a workflow-bound Sol review running past the soft deadline and saves
 
 test('marks an exit-zero workflow-bound review unavailable when no valid verdict was emitted', async () => {
   const item = await fixture();
-  const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(workspace, '.codex', 'workflow-controller'); const manifest = path.join(item.root, 'manifest.json');
+  const workspace = path.join(item.root, 'workspace'); const stateDir = stateDirFor(workspace); const manifest = path.join(item.root, 'manifest.json');
   try {
-    await mkdir(workspace);
+    await mkdir(workspace, { recursive: true });
     await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
     await writeFile(manifest, JSON.stringify(v3ReviewManifest(workspace, { goal: 'Reject empty review', requirements: [{ id: 'R1', text: 'invalid output is visible' }], executionOwner: '/root/empty-review' })));
-    await dispatch('init', { state_dir: stateDir, manifest });
+    await dispatch('init', { manifest });
     const [claim] = await dispatch('claim', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', agent_task_path: '/root/empty-review', agent_role: 'avsp_sol_high' });
     await dispatch('heartbeat', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', claim_id: claim.node.claim_id });
     const spawnProcess = () => {
@@ -1056,11 +1060,11 @@ test('rejects a finding identifier longer than the controller limit', async () =
 
 test('rejects inherited coverage for a workflow requirement named toString', async () => {
   const item = await fixture();
-  const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(workspace, '.codex', 'workflow-controller'); const manifest = path.join(item.root, 'manifest.json');
+  const workspace = path.join(item.root, 'workspace'); const stateDir = stateDirFor(workspace); const manifest = path.join(item.root, 'manifest.json');
   try {
-    await mkdir(workspace); await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
+    await mkdir(workspace, { recursive: true }); await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
     await writeFile(manifest, JSON.stringify(v3ReviewManifest(workspace, { goal: 'Reject inherited coverage', requirements: [{ id: 'toString', text: 'coverage must be own' }], executionOwner: '/root/to-string-review' })));
-    await dispatch('init', { state_dir: stateDir, manifest });
+    await dispatch('init', { manifest });
     const [claim] = await dispatch('claim', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', agent_task_path: '/root/to-string-review', agent_role: 'avsp_sol_high' });
     await dispatch('heartbeat', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', claim_id: claim.node.claim_id });
     const [context] = await dispatch('audit-context', { state_dir: stateDir, task_id: 'review-task' });
@@ -1086,12 +1090,12 @@ test('rejects inherited coverage for a workflow requirement named toString', asy
 
 test('marks a structurally complete workflow review unavailable when its audit context is stale or mismatched', async () => {
   const item = await fixture();
-  const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(workspace, '.codex', 'workflow-controller'); const manifest = path.join(item.root, 'manifest.json');
+  const workspace = path.join(item.root, 'workspace'); const stateDir = stateDirFor(workspace); const manifest = path.join(item.root, 'manifest.json');
   try {
-    await mkdir(workspace);
+    await mkdir(workspace, { recursive: true });
     await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
     await writeFile(manifest, JSON.stringify(v3ReviewManifest(workspace, { goal: 'Reject mismatched review', requirements: [{ id: 'R1', text: 'review context must match' }], executionOwner: '/root/mismatched-review' })));
-    await dispatch('init', { state_dir: stateDir, manifest });
+    await dispatch('init', { manifest });
     const [claim] = await dispatch('claim', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', agent_task_path: '/root/mismatched-review', agent_role: 'avsp_sol_high' });
     await dispatch('heartbeat', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', claim_id: claim.node.claim_id });
     const [auditContext] = await dispatch('audit-context', { state_dir: stateDir, task_id: 'review-task' });
@@ -1122,12 +1126,12 @@ test('marks a structurally complete workflow review unavailable when its audit c
 
 test('closes a workflow-bound unavailable Sol review with an explicit completion attestation', async () => {
   const item = await fixture();
-  const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(workspace, '.codex', 'workflow-controller'); const manifest = path.join(item.root, 'manifest.json');
+  const workspace = path.join(item.root, 'workspace'); const stateDir = stateDirFor(workspace); const manifest = path.join(item.root, 'manifest.json');
   try {
-    await mkdir(workspace);
+    await mkdir(workspace, { recursive: true });
     await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
     await writeFile(manifest, JSON.stringify(v3ReviewManifest(workspace, { goal: 'Persist unavailable review', requirements: [{ id: 'R1', text: 'unavailable result is visible' }], executionOwner: '/root/unavailable-review' })));
-    await dispatch('init', { state_dir: stateDir, manifest });
+    await dispatch('init', { manifest });
     const [claim] = await dispatch('claim', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', agent_task_path: '/root/unavailable-review', agent_role: 'avsp_sol_high' });
     await dispatch('heartbeat', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', claim_id: claim.node.claim_id });
     const spawnProcess = () => {
@@ -1152,12 +1156,12 @@ test('closes a workflow-bound unavailable Sol review with an explicit completion
 
 test('records native_agent_start_failed when the workflow-bound Sol process cannot start', async () => {
   const item = await fixture();
-  const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(workspace, '.codex', 'workflow-controller'); const manifest = path.join(item.root, 'manifest.json');
+  const workspace = path.join(item.root, 'workspace'); const stateDir = stateDirFor(workspace); const manifest = path.join(item.root, 'manifest.json');
   try {
-    await mkdir(workspace);
+    await mkdir(workspace, { recursive: true });
     await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
     await writeFile(manifest, JSON.stringify(v3ReviewManifest(workspace, { goal: 'Persist start failure', requirements: [{ id: 'R1', text: 'start failure is visible' }], executionOwner: '/root/start-failure-review' })));
-    await dispatch('init', { state_dir: stateDir, manifest });
+    await dispatch('init', { manifest });
     const [claim] = await dispatch('claim', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', agent_task_path: '/root/start-failure-review', agent_role: 'avsp_sol_high' });
     await dispatch('heartbeat', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', claim_id: claim.node.claim_id });
     const spawnProcess = () => {
@@ -1180,12 +1184,12 @@ test('records native_agent_start_failed when the workflow-bound Sol process cann
 
 test('records native_agent_exit_confirmed when a started Sol process later reports an error', async () => {
   const item = await fixture();
-  const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(workspace, '.codex', 'workflow-controller'); const manifest = path.join(item.root, 'manifest.json');
+  const workspace = path.join(item.root, 'workspace'); const stateDir = stateDirFor(workspace); const manifest = path.join(item.root, 'manifest.json');
   try {
-    await mkdir(workspace);
+    await mkdir(workspace, { recursive: true });
     await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
     await writeFile(manifest, JSON.stringify(v3ReviewManifest(workspace, { goal: 'Persist post-start process error', requirements: [{ id: 'R1', text: 'post-start failure is visible' }], executionOwner: '/root/post-start-error-review' })));
-    await dispatch('init', { state_dir: stateDir, manifest });
+    await dispatch('init', { manifest });
     const [claim] = await dispatch('claim', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', agent_task_path: '/root/post-start-error-review', agent_role: 'avsp_sol_high' });
     await dispatch('heartbeat', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', claim_id: claim.node.claim_id });
     const spawnProcess = () => {
@@ -1206,12 +1210,12 @@ test('records native_agent_exit_confirmed when a started Sol process later repor
 
 test('records native_agent_start_failed when spawning synchronously throws', async () => {
   const item = await fixture();
-  const workspace = path.join(item.root, 'workspace'); const stateDir = path.join(workspace, '.codex', 'workflow-controller'); const manifest = path.join(item.root, 'manifest.json');
+  const workspace = path.join(item.root, 'workspace'); const stateDir = stateDirFor(workspace); const manifest = path.join(item.root, 'manifest.json');
   try {
-    await mkdir(workspace);
+    await mkdir(workspace, { recursive: true });
     await writeFile(path.join(workspace, 'source.txt'), 'review target\n');
     await writeFile(manifest, JSON.stringify(v3ReviewManifest(workspace, { goal: 'Persist synchronous start failure', requirements: [{ id: 'R1', text: 'sync start failure is visible' }], executionOwner: '/root/sync-start-failure-review' })));
-    await dispatch('init', { state_dir: stateDir, manifest });
+    await dispatch('init', { manifest });
     const [claim] = await dispatch('claim', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', agent_task_path: '/root/sync-start-failure-review', agent_role: 'avsp_sol_high' });
     await dispatch('heartbeat', { state_dir: stateDir, task_id: 'review-task', node_id: 'total-review', claim_id: claim.node.claim_id });
     const result = await runSolReview([

@@ -7,17 +7,17 @@ import { ControllerError, canonicalStateDirectory, dispatch, statePathKey } from
 import { globalWorkflowStorePath, readGlobalTaskChangeToken } from './global_workflow_store.mjs';
 
 export const TOOLS = [
-  ['workflow_init', '从 JSON 清单创建持久化 DAG；v3 可用 review_entry_stage 直接从 terra_single、terra_cohort、sol_high 或 sol_xhigh 开始，并必须给出 review_context.environment/scenarios/boundaries；state_dir 必须是 workspace 内的绝对逻辑 namespace，目录是否已存在都不会被读取、扫描或写入。', ['manifest', 'state_dir'], { manifest: { description: 'v3 工作流清单对象、内联 JSON 对象字符串或普通 JSON 文件路径。requirements 必须为 [{id,text}]；每个 assurance 维度为 {status,evidence:string[],rationale}，字段名为 impact/recoverability/uncertainty/verifiability/coupling，另含 selection_reason；节点使用 id（不是 node_id）及完整路由字段。', anyOf: [{ type: 'object' }, { type: 'string' }] }, state_dir: { type: 'string' } }],
+  ['workflow_init', '从 JSON 清单创建持久化 DAG；v3 可用 review_entry_stage 直接从 terra_single、terra_cohort、sol_high 或 sol_xhigh 开始，并必须给出 review_context.environment/scenarios/boundaries。控制器从 manifest.workspace 自动派生全局 state_dir 并在结果中返回；项目内不使用任何工作流路径或状态。', ['manifest'], { manifest: { description: 'v3 工作流清单对象、内联 JSON 对象字符串或普通 JSON 文件路径。requirements 必须为 [{id,text}]；每个 assurance 维度为 {status,evidence:string[],rationale}，字段名为 impact/recoverability/uncertainty/verifiability/coupling，另含 selection_reason；节点使用 id（不是 node_id）及完整路由字段。', anyOf: [{ type: 'object' }, { type: 'string' }] } }],
   ['workflow_raise_assurance', '在末端质量门开始前，按结构化新证据将 v3 Terra assurance 提高到 Sol，并把同一个未认领门重绑定为 sol_high；不得降级或新增第二个审核门。', ['task_id', 'target_assurance_level', 'reason', 'assurance_assessment', 'replacement_agent_task_path', 'integration_owner', 'state_dir'], { task_id: { type: 'string' }, target_assurance_level: { enum: ['sol'] }, reason: { type: 'string' }, assurance_assessment: { anyOf: [{ type: 'object' }, { type: 'string' }], description: '五个风险维度分别含 status、evidence、rationale，并含 selection_reason；优先传内联 JSON 对象，外部文件不得位于目标 workspace 内。' }, replacement_agent_task_path: { type: 'string', description: '预留给新末端审核者的独立 agent task path。' }, integration_owner: { type: 'string', description: '负责该末端门集成与关闭的真实协调者 task path。' }, state_dir: { type: 'string' } }],
   ['workflow_rebind_pending', '确认预定实例已停止或未启动后，为未认领的 pending 节点换绑 execution_owner；保留原因和旧 owner。', ['task_id', 'node_id', 'reason', 'replacement_agent_task_path', 'previous_agent_stopped', 'state_dir'], { task_id: { type: 'string' }, node_id: { type: 'string' }, reason: { type: 'string' }, replacement_agent_task_path: { type: 'string' }, previous_agent_stopped: { type: 'boolean', const: true }, state_dir: { type: 'string' } }],
   ['workflow_invalidate_gate', '末端 pass 在关闭前因任务快照或工作区变化失效时，保留旧记录并受控重开质量门；审核门必须绑定新的独立 reviewer，terra_cohort 可指定首个重开 lane。', ['task_id', 'reason', 'replacement_agent_task_path', 'state_dir'], { task_id: { type: 'string' }, reason: { type: 'string' }, replacement_agent_task_path: { type: 'string', description: '审核门失效时必填。' }, reviewer_slot: { enum: ['coverage', 'adversarial'], description: '仅重开 v3 terra_cohort 时可选，指定预留给替代审核者的首个 lane，默认 coverage。' }, state_dir: { type: 'string' } }],
   ['workflow_reconcile_workspace', '恢复指定初始化任务留下的工作区租约；必须提供 workspace、task_id 和 state_dir。', ['workspace', 'task_id', 'state_dir'], { workspace: { type: 'string' }, task_id: { type: 'string' }, state_dir: { type: 'string' } }],
   ['workflow_ready', '返回所有依赖均已成功的 DAG 节点。', ['task_id', 'state_dir'], { task_id: { type: 'string' }, state_dir: { type: 'string' } }],
   ['workflow_claim', '认领就绪节点并返回 claim_id；v3 terra_cohort 必须提供 coverage 或 adversarial reviewer_slot，两个 lane 可并行。', ['task_id', 'node_id', 'agent_task_path', 'agent_role', 'state_dir'], { task_id: { type: 'string' }, node_id: { type: 'string' }, agent_task_path: { type: 'string' }, agent_thread_id: { type: 'string' }, agent_role: { type: 'string' }, reviewer_slot: { enum: ['coverage', 'adversarial'], description: '仅 v3 terra_cohort 必填。' }, fallback_reason: { type: 'string' }, lease_duration_sec: { type: 'integer', minimum: 1 }, activation_timeout_sec: { type: 'integer', minimum: 1 }, state_dir: { type: 'string' } }],
-  ['workflow_start', '由已开始回合的原生代理原子认领并激活节点；v3 terra_cohort 必须提供 coverage 或 adversarial reviewer_slot。', ['task_id', 'node_id', 'agent_task_path', 'agent_role', 'native_agent_started', 'state_dir'], { task_id: { type: 'string' }, node_id: { type: 'string' }, agent_task_path: { type: 'string' }, agent_thread_id: { type: 'string' }, agent_role: { type: 'string' }, reviewer_slot: { enum: ['coverage', 'adversarial'], description: '仅 v3 terra_cohort 必填。' }, fallback_reason: { type: 'string' }, native_agent_started: { type: 'boolean', const: true, description: '仅在原生 agent 已开始当前回合后传入。' }, lease_duration_sec: { type: 'integer', minimum: 1 }, activation_timeout_sec: { type: 'integer', minimum: 1 }, state_dir: { type: 'string' } }],
+  ['workflow_start', '由已开始回合的原生代理原子认领并激活节点；返回的 claim_id 必须原样保存并用于 heartbeat、record_review 与 complete，禁止猜测。v3 terra_cohort 必须提供 coverage 或 adversarial reviewer_slot。', ['task_id', 'node_id', 'agent_task_path', 'agent_role', 'native_agent_started', 'state_dir'], { task_id: { type: 'string' }, node_id: { type: 'string' }, agent_task_path: { type: 'string' }, agent_thread_id: { type: 'string' }, agent_role: { type: 'string' }, reviewer_slot: { enum: ['coverage', 'adversarial'], description: '仅 v3 terra_cohort 必填。' }, fallback_reason: { type: 'string' }, native_agent_started: { type: 'boolean', const: true, description: '仅在原生 agent 已开始当前回合后传入。' }, lease_duration_sec: { type: 'integer', minimum: 1 }, activation_timeout_sec: { type: 'integer', minimum: 1 }, state_dir: { type: 'string' } }],
   ['workflow_acquire_write_lock', '仅在即将修改文件时，为实际最小 workspace 相对路径申请短写锁；声明 workspace_claims 只是可申请上界，不会在 init 时预锁。完成该组写入后必须立即释放。', ['task_id', 'node_id', 'claim_id', 'write_prefixes', 'purpose', 'state_dir'], { task_id: { type: 'string' }, node_id: { type: 'string' }, claim_id: { type: 'string' }, write_prefixes: { type: 'array', minItems: 1, maxItems: 64, items: { type: 'string' }, description: '实际将要修改的最小 workspace 相对 POSIX 路径；不得使用彼此重叠的前缀。' }, purpose: { type: 'string', description: '这一次实际写入组的具体目的；根目录锁只限确有全工作区副作用时。' }, state_dir: { type: 'string' } }],
   ['workflow_release_write_lock', '完成一组实际写入后立即释放当前或刚终止 claim 持有的指定短写锁；后者用于自动清理失败后的安全重试。节点完成、放弃、救援或重排队也会自动清理其锁。', ['task_id', 'node_id', 'claim_id', 'lock_ids', 'state_dir'], { task_id: { type: 'string' }, node_id: { type: 'string' }, claim_id: { type: 'string' }, lock_ids: { type: 'array', minItems: 1, maxItems: 64, items: { type: 'string' } }, state_dir: { type: 'string' } }],
-  ['workflow_complete', '以匹配的 claim_id、内联 JSON 结果和 completion_attestation 完成节点；工作区内的结果 JSON 文件路径会被拒绝；放弃使用 workflow_abandon。', ['task_id', 'node_id', 'claim_id', 'status', 'result', 'completion_attestation', 'state_dir'], { task_id: { type: 'string' }, node_id: { type: 'string' }, claim_id: { type: 'string' }, status: { enum: ['succeeded', 'failed', 'blocked', 'skipped', 'unavailable'] }, result: { anyOf: [{ type: 'object' }, { type: 'string' }], description: '优先传内联 JSON 对象或 JSON 对象字符串；外部文件路径仅允许位于目标 workspace 之外。total_review 的正式制品由控制器写入全局 artifact store。' }, completion_attestation: { enum: ['native_agent_finished', 'root_rescue_self_completion', 'native_agent_exit_confirmed', 'native_agent_start_failed'], description: '普通节点用 native_agent_finished；Root 救援用 root_rescue_self_completion；总审 unavailable 可用其余两项。' }, state_dir: { type: 'string' } }],
+  ['workflow_complete', '只由 main/root 调用：使用 workflow_start 返回的同一 claim_id、内联结果和 completion_attestation。审核节点必须先由 main/root 成功 workflow_record_review，再在确认审核代理原生 Completed 后以 native_agent_finished 完成；审核代理自身只返回审核 JSON。工作区内的结果 JSON 文件路径会被拒绝；放弃使用 workflow_abandon。', ['task_id', 'node_id', 'claim_id', 'status', 'result', 'completion_attestation', 'state_dir'], { task_id: { type: 'string' }, node_id: { type: 'string' }, claim_id: { type: 'string' }, status: { enum: ['succeeded', 'failed', 'blocked', 'skipped', 'unavailable'] }, result: { anyOf: [{ type: 'object' }, { type: 'string' }], description: '优先传内联 JSON 对象或 JSON 对象字符串；外部文件路径仅允许位于目标 workspace 之外。total_review 的正式制品由控制器写入全局 artifact store。' }, completion_attestation: { enum: ['native_agent_finished', 'root_rescue_self_completion', 'native_agent_exit_confirmed', 'native_agent_start_failed'], description: '普通节点：仅 root 在确认原生代理 Completed 后用 native_agent_finished。root 救援：root_rescue_self_completion。native_agent_start_failed/native_agent_exit_confirmed 仅用于已有活动 claim 的 workflow-bound total_review，且控制器已记录 unavailable review。' }, state_dir: { type: 'string' } }],
   ['workflow_heartbeat', '更新仍在运行节点的紧凑心跳；仅有效 claim_id 可以更新。', ['task_id', 'node_id', 'claim_id', 'state_dir'], { task_id: { type: 'string' }, node_id: { type: 'string' }, claim_id: { type: 'string' }, state_dir: { type: 'string' } }],
   ['workflow_checkpoint', '持久化运行中代理的紧凑进度 checkpoint；中断后新的代理将收到它和依赖证据组成的恢复包。工作区内 JSON 文件路径会被拒绝。', ['task_id', 'node_id', 'claim_id', 'checkpoint', 'state_dir'], { task_id: { type: 'string' }, node_id: { type: 'string' }, claim_id: { type: 'string' }, checkpoint: { anyOf: [{ type: 'object' }, { type: 'string' }], description: '不超过 32 KiB 的内联 JSON 对象或 JSON 对象字符串；外部文件路径仅允许位于目标 workspace 之外。' }, state_dir: { type: 'string' } }],
   ['workflow_abandon', '在确认原执行者已停止后，以有效 claim_id 显式放弃运行节点；v3 terra_cohort 还必须给出 lane reviewer_slot。', ['task_id', 'node_id', 'claim_id', 'reason', 'previous_agent_stopped', 'state_dir'], { task_id: { type: 'string' }, node_id: { type: 'string' }, claim_id: { type: 'string' }, reason: { type: 'string' }, reviewer_slot: { enum: ['coverage', 'adversarial'], description: '仅 v3 terra_cohort 必填。' }, previous_agent_stopped: { type: 'boolean', const: true }, state_dir: { type: 'string' } }],
@@ -25,13 +25,13 @@ export const TOOLS = [
   ['workflow_requeue_stale', '协调者已用原生状态确认旧代理停止后，原子地重排队已过期 claim，并把替代实例保留到对应执行者或 cohort lane 后返回恢复包；控制器不能自行停止或恢复 Codex 代理。', ['task_id', 'node_id', 'claim_id', 'reason', 'replacement_agent_task_path', 'previous_agent_stopped', 'state_dir'], { task_id: { type: 'string' }, node_id: { type: 'string' }, claim_id: { type: 'string' }, reason: { type: 'string' }, replacement_agent_task_path: { type: 'string' }, reviewer_slot: { enum: ['coverage', 'adversarial'], description: '仅重排 v3 terra_cohort lane 时必填。' }, previous_agent_stopped: { type: 'boolean', const: true }, state_dir: { type: 'string' } }],
   ['workflow_rescue', '确认 Luna executor 已停止后，把一个正在运行的 delegable 节点显式转交 main/root 救援；记录原 claim、原因、替代路径和恢复包，不伪装为 Luna 已完成。', ['task_id', 'node_id', 'claim_id', 'reason', 'replacement_agent_task_path', 'previous_agent_stopped', 'state_dir'], { task_id: { type: 'string' }, node_id: { type: 'string' }, claim_id: { type: 'string' }, reason: { type: 'string' }, replacement_agent_task_path: { type: 'string' }, previous_agent_stopped: { type: 'boolean', const: true }, state_dir: { type: 'string' } }],
   ['workflow_audit_context', '为独立审核构建完整证据包，包含目标、环境/场景/边界、当前状态、全部审核与修复历史。', ['task_id', 'state_dir'], { task_id: { type: 'string' }, state_dir: { type: 'string' } }],
-  ['workflow_record_review', '记录绑定 claim、快照和指纹的独立 Terra/Sol 审核；v3 高级审核先独立判断再核对历史，且必须回填 audit-context 的 review_history_digest；terra_cohort 的质询轮必须精确挑战另一 lane 的盲审。审核内容应以内联 JSON 传入，工作区内 JSON 文件路径会被拒绝。', ['task_id', 'review', 'state_dir'], { task_id: { type: 'string' }, review: { anyOf: [{ type: 'object' }, { type: 'string' }], description: '审核 JSON 必须含 claim_id；v3 还必须含 independent_assessment、history_reconciliation、review_history_digest；cohort 质询轮还需 challenge_targets:[另一 lane 的 blind claim_id]。优先传内联对象，外部文件路径仅允许位于目标 workspace 之外。' }, state_dir: { type: 'string' } }],
+  ['workflow_record_review', '只由 main/root 调用：先等待审核代理返回审核 JSON，再用 workflow_start 返回的同一 claim_id 记录；成功后才能 workflow_complete。v3 高级审核先独立判断再核对历史，且必须回填 audit-context 的 review_history_digest；terra_cohort 的质询轮必须精确挑战另一 lane 的盲审。审核内容应以内联 JSON 传入，工作区内 JSON 文件路径会被拒绝。', ['task_id', 'review', 'state_dir'], { task_id: { type: 'string' }, review: { anyOf: [{ type: 'object' }, { type: 'string' }], description: '审核 JSON 必须含 claim_id；v3 还必须含 independent_assessment、history_reconciliation、review_history_digest；cohort 质询轮还需 challenge_targets:[另一 lane 的 blind claim_id]。优先传内联对象，外部文件路径仅允许位于目标 workspace 之外。' }, state_dir: { type: 'string' } }],
   ['workflow_record_repair', '记录失败审核或 v3 cohort 的精确修复与验证证据；v3 在每次有效失败后必须先记录该次修复，才可升级。修复内容应以内联 JSON 传入，工作区内 JSON 文件路径会被拒绝。', ['task_id', 'repair', 'state_dir'], { task_id: { type: 'string' }, repair: { anyOf: [{ type: 'object' }, { type: 'string' }], description: '修复 JSON 必须含 source_review_claim_id、repaired_by、addressed_findings、verification_evidence 和当前 workspace_fingerprint。优先传内联对象，外部文件路径仅允许位于目标 workspace 之外。' }, state_dir: { type: 'string' } }],
   ['workflow_close_check', '返回所有节点是否已完成、总审是否仍一致，并在通过时释放工作区租约。', ['task_id', 'state_dir'], { task_id: { type: 'string' }, state_dir: { type: 'string' } }],
   ['workflow_release_workspace', '中断后确认原执行者已停止，且没有运行节点时显式释放工作区租约。', ['task_id', 'previous_agent_stopped', 'state_dir'], { task_id: { type: 'string' }, previous_agent_stopped: { type: 'boolean', const: true }, state_dir: { type: 'string' } }],
   ['workflow_stale', '列出未在启动期限内产生首个心跳或之后失去心跳的运行节点，并返回当前工作区的实际写锁；不会自动接管或过期释放。', ['task_id', 'state_dir'], { task_id: { type: 'string' }, state_dir: { type: 'string' } }],
   ['workflow_status', '默认返回适合轮询的任务摘要及当前工作区实际写锁；仅在排障或审计需要完整参与者、结果和审核记录时设 detail=full。', ['task_id', 'state_dir'], { task_id: { type: 'string' }, state_dir: { type: 'string' }, detail: { enum: ['summary', 'full'], description: '默认 summary；full 返回控制器完整状态视图。' } }],
-  ['workflow_wait', '按 cursor 被动等待可操作变化；忽略普通 heartbeat，默认 300 秒、最大 600 秒。', ['task_id', 'state_dir', 'after_cursor'], { task_id: { type: 'string' }, state_dir: { type: 'string' }, after_cursor: { type: 'string', description: '最近状态或等待结果的 cursor。' }, timeout_sec: { type: 'integer', minimum: 1, maximum: 600, description: '等待上限，默认 300 秒。' } }],
+  ['workflow_wait', '按 workflow_status 或上次 workflow_wait 返回的 cursor 被动等待可操作变化；每次必须传 workflow_init/status 返回的同一非空 task_id 与 state_dir。忽略普通 heartbeat，默认 300 秒、最大 600 秒。', ['task_id', 'state_dir', 'after_cursor'], { task_id: { type: 'string', minLength: 1, description: '复用 workflow_init/status 返回的 task_id，不能为空。' }, state_dir: { type: 'string' }, after_cursor: { type: 'string', description: '最近 workflow_status 或 workflow_wait 返回的 cursor。' }, timeout_sec: { type: 'integer', minimum: 1, maximum: 600, description: '等待上限，默认 300 秒。' } }],
   ['workflow_doctor', '只读诊断指定任务的用户级全局 SQLite 状态、工作区租约、过期节点与受控重派前提；诊断结果以 database_path 和 task_key 定位任务，不会修改或删除状态。', ['task_id', 'state_dir'], { task_id: { type: 'string' }, state_dir: { type: 'string' } }],
 ].map(([name, description, required, properties]) => ({ name, description, inputSchema: { type: 'object', required, properties } }));
 
@@ -282,9 +282,13 @@ function compactStatus(result) {
   ]);
 }
 
-function compactNodeEnvelope(result, fallbackReason = null) {
+function compactNodeEnvelope(result, fallbackReason = null, stateDir = null) {
   return definedObject([
     ['task_id', result.task_id],
+    ['state_dir', stateDir],
+    ['node_id', result.node?.id ?? null],
+    ['claim_id', result.claim_id ?? result.node?.claim_id ?? null],
+    ['reviewer_slot', result.reviewer_slot ?? null],
     ['review_protocol_version', result.review_protocol_version],
     ['review_entry_stage', result.review_entry_stage],
     ['assurance_level', result.assurance_level],
@@ -304,7 +308,7 @@ export function compactMcpResult(toolName, result, argumentsValue = {}) {
     if (argumentsValue.detail !== undefined && !['summary', 'full'].includes(argumentsValue.detail)) throw new ControllerError('workflow_status.detail must be summary or full');
     return argumentsValue.detail === 'full' ? result : compactStatus(result);
   }
-  if (toolName === 'workflow_init') return { state_path: result.state_path, database_path: result.database_path, task_key: result.task_key, task: compactStatus(result.task) };
+  if (toolName === 'workflow_init') return { state_dir: result.state_dir, state_path: result.state_path, database_path: result.database_path, task_key: result.task_key, task: compactStatus(result.task) };
   if (toolName === 'workflow_raise_assurance') return {
     task_id: result.task_id,
     prior_assurance_level: result.prior_assurance_level,
@@ -324,7 +328,7 @@ export function compactMcpResult(toolName, result, argumentsValue = {}) {
   };
   if (toolName === 'workflow_ready') return { ready_nodes: (result.ready_nodes ?? []).map(compactReadyNode) };
   if (['workflow_claim', 'workflow_start', 'workflow_heartbeat', 'workflow_abandon', 'workflow_retry', 'workflow_rebind_pending', 'workflow_requeue_stale', 'workflow_rescue', 'workflow_complete'].includes(toolName)) {
-    return compactNodeEnvelope(result, argumentsValue.fallback_reason);
+    return compactNodeEnvelope(result, argumentsValue.fallback_reason, argumentsValue.state_dir);
   }
   if (toolName === 'workflow_record_review') return { task_id: result.task_id, assurance_level: result.assurance_level, effective_assurance_level: result.effective_assurance_level, review: compactReview(result.review), max_review_charter: compactMaxReviewCharter(result.max_review_charter) };
   if (toolName === 'workflow_record_repair') return { task_id: result.task_id, assurance_level: result.assurance_level, effective_assurance_level: result.effective_assurance_level, repair_record: result.repair_record, max_review_charter: compactMaxReviewCharter(result.max_review_charter) };
@@ -340,7 +344,9 @@ function mcpTextSummary(toolName, value, { error = false } = {}) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return `${toolName} completed.`;
   const taskId = value.task_id ?? value.task?.task_id ?? null;
   const state = value.reason ?? value.status ?? value.workspace_lease_status ?? value.node?.status ?? null;
-  const details = [taskId ? `task=${summaryText(taskId)}` : null, state !== null ? `state=${summaryText(state)}` : null].filter(Boolean);
+  const nodeId = value.node_id ?? value.node?.id ?? null;
+  const claimId = value.claim_id ?? value.node?.claim_id ?? null;
+  const details = [taskId ? `task=${summaryText(taskId)}` : null, nodeId ? `node=${summaryText(nodeId)}` : null, claimId ? `claim=${summaryText(claimId)}` : null, state !== null ? `state=${summaryText(state)}` : null].filter(Boolean);
   return `${toolName} completed${details.length ? ` (${details.join(', ')})` : ''}.`;
 }
 
@@ -461,7 +467,7 @@ async function waitForWorkflowChange(parameters, signal) {
   const rawStateDir = typeof parameters.state_dir === 'string' ? parameters.state_dir.trim() : '';
   if (!rawStateDir || !path.isAbsolute(rawStateDir)) throw new ControllerError('state_dir must be an absolute path');
   const afterCursor = typeof parameters.after_cursor === 'string' ? parameters.after_cursor.trim() : '';
-  if (!taskId) throw new ControllerError('task_id must be a non-empty string');
+  if (!taskId) throw new ControllerError('task_id must be a non-empty string; call workflow_status or reuse the task_id returned by workflow_init before calling workflow_wait');
   if (!/^[a-f0-9]{64}$/.test(afterCursor)) throw new ControllerError('after_cursor must be a workflow_status or workflow_wait cursor');
   const timeoutSec = workflowWaitTimeout(parameters.timeout_sec);
   // Reserve a lexical key before the first filesystem await. This closes the
@@ -493,15 +499,15 @@ async function waitForWorkflowChange(parameters, signal) {
       if (summary.cursor !== afterCursor) return workflowWaitResult(summary, true, 'state_changed');
       const remainingMs = deadline - Date.now();
       if (remainingMs <= 0) return workflowWaitResult(summary, false, 'timeout');
-      const controlPath = typeof state.workspace_lease?.registry_path === 'string' ? path.resolve(state.workspace_lease.registry_path) : null;
+      const workspace = state.workspace;
       const taskStatePath = path.join(stateDir, `${taskId}.sqlite`);
-      taskSignal ??= await readGlobalTaskChangeToken(taskStatePath, controlPath);
+      taskSignal ??= await readGlobalTaskChangeToken(taskStatePath, workspace);
       const nextDeadline = nextWorkflowDeadlineMs(summary);
       const deadlineWait = nextDeadline === null ? remainingMs : Math.max(0, nextDeadline - Date.now());
       const waitMs = Math.min(intervalMs, remainingMs, deadlineWait);
       if (waitMs <= 0) continue;
-      await waitForTaskStateSignal(stateDir, taskId, controlPath, waitMs, signal);
-      const nextSignal = await readGlobalTaskChangeToken(taskStatePath, controlPath);
+      await waitForTaskStateSignal(stateDir, taskId, workspace, waitMs, signal);
+      const nextSignal = await readGlobalTaskChangeToken(taskStatePath, workspace);
       if (sameTaskSignal(taskSignal, nextSignal)) {
         intervalMs = Math.min(MAX_INTERNAL_WAIT_INTERVAL_MS, Math.ceil(intervalMs * 1.8));
       } else {

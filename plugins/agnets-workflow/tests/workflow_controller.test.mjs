@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { DatabaseSync } from 'node:sqlite';
 import os from 'node:os';
@@ -17,6 +17,8 @@ test.after(async () => {
   await rm(isolatedCodexHome, { recursive: true, force: true });
 });
 const controller = path.join(root, 'scripts', 'workflow_controller.mjs');
+const { globalStateDirectoryForWorkspace } = await import('../scripts/workflow_controller.mjs');
+const stateDirFor = workspace => { mkdirSync(workspace, { recursive: true }); return globalStateDirectoryForWorkspace(workspace); };
 
 async function canonicalStateNamespace(stateDir) {
   const { canonicalStateDirectory } = await import('../scripts/workflow_controller.mjs');
@@ -50,7 +52,7 @@ test('v3 requires an explicit justification for a workspace-wide write claim', a
   const { ControllerError, dispatch } = await import('../scripts/workflow_controller.mjs');
   const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-claim-scope-'));
   const workspace = path.join(temp, 'workspace');
-  const stateDir = path.join(workspace, '.codex', 'workflow-controller');
+  const stateDir = stateDirFor(workspace);
   const manifestPath = path.join(temp, 'manifest.json');
   try {
     await mkdir(workspace, { recursive: true });
@@ -58,7 +60,7 @@ test('v3 requires an explicit justification for a workspace-wide write claim', a
     delete manifest.global_write_justification;
     await writeFile(manifestPath, JSON.stringify(manifest));
     await assert.rejects(
-      () => dispatch('init', { manifest: manifestPath, state_dir: stateDir }),
+      () => dispatch('init', { manifest: manifestPath, }),
       error => error instanceof ControllerError && /global_write_justification is required/.test(error.message),
     );
   } finally {
@@ -66,31 +68,34 @@ test('v3 requires an explicit justification for a workspace-wide write claim', a
   }
 });
 
-test('v3 requires every new task state directory to stay in a non-ignored workspace directory', async () => {
+test('v3 derives a global namespace and rejects caller-selected state directories', async () => {
   const { ControllerError, dispatch } = await import('../scripts/workflow_controller.mjs');
   const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-state-boundary-'));
   const workspace = path.join(temp, 'workspace');
-  const stateDir = path.join(workspace, '.codex', 'workflow-controller');
+  const stateDir = stateDirFor(workspace);
   const externalStateDir = path.join(temp, 'external-state');
   const ignoredStateDirs = [
     path.join(workspace, '.git', 'workflow-state'),
     path.join(workspace, 'node_modules', 'workflow-state'),
+    path.join(workspace, '.codex', 'workflow-fix-state'),
   ];
   const manifestPath = path.join(temp, 'manifest.json');
   try {
     await mkdir(workspace, { recursive: true });
     await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace)));
-    await dispatch('init', { manifest: manifestPath, state_dir: stateDir });
+    const [initialized] = await dispatch('init', { manifest: manifestPath });
+    assert.equal(initialized.state_dir, await canonicalStateNamespace(stateDir));
+    assert.equal(existsSync(path.join(workspace, '.codex')), false);
     await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace, { task_id: 'external-state' })));
     await assert.rejects(
       () => dispatch('init', { manifest: manifestPath, state_dir: externalStateDir }),
-      error => error instanceof ControllerError && /state_dir must be inside its workspace/.test(error.message),
+      error => error instanceof ControllerError && /derives state_dir from manifest\.workspace|global namespace returned by workflow_init/.test(error.message),
     );
     for (const [index, ignoredStateDir] of ignoredStateDirs.entries()) {
       await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace, { task_id: `ignored-state-${index}` })));
       await assert.rejects(
         () => dispatch('init', { manifest: manifestPath, state_dir: ignoredStateDir }),
-        error => error instanceof ControllerError && /state_dir cannot be inside an ignored workspace directory/.test(error.message),
+        error => error instanceof ControllerError && /derives state_dir from manifest\.workspace|global namespace returned by workflow_init/.test(error.message),
       );
       assert.equal(existsSync(ignoredStateDir), false);
     }
@@ -100,22 +105,49 @@ test('v3 requires every new task state directory to stay in a non-ignored worksp
   }
 });
 
+test('v3 rejects an unsafe quality_review manifest before any task state is created', async () => {
+  const { ControllerError, dispatch } = await import('../scripts/workflow_controller.mjs');
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-quality-risk-'));
+  const workspace = path.join(temp, 'workspace');
+  const stateDir = stateDirFor(workspace);
+  const manifestPath = path.join(temp, 'manifest.json');
+  try {
+    await mkdir(workspace, { recursive: true });
+    const manifest = v3Manifest(workspace, { task_id: 'unsafe-quality-risk' });
+    manifest.nodes[1].execution_risk = 'protected';
+    await writeFile(manifestPath, JSON.stringify(manifest));
+    await assert.rejects(
+      () => dispatch('init', { manifest: manifestPath, }),
+      error => error instanceof ControllerError && /quality_review node must be read_only; set execution_risk/.test(error.message),
+    );
+    assert.equal(existsSync(stateDir), false);
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
 test('v3 runtime initializes current manifests and rejects non-v3 schema states', async () => {
   const { ControllerError, dispatch } = await import('../scripts/workflow_controller.mjs');
   const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-'));
   const workspace = path.join(temp, 'workspace');
-  const stateDir = path.join(workspace, '.codex', 'workflow-controller');
+  const stateDir = stateDirFor(workspace);
   const manifestPath = path.join(temp, 'manifest.json');
   try {
     await mkdir(workspace, { recursive: true });
     await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace)));
-    const [initialized] = await dispatch('init', { manifest: manifestPath, state_dir: stateDir });
+    const [initialized] = await dispatch('init', { manifest: manifestPath, });
     assert.equal(initialized.task.task_id, 'feature');
 
     const [work] = await dispatch('claim', { task_id: 'feature', node_id: 'work', agent_task_path: '/root/work', agent_role: 'avsp_terra_high', state_dir: stateDir });
     const resultPath = path.join(temp, 'work-result.json');
     await writeFile(resultPath, JSON.stringify({ changed: true }));
     await dispatch('heartbeat', { task_id: 'feature', node_id: 'work', claim_id: work.claim_id, state_dir: stateDir });
+    await assert.rejects(
+      () => dispatch('complete', { task_id: 'feature', node_id: 'work', claim_id: work.claim_id, status: 'succeeded', result: resultPath, state_dir: stateDir }),
+      error => error instanceof ControllerError && /requires completion_attestation=native_agent_finished.*main\/root.*Completed/.test(error.message),
+    );
+    const [beforeCompletion] = await dispatch('status', { task_id: 'feature', state_dir: stateDir });
+    assert.equal(beforeCompletion.nodes.find(node => node.id === 'work').status, 'running');
     const [completed] = await dispatch('complete', { task_id: 'feature', node_id: 'work', claim_id: work.claim_id, status: 'succeeded', result: resultPath, completion_attestation: 'native_agent_finished', state_dir: stateDir });
     assert.equal(completed.node.status, 'succeeded');
 
@@ -126,10 +158,10 @@ test('v3 runtime initializes current manifests and rejects non-v3 schema states'
     assert.equal(raised.node.agent_type, 'avsp_sol_high');
 
     await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace, { task_id: 'non-v3', routing_schema_version: 2 })));
-    await assert.rejects(() => dispatch('init', { manifest: manifestPath, state_dir: stateDir }), error => error instanceof ControllerError && /routing_schema_version must be 3/.test(error.message));
+    await assert.rejects(() => dispatch('init', { manifest: manifestPath, }), error => error instanceof ControllerError && /routing_schema_version must be 3/.test(error.message));
 
     await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace, { task_id: 'controlled', assurance_assessment: assessment('controlled') })));
-    await assert.rejects(() => dispatch('init', { manifest: manifestPath, state_dir: stateDir }), error => error instanceof ControllerError && /cannot initialize a persistent workflow/.test(error.message));
+    await assert.rejects(() => dispatch('init', { manifest: manifestPath, }), error => error instanceof ControllerError && /cannot initialize a persistent workflow/.test(error.message));
   } finally {
     await rm(temp, { recursive: true, force: true });
   }
@@ -139,18 +171,16 @@ test('workflow payloads are inline and workspace-local JSON result paths are rej
   const { ControllerError, dispatch } = await import('../scripts/workflow_controller.mjs');
   const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-inline-payloads-'));
   const workspace = path.join(temp, 'workspace');
-  const stateDir = path.join(workspace, '.codex', 'workflow-controller');
+  const stateDir = stateDirFor(workspace);
   const manifestPath = path.join(temp, 'manifest.json');
-  const localResultPath = path.join(stateDir, 'agent-result.json');
+  const localResultPath = path.join(workspace, 'agent-result.json');
   try {
     await mkdir(workspace, { recursive: true });
     await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace, { task_id: 'inline-payloads' })));
-    await dispatch('init', { manifest: manifestPath, state_dir: stateDir });
-    // Simulate an external/legacy producer attempting to use the logical
-    // namespace as a JSON spool.
-    await mkdir(stateDir, { recursive: true });
+    await dispatch('init', { manifest: manifestPath, });
+    // A project-local JSON file is input data, never a controller payload.
     for (const [command, parameter] of [['checkpoint', 'checkpoint'], ['record-review', 'review'], ['record-repair', 'repair'], ['raise-assurance', 'assurance_assessment']]) {
-      const localPath = path.join(stateDir, `${parameter}.json`);
+      const localPath = path.join(workspace, `${parameter}.json`);
       await writeFile(localPath, JSON.stringify({ forbidden: true }));
       await assert.rejects(
         () => dispatch(command, { task_id: 'inline-payloads', [parameter]: localPath, state_dir: stateDir }),
@@ -177,14 +207,14 @@ test('v3 writes workspace coordination only to the user-level SQLite store', asy
   const { globalWorkflowStorePath } = await import('../scripts/global_workflow_store.mjs');
   const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-sqlite-control-'));
   const workspace = path.join(temp, 'workspace');
-  const stateDir = path.join(workspace, 'state-a');
+  const stateDir = stateDirFor(workspace);
   const manifestPath = path.join(temp, 'manifest.json');
   const controlPath = path.join(workspace, '.codex', 'workflow-controller', 'workflow.sqlite');
   try {
     await mkdir(workspace, { recursive: true });
     await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace)));
-    const [initialized] = await dispatch('init', { manifest: manifestPath, state_dir: stateDir });
-    const canonicalStateDir = await canonicalStateNamespace(stateDir);
+    const [initialized] = await dispatch('init', { manifest: manifestPath, });
+    const canonicalStateDir = stateDir;
     assert.equal(initialized.database_path, globalWorkflowStorePath());
     assert.equal(initialized.state_path, globalWorkflowStorePath());
     assert.deepEqual(initialized.task_key, { namespace: canonicalStateDir, task_id: 'feature' });
@@ -225,15 +255,15 @@ test('v3 permits independent write claims in one workspace without taking a whol
   const { dispatch } = await import('../scripts/workflow_controller.mjs');
   const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-disjoint-claims-'));
   const workspace = path.join(temp, 'workspace');
-  const stateDir = path.join(workspace, '.codex', 'workflow-controller');
+  const stateDir = stateDirFor(workspace);
   const alphaManifestPath = path.join(temp, 'alpha.json');
   const betaManifestPath = path.join(temp, 'beta.json');
   try {
     await mkdir(workspace, { recursive: true });
     await writeFile(alphaManifestPath, JSON.stringify(v3Manifest(workspace, { task_id: 'alpha', workspace_claims: [{ mode: 'write', prefix: 'apps/alpha' }] })));
     await writeFile(betaManifestPath, JSON.stringify(v3Manifest(workspace, { task_id: 'beta', workspace_claims: [{ mode: 'write', prefix: 'apps/beta' }] })));
-    const [alpha] = await dispatch('init', { manifest: alphaManifestPath, state_dir: stateDir });
-    const [beta] = await dispatch('init', { manifest: betaManifestPath, state_dir: stateDir });
+    const [alpha] = await dispatch('init', { manifest: alphaManifestPath, });
+    const [beta] = await dispatch('init', { manifest: betaManifestPath, });
     assert.equal(alpha.task.task_id, 'alpha');
     assert.equal(beta.task.task_id, 'beta');
     assert.equal(existsSync(path.join(stateDir, 'workflow.sqlite')), false);
@@ -246,7 +276,7 @@ test('v3 treats workspace claims as a write-lock envelope and locks only actual 
   const { ControllerError, dispatch } = await import('../scripts/workflow_controller.mjs');
   const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-demand-locks-'));
   const workspace = path.join(temp, 'workspace');
-  const stateDir = path.join(workspace, '.codex', 'workflow-controller');
+  const stateDir = stateDirFor(workspace);
   const alphaManifestPath = path.join(temp, 'alpha.json');
   const betaManifestPath = path.join(temp, 'beta.json');
   const resultPath = path.join(temp, 'result.json');
@@ -255,8 +285,8 @@ test('v3 treats workspace claims as a write-lock envelope and locks only actual 
     const sharedClaim = [{ mode: 'write', prefix: 'apps/shared' }];
     await writeFile(alphaManifestPath, JSON.stringify(v3Manifest(workspace, { task_id: 'alpha', workspace_claims: sharedClaim })));
     await writeFile(betaManifestPath, JSON.stringify(v3Manifest(workspace, { task_id: 'beta', workspace_claims: sharedClaim })));
-    await dispatch('init', { manifest: alphaManifestPath, state_dir: stateDir });
-    await dispatch('init', { manifest: betaManifestPath, state_dir: stateDir });
+    await dispatch('init', { manifest: alphaManifestPath, });
+    await dispatch('init', { manifest: betaManifestPath, });
 
     const [alphaStart] = await dispatch('start', { task_id: 'alpha', node_id: 'work', agent_task_path: '/root/work', agent_role: 'avsp_terra_high', native_agent_started: true, state_dir: stateDir });
     const [betaStart] = await dispatch('start', { task_id: 'beta', node_id: 'work', agent_task_path: '/root/work', agent_role: 'avsp_terra_high', native_agent_started: true, state_dir: stateDir });
@@ -299,17 +329,18 @@ test('new workflow initialization ignores a materialized state_dir without scann
   const { globalWorkflowStorePath } = await import('../scripts/global_workflow_store.mjs');
   const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-unrecognized-local-state-'));
   const workspace = path.join(temp, 'workspace');
-  const stateDir = path.join(workspace, '.codex', 'workflow-controller');
+  const stateDir = stateDirFor(workspace);
+  const legacyStateDir = path.join(workspace, '.codex', 'workflow-controller');
   const manifestPath = path.join(temp, 'manifest.json');
   const localFiles = [
-    path.join(stateDir, 'feature.sqlite'),
-    path.join(stateDir, 'workflow.sqlite'),
-    path.join(stateDir, 'feature.json'),
-    path.join(stateDir, 'workspace-lease.json'),
+    path.join(legacyStateDir, 'feature.sqlite'),
+    path.join(legacyStateDir, 'workflow.sqlite'),
+    path.join(legacyStateDir, 'feature.json'),
+    path.join(legacyStateDir, 'workspace-lease.json'),
     path.join(workspace, '.codex-workflow-controller-authority.json'),
   ];
   try {
-    await mkdir(stateDir, { recursive: true });
+    await mkdir(legacyStateDir, { recursive: true });
     const contents = new Map();
     for (const localPath of localFiles) {
       const value = `unrecognized local state: ${path.basename(localPath)}`;
@@ -317,7 +348,7 @@ test('new workflow initialization ignores a materialized state_dir without scann
       contents.set(localPath, value);
     }
     await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace)));
-    const [initialized] = await dispatch('init', { manifest: manifestPath, state_dir: stateDir });
+    const [initialized] = await dispatch('init', { manifest: manifestPath, });
     assert.equal(initialized.state_path, globalWorkflowStorePath());
     assert.equal(initialized.database_path, globalWorkflowStorePath());
     for (const [localPath, value] of contents) assert.equal(await readFile(localPath, 'utf8'), value);
@@ -331,12 +362,12 @@ test('v3 blocks missing workspace control when global task state exists without 
   const { globalWorkflowStorePath } = await import('../scripts/global_workflow_store.mjs');
   const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-global-orphan-'));
   const workspace = path.join(temp, 'workspace');
-  const stateDir = path.join(workspace, '.codex', 'workflow-controller');
+  const stateDir = stateDirFor(workspace);
   const manifestPath = path.join(temp, 'manifest.json');
   try {
     await mkdir(workspace, { recursive: true });
     await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace)));
-    const [initialized] = await dispatch('init', { manifest: manifestPath, state_dir: stateDir });
+    const [initialized] = await dispatch('init', { manifest: manifestPath, });
     const store = new DatabaseSync(globalWorkflowStorePath());
     try {
       assert.equal(store.prepare('DELETE FROM workspace_control WHERE workspace = ?').run(initialized.task.workspace).changes, 1);
@@ -345,7 +376,7 @@ test('v3 blocks missing workspace control when global task state exists without 
     }
     await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace, { task_id: 'replacement' })));
     await assert.rejects(
-      () => dispatch('init', { manifest: manifestPath, state_dir: stateDir }),
+      () => dispatch('init', { manifest: manifestPath, }),
       error => error instanceof ControllerError && /Workspace control database is missing while current v3 task state exists/.test(error.message),
     );
   } finally {
@@ -358,12 +389,12 @@ test('v3 ignores malformed global task state for another workspace when recreati
   const { globalWorkflowStorePath } = await import('../scripts/global_workflow_store.mjs');
   const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-unrelated-corrupt-state-'));
   const workspace = path.join(temp, 'workspace');
-  const stateDir = path.join(workspace, '.codex', 'workflow-controller');
+  const stateDir = stateDirFor(workspace);
   const manifestPath = path.join(temp, 'manifest.json');
   try {
     await mkdir(workspace, { recursive: true });
     await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace)));
-    const [initialized] = await dispatch('init', { manifest: manifestPath, state_dir: stateDir });
+    const [initialized] = await dispatch('init', { manifest: manifestPath, });
     const store = new DatabaseSync(globalWorkflowStorePath());
     try {
       assert.equal(store.prepare('DELETE FROM workspace_control WHERE workspace = ?').run(initialized.task.workspace).changes, 1);
@@ -374,7 +405,7 @@ test('v3 ignores malformed global task state for another workspace when recreati
       store.close();
     }
     await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace, { task_id: 'replacement' })));
-    const [replacement] = await dispatch('init', { manifest: manifestPath, state_dir: stateDir });
+    const [replacement] = await dispatch('init', { manifest: manifestPath, });
     assert.equal(replacement.task.task_id, 'replacement');
   } finally {
     await rm(temp, { recursive: true, force: true });
@@ -385,13 +416,13 @@ test('v3 retries an abandoned ordinary protocol review at the same stage with a 
   const { dispatch } = await import('../scripts/workflow_controller.mjs');
   const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-abandoned-review-'));
   const workspace = path.join(temp, 'workspace');
-  const stateDir = path.join(workspace, '.codex', 'workflow-controller');
+  const stateDir = stateDirFor(workspace);
   const manifestPath = path.join(temp, 'manifest.json');
   const resultPath = path.join(temp, 'work-result.json');
   try {
     await mkdir(workspace, { recursive: true });
     await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace)));
-    await dispatch('init', { manifest: manifestPath, state_dir: stateDir });
+    await dispatch('init', { manifest: manifestPath, });
     const [work] = await dispatch('start', { task_id: 'feature', node_id: 'work', agent_task_path: '/root/work', agent_role: 'avsp_terra_high', native_agent_started: true, state_dir: stateDir });
     await writeFile(resultPath, JSON.stringify({ changed: true }));
     await dispatch('complete', { task_id: 'feature', node_id: 'work', claim_id: work.claim_id, status: 'succeeded', result: resultPath, completion_attestation: 'native_agent_finished', state_dir: stateDir });
@@ -412,12 +443,12 @@ test('v3 non-cohort review completion accepts only its exact recorded verdict/st
   const { ControllerError, dispatch } = await import('../scripts/workflow_controller.mjs');
   const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-review-matrix-'));
   const workspace = path.join(temp, 'workspace');
-  const stateDir = path.join(workspace, '.codex', 'workflow-controller');
+  const stateDir = stateDirFor(workspace);
   const manifestPath = path.join(temp, 'manifest.json');
   const resultPath = path.join(temp, 'result.json');
   const prepare = async (taskId, verdict) => {
     await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace, { task_id: taskId })));
-    await dispatch('init', { manifest: manifestPath, state_dir: stateDir });
+    await dispatch('init', { manifest: manifestPath, });
     const [work] = await dispatch('start', { task_id: taskId, node_id: 'work', agent_task_path: '/root/work', agent_role: 'avsp_terra_high', native_agent_started: true, state_dir: stateDir });
     await writeFile(resultPath, JSON.stringify({ taskId }));
     await dispatch('complete', { task_id: taskId, node_id: 'work', claim_id: work.claim_id, status: 'succeeded', result: resultPath, completion_attestation: 'native_agent_finished', state_dir: stateDir });
@@ -455,17 +486,20 @@ test('v3 non-cohort review completion accepts only its exact recorded verdict/st
       assert.equal(completed.node.status, accepted);
     }
     await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace, { task_id: 'missing-record' })));
-    await dispatch('init', { manifest: manifestPath, state_dir: stateDir });
+    await dispatch('init', { manifest: manifestPath, });
     const [work] = await dispatch('start', { task_id: 'missing-record', node_id: 'work', agent_task_path: '/root/work', agent_role: 'avsp_terra_high', native_agent_started: true, state_dir: stateDir });
     await dispatch('complete', { task_id: 'missing-record', node_id: 'work', claim_id: work.claim_id, status: 'succeeded', result: resultPath, completion_attestation: 'native_agent_finished', state_dir: stateDir });
     const [review] = await dispatch('start', { task_id: 'missing-record', node_id: 'review', agent_task_path: '/root/reviewer', agent_role: 'avsp_terra_xhigh', native_agent_started: true, state_dir: stateDir });
     await assert.rejects(
       () => dispatch('complete', { task_id: 'missing-record', node_id: 'review', claim_id: review.claim_id, status: 'succeeded', result: resultPath, completion_attestation: 'native_agent_finished', state_dir: stateDir }),
-      error => error instanceof ControllerError && /requires a recorded review/.test(error.message),
+      error => error instanceof ControllerError && /requires a recorded review.*workflow_record_review.*exact claim_id/.test(error.message),
     );
+    const [afterMissingRecord] = await dispatch('status', { task_id: 'missing-record', state_dir: stateDir });
+    assert.equal(afterMissingRecord.nodes.find(node => node.id === 'review').status, 'running');
+    assert.equal(afterMissingRecord.reviews.length, 0);
     await assert.rejects(
       () => dispatch('complete', { task_id: 'missing-record', node_id: 'review', claim_id: review.claim_id, status: 'unavailable', result: resultPath, completion_attestation: 'native_agent_finished', state_dir: stateDir }),
-      error => error instanceof ControllerError && /requires a recorded review/.test(error.message),
+      error => error instanceof ControllerError && /requires a recorded review.*workflow_record_review.*exact claim_id/.test(error.message),
     );
   } finally {
     await rm(temp, { recursive: true, force: true });
@@ -476,7 +510,7 @@ test('v3 max closure abandon and stale requeue restore the frozen charter for a 
   const { dispatch } = await import('../scripts/workflow_controller.mjs');
   const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-max-closure-'));
   const workspace = path.join(temp, 'workspace');
-  const stateDir = path.join(workspace, '.codex', 'workflow-controller');
+  const stateDir = stateDirFor(workspace);
   const manifestPath = path.join(temp, 'manifest.json');
   const resultPath = path.join(temp, 'result.json');
   const reviewPath = path.join(temp, 'review.json');
@@ -510,7 +544,7 @@ test('v3 max closure abandon and stale requeue restore the frozen charter for a 
     await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace, {
       task_id: 'max-closure', assurance_level: 'sol', assurance_assessment: assessment('sol'), review_entry_stage: 'sol_high', nodes: [{ id: 'work', kind: 'implementation', execution_risk: 'protected', routing_reason: 'bounded work', execution_owner: '/root/work', integration_owner: '/root', quality_guard: 'targeted test' }, reviewNode],
     })));
-    await dispatch('init', { manifest: manifestPath, state_dir: stateDir });
+    await dispatch('init', { manifest: manifestPath, });
     const [work] = await dispatch('start', { task_id: 'max-closure', node_id: 'work', agent_task_path: '/root/work', agent_role: 'avsp_terra_high', native_agent_started: true, state_dir: stateDir });
     await writeFile(resultPath, JSON.stringify({ changed: true }));
     await dispatch('complete', { task_id: 'max-closure', node_id: 'work', claim_id: work.claim_id, status: 'succeeded', result: resultPath, completion_attestation: 'native_agent_finished', state_dir: stateDir });
@@ -554,12 +588,12 @@ test('v3 initialization supports the documented workspace control state_dir', as
   const { globalWorkflowStorePath } = await import('../scripts/global_workflow_store.mjs');
   const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-control-state-'));
   const workspace = path.join(temp, 'workspace');
-  const stateDir = path.join(workspace, '.codex', 'workflow-controller');
+  const stateDir = stateDirFor(workspace);
   const manifestPath = path.join(temp, 'manifest.json');
   try {
     await mkdir(workspace, { recursive: true });
     await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace)));
-    const [initialized] = await dispatch('init', { manifest: manifestPath, state_dir: stateDir });
+    const [initialized] = await dispatch('init', { manifest: manifestPath, });
     assert.equal(initialized.database_path, globalWorkflowStorePath());
     assert.equal(initialized.state_path, globalWorkflowStorePath());
     assert.deepEqual(initialized.task_key, { namespace: await canonicalStateNamespace(stateDir), task_id: 'feature' });
@@ -574,14 +608,14 @@ test('v3 initialization completes missing direct review dependencies', async () 
   const { dispatch } = await import('../scripts/workflow_controller.mjs');
   const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-review-topology-'));
   const workspace = path.join(temp, 'workspace');
-  const stateDir = path.join(workspace, '.codex', 'workflow-controller');
+  const stateDir = stateDirFor(workspace);
   const manifestPath = path.join(temp, 'manifest.json');
   const evidence = id => ({ id, kind: 'evidence', execution_risk: 'read_only', routing_reason: 'independent evidence', execution_owner: `/root/${id}`, integration_owner: '/root', quality_guard: 'record evidence' });
   const review = { id: 'review', kind: 'quality_review', depends_on: ['work-a'], execution_risk: 'read_only', routing_reason: 'independent quality gate', execution_owner: '/root/reviewer', integration_owner: '/root', quality_guard: 'review requirements' };
   try {
     await mkdir(workspace, { recursive: true });
     await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace, { nodes: [evidence('work-a'), evidence('work-b'), evidence('work-c'), review] })));
-    const [initialized] = await dispatch('init', { manifest: manifestPath, state_dir: stateDir });
+    const [initialized] = await dispatch('init', { manifest: manifestPath, });
     assert.deepEqual(initialized.task.nodes.find(node => node.id === 'review').depends_on, ['work-a', 'work-b', 'work-c']);
   } finally {
     await rm(temp, { recursive: true, force: true });
@@ -592,12 +626,12 @@ test('v3 namespace authority rejects a replaced workspace before a claim can mut
   const { dispatch } = await import('../scripts/workflow_controller.mjs');
   const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-authority-'));
   const workspace = path.join(temp, 'workspace');
-  const stateDir = path.join(workspace, '.codex', 'workflow-controller');
+  const stateDir = stateDirFor(workspace);
   const manifestPath = path.join(temp, 'manifest.json');
   try {
     await mkdir(workspace, { recursive: true });
     await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace)));
-    await dispatch('init', { manifest: manifestPath, state_dir: stateDir });
+    await dispatch('init', { manifest: manifestPath, });
     const displaced = path.join(temp, 'displaced-workspace');
     await rename(workspace, displaced);
     await mkdir(workspace);
@@ -616,12 +650,12 @@ test('v3 release-only state is never pruned merely by age', async () => {
   const { globalWorkflowStorePath } = await import('../scripts/global_workflow_store.mjs');
   const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-prune-'));
   const workspace = path.join(temp, 'workspace');
-  const stateDir = path.join(workspace, '.codex', 'workflow-controller');
+  const stateDir = stateDirFor(workspace);
   const manifestPath = path.join(temp, 'manifest.json');
   try {
     await mkdir(workspace, { recursive: true });
     await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace)));
-    await dispatch('init', { manifest: manifestPath, state_dir: stateDir });
+    await dispatch('init', { manifest: manifestPath, });
     const [activeCloseCheck, activeCloseCode] = await dispatch('close-check', { task_id: 'feature', state_dir: stateDir });
     assert.equal(activeCloseCode, 2);
     assert.equal(activeCloseCheck.close_allowed, false);
@@ -654,12 +688,12 @@ test('v3 prune deletes only fully closed released tasks and keeps corrupt or art
   const { globalTaskStateExists, globalWorkflowArtifactTaskPath, globalWorkflowStorePath, readGlobalTaskState, taskNamespaceKey, writeGlobalTaskState } = await import('../scripts/global_workflow_store.mjs');
   const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-prune-contract-'));
   const workspace = path.join(temp, 'workspace');
-  const stateDir = path.join(workspace, '.codex', 'workflow-controller');
+  const stateDir = stateDirFor(workspace);
   const manifestPath = path.join(temp, 'manifest.json');
   const old = '1970-01-01T00:00:00.000Z';
   const makeReleasedState = async (taskId, status, { closedRevisionMatches = true } = {}) => {
     await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace, { task_id: taskId })));
-    const [initialized] = await dispatch('init', { manifest: manifestPath, state_dir: stateDir });
+    const [initialized] = await dispatch('init', { manifest: manifestPath, });
     await dispatch('release-workspace', { task_id: taskId, previous_agent_stopped: true, state_dir: stateDir });
     const logicalPath = path.join(initialized.task_key.namespace, `${initialized.task_key.task_id}.sqlite`);
     const state = await readGlobalTaskState(logicalPath);
@@ -709,14 +743,14 @@ test('v3 startup prune advances past a full retained batch to a later eligible t
   const { globalTaskStateExists, globalWorkflowStorePath, readGlobalTaskState, taskNamespaceKey, writeGlobalTaskState } = await import('../scripts/global_workflow_store.mjs');
   const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-prune-progress-'));
   const workspace = path.join(temp, 'workspace');
-  const stateDir = path.join(workspace, '.codex', 'workflow-controller');
+  const stateDir = stateDirFor(workspace);
   const manifestPath = path.join(temp, 'manifest.json');
   const old = '1970-01-01T00:00:00.000Z';
   const validTaskId = 'zzz-valid';
   try {
     await mkdir(workspace, { recursive: true });
     await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace, { task_id: validTaskId })));
-    const [initialized] = await dispatch('init', { manifest: manifestPath, state_dir: stateDir });
+    const [initialized] = await dispatch('init', { manifest: manifestPath, });
     await dispatch('release-workspace', { task_id: validTaskId, previous_agent_stopped: true, state_dir: stateDir });
     const validPath = path.join(initialized.task_key.namespace, `${validTaskId}.sqlite`);
     const baseState = await readGlobalTaskState(validPath);
