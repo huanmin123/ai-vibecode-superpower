@@ -5,6 +5,7 @@ set -eu
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P) || exit 1
 source_agents=$script_dir/codex-global-config/AGENTS.md
 source_config=$script_dir/codex-global-config/config.toml
+source_model_provider_settings=$script_dir/codex-global-config/model-provider-settings.toml
 source_docs=$script_dir/codex-global-config/docs
 source_agent_roles=$script_dir/codex-global-config/agents/ai-vibecode-superpower
 source_agent_role_manifest=$script_dir/codex-global-config/agents/ai-vibecode-superpower.sha256
@@ -19,7 +20,7 @@ legacy_plugin_skill_names_to_remove='adaptive-efficiency'
 managed_standalone_skill_names='gpt-image-2-cli project-doc-planner'
 managed_agent_role_files='ai-vibecode-superpower-avsp_luna_high.toml ai-vibecode-superpower-avsp_luna_xhigh.toml ai-vibecode-superpower-avsp_luna_high_executor.toml ai-vibecode-superpower-avsp_luna_xhigh_executor.toml ai-vibecode-superpower-avsp_sol_high.toml ai-vibecode-superpower-avsp_sol_max.toml ai-vibecode-superpower-avsp_sol_xhigh.toml ai-vibecode-superpower-avsp_terra_high.toml ai-vibecode-superpower-avsp_terra_xhigh.toml ai-vibecode-superpower-avsp_terra_xhigh_readonly.toml ai-vibecode-superpower-avsp_terra_low_readonly.toml ai-vibecode-superpower-avsp_terra_medium_readonly.toml'
 
-for source_path in "$source_agents" "$source_config" "$source_agent_role_manifest" "$source_marketplace"; do
+for source_path in "$source_agents" "$source_config" "$source_model_provider_settings" "$source_agent_role_manifest" "$source_marketplace"; do
     if [ ! -f "$source_path" ]; then
         printf '%s\n' "Missing source file: $source_path" >&2
         exit 1
@@ -78,6 +79,10 @@ if [ "$codex_home" = / ]; then
     printf '%s\n' 'Refusing to install into a filesystem root.' >&2
     exit 1
 fi
+if command -v pgrep >/dev/null 2>&1 && pgrep -f '(^|[[:space:]])app-server([[:space:]]|$)' >/dev/null 2>&1; then
+    printf '%s\n' 'Codex Desktop is still running. Exit every Codex Desktop window and wait for its app-server processes to stop before installing; otherwise the live app can overwrite plugin registration and keep the previous MCP cache loaded.' >&2
+    exit 1
+fi
 
 if [ "$codex_home/AGENTS.md" -ef "$source_agents" ] || \
    [ "$codex_home/config.toml" -ef "$source_config" ] || \
@@ -100,6 +105,83 @@ lock_file=$codex_home/.install.lock
 agents_parent_created=0
 tab=$(printf '\t')
 carriage_return=$(printf '\r')
+
+managed_plugin_version() {
+    node --input-type=module - "$source_plugin/.codex-plugin/plugin.json" "$managed_plugin_name" <<'NODE'
+import { readFile } from 'node:fs/promises';
+
+const [manifestPath, expectedName] = process.argv.slice(2);
+const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
+if (manifest.name !== expectedName || typeof manifest.version !== 'string' || !/^[0-9A-Za-z][0-9A-Za-z.+_-]*$/.test(manifest.version)) {
+  process.exitCode = 1;
+} else {
+  process.stdout.write(manifest.version);
+}
+NODE
+}
+
+expand_plugin_mcp_home() {
+    candidate_cache=$1
+    node --input-type=module - "$candidate_cache/.mcp.json" "$codex_home" <<'NODE'
+import { readFile, writeFile } from 'node:fs/promises';
+import path from 'node:path';
+const [descriptorPath, codexHome] = process.argv.slice(2);
+const content = await readFile(descriptorPath, 'utf8');
+const expanded = content.replaceAll('<CODEX_HOME>', codexHome.replaceAll('\\', '/'));
+if (expanded !== content) await writeFile(descriptorPath, expanded, 'utf8');
+const descriptor = JSON.parse(expanded);
+const server = descriptor?.mcpServers?.['workflow-controller'];
+if (server?.env?.CODEX_HOME !== codexHome.replaceAll('\\', '/') || server?.env_vars !== undefined) process.exitCode = 1;
+NODE
+}
+
+plugin_cache_matches_source() {
+    candidate_cache=$1
+    [ -d "$candidate_cache" ] || return 1
+    expand_plugin_mcp_home "$candidate_cache" || return 1
+    node --input-type=module - "$source_plugin" "$candidate_cache" "$codex_home" <<'NODE'
+import { lstat, readdir, readFile } from 'node:fs/promises';
+import { join, relative, sep } from 'node:path';
+import { createHash } from 'node:crypto';
+
+const [sourceRoot, cacheRoot, codexHome] = process.argv.slice(2);
+
+async function collect(root) {
+  const rootStat = await lstat(root);
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) throw new Error(`unsafe plugin root: ${root}`);
+  const records = [];
+  async function visit(directory) {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      const absolute = join(directory, entry.name);
+      const stat = await lstat(absolute);
+      if (stat.isSymbolicLink()) throw new Error(`unsafe plugin link: ${absolute}`);
+      if (stat.isDirectory()) {
+        await visit(absolute);
+      } else if (stat.isFile()) {
+        const name = relative(root, absolute).split(sep).join('/');
+        let content = await readFile(absolute);
+        if (root === sourceRoot && name === '.mcp.json') content = Buffer.from(content.toString('utf8').replaceAll('<CODEX_HOME>', codexHome.replaceAll('\\', '/')));
+        const digest = createHash('sha256').update(content).digest('hex');
+        records.push([name, digest]);
+      } else {
+        throw new Error(`unsupported plugin entry: ${absolute}`);
+      }
+    }
+  }
+  await visit(root);
+  return records.sort(([left], [right]) => left.localeCompare(right));
+}
+
+const [source, cache] = await Promise.all([collect(sourceRoot), collect(cacheRoot)]);
+process.exitCode = JSON.stringify(source) === JSON.stringify(cache) ? 0 : 1;
+NODE
+}
+
+managed_plugin_is_active() {
+    expected_version=$1
+    plugin_output=$(CODEX_HOME="$codex_home" codex plugin list 2>&1) || return 1
+    printf '%s\n' "$plugin_output" | rg -q "^[[:space:]]*$managed_plugin_name@$managed_marketplace_name[[:space:]]+installed,[[:space:]]+enabled[[:space:]]+$expected_version[[:space:]]"
+}
 
 install_managed_plugin() {
     command -v codex >/dev/null 2>&1 || {
@@ -130,8 +212,38 @@ install_managed_plugin() {
         printf '%s\n' "Node.js 22.5.0 or newer is required for the native SQLite workflow controller; found $node_version" >&2
         return 1
     fi
+    plugin_version=$(managed_plugin_version) || {
+        printf '%s\n' "Invalid managed plugin manifest: $source_plugin/.codex-plugin/plugin.json" >&2
+        return 1
+    }
+    plugin_cache=$codex_home/plugins/cache/$managed_marketplace_name/$managed_plugin_name/$plugin_version
     CODEX_HOME="$codex_home" codex plugin marketplace add "$script_dir"
-    CODEX_HOME="$codex_home" codex plugin add "$managed_plugin_name@$managed_marketplace_name"
+    if ! plugin_cache_matches_source "$plugin_cache" || ! managed_plugin_is_active "$plugin_version"; then
+        if ! plugin_add_output=$(CODEX_HOME="$codex_home" codex plugin add "$managed_plugin_name@$managed_marketplace_name" 2>&1); then
+            if ! plugin_cache_matches_source "$plugin_cache" || ! managed_plugin_is_active "$plugin_version"; then
+                printf '%s\n' "Could not install managed plugin: $managed_plugin_name@$managed_marketplace_name" >&2
+                printf '%s\n' "$plugin_add_output" >&2
+                return 1
+            fi
+            printf '%s\n' 'Codex reported an error while cleaning an older plugin cache entry, but the requested plugin cache and active configuration were verified.' >&2
+            printf '%s\n' "$plugin_add_output" >&2
+        fi
+    fi
+    # plugin add can rewrite config.toml from an in-memory snapshot; register
+    # the marketplace again so the installed plugin remains discoverable.
+    CODEX_HOME="$codex_home" codex plugin marketplace add "$script_dir"
+    marketplace_output=$(CODEX_HOME="$codex_home" codex plugin marketplace list 2>&1) || {
+        printf '%s\n' 'Could not verify managed plugin marketplace registration.' >&2
+        return 1
+    }
+    printf '%s\n' "$marketplace_output" | rg -q "^[[:space:]]*$managed_marketplace_name[[:space:]]" || {
+        printf '%s\n' "Codex did not retain marketplace registration after plugin install: $managed_marketplace_name" >&2
+        return 1
+    }
+    if ! plugin_cache_matches_source "$plugin_cache" || ! managed_plugin_is_active "$plugin_version"; then
+        printf '%s\n' "Codex did not retain the exact managed plugin version: $managed_plugin_name@$managed_marketplace_name ($plugin_version)" >&2
+        return 1
+    fi
 }
 
 remove_retired_workflow_plugin() {
@@ -796,6 +908,11 @@ merge_managed_config() {
         BEGIN {
             section = "root"
             current = "root"
+            provider_order[1] = "request_max_retries"
+            provider_order[2] = "stream_max_retries"
+            provider_order[3] = "stream_idle_timeout_ms"
+            provider_order[4] = "websocket_connect_timeout_ms"
+            provider_count = 4
         }
         function managed_key(section, key) {
             return (section == "root" && (key == "model" || key == "model_reasoning_effort" || key == "sandbox_mode" || key == "approval_policy" || key == "approvals_reviewer")) ||
@@ -819,7 +936,7 @@ merge_managed_config() {
                 }
             }
         }
-        FNR == NR {
+        FILENAME == ARGV[1] {
             if ($0 ~ /^[[:space:]]*\[\[[^]]+\]\][[:space:]]*(#.*)?$/) {
                 section = "other"
                 next
@@ -842,23 +959,57 @@ merge_managed_config() {
             }
             next
         }
+        FILENAME == ARGV[2] {
+            if ($0 ~ /^[[:space:]]*([A-Za-z][A-Za-z0-9_-]*)[[:space:]]*=/) {
+                key = $0; sub(/^[[:space:]]*/, "", key); sub(/[[:space:]]*=.*/, "", key)
+                provider_value[key] = substr($0, index($0, "=") + 1)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", provider_value[key])
+            }
+            next
+        }
+        function is_provider_section(section) { return section ~ /^model_providers\.("[^"]+"|\047[^\047]+\047|[A-Za-z0-9_-]+)$/ }
+        function flush_provider_missing(    key) {
+            if (!provider_section) return
+            for (position = 1; position <= provider_count; position++) {
+                key = provider_order[position]
+                if (!provider_seen[key]) {
+                    print key " = " provider_value[key]
+                    provider_seen[key] = 1
+                }
+            }
+        }
         {
             if ($0 ~ /^[[:space:]]*\[\[[^]]+\]\][[:space:]]*(#.*)?$/) {
                 flush_missing(current)
+                flush_provider_missing()
                 current = "other"
+                provider_section = 0
+                for (position = 1; position <= provider_count; position++) provider_seen[provider_order[position]] = 0
                 print
                 next
             }
             if ($0 ~ /^[[:space:]]*\[[^]]+\][[:space:]]*(#.*)?$/) {
                 flush_missing(current)
+                flush_provider_missing()
                 header = $0
                 sub(/^[[:space:]]*\[/, "", header)
                 sub(/\][[:space:]]*(#.*)?$/, "", header)
                 gsub(/^[[:space:]]+|[[:space:]]+$/, "", header)
                 current = (header == "agents" || header == "features") ? header : "other"
+                provider_section = is_provider_section(header)
+                if (provider_section) provider_found = 1
+                for (position = 1; position <= provider_count; position++) provider_seen[provider_order[position]] = 0
                 present[current] = 1
                 print
                 next
+            }
+            if (provider_section && $0 ~ /^[[:space:]]*[A-Za-z][A-Za-z0-9_-]*[[:space:]]*=/) {
+                key = $0; sub(/^[[:space:]]*/, "", key); sub(/[[:space:]]*=.*/, "", key)
+                if (key in provider_value && !provider_seen[key]) {
+                    print key " = " provider_value[key]
+                    provider_seen[key] = 1
+                    next
+                }
             }
             if (index($0, "=") > 0) {
                 key = substr($0, 1, index($0, "=") - 1)
@@ -886,7 +1037,18 @@ merge_managed_config() {
                     exit 1
                 }
             }
+            for (position = 1; position <= provider_count; position++) {
+                key = provider_order[position]
+                if (!(key in provider_value)) {
+                    print "Missing managed model provider setting: " key > "/dev/stderr"
+                    exit 1
+                }
+            }
+            if (!provider_found) {
+                print "No [model_providers.<provider-id>] table found in " ARGV[3] "; skipped managed model provider settings." > "/dev/stderr"
+            }
             flush_missing(current)
+            flush_provider_missing()
             if (!present["agents"]) {
                 print ""
                 print "[agents]"
@@ -898,7 +1060,7 @@ merge_managed_config() {
                 flush_missing("features")
             }
         }
-    ' "$source_config" "$config_input" > "$config_output"
+    ' "$source_config" "$source_model_provider_settings" "$config_input" > "$config_output"
 }
 
 rollback() {
@@ -992,6 +1154,7 @@ if ! path_exists "$config_input"; then
     : > "$config_input"
 fi
 assert_safe_toml_merge_input "$source_config"
+assert_safe_toml_merge_input "$source_model_provider_settings"
 assert_safe_toml_merge_input "$config_input"
 merge_managed_config "$config_input" "$stage_dir/merged-config.toml"
 assert_safe_toml_merge_input "$stage_dir/merged-config.toml"
@@ -1081,6 +1244,11 @@ done < "$manifest"
 install_managed_plugin
 
 remove_retired_workflow_plugin
+
+assert_safe_toml_merge_input "$codex_home/config.toml"
+merge_managed_config "$codex_home/config.toml" "$stage_dir/remerged-config.toml"
+assert_safe_toml_merge_input "$stage_dir/remerged-config.toml"
+mv "$stage_dir/remerged-config.toml" "$codex_home/config.toml"
 
 while IFS="$tab" read -r target_name target_path candidate_path target_kind target_operation; do
     [ "$target_operation" = remove ] || continue

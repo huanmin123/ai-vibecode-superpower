@@ -18,6 +18,7 @@ test.after(async () => {
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const mcp = path.join(root, 'scripts', 'workflow_controller_mcp.mjs');
+const pluginMcp = path.join(root, '.mcp.json');
 const { globalStateDirectoryForWorkspace } = await import('../scripts/workflow_controller.mjs');
 const stateDirFor = workspace => { mkdirSync(workspace, { recursive: true }); return globalStateDirectoryForWorkspace(workspace); };
 
@@ -105,6 +106,17 @@ test('MCP exposes the current v3 workflow contract', async () => {
   assert.match(source, /workflow_release_write_lock/);
   assert.doesNotMatch(source, /workflow_recover_lock/);
   assert.doesNotMatch(source, /workflow_record_verification/);
+});
+
+test('plugin MCP starts from its own installed directory without scanning plugin caches', async () => {
+  const descriptor = JSON.parse(await readFile(pluginMcp, 'utf8'));
+  const server = descriptor.mcpServers?.['workflow-controller'];
+  assert.deepEqual(server?.args, ['./scripts/workflow_controller_mcp.mjs']);
+  assert.equal(server?.cwd, '.');
+  assert.equal(server?.command, 'node');
+  assert.deepEqual(server?.env, { CODEX_HOME: '<CODEX_HOME>' });
+  assert.equal(server?.env_vars, undefined);
+  assert.doesNotMatch(JSON.stringify(server), /plugins[\\/]cache|readdirSync|candidates/);
 });
 
 test('MCP wait scheduling uses the earliest Terra cohort lane deadline', async () => {
@@ -210,12 +222,26 @@ test('MCP serves v3 workflow state over stdio and releases a cancelled wait', as
     const completeTool = toolList.result.tools.find(tool => tool.name === 'workflow_complete');
     const checkpointTool = toolList.result.tools.find(tool => tool.name === 'workflow_checkpoint');
     const reviewTool = toolList.result.tools.find(tool => tool.name === 'workflow_record_review');
+    const repairTool = toolList.result.tools.find(tool => tool.name === 'workflow_record_repair');
+    const escalationTool = toolList.result.tools.find(tool => tool.name === 'workflow_escalate_execution');
     const waitTool = toolList.result.tools.find(tool => tool.name === 'workflow_wait');
     assert.match(initTool.inputSchema.properties.manifest.description, /清单对象/);
     assert.deepEqual(initTool.inputSchema.properties.manifest.anyOf, [{ type: 'object' }, { type: 'string' }]);
     assert.deepEqual(completeTool.inputSchema.properties.result.anyOf, [{ type: 'object' }, { type: 'string' }]);
     assert.deepEqual(checkpointTool.inputSchema.properties.checkpoint.anyOf, [{ type: 'object' }, { type: 'string' }]);
-    assert.deepEqual(reviewTool.inputSchema.properties.review.anyOf, [{ type: 'object' }, { type: 'string' }]);
+    const reviewSchema = reviewTool.inputSchema.properties.review.anyOf[0];
+    const repairSchema = repairTool.inputSchema.properties.repair.anyOf[0];
+    assert.equal(reviewSchema.type, 'object');
+    assert.ok(reviewSchema.required.includes('requirement_coverage'));
+    assert.deepEqual(reviewSchema.properties.verdict.enum, ['pass', 'fail', 'unavailable']);
+    assert.deepEqual(reviewSchema.properties.findings.items.required, ['id', 'severity', 'requirement_id', 'summary', 'evidence']);
+    assert.deepEqual(reviewSchema.properties.findings.items.properties.severity.enum, ['blocking', 'advisory']);
+    assert.equal(repairSchema.type, 'object');
+    assert.deepEqual(repairSchema.properties.addressed_findings.items.required, ['finding_id', 'resolution', 'verification_evidence']);
+    assert.ok(escalationTool.inputSchema.required.includes('previous_agent_stopped'));
+    assert.ok(escalationTool.inputSchema.required.includes('assurance_assessment'));
+    assert.equal(escalationTool.inputSchema.properties.previous_agent_stopped.const, true);
+    assert.match(escalationTool.description, /protected Terra/);
     assert.equal(waitTool.inputSchema.properties.task_id.minLength, 1);
     assert.match(waitTool.description, /同一非空 task_id/);
     assert.match(completeTool.description, /只由 main\/root 调用/);
@@ -225,9 +251,10 @@ test('MCP serves v3 workflow state over stdio and releases a cancelled wait', as
     const inline = await server.request({ method: 'tools/call', params: { name: 'workflow_init', arguments: { manifest: JSON.stringify(v3McpManifest(workspace)) } } });
     const inlineResult = resultObject(inline);
     assert.equal(inlineResult.task.task_id, 'mcp-task');
+    assert.equal(inlineResult.task.execution_routing_policy_version, 2);
     assert.equal(inlineResult.database_path, inlineResult.state_path);
     assert.deepEqual(inlineResult.task_key, { namespace: await canonicalStateNamespace(stateDir), task_id: 'mcp-task' });
-    assert.equal(inlineResult.database_path, path.join(isolatedCodexHome, 'state', 'agnets-workflow', 'workflow.sqlite'));
+    assert.equal(inlineResult.database_path, path.join(isolatedCodexHome, 'state', 'agnets-workflow', 'current', 'workflow.sqlite'));
     const objectInit = await server.request({ method: 'tools/call', params: { name: 'workflow_init', arguments: { manifest: v3McpManifest(workspace, 'mcp-object-task') } } });
     assert.equal(resultObject(objectInit).task.task_id, 'mcp-object-task');
     const init = await server.request({ method: 'tools/call', params: { name: 'workflow_init', arguments: { manifest: manifestPath } } });
@@ -301,7 +328,54 @@ test('MCP returns actionable protocol errors without a raw JSON content document
     const missingTask = await server.request({ method: 'tools/call', params: { name: 'workflow_wait', arguments: { task_id: '', state_dir: stateDir, after_cursor: '0'.repeat(64), timeout_sec: 1 } } });
     assert.equal(missingTask.result.isError, true);
     assert.doesNotMatch(missingTask.result.content[0].text, /^\s*[\[{]/);
-    assert.match(resultObject(missingTask).error, /task_id must be a non-empty string/);
+    assert.match(missingTask.result.content[0].text, /\[INVALID_ARGUMENT\] at task_id/);
+    const error = resultObject(missingTask);
+    assert.equal(error.error_code, 'INVALID_ARGUMENT');
+    assert.equal(error.retryable, false);
+    assert.equal(error.field_errors[0].path, 'task_id');
+    assert.match(error.error, /task_id must be a non-empty string/);
+    const missingStatusTask = await server.request({ method: 'tools/call', params: { name: 'workflow_status', arguments: { task_id: '', state_dir: stateDir } } });
+    assert.equal(missingStatusTask.result.isError, true);
+    const statusError = resultObject(missingStatusTask);
+    assert.equal(statusError.error_code, 'INVALID_ARGUMENT');
+    assert.equal(statusError.field_errors[0].path, 'task_id');
+    assert.equal(statusError.field_errors[0].expected, 'non-empty string');
+  } finally {
+    await closeMcp(server.child);
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test('MCP returns field-level review errors and accepts one corrected payload from the audit context', async () => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-mcp-review-contract-'));
+  const workspace = path.join(temp, 'workspace');
+  const stateDir = stateDirFor(workspace);
+  const server = startMcp();
+  try {
+    await mkdir(workspace, { recursive: true });
+    const initialized = await server.request({ method: 'tools/call', params: { name: 'workflow_init', arguments: { manifest: v3McpManifest(workspace, 'review-contract') } } });
+    assert.equal(initialized.result.isError, undefined);
+    const started = resultObject(await server.request({ method: 'tools/call', params: { name: 'workflow_start', arguments: { task_id: 'review-contract', node_id: 'total-review', agent_task_path: '/root/review-contract-sol-review', agent_role: 'avsp_sol_high', native_agent_started: true, state_dir: stateDir } } }));
+    await server.request({ method: 'tools/call', params: { name: 'workflow_heartbeat', arguments: { task_id: 'review-contract', node_id: 'total-review', claim_id: started.claim_id, state_dir: stateDir } } });
+    const context = resultObject(await server.request({ method: 'tools/call', params: { name: 'workflow_audit_context', arguments: { task_id: 'review-contract', state_dir: stateDir } } }));
+    assert.equal(context.review_input_contract.action, 'record_review');
+    assert.deepEqual(context.review_input_contract.requirement_ids, ['R1']);
+    assert.equal(context.review_input_contract.active_claims[0].claim_id, started.claim_id);
+    const baseReview = {
+      auditor_task: '/root/review-contract-sol-review', auditor_role: 'avsp_sol_high', claim_id: started.claim_id,
+      findings: [], requirement_coverage: { R1: 'reviewed' }, workflow_snapshot: context.workflow_snapshot, workspace_fingerprint: context.workspace_fingerprint,
+      scope_and_regression: 'within declared scope', verification_gaps: 'none', residual_risk: 'accepted', independent_assessment: 'independent pass assessment', history_reconciliation: 'no prior reviews', review_history_digest: context.review_history_digest,
+    };
+    const invalid = await server.request({ method: 'tools/call', params: { name: 'workflow_record_review', arguments: { task_id: 'review-contract', state_dir: stateDir, review: { ...baseReview, verdict: 'unknown' } } } });
+    assert.equal(invalid.result.isError, true);
+    const error = resultObject(invalid);
+    assert.equal(error.error_code, 'INVALID_ARGUMENT');
+    assert.equal(error.retryable, false);
+    assert.equal(error.field_errors[0].path, 'review.verdict');
+    assert.deepEqual(error.field_errors[0].expected, ['pass', 'fail', 'unavailable']);
+    const recordedResponse = await server.request({ method: 'tools/call', params: { name: 'workflow_record_review', arguments: { task_id: 'review-contract', state_dir: stateDir, review: { ...baseReview, verdict: 'pass' } } } });
+    const recorded = resultObject(recordedResponse);
+    assert.equal(recorded.review.verdict, 'pass');
   } finally {
     await closeMcp(server.child);
     await rm(temp, { recursive: true, force: true });

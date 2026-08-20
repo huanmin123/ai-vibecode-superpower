@@ -41,6 +41,8 @@ quality_guard: <负责核验契约、diff、产物和验证的实例或检查>
 routing_reason: <为何该风险分流和 role 选择成立；xhigh executor 说明具体局部理解理由>
 ```
 
+新建 `delegable` 节点的 `agent_type` 必须是 Luna executor；Terra 只执行初始即为 `protected` 的节点。Luna 已停止后若发现新选择、共享冲突、不可控副作用、不可恢复性或验证缺口，先停止并返回证据；协调者只有在形成新的完整契约、质量检查和更新后的 `assurance_assessment` 后，才能通过 `workflow_escalate_execution` 将该节点改为 `protected` 并转交 Terra；若评估出现 `unknown`，先升级至 Sol。
+
 默认使用自包含消息。只有确需有限最近上下文时，`fork_turns` 才能改为正整数；`all` 只能用于不传自定义 `agent_type` 的 full-history fork。
 
 ## 完成消息

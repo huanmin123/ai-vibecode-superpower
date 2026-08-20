@@ -1,6 +1,6 @@
 # 恢复与保留
 
-当前控制器仅支持当前 SQLite 状态。所有工作区和任务共享固定用户级 Codex home 的 `state/agnets-workflow/workflow.sqlite`；显式 `CODEX_HOME` 必须是绝对路径，未设置时使用平台用户目录下的 `.codex/state/agnets-workflow/workflow.sqlite`。`workflow_init` 自动派生并返回全局 `state_dir`；审查制品统一位于全局 `state/agnets-workflow/artifacts/<namespace-hash>/<task>/<claim>/`，不属于项目目录。其他 schema 或项目本地文件不属于当前工作流状态，初始化不会读取、迁移或兼容它们。
+当前控制器仅支持当前 SQLite 状态。所有工作区和任务共享当前用户级 Codex home 的 `state/agnets-workflow/current/workflow.sqlite`；MCP 自己解析该 home，调用方不传入 home 路径。`workflow_init` 自动派生并返回全局 `state_dir`；审查制品统一位于全局 `state/agnets-workflow/current/artifacts/<namespace-hash>/<task>/<claim>/`，不属于项目目录。其他 schema 或项目本地文件不属于当前工作流状态，初始化不会读取、迁移或兼容它们。
 
 `workflow_stale` 区分未激活与心跳过期，并列出当前实际写锁；`workflow_status` 也提供相同的锁可见性。锁不会依时间自动释放。协调者必须先确认原执行者已经停止，才可调用 `workflow_requeue_stale`、`workflow_rescue` 或 `workflow_release_workspace`；已终止 claim 的指定锁可用 `workflow_release_write_lock` 重试释放。`workflow_rebind_pending` 只用于从未启动的 pending 节点。
 

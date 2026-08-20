@@ -19,34 +19,9 @@
 
 ## 调用驱动
 
-在已安装插件缓存中定位驱动；不要假设开发仓库路径就是运行中的 skill。
+从当前已加载 skill 的绝对 `SKILL.md` 路径定位驱动：把末尾 `SKILL.md` 替换为 `scripts/agent-toolchain.ps1`（Windows）或 `scripts/agent-toolchain.sh`（macOS/Linux）。该绝对 skill 路径已由 Codex 在本会话的 Available skills 中提供。不得扫描 `plugins/cache`、按时间挑选版本、使用开发仓库路径，或自行展开 home 环境变量。
 
-macOS/Linux：
-
-```sh
-codex_home="${CODEX_HOME:-$HOME/.codex}"
-driver=$(find "$codex_home/plugins/cache" -type f -path '*/agnets-workflow/*/skills/agent-toolchain/scripts/agent-toolchain.sh' -print 2>/dev/null | sort | tail -n 1)
-[ -n "$driver" ] || { printf '%s\n' '未找到已安装的 agnets-workflow 插件。' >&2; exit 1; }
-"$driver" configure --project "$PWD"
-"$driver" bootstrap --project "$PWD" --dry-run
-"$driver" bootstrap --project "$PWD" --apply
-"$driver" init-codegraph --project "$PWD"
-"$driver" doctor --project "$PWD"
-```
-
-Windows PowerShell 7：
-
-```powershell
-$codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
-$driver = @(Get-ChildItem -Path (Join-Path $codexHome 'plugins/cache/*/agnets-workflow/*/skills/agent-toolchain/scripts/agent-toolchain.ps1') -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime | Select-Object -Last 1 -ExpandProperty FullName)
-if ($driver.Count -ne 1) { throw '未找到已安装的 agnets-workflow 插件。' }
-$driver = $driver[0]
-& $driver configure --project $PWD
-& $driver bootstrap --project $PWD --dry-run
-& $driver bootstrap --project $PWD --apply
-& $driver init-codegraph --project $PWD
-& $driver doctor --project $PWD
-```
+按该确定路径依次运行 `configure --project <目标项目>`、`bootstrap --project <目标项目> --dry-run`、`bootstrap --project <目标项目> --apply`、`init-codegraph --project <目标项目>` 和 `doctor --project <目标项目>`。
 
 ## 安装结果
 

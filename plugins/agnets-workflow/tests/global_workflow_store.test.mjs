@@ -141,7 +141,7 @@ test('global workflow store rejects a relative CODEX_HOME before touching the cw
     assert.throws(() => globalWorkflowStorePath(), /CODEX_HOME must be an absolute path/);
     const absolute = path.join(os.tmpdir(), 'agnets-global-trimmed-home');
     process.env.CODEX_HOME = `  ${absolute}  `;
-    assert.equal(globalWorkflowStorePath(), path.join(absolute, 'state', 'agnets-workflow', 'workflow.sqlite'));
+    assert.equal(globalWorkflowStorePath(), path.join(absolute, 'state', 'agnets-workflow', 'current', 'workflow.sqlite'));
   } finally {
     if (previousHome === undefined) delete process.env.CODEX_HOME;
     else process.env.CODEX_HOME = previousHome;
@@ -168,7 +168,7 @@ test('global workflow store validates existing parent links before creating any 
       /parent is not a regular directory/,
     );
     assert.equal(existsSync(path.join(linkedStateTarget, 'agnets-workflow')), false);
-    assert.equal(existsSync(path.join(linkedStateTarget, 'agnets-workflow', 'workflow.sqlite')), false);
+    assert.equal(existsSync(path.join(linkedStateTarget, 'agnets-workflow', 'current', 'workflow.sqlite')), false);
   } finally {
     if (previousHome === undefined) delete process.env.CODEX_HOME;
     else process.env.CODEX_HOME = previousHome;

@@ -1,8 +1,8 @@
 # 系统文档与命令路由
 
-- 已设置 `CODEX_HOME` 时全局文档以其为基准，否则用展开后的 `~/.codex/`；不得解析到项目 `docs/`。
-- 执行系统命令前读取全局文档入口：`<CODEX_HOME>/docs/README.md`；未设置 `CODEX_HOME` 时读取 `~/.codex/docs/README.md`，一次识别本机系统、Shell 和架构，再按需读平台规范。
-- Windows 本机命令读取 `<CODEX_HOME>/docs/system/windows.md`；macOS 本机或远端命令读取 `<CODEX_HOME>/docs/system/macos.md`；Linux 本机或远端命令读取 `<CODEX_HOME>/docs/system/linux.md`。未设置 `CODEX_HOME` 时，将 `<CODEX_HOME>` 替换为 `~/.codex`。
+- 全局文档固定以 `<CODEX_HOME>` 为基准；安装器会在部署前把该占位符替换为本机已解析的绝对 Codex home。不得解析到项目 `docs/`，也不得把占位符作为命令路径传入工具。
+- 执行系统命令前读取全局文档入口：`<CODEX_HOME>/docs/README.md`，一次识别本机系统、Shell 和架构，再按需读平台规范。
+- Windows 本机命令读取 `<CODEX_HOME>/docs/system/windows.md`；macOS 本机或远端命令读取 `<CODEX_HOME>/docs/system/macos.md`；Linux 本机或远端命令读取 `<CODEX_HOME>/docs/system/linux.md`。
 - SSH、SCP、SFTP 或 rsync 还须读取 `<CODEX_HOME>/docs/system/ssh.md` 和目标系统文档；本地与远端 Shell 分开构造、转义和验证。
 - 文本搜索必须使用 `rg`；缺失时按 `<CODEX_HOME>/docs/system/rg.md` 和系统文档安装验证。命令语法、工具安装和排障只放系统文档。
 

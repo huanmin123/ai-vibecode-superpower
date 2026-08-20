@@ -1188,10 +1188,12 @@ export async function runSolReview(argv = process.argv.slice(2), environment = p
 export async function main() {
   try {
     const result = await runSolReview();
-    process.stdout.write(`${JSON.stringify(result)}\n`);
+    const verdict = result.review_verdict?.valid === true ? 'valid' : 'unavailable';
+    const artifact = typeof result.result_path === 'string' ? 'persisted' : 'not_persisted';
+    process.stdout.write(`sol review: verdict=${verdict} exit_code=${result.exit_code} artifact=${artifact}\n`);
     process.exitCode = result.exit_code;
   } catch (error) {
-    process.stderr.write(`${error.stack || error}\n`);
+    process.stderr.write(`sol review failed: ${error.message || error}\n`);
     process.exitCode = 1;
   }
 }

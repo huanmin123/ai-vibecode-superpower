@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { createReadStream, realpathSync, promises as fs } from 'node:fs';
+import { realpathSync, promises as fs } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
@@ -67,17 +67,13 @@ const READ_ONLY_FALLBACK_ROLES = new Map([
 ]);
 const READ_ONLY_FALLBACK_ROLE_SET = new Set([...READ_ONLY_FALLBACK_ROLES.values(), FALLBACK_ROLE]);
 const PROTECTED_EXECUTOR_ROLE = 'avsp_terra_high';
+const CURRENT_EXECUTION_ROUTING_POLICY_VERSION = 2;
 const ROUTING_FIELDS = ['execution_risk', 'routing_reason', 'execution_owner', 'integration_owner', 'quality_guard'];
-const IGNORED_DIRECTORIES = new Set(['.git', '.codex', 'node_modules', '.venv']);
-const WORKSPACE_CONTROL_FILENAME = 'workflow.sqlite';
+const GLOBAL_WORKSPACE_CONTROL_FILENAME = 'workflow.sqlite';
 const MAX_MANIFEST_BYTES = 1 * 1024 * 1024;
 const MAX_NODE_RESULT_BYTES = 64 * 1024;
 const MAX_REVIEW_BYTES = 128 * 1024;
 const MAX_STATE_BYTES = 8 * 1024 * 1024;
-const MAX_FINGERPRINT_FILES = 100_000;
-const MAX_FINGERPRINT_FILE_BYTES = 512 * 1024 * 1024;
-const MAX_FINGERPRINT_TOTAL_BYTES = 2 * 1024 * 1024 * 1024;
-const FINGERPRINT_ATTEMPTS = 3;
 const MAX_NODES = 64;
 const MAX_REQUIREMENTS = 64;
 const MAX_NODE_ATTEMPTS = 8;
@@ -97,7 +93,39 @@ const DEFAULT_TASK_RETENTION_DAYS = 7;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const MAX_PRUNE_REPORT_ENTRIES = 128;
 const SQLITE_STATE_SUFFIX = '.sqlite';
-export class ControllerError extends Error {}
+export class ControllerError extends Error {
+  constructor(message, { code = 'WORKFLOW_ERROR', fieldErrors = [], retryable = false, recovery = null } = {}) {
+    super(message);
+    this.name = 'ControllerError';
+    this.code = code;
+    this.field_errors = fieldErrors;
+    this.retryable = retryable;
+    this.recovery = recovery;
+  }
+}
+
+function invalidArgument(message, path, expected, actual) {
+  const fieldErrors = [{ path, code: 'invalid_argument', ...(expected === undefined ? {} : { expected }), ...(actual === undefined ? {} : { actual }), message }];
+  return new ControllerError(message, { code: 'INVALID_ARGUMENT', fieldErrors });
+}
+
+function failedPrecondition(message, path, recoveryAction = 'refresh_workflow_status') {
+  return new ControllerError(message, {
+    code: 'FAILED_PRECONDITION',
+    retryable: false,
+    fieldErrors: path ? [{ path, code: 'stale_precondition', message }] : [],
+    recovery: { action: recoveryAction },
+  });
+}
+
+function unsupportedWorkflowState(message, path, expected, actual) {
+  return new ControllerError(message, {
+    code: 'UNSUPPORTED_WORKFLOW_STATE',
+    fieldErrors: [{ path, code: 'unsupported_state', ...(expected === undefined ? {} : { expected }), ...(actual === undefined ? {} : { actual }), message }],
+    retryable: false,
+    recovery: { action: 'start_new_workflow' },
+  });
+}
 
 function asControllerError(error) {
   if (error instanceof ControllerError) return error;
@@ -129,18 +157,17 @@ const NATIVE_AGENT_EXIT_CONFIRMED = 'native_agent_exit_confirmed';
 const NATIVE_AGENT_START_FAILED = 'native_agent_start_failed';
 const taskStateTransactionContext = new AsyncLocalStorage();
 
-function isWorkspaceControlFile(name) {
-  return workspacePathKey(name) === workspacePathKey(WORKSPACE_CONTROL_FILENAME);
-}
-
 function requiredString(value, name) {
-  if (typeof value !== 'string' || !value.trim()) throw new ControllerError(`${name} must be a non-empty string`);
+  if (typeof value !== 'string' || !value.trim()) {
+    const actual = typeof value === 'string' ? 'empty string' : value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value;
+    throw invalidArgument(`${name} must be a non-empty string`, name, 'non-empty string', actual);
+  }
   return value.trim();
 }
 
 function requiredIdentifier(value, name) {
   const identifier = requiredString(value, name);
-  if (!/^[A-Za-z][A-Za-z0-9._-]{0,79}$/.test(identifier)) throw new ControllerError(`${name} must use letters, digits, dot, underscore, or hyphen and start with a letter`);
+  if (!/^[A-Za-z][A-Za-z0-9._-]{0,79}$/.test(identifier)) throw invalidArgument(`${name} must use letters, digits, dot, underscore, or hyphen and start with a letter`, name, 'identifier starting with a letter and containing letters, digits, dot, underscore, or hyphen');
   return identifier;
 }
 
@@ -281,38 +308,38 @@ function requireAssuranceLevelMatches(level, assessment, label = 'assurance_leve
 }
 
 function reviewContextValue(value, label = 'review_context') {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new ControllerError(`${label} must be an object`);
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw invalidArgument(`${label} must be an object`, label, 'object', Array.isArray(value) ? 'array' : typeof value);
   const expected = ['boundaries', 'environment', 'scenarios'];
   const keys = Object.keys(value).sort();
-  if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) throw new ControllerError(`${label} must contain exactly: ${expected.join(', ')}`);
-  if (!nonEmptyReviewValue(value.environment)) throw new ControllerError(`${label}.environment must be non-empty`);
-  if (!Array.isArray(value.scenarios) || !value.scenarios.length || value.scenarios.some(item => !nonEmptyReviewValue(item))) throw new ControllerError(`${label}.scenarios must be a non-empty array of non-empty values`);
-  if (!nonEmptyReviewValue(value.boundaries)) throw new ControllerError(`${label}.boundaries must be non-empty`);
+  if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) throw invalidArgument(`${label} must contain exactly: ${expected.join(', ')}`, label, expected, keys);
+  if (!nonEmptyReviewValue(value.environment)) throw invalidArgument(`${label}.environment must be non-empty`, `${label}.environment`, 'non-empty string, array, or object');
+  if (!Array.isArray(value.scenarios) || !value.scenarios.length || value.scenarios.some(item => !nonEmptyReviewValue(item))) throw invalidArgument(`${label}.scenarios must be a non-empty array of non-empty values`, `${label}.scenarios`, 'non-empty array of non-empty values', Array.isArray(value.scenarios) ? `array(${value.scenarios.length})` : typeof value.scenarios);
+  if (!nonEmptyReviewValue(value.boundaries)) throw invalidArgument(`${label}.boundaries must be non-empty`, `${label}.boundaries`, 'non-empty string, array, or object');
   return structuredClone(value);
 }
 
 function reviewFindings(state, value, verdict) {
   const rawFindings = value ?? [];
-  if (!Array.isArray(rawFindings)) throw new ControllerError('Review findings must be an array');
+  if (!Array.isArray(rawFindings)) throw invalidArgument('Review findings must be an array', 'review.findings', 'array', typeof rawFindings);
   if (rawFindings.length > MAX_REVIEW_FINDINGS) throw new ControllerError(`Review findings exceed the ${MAX_REVIEW_FINDINGS}-finding limit`);
   const requirementIds = new Set(state.requirements.map(requirement => requirement.id));
   const findings = rawFindings.map((finding, index) => {
-    if (!finding || typeof finding !== 'object' || Array.isArray(finding)) throw new ControllerError(`Review findings[${index}] must be an object`);
+    if (!finding || typeof finding !== 'object' || Array.isArray(finding)) throw invalidArgument(`Review findings[${index}] must be an object`, `review.findings[${index}]`, 'object', Array.isArray(finding) ? 'array' : typeof finding);
     const keys = Object.keys(finding).sort();
     const expectedFields = [...REVIEW_FINDING_FIELDS].sort();
     if (keys.length !== expectedFields.length || keys.some((key, keyIndex) => key !== expectedFields[keyIndex])) {
-      throw new ControllerError(`Review findings[${index}] must contain exactly: ${REVIEW_FINDING_FIELDS.join(', ')}`);
+      throw invalidArgument(`Review findings[${index}] must contain exactly: ${REVIEW_FINDING_FIELDS.join(', ')}`, `review.findings[${index}]`, REVIEW_FINDING_FIELDS, Object.keys(finding));
     }
     const id = requiredIdentifier(finding.id, `Review findings[${index}].id`);
     const severity = requiredString(finding.severity, `Review findings[${index}].severity`);
-    if (!REVIEW_FINDING_SEVERITIES.has(severity)) throw new ControllerError(`Review findings[${index}].severity must be blocking or advisory`);
+    if (!REVIEW_FINDING_SEVERITIES.has(severity)) throw invalidArgument(`Review findings[${index}].severity must be blocking or advisory`, `review.findings[${index}].severity`, ['blocking', 'advisory'], severity);
     const requirementId = finding.requirement_id === null ? null : requiredIdentifier(finding.requirement_id, `Review findings[${index}].requirement_id`);
-    if (requirementId !== null && !requirementIds.has(requirementId)) throw new ControllerError(`Review finding references an unknown requirement: ${requirementId}`);
+    if (requirementId !== null && !requirementIds.has(requirementId)) throw invalidArgument(`Review finding references an unknown requirement: ${requirementId}`, `review.findings[${index}].requirement_id`, [...requirementIds], requirementId);
     return { id, severity, requirement_id: requirementId, summary: requiredString(finding.summary, `Review findings[${index}].summary`), evidence: requiredReviewValue(finding.evidence, `Review findings[${index}].evidence`) };
   });
   if (new Set(findings.map(finding => finding.id)).size !== findings.length) throw new ControllerError('Review finding ids must be unique');
-  if (verdict === 'fail' && !findings.some(finding => finding.severity === 'blocking')) throw new ControllerError('A fail review requires at least one blocking finding');
-  if (verdict === 'pass' && findings.some(finding => finding.severity === 'blocking')) throw new ControllerError('A pass review cannot contain a blocking finding');
+  if (verdict === 'fail' && !findings.some(finding => finding.severity === 'blocking')) throw invalidArgument('A fail review requires at least one blocking finding', 'review.findings', 'at least one finding with severity=blocking');
+  if (verdict === 'pass' && findings.some(finding => finding.severity === 'blocking')) throw invalidArgument('A pass review cannot contain a blocking finding', 'review.findings', 'no finding with severity=blocking');
   if (verdict === 'unavailable' && findings.length) throw new ControllerError('An unavailable review cannot contain findings');
   return findings;
 }
@@ -334,23 +361,23 @@ function maxClosureRepairRegressions(state, review, findings) {
 
 function addressedReviewFindings(sourceReview, value) {
   if (!hasOwn(sourceReview, 'findings')) return requiredReviewValue(value, 'addressed_findings');
-  if (!Array.isArray(value)) throw new ControllerError('addressed_findings must be an array for a structured review');
+  if (!Array.isArray(value)) throw invalidArgument('addressed_findings must be an array for a structured review', 'repair.addressed_findings', 'array', typeof value);
   const sourceById = new Map(sourceReview.findings.map(finding => [finding.id, finding]));
   const addressed = value.map((item, index) => {
-    if (!item || typeof item !== 'object' || Array.isArray(item)) throw new ControllerError(`addressed_findings[${index}] must be an object`);
+    if (!item || typeof item !== 'object' || Array.isArray(item)) throw invalidArgument(`addressed_findings[${index}] must be an object`, `repair.addressed_findings[${index}]`, 'object', Array.isArray(item) ? 'array' : typeof item);
     const keys = Object.keys(item).sort();
     const expectedFields = [...REPAIR_FINDING_FIELDS].sort();
     if (keys.length !== expectedFields.length || keys.some((key, keyIndex) => key !== expectedFields[keyIndex])) {
-      throw new ControllerError(`addressed_findings[${index}] must contain exactly: ${REPAIR_FINDING_FIELDS.join(', ')}`);
+      throw invalidArgument(`addressed_findings[${index}] must contain exactly: ${REPAIR_FINDING_FIELDS.join(', ')}`, `repair.addressed_findings[${index}]`, REPAIR_FINDING_FIELDS, Object.keys(item));
     }
     const findingId = requiredString(item.finding_id, `addressed_findings[${index}].finding_id`);
-    if (!sourceById.has(findingId)) throw new ControllerError(`addressed_findings references an unknown finding: ${findingId}`);
+    if (!sourceById.has(findingId)) throw invalidArgument(`addressed_findings references an unknown finding: ${findingId}`, `repair.addressed_findings[${index}].finding_id`, [...sourceById.keys()], findingId);
     return { finding_id: findingId, resolution: requiredReviewValue(item.resolution, `addressed_findings[${index}].resolution`), verification_evidence: requiredReviewValue(item.verification_evidence, `addressed_findings[${index}].verification_evidence`) };
   });
   if (new Set(addressed.map(item => item.finding_id)).size !== addressed.length) throw new ControllerError('addressed_findings finding_id values must be unique');
   const addressedIds = new Set(addressed.map(item => item.finding_id));
   const missingBlocking = sourceReview.findings.filter(finding => finding.severity === 'blocking' && !addressedIds.has(finding.id)).map(finding => finding.id);
-  if (missingBlocking.length) throw new ControllerError(`addressed_findings must resolve every blocking finding: ${missingBlocking.join(', ')}`);
+  if (missingBlocking.length) throw invalidArgument(`addressed_findings must resolve every blocking finding: ${missingBlocking.join(', ')}`, 'repair.addressed_findings', missingBlocking);
   return addressed;
 }
 
@@ -757,7 +784,7 @@ function publicWorkspaceLease(state) {
     status: lease.status,
     acquired_at: lease.acquired_at,
     ...(lease.released_at ? { released_at: lease.released_at } : {}),
-    workspace_claims: lease.workspace_claims ?? state.workspace_claims,
+    workspace_claims: lease.workspace_claims,
     ...reference,
   };
 }
@@ -1060,12 +1087,10 @@ async function normalizeWorkspaceClaims(rawClaims, workspace) {
     const prefix = claim.prefix;
     if (prefix.length > MAX_WORKSPACE_CLAIM_PREFIX_LENGTH) throw new ControllerError(`workspace_claim prefix exceeds the ${MAX_WORKSPACE_CLAIM_PREFIX_LENGTH}-character limit`);
     if (!prefix || prefix.includes('\0') || prefix.includes('\\') || path.posix.isAbsolute(prefix) || path.win32.isAbsolute(prefix) || prefix.endsWith('/') || prefix.split('/').some(segment => !segment || segment === '.' || segment === '..')) {
-      if (prefix !== '.') throw new ControllerError(`Invalid workspace_claim prefix: ${prefix}`);
+      if (prefix !== '.') throw invalidArgument(`Invalid workspace_claim prefix: ${prefix}`, 'workspace_claims[].prefix', 'workspace-relative POSIX segment prefix', prefix);
     }
-    if (prefix !== '.' && (prefix === '.' || prefix.includes('/./') || prefix.startsWith('./') || prefix.endsWith('/.'))) throw new ControllerError(`Invalid workspace_claim prefix: ${prefix}`);
+    if (prefix !== '.' && (prefix === '.' || prefix.includes('/./') || prefix.startsWith('./') || prefix.endsWith('/.'))) throw invalidArgument(`Invalid workspace_claim prefix: ${prefix}`, 'workspace_claims[].prefix', 'workspace-relative POSIX segment prefix', prefix);
     if (isUnsafeWorkspaceClaimPrefix(prefix)) throw new ControllerError(`workspace_claim prefix has an unsafe Windows path alias: ${prefix}`);
-    const first = claimSegments(prefix)[0];
-    if (first && (isIgnoredFingerprintDirectory(first) || isWorkspaceControlFile(first))) throw new ControllerError(`workspace_claims cannot include ignored or controller directory: ${prefix}`);
     await assertClaimDoesNotTraverseLink(workspace, prefix);
     const key = workspacePathKey(prefix);
     const existing = byPrefix.get(key);
@@ -1086,8 +1111,6 @@ function normalizeStoredWorkspaceClaims(rawClaims) {
     if (prefix.length > MAX_WORKSPACE_CLAIM_PREFIX_LENGTH) throw new ControllerError(`workspace_claim prefix exceeds the ${MAX_WORKSPACE_CLAIM_PREFIX_LENGTH}-character limit`);
     if (!prefix || prefix.includes('\0') || prefix.includes('\\') || path.posix.isAbsolute(prefix) || path.win32.isAbsolute(prefix) || (prefix !== '.' && (prefix.endsWith('/') || prefix.split('/').some(segment => !segment || segment === '.' || segment === '..')))) throw new ControllerError(`Invalid stored workspace_claim prefix: ${prefix}`);
     if (isUnsafeWorkspaceClaimPrefix(prefix)) throw new ControllerError(`Stored workspace_claim prefix has an unsafe Windows path alias: ${prefix}`);
-    const first = claimSegments(prefix)[0];
-    if (first && (isIgnoredFingerprintDirectory(first) || isWorkspaceControlFile(first))) throw new ControllerError(`Stored workspace_claim targets ignored or controller directory: ${prefix}`);
     const key = workspacePathKey(prefix); const existing = byPrefix.get(key);
     if (!existing || claim.mode === 'write') byPrefix.set(key, { mode: claim.mode, prefix });
   }
@@ -1126,12 +1149,16 @@ async function loadState(filePath) {
     throw new ControllerError(`Current global controller state does not exist: ${taskKey(filePath)}`);
   }
   if (!state || typeof state !== 'object' || state.version !== VERSION) throw new ControllerError(`Unsupported controller state: ${filePath}`);
-  if (state.workspace_lease?.state_path !== undefined) {
-    const leasePath = await canonicalStatePath(state.workspace_lease.state_path, 'workspace_lease.state_path');
-    if (!sameStatePath(leasePath, filePath)) throw new ControllerError(`workspace_lease.state_path does not identify this state: ${filePath}`);
-    state.workspace_lease.state_path = leasePath;
-    if (state.workspace_lease.task_key !== undefined && state.workspace_lease.task_key !== taskKey(filePath)) throw new ControllerError(`workspace_lease.task_key does not identify this state: ${filePath}`);
+  if (!state.workspace_lease || typeof state.workspace_lease !== 'object' || Array.isArray(state.workspace_lease)) {
+    throw unsupportedWorkflowState('Task state has no current workspace lease', 'workspace_lease', 'current workspace lease object', 'missing');
   }
+  if (!hasOwn(state.workspace_lease, 'state_path')) {
+    throw unsupportedWorkflowState('Task workspace lease has no current state_path', 'workspace_lease.state_path', 'present', 'missing');
+  }
+  const leasePath = await canonicalStatePath(state.workspace_lease.state_path, 'workspace_lease.state_path');
+  if (!sameStatePath(leasePath, filePath)) throw new ControllerError(`workspace_lease.state_path does not identify this state: ${filePath}`);
+  state.workspace_lease.state_path = leasePath;
+  if (state.workspace_lease.task_key !== taskKey(filePath)) throw unsupportedWorkflowState(`workspace_lease.task_key does not identify this state: ${filePath}`, 'workspace_lease.task_key', taskKey(filePath), state.workspace_lease.task_key ?? 'missing');
   return state;
 }
 
@@ -1162,130 +1189,42 @@ function sameFileObjectIdentity(left, right) {
 }
 
 function addEvent(state, type, details = {}) {
-  state.events ??= [];
   state.events.push({ at: utcNow(), type, ...details });
   state.updated_at = utcNow();
 }
 
-async function walkFiles(root, directory = root, files = []) {
-  let entries;
-  try { entries = await fs.readdir(directory, { withFileTypes: true }); } catch (error) { throw new ControllerError(`Workspace is not a directory: ${root}`); }
-  for (const entry of entries) {
-    const entryPath = path.join(directory, entry.name);
-    if (entry.isDirectory()) {
-      if (!isIgnoredFingerprintDirectory(entry.name)) await walkFiles(root, path.join(directory, entry.name), files);
-    } else if (entry.isSymbolicLink()) {
-      throw new ControllerError(`Workspace contains a symbolic link that cannot be fingerprinted safely: ${entryPath}`);
-    } else if (entry.isFile()) {
-      const relative = path.relative(root, path.join(directory, entry.name));
-      files.push(relative);
-      if (files.length > MAX_FINGERPRINT_FILES) throw new ControllerError(`Workspace exceeds the ${MAX_FINGERPRINT_FILES}-file fingerprint limit`);
-    }
+// A workflow anchor intentionally does not enumerate, hash, or otherwise
+// traverse the project tree.  Large workspaces are verified through explicit
+// node evidence and quality-gate checks; this anchor detects replacement of a
+// claimed root, claim topology changes, links, and project-root replacement.
+async function workspaceClaimAnchor(workspace, claim) {
+  await assertClaimDoesNotTraverseLink(workspace, claim.prefix);
+  const relative = claim.prefix === '.' ? '' : claim.prefix.split('/').join(path.sep);
+  const claimedPath = path.join(workspace, relative);
+  let metadata;
+  try { metadata = await fs.lstat(claimedPath, { bigint: true }); }
+  catch (error) {
+    if (error.code === 'ENOENT') return { mode: claim.mode, prefix: claim.prefix, state: 'missing' };
+    throw error;
   }
-  return files;
-}
-
-function isIgnoredFingerprintDirectory(name) {
-  // Package-manager caches are derived download artifacts, like node_modules.
-  // They may be populated while verification runs and must not invalidate a
-  // source review or make the fingerprint traverse a large transient cache.
-  const key = workspacePathKey(name);
-  return [...IGNORED_DIRECTORIES].some(directory => workspacePathKey(directory) === key)
-    || key === workspacePathKey('.yarn')
-    || key.startsWith(workspacePathKey('.yarn-cache'));
-}
-
-class WorkspaceChangedDuringFingerprint extends Error {}
-
-function fixedLength(value) {
-  const length = Buffer.alloc(8);
-  length.writeBigUInt64BE(BigInt(value));
-  return length;
-}
-
-function framedString(hash, value) {
-  const bytes = Buffer.from(value, 'utf8');
-  hash.update(fixedLength(bytes.length));
-  hash.update(bytes);
-}
-
-function sameFingerprintMetadata(left, right) {
-  return left.size === right.size && left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs;
-}
-
-async function fingerprintItem(root, relativePath) {
-  const filePath = path.join(root, relativePath);
-  const before = await fs.stat(filePath);
-  if (!before.isFile()) throw new WorkspaceChangedDuringFingerprint(`File changed type while fingerprinting: ${filePath}`);
-  if (before.size > MAX_FINGERPRINT_FILE_BYTES) throw new ControllerError(`Workspace file exceeds the ${MAX_FINGERPRINT_FILE_BYTES}-byte fingerprint limit: ${filePath}`);
-  const item = createHash('sha256');
-  framedString(item, 'file');
-  framedString(item, relativePath.split(path.sep).join('/'));
-  item.update(fixedLength(before.size));
-  for await (const chunk of createReadStream(filePath)) item.update(chunk);
-  const after = await fs.stat(filePath);
-  if (!sameFingerprintMetadata(before, after)) throw new WorkspaceChangedDuringFingerprint(`File changed while fingerprinting: ${filePath}`);
-  return { digest: item.digest(), bytes: before.size };
-}
-
-async function filesForWorkspaceClaims(workspace, claims) {
-  const files = new Set();
-  const missing = [];
-  for (const claim of claims) {
-    // Claims are persistent input and directory topology can change after init.
-    await assertClaimDoesNotTraverseLink(workspace, claim.prefix);
-    const relative = claim.prefix === '.' ? '' : claim.prefix.split('/').join(path.sep);
-    const claimedPath = path.join(workspace, relative);
-    let metadata;
-    try { metadata = await fs.lstat(claimedPath); }
-    catch (error) {
-      if (error.code === 'ENOENT') { missing.push(claim.prefix); continue; }
-      throw error;
-    }
-    if (metadata.isSymbolicLink()) throw new ControllerError(`Workspace claim became a symbolic link while fingerprinting: ${claim.prefix}`);
-    if (metadata.isDirectory()) {
-      for (const file of await walkFiles(workspace, claimedPath)) files.add(file);
-    } else if (metadata.isFile()) {
-      files.add(path.relative(workspace, claimedPath));
-    } else {
-      throw new ControllerError(`Workspace claim is not a regular file or directory: ${claim.prefix}`);
-    }
-  }
-  return { files: [...files].sort((left, right) => left < right ? -1 : left > right ? 1 : 0), missing: [...new Set(missing)].sort((left, right) => workspacePathKey(left).localeCompare(workspacePathKey(right))) };
-}
-
-async function fingerprintAttempt(workspace, claims) {
-  const before = await filesForWorkspaceClaims(workspace, claims);
-  const files = before.files;
-  const digest = createHash('sha256');
-  framedString(digest, 'workspace-claims-v2');
-  for (const claim of claims) { framedString(digest, claim.mode); framedString(digest, claim.prefix); }
-  for (const prefix of before.missing) { framedString(digest, 'missing'); framedString(digest, prefix); }
-  let totalBytes = 0;
-  for (const relative of files) {
-    const item = await fingerprintItem(workspace, relative);
-    totalBytes += item.bytes;
-    if (totalBytes > MAX_FINGERPRINT_TOTAL_BYTES) throw new ControllerError(`Workspace exceeds the ${MAX_FINGERPRINT_TOTAL_BYTES}-byte fingerprint limit`);
-    digest.update(item.digest);
-  }
-  const after = await filesForWorkspaceClaims(workspace, claims);
-  if (files.length !== after.files.length || files.some((entry, index) => entry !== after.files[index]) || before.missing.length !== after.missing.length || before.missing.some((entry, index) => entry !== after.missing[index])) throw new WorkspaceChangedDuringFingerprint('Workspace file set changed while fingerprinting');
-  return { algorithm: 'sha256-item-claims-v2', value: digest.digest('hex'), file_count: files.length, total_bytes: totalBytes, workspace_claims: claims };
+  if (metadata.isSymbolicLink()) throw new ControllerError(`Workspace claim became a symbolic link or reparse point: ${claim.prefix}`);
+  if (!metadata.isDirectory() && !metadata.isFile()) throw new ControllerError(`Workspace claim is not a regular file or directory: ${claim.prefix}`);
+  return { mode: claim.mode, prefix: claim.prefix, state: metadata.isDirectory() ? 'directory' : 'file', identity: fileIdentity(metadata) };
 }
 
 export async function workspaceFingerprint(workspaceValue, rawClaims = undefined) {
   const workspace = await canonicalWorkspace(workspaceValue);
   const claims = await normalizeWorkspaceClaims(rawClaims, workspace);
-  for (let attempt = 1; attempt <= FINGERPRINT_ATTEMPTS; attempt++) {
-    try { return await fingerprintAttempt(workspace, claims); }
-    catch (error) {
-      if (!(error instanceof WorkspaceChangedDuringFingerprint) || attempt === FINGERPRINT_ATTEMPTS) {
-        if (error instanceof WorkspaceChangedDuringFingerprint) throw new ControllerError(`Workspace did not stabilize after ${FINGERPRINT_ATTEMPTS} fingerprint attempts: ${error.message}`);
-        throw error;
-      }
-    }
-  }
-  throw new ControllerError('Workspace fingerprint did not complete');
+  const workspaceMetadata = await fs.lstat(workspace, { bigint: true });
+  if (workspaceMetadata.isSymbolicLink() || !workspaceMetadata.isDirectory()) throw new ControllerError(`Workspace is not a regular directory: ${workspace}`);
+  const claimAnchors = await Promise.all(claims.map(claim => workspaceClaimAnchor(workspace, claim)));
+  const material = {
+    algorithm: 'sha256-workspace-claim-anchors-v1',
+    workspace_identity: fileIdentity(workspaceMetadata),
+    workspace_claims: claims,
+    claim_anchors: claimAnchors,
+  };
+  return { ...material, value: createHash('sha256').update(stableJson(material)).digest('hex'), traversal: 'none' };
 }
 
 function validateNodes(nodes) {
@@ -1437,6 +1376,7 @@ function workflowSnapshotMaterial(state, { includeAssurance = true, excludeAllRe
     }));
   const material = {
     task_id: state.task_id,
+    execution_routing_policy_version: state.execution_routing_policy_version,
     goal: state.goal,
     requirements: [...state.requirements].sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0),
     scope: state.scope,
@@ -1458,7 +1398,7 @@ function workflowSnapshotMaterial(state, { includeAssurance = true, excludeAllRe
 
 function workflowSnapshotFor(state, { digestAlgorithm, includeAssurance, excludeAllReviews, includeClaims = true }) {
   return {
-    workflow_revision: state.workflow_revision ?? 0,
+    workflow_revision: state.workflow_revision,
     digest_algorithm: digestAlgorithm,
     digest: createHash('sha256').update(stableJson(workflowSnapshotMaterial(state, { includeAssurance, excludeAllReviews, includeClaims }))).digest('hex'),
   };
@@ -1486,7 +1426,7 @@ function completeReviewDirectDependencies(nodes, routingSchemaVersion) {
 export function sameJson(left, right) { return stableJson(left) === stableJson(right); }
 
 function bumpWorkflowRevision(state, eventType, details = {}) {
-  state.workflow_revision = (state.workflow_revision ?? 0) + 1;
+  state.workflow_revision += 1;
   addEvent(state, eventType, { ...details, workflow_revision: state.workflow_revision });
 }
 
@@ -1511,12 +1451,12 @@ function validateAgentType(kind, executionRisk, agentType) {
   }
   if (agentType == null) return;
   if (kind === QUALITY_REVIEW_KIND) {
-    if (executionRisk !== 'read_only') throw new ControllerError('A quality_review node must be read_only; set execution_risk="read_only" and use avsp_terra_xhigh because an independent review must not write the reviewed workspace');
-    if (agentType !== TERRA_REVIEW_ROLE) throw new ControllerError('A quality_review node requires avsp_terra_xhigh');
+    if (executionRisk !== 'read_only') throw invalidArgument('A quality_review node must be read_only; set execution_risk="read_only" and use avsp_terra_xhigh because an independent review must not write the reviewed workspace', 'nodes[].execution_risk', 'read_only', executionRisk);
+    if (agentType !== TERRA_REVIEW_ROLE) throw invalidArgument('A quality_review node requires avsp_terra_xhigh', 'nodes[].agent_type', TERRA_REVIEW_ROLE, agentType);
     return;
   }
   if (executionRisk === 'protected' && agentType !== PROTECTED_EXECUTOR_ROLE) throw new ControllerError('A protected node agent_type must be avsp_terra_high or omitted');
-  if (executionRisk === 'delegable' && !LUNA_EXECUTOR_ROLES.has(agentType) && agentType !== PROTECTED_EXECUTOR_ROLE) throw new ControllerError('A delegable node agent_type must be a Luna executor or avsp_terra_high');
+  if (executionRisk === 'delegable' && !LUNA_EXECUTOR_ROLES.has(agentType)) throw new ControllerError('A delegable node agent_type must be a Luna executor; use protected routing for direct Terra execution');
   if (executionRisk === 'read_only' && (!READ_ONLY_ROLES.has(agentType) || READ_ONLY_FALLBACK_ROLE_SET.has(agentType))) throw new ControllerError('A read_only node agent_type cannot configure a Terra fallback role or other non-primary role');
 }
 
@@ -1538,16 +1478,30 @@ function nodeRecord(raw, options = {}) {
 
 function normalizeState(state) {
   if (!state || typeof state !== 'object' || Array.isArray(state)) throw new ControllerError('Task state must be an object');
+  const requiredStateFields = [
+    'version', 'routing_schema_version', 'execution_routing_policy_version', 'assurance_level', 'assurance_assessment',
+    'review_protocol_version', 'review_entry_stage', 'review_context', 'task_id', 'workspace', 'workspace_claims', 'goal',
+    'requirements', 'scope', 'non_goals', 'nodes', 'participants', 'reviews', 'repair_records', 'max_review_charter',
+    'events', 'workflow_revision', 'closed_revision', 'closed_at', 'created_at', 'updated_at', 'workspace_lease',
+  ];
+  const missingStateField = requiredStateFields.find(field => !hasOwn(state, field));
+  if (missingStateField) throw unsupportedWorkflowState(`Task state is missing required current field: ${missingStateField}`, missingStateField, 'present', 'missing');
   if (!state.nodes || typeof state.nodes !== 'object' || Array.isArray(state.nodes) || !Object.keys(state.nodes).length) throw new ControllerError('Task state must contain nodes');
-  if (state.workspace_claims === undefined || state.workspace_claims === null) throw new ControllerError('Current task state requires workspace_claims');
   state.workspace_claims = normalizeStoredWorkspaceClaims(state.workspace_claims);
-  state.workflow_revision ??= 0;
-  state.closed_revision ??= null;
-  state.closed_at ??= null;
-  state.assurance_assessment ??= null;
-  state.repair_records ??= [];
+  if (!Array.isArray(state.events)) throw unsupportedWorkflowState('Task state events must be an array', 'events', 'array', typeof state.events);
+  if (!Number.isSafeInteger(state.workflow_revision) || state.workflow_revision < 0) throw unsupportedWorkflowState('Task state workflow_revision must be a non-negative integer', 'workflow_revision', 'non-negative integer', state.workflow_revision);
+  if (state.closed_revision !== null && (!Number.isSafeInteger(state.closed_revision) || state.closed_revision < 0)) throw unsupportedWorkflowState('Task state closed_revision must be null or a non-negative integer', 'closed_revision', 'null or non-negative integer', state.closed_revision);
+  if (state.closed_at !== null && !validTimestamp(state.closed_at)) throw unsupportedWorkflowState('Task state closed_at must be null or an ISO timestamp', 'closed_at', 'null or ISO timestamp', state.closed_at);
+  if (!validTimestamp(state.created_at) || !validTimestamp(state.updated_at)) throw unsupportedWorkflowState('Task state timestamps are invalid', !validTimestamp(state.created_at) ? 'created_at' : 'updated_at', 'ISO timestamp', !validTimestamp(state.created_at) ? state.created_at : state.updated_at);
   if (!Array.isArray(state.repair_records)) throw new ControllerError('Task repair_records must be an array');
   if (state.routing_schema_version !== REVIEW_PROTOCOL_VERSION) throw new ControllerError('Task state must use routing_schema_version=3');
+  if (state.execution_routing_policy_version !== CURRENT_EXECUTION_ROUTING_POLICY_VERSION) {
+    throw new ControllerError('Task state has an unsupported execution routing policy version; old workflow state is not read or migrated automatically', {
+      code: 'UNSUPPORTED_WORKFLOW_STATE',
+      fieldErrors: [{ path: 'execution_routing_policy_version', code: 'unsupported_version', expected: CURRENT_EXECUTION_ROUTING_POLICY_VERSION, actual: state.execution_routing_policy_version ?? 'missing' }],
+      recovery: { action: 'start_new_workflow' },
+    });
+  }
   if (!ASSURANCE_LEVELS.has(state.assurance_level)) throw new ControllerError('A v3 task state requires assurance_level terra or sol');
   if (state.assurance_assessment !== null) state.assurance_assessment = assuranceAssessment(state.assurance_assessment, 'assurance_assessment');
   {
@@ -1559,16 +1513,19 @@ function normalizeState(state) {
   for (const [nodeId, node] of Object.entries(state.nodes)) {
     if (!node || typeof node !== 'object' || Array.isArray(node)) throw new ControllerError(`Task node must be an object: ${nodeId}`);
     if (node.id !== nodeId) throw new ControllerError(`Task node key and id must match: ${nodeId}`);
-    node.agent_thread_id ??= null; node.agent_role ??= null; node.claim_id ??= null; node.claimed_at ??= null; node.activation_at ??= null; node.activation_deadline_at ??= null; node.heartbeat_at ??= null;
-    node.lease_duration_sec ??= null; node.heartbeat_count ??= 0; node.attempt ??= node.agent_task_path ? 1 : 0;
-    node.attempt_budget_used ??= Math.min(node.attempt, MAX_NODE_ATTEMPTS); node.unavailable_attempts ??= 0;
+    const requiredNodeFields = [
+      'id', 'kind', 'review_stage', 'agent_type', 'depends_on', 'execution_risk', 'routing_reason', 'execution_owner', 'integration_owner', 'quality_guard',
+      'rescue_role', 'rescue_reason', 'rescued_at', 'rescue_count', 'status', 'agent_task_path', 'agent_thread_id', 'agent_role', 'claim_id', 'claimed_at',
+      'activation_at', 'activation_deadline_at', 'heartbeat_at', 'heartbeat_count', 'lease_duration_sec', 'attempt', 'attempt_budget_used', 'unavailable_attempts',
+      'result', 'checkpoint', 'checkpoint_at', 'workflow_completion_intent', 'recovery_history', 'review_gate',
+    ];
+    const missingNodeField = requiredNodeFields.find(field => !hasOwn(node, field));
+    if (missingNodeField) throw unsupportedWorkflowState(`Task node is missing required current field: ${nodeId}.${missingNodeField}`, `nodes.${nodeId}.${missingNodeField}`, 'present', 'missing');
     if (!Number.isSafeInteger(node.attempt) || node.attempt < 0 || !Number.isSafeInteger(node.attempt_budget_used) || node.attempt_budget_used < 0 || node.attempt_budget_used > MAX_NODE_ATTEMPTS || !Number.isSafeInteger(node.unavailable_attempts) || node.unavailable_attempts < 0 || node.unavailable_attempts > MAX_UNAVAILABLE_ATTEMPTS || node.attempt_budget_used + node.unavailable_attempts > node.attempt) {
       throw new ControllerError(`Task node has invalid attempt accounting: ${nodeId}`);
     }
-    node.checkpoint ??= null; node.checkpoint_at ??= null; node.recovery_history ??= []; node.workflow_completion_intent ??= null;
-    node.rescue_role ??= null; node.rescue_reason ??= null; node.rescued_at ??= null; node.rescue_count ??= 0;
-    node.review_stage ??= node.kind === QUALITY_REVIEW_KIND ? 'terra' : node.kind === 'total_review' ? 'sol' : null;
-    node.review_gate ??= null;
+    if (!Array.isArray(node.recovery_history)) throw unsupportedWorkflowState(`Task node recovery_history must be an array: ${nodeId}`, `nodes.${nodeId}.recovery_history`, 'array', typeof node.recovery_history);
+    if (!Number.isSafeInteger(node.heartbeat_count) || node.heartbeat_count < 0 || !Number.isSafeInteger(node.rescue_count) || node.rescue_count < 0) throw unsupportedWorkflowState(`Task node counters are invalid: ${nodeId}`, `nodes.${nodeId}`, 'non-negative integer counters', 'invalid');
     if (isReviewNode(node, state.routing_schema_version)) {
       if (!node.review_gate || typeof node.review_gate !== 'object' || !REVIEW_PROTOCOL_STAGES.has(node.review_gate.stage)) throw new ControllerError('A v3 review node requires an explicit review_gate');
       if (node.kind !== protocolNodeKind(node.review_gate.stage) || node.agent_type !== protocolNodeRole(node.review_gate.stage)) throw new ControllerError('A v3 review node does not match its review_gate stage');
@@ -1579,6 +1536,15 @@ function normalizeState(state) {
     }
     if (!hasOwn(node, 'execution_risk')) throw new ControllerError(`Task node lacks current routing fields: ${nodeId}`);
   }
+  if (!state.workspace_lease || typeof state.workspace_lease !== 'object' || Array.isArray(state.workspace_lease)) throw unsupportedWorkflowState('Task state requires a current workspace_lease', 'workspace_lease', 'current workspace lease object', typeof state.workspace_lease);
+  const requiredLeaseFields = ['registry_path', 'state_path', 'task_key', 'state_parent_authority', 'status', 'acquired_at', 'workspace_claims'];
+  const missingLeaseField = requiredLeaseFields.find(field => !hasOwn(state.workspace_lease, field));
+  if (missingLeaseField) throw unsupportedWorkflowState(`Task workspace lease is missing required current field: ${missingLeaseField}`, `workspace_lease.${missingLeaseField}`, 'present', 'missing');
+  if (!['active', 'released'].includes(state.workspace_lease.status) || !validTimestamp(state.workspace_lease.acquired_at)) throw unsupportedWorkflowState('Task workspace lease is invalid', 'workspace_lease', 'current active or released lease', 'invalid');
+  if (state.workspace_lease.status === 'released' && (!hasOwn(state.workspace_lease, 'released_at') || !validTimestamp(state.workspace_lease.released_at))) throw unsupportedWorkflowState('Released task workspace lease requires released_at', 'workspace_lease.released_at', 'ISO timestamp', state.workspace_lease.released_at ?? 'missing');
+  if (state.workspace_lease.status === 'active' && hasOwn(state.workspace_lease, 'released_at')) throw unsupportedWorkflowState('Active task workspace lease must not carry released_at', 'workspace_lease.released_at', 'absent', state.workspace_lease.released_at);
+  state.workspace_lease.workspace_claims = normalizeStoredWorkspaceClaims(state.workspace_lease.workspace_claims);
+  if (!sameJson(state.workspace_lease.workspace_claims, state.workspace_claims)) throw unsupportedWorkflowState('Task workspace lease claims do not match task claims', 'workspace_lease.workspace_claims', state.workspace_claims, state.workspace_lease.workspace_claims);
   validateNodes(state.nodes);
   validateReviewTopology(state.nodes, state.assurance_level, state.routing_schema_version, state.review_entry_stage);
   return state;
@@ -1634,7 +1600,7 @@ async function makeState(manifest) {
   const created = utcNow();
   const events = [{ at: created, type: 'task_initialized', workflow_revision: 0 }];
   if (normalizedReviewDependencies.length) events.push({ at: created, type: 'review_direct_dependencies_completed', node_id: reviewNodes(nodes, routingSchemaVersion)[0].id, added_dependencies: normalizedReviewDependencies, workflow_revision: 0 });
-  const state = { version: VERSION, routing_schema_version: REVIEW_PROTOCOL_VERSION, assurance_level: assuranceLevel, assurance_assessment: assuranceAssessmentValue, review_protocol_version: REVIEW_PROTOCOL_VERSION, review_entry_stage: reviewEntryStage, review_context: reviewContext, task_id: taskId, workspace, workspace_claims: workspaceClaims, ...(globalWriteReason === null ? {} : { global_write_justification: globalWriteReason }), goal, requirements, scope: manifest.scope ?? [], non_goals: manifest.non_goals ?? [], nodes, participants: [], reviews: [], repair_records: [], max_review_charter: null, events, workflow_revision: 0, closed_revision: null, closed_at: null, created_at: created, updated_at: created };
+  const state = { version: VERSION, routing_schema_version: REVIEW_PROTOCOL_VERSION, execution_routing_policy_version: CURRENT_EXECUTION_ROUTING_POLICY_VERSION, assurance_level: assuranceLevel, assurance_assessment: assuranceAssessmentValue, review_protocol_version: REVIEW_PROTOCOL_VERSION, review_entry_stage: reviewEntryStage, review_context: reviewContext, task_id: taskId, workspace, workspace_claims: workspaceClaims, ...(globalWriteReason === null ? {} : { global_write_justification: globalWriteReason }), goal, requirements, scope: manifest.scope ?? [], non_goals: manifest.non_goals ?? [], nodes, participants: [], reviews: [], repair_records: [], max_review_charter: null, events, workflow_revision: 0, closed_revision: null, closed_at: null, created_at: created, updated_at: created, workspace_lease: null };
   return state;
 }
 
@@ -1693,7 +1659,7 @@ function staleNodes(state, now = Date.now()) {
 
 function compactState(state) {
   const workspaceLease = publicWorkspaceLease(state);
-  return { task_id: state.task_id, ...(workspaceLease ? { state_path: workspaceLease.state_path, database_path: workspaceLease.database_path, task_key: workspaceLease.task_key } : {}), workspace: state.workspace, workspace_claims: state.workspace_claims, workspace_lease: workspaceLease, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), assurance_assessment: state.assurance_assessment, review_protocol_version: state.review_protocol_version, review_entry_stage: state.review_entry_stage, review_context: state.review_context, goal: state.goal, nodes: Object.values(state.nodes), ready_nodes: readyNodes(state), stale_nodes: staleNodes(state), participants: state.participants, reviews: externallyVisibleReviews(state), repair_records: state.repair_records, workflow_revision: state.workflow_revision, updated_at: state.updated_at };
+  return { task_id: state.task_id, ...(workspaceLease ? { state_path: workspaceLease.state_path, database_path: workspaceLease.database_path, task_key: workspaceLease.task_key } : {}), workspace: state.workspace, workspace_claims: state.workspace_claims, workspace_lease: workspaceLease, execution_routing_policy_version: state.execution_routing_policy_version, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), assurance_assessment: state.assurance_assessment, review_protocol_version: state.review_protocol_version, review_entry_stage: state.review_entry_stage, review_context: state.review_context, goal: state.goal, nodes: Object.values(state.nodes), ready_nodes: readyNodes(state), stale_nodes: staleNodes(state), participants: state.participants, reviews: externallyVisibleReviews(state), repair_records: state.repair_records, workflow_revision: state.workflow_revision, updated_at: state.updated_at };
 }
 
 function doctorCheck(id, status, detail) { return { id, status, detail }; }
@@ -1800,11 +1766,8 @@ async function doctorTask(parameters) {
 }
 
 async function validateWorkspaceLeaseEntry(entry, leasePath) {
-  const fields = new Set(['task_id', 'state_path', 'state_dir', 'acquired_at', 'phase', 'workspace_claims']);
-  const authorityFields = new Set([...fields, 'state_parent_authority']);
-  const keyedFields = new Set([...fields, 'task_key']);
-  const keyedAuthorityFields = new Set([...authorityFields, 'task_key']);
-  if ((!hasExactFields(entry, fields) && !hasExactFields(entry, authorityFields) && !hasExactFields(entry, keyedFields) && !hasExactFields(entry, keyedAuthorityFields)) || !validTimestamp(entry.acquired_at) || !['initializing', 'active'].includes(entry.phase)) throw new ControllerError(`Unsupported workspace lease entry: ${leasePath}`);
+  const fields = new Set(['task_id', 'task_key', 'state_path', 'state_dir', 'state_parent_authority', 'acquired_at', 'phase', 'workspace_claims']);
+  if (!hasExactFields(entry, fields) || !validTimestamp(entry.acquired_at) || !['initializing', 'active'].includes(entry.phase)) throw new ControllerError(`Unsupported workspace lease entry: ${leasePath}`);
   requiredIdentifier(entry.task_id, 'workspace lease task_id');
   if (typeof entry.state_path !== 'string' || typeof entry.state_dir !== 'string') throw new ControllerError(`Invalid workspace lease entry path: ${leasePath}`);
   const statePath = await canonicalStatePath(entry.state_path, 'workspace lease state_path');
@@ -1812,9 +1775,8 @@ async function validateWorkspaceLeaseEntry(entry, leasePath) {
   if (!sameStatePath(path.dirname(statePath), stateDir)) throw new ControllerError(`Invalid workspace lease entry path: ${leasePath}`);
   entry.state_path = statePath;
   entry.state_dir = stateDir;
-  entry.task_key ??= taskKey(statePath);
   if (entry.task_key !== taskKey(statePath)) throw new ControllerError(`Invalid workspace lease task key: ${leasePath}`);
-  if (entry.state_parent_authority !== undefined && !validStateParentAuthority(entry.state_parent_authority, statePath)) throw new ControllerError(`Invalid workspace lease state parent authority: ${leasePath}`);
+  if (!validStateParentAuthority(entry.state_parent_authority, statePath)) throw new ControllerError(`Invalid workspace lease state parent authority: ${leasePath}`);
   entry.workspace_claims = normalizeStoredWorkspaceClaims(entry.workspace_claims);
 }
 
@@ -1847,9 +1809,8 @@ function writeLocksConflict(left, right) {
 }
 
 function validateWorkspaceWriteLock(lock, lease, leasePath) {
-  const fields = new Set(['lock_id', 'task_id', 'state_path', 'node_id', 'claim_id', 'prefix', 'purpose', 'acquired_at']);
-  const keyedFields = new Set([...fields, 'task_key']);
-  if ((!hasExactFields(lock, fields) && !hasExactFields(lock, keyedFields)) || !validTimestamp(lock.acquired_at)) throw new ControllerError(`Unsupported workspace write lock: ${leasePath}`);
+  const fields = new Set(['lock_id', 'task_id', 'task_key', 'state_path', 'node_id', 'claim_id', 'prefix', 'purpose', 'acquired_at']);
+  if (!hasExactFields(lock, fields) || !validTimestamp(lock.acquired_at)) throw new ControllerError(`Unsupported workspace write lock: ${leasePath}`);
   requiredString(lock.lock_id, 'workspace write lock lock_id');
   requiredIdentifier(lock.task_id, 'workspace write lock task_id');
   requiredIdentifier(lock.node_id, 'workspace write lock node_id');
@@ -1857,7 +1818,6 @@ function validateWorkspaceWriteLock(lock, lease, leasePath) {
   requiredWriteLockPurpose(lock.purpose);
   if (typeof lock.state_path !== 'string') throw new ControllerError(`Invalid workspace write lock state path: ${leasePath}`);
   lock.state_path = path.resolve(lock.state_path);
-  lock.task_key ??= taskKey(lock.state_path);
   if (lock.task_key !== taskKey(lock.state_path)) throw new ControllerError(`Invalid workspace write lock task key: ${leasePath}`);
   const normalized = normalizeStoredWorkspaceClaims([{ mode: 'write', prefix: lock.prefix }]);
   if (normalized.length !== 1 || normalized[0].prefix !== lock.prefix) throw new ControllerError(`Invalid workspace write lock prefix: ${leasePath}`);
@@ -1902,13 +1862,17 @@ async function validateWorkspaceLease(lease, leasePath) {
 // This is an internal global locator for the workspace-control row in the
 // single user-level global store; no project-local controller path is used.
 function workspaceLeasePath(workspace) {
-  return path.join(globalWorkflowStateRoot(), 'workspace-controls', globalNamespaceHash(workspace), 'control', 'state', WORKSPACE_CONTROL_FILENAME);
+  return path.join(globalWorkflowStateRoot(), 'workspace-controls', globalNamespaceHash(workspace), 'control', 'state', GLOBAL_WORKSPACE_CONTROL_FILENAME);
 }
 
 async function assertWorkspaceControlCreationIsSafe(workspace, stateDirectory) {
   const globalStates = await listGlobalTaskStatesForWorkspace(workspace);
   if (globalStates.length) {
-    const uniqueStatePaths = [...new Set(globalStates.map(entry => entry.state.workspace_lease?.state_path ?? path.join(entry.namespace_key, `${entry.task_id}${SQLITE_STATE_SUFFIX}`)))];
+    const uniqueStatePaths = [...new Set(globalStates.map(entry => {
+      const statePath = entry.state?.workspace_lease?.state_path;
+      if (typeof statePath !== 'string') throw unsupportedWorkflowState(`Current global task state lacks workspace_lease.state_path: ${entry.task_id}`, 'workspace_lease.state_path', 'present', 'missing');
+      return statePath;
+    }))];
     throw new ControllerError(`Workspace control database is missing while current v3 task state exists; explicit destructive recovery is required: ${uniqueStatePaths.join(', ')}`);
   }
 }
@@ -1935,9 +1899,12 @@ async function withWorkspaceLeaseLock(workspace, callback, { allowAuthorityCreat
   catch (error) { throw asControllerError(error); }
   let result;
   await withWorkspaceControlTransaction(workspace, async (storedLease, save) => {
-    const lease = storedLease && typeof storedLease === 'object' && !Array.isArray(storedLease)
-      ? storedLease
-      : { version: WORKSPACE_LEASE_VERSION, workspace, active_tasks: [], active_locks: [], updated_at: utcNow() };
+    if (!storedLease) {
+      if (!allowAuthorityCreation) throw new ControllerError(`Workspace control database does not exist: ${leasePath}`);
+      throw new ControllerError(`Workspace control database disappeared during initialization: ${leasePath}`);
+    }
+    if (typeof storedLease !== 'object' || Array.isArray(storedLease)) throw new ControllerError(`Unsupported workspace control lease: ${leasePath}`);
+    const lease = storedLease;
     await validateWorkspaceLease(lease, leasePath);
     const context = {
       lease,
@@ -1956,7 +1923,14 @@ async function withWorkspaceLeaseLock(workspace, callback, { allowAuthorityCreat
 async function loadWorkspaceLease(leasePath, workspace, { authorityContext = null } = {}) {
   if (leasePath !== workspaceLeasePath(workspace)) throw new ControllerError(`Workspace control path does not match its canonical workspace: ${leasePath}`);
   let lease;
-  try { lease = authorityContext?.lease ?? (await readWorkspaceControl(workspace)).payload; }
+  try {
+    if (authorityContext?.lease) lease = authorityContext.lease;
+    else {
+      const control = await readWorkspaceControl(workspace);
+      if (!control || typeof control !== 'object' || !hasOwn(control, 'payload')) throw new ControllerError(`Workspace control database does not exist: ${leasePath}`);
+      lease = control.payload;
+    }
+  }
   catch (error) { throw asControllerError(error); }
   if (!lease || typeof lease !== 'object' || Array.isArray(lease)) throw new ControllerError(`Unsupported workspace control lease: ${leasePath}`);
   await validateWorkspaceLease(lease, leasePath);
@@ -1990,7 +1964,7 @@ async function writeWorkspaceLeaseRegistry(context, leasePath, lease) {
   context.lease = lease;
 }
 
-function stateWorkspaceClaims(state) { return state.workspace_lease?.workspace_claims ?? state.workspace_claims; }
+function stateWorkspaceClaims(state) { return state.workspace_lease.workspace_claims; }
 
 function workspaceLeaseEntryMatches(entry, state, filePath, { activeOnly = true } = {}) {
   return entry.task_id === state.task_id
@@ -2049,11 +2023,11 @@ function activeOrTerminalClaimForWriteLock(state, node, parameters) {
   if (isCohortReviewNode(state, node)) {
     const claimId = requiredString(parameters.claim_id, 'claim_id');
     const lane = cohortLaneForClaim(node, claimId);
-    if (!lane || (lane.status !== RUNNING && !TERMINAL.has(lane.status))) throw new ControllerError(`Claim does not own an active or terminal Terra cohort lane: ${parameters.node_id}`);
+    if (!lane || (lane.status !== RUNNING && !TERMINAL.has(lane.status))) throw failedPrecondition(`Claim does not own an active or terminal Terra cohort lane: ${parameters.node_id}`, 'claim_id', 'workflow_status');
     return lane;
   }
   const claimId = requiredString(parameters.claim_id, 'claim_id');
-  if (!node || (node.status !== RUNNING && !TERMINAL.has(node.status)) || node.claim_id !== claimId) throw new ControllerError(`Claim does not own an active or terminal node: ${parameters.node_id}`);
+  if (!node || (node.status !== RUNNING && !TERMINAL.has(node.status)) || node.claim_id !== claimId) throw failedPrecondition(`Claim does not own an active or terminal node: ${parameters.node_id}`, 'claim_id', 'workflow_status');
   return node;
 }
 
@@ -2077,7 +2051,7 @@ async function acquireWorkspaceWriteLock(parameters) {
   }
   return withWorkspaceLeaseLock(initialState.workspace, async (leasePath, authorityContext) => {
     const { state, node, activeClaim } = await currentWriteLockOwner(filePath, nodeId, parameters);
-    if (activeClaim.claim_id !== claimId) throw new ControllerError(`Claim does not own node: ${nodeId}`);
+    if (activeClaim.claim_id !== claimId) throw failedPrecondition(`Claim does not own node: ${nodeId}`, 'claim_id', 'workflow_status');
     if (node.execution_risk === 'read_only') throw new ControllerError(`A read_only node cannot acquire a workspace write lock: ${nodeId}`);
     if (state.workspace !== initialState.workspace || state.workspace_lease?.registry_path !== leasePath) throw new ControllerError('Task workspace lease authority changed while acquiring a write lock');
     await requireActiveWorkspaceLease(state, filePath, authorityContext);
@@ -2120,7 +2094,7 @@ async function releaseWorkspaceWriteLock(parameters) {
   const lockIds = requestedWriteLockIds(parameters.lock_ids);
   return withWorkspaceLeaseLock(initialState.workspace, async (leasePath, authorityContext) => {
     const { state, activeClaim } = await currentWriteLockOwner(filePath, nodeId, parameters, { allowTerminal: true });
-    if (activeClaim.claim_id !== claimId) throw new ControllerError(`Claim does not own node: ${nodeId}`);
+    if (activeClaim.claim_id !== claimId) throw failedPrecondition(`Claim does not own node: ${nodeId}`, 'claim_id', 'workflow_status');
     if (state.workspace !== initialState.workspace || state.workspace_lease?.registry_path !== leasePath) throw new ControllerError('Task workspace lease authority changed while releasing a write lock');
     await requireActiveWorkspaceLease(state, filePath, authorityContext);
     const owned = authorityContext.lease.active_locks.filter(lock => workspaceWriteLockMatchesOwner(lock, state, filePath, nodeId, claimId));
@@ -2208,7 +2182,8 @@ async function withActiveWorkspaceStateLock(filePath, callback, { cursorRelevant
 
 function assertReleaseStateCanBeReleased(state, { closeAllowed, parameters }) {
   state.workspace_claims = normalizeStoredWorkspaceClaims(state.workspace_claims);
-  if (state.workspace_lease) state.workspace_lease.workspace_claims = normalizeStoredWorkspaceClaims(state.workspace_lease.workspace_claims ?? state.workspace_claims);
+  state.workspace_lease.workspace_claims = normalizeStoredWorkspaceClaims(state.workspace_lease.workspace_claims);
+  if (!sameJson(state.workspace_lease.workspace_claims, state.workspace_claims)) throw unsupportedWorkflowState('Task workspace lease claims do not match task claims', 'workspace_lease.workspace_claims', state.workspace_claims, state.workspace_lease.workspace_claims);
   if (!state.nodes || typeof state.nodes !== 'object' || Array.isArray(state.nodes) || !Object.keys(state.nodes).length) throw new ControllerError('Cannot release workspace lease: task nodes are unreadable or empty');
   const unknownNodes = Object.values(state.nodes).filter(node => !node || typeof node !== 'object' || ![PENDING, RUNNING, ...TERMINAL].includes(node.status));
   if (unknownNodes.length) throw new ControllerError('Cannot release workspace lease while node statuses are unknown');
@@ -2249,10 +2224,7 @@ async function releaseWorkspaceLease(parameters, { closeAllowed = false } = {}) 
   if (!alreadyReleased) {
     await withActiveWorkspaceStateLock(filePath, async state => {
       assertReleaseStateCanBeReleased(state, { closeAllowed, parameters });
-      state.workflow_revision ??= 0;
-      state.events ??= [];
       state.updated_at = utcNow();
-      state.workspace_lease.workspace_claims ??= state.workspace_claims;
       state.workspace_lease.status = 'released';
       state.workspace_lease.released_at = utcNow();
       addEvent(state, 'workspace_lease_released', { close_allowed: closeAllowed });
@@ -2544,7 +2516,7 @@ async function claimNode(parameters, activateImmediately = false) {
     // Total reviews are read-only guards, not protected execution work.
     if (node.execution_risk === 'protected' && node.kind !== 'total_review' && role !== PROTECTED_EXECUTOR_ROLE) throw new ControllerError('Only avsp_terra_high can claim protected work');
     if (node.execution_risk === 'read_only' && node.kind !== 'total_review' && !READ_ONLY_ROLES.has(role)) throw new ControllerError('A read_only node requires a configured read-only role');
-    if (node.execution_risk === 'delegable' && !LUNA_EXECUTOR_ROLES.has(role) && role !== PROTECTED_EXECUTOR_ROLE && !(node.rescue_role === ROOT_RESCUE_ROLE && role === ROOT_RESCUE_ROLE)) throw new ControllerError('A delegable node requires a Luna executor, avsp_terra_high, or an explicit main/root rescue');
+    if (node.execution_risk === 'delegable' && !LUNA_EXECUTOR_ROLES.has(role) && !(node.rescue_role === ROOT_RESCUE_ROLE && role === ROOT_RESCUE_ROLE)) throw new ControllerError('A delegable node requires a Luna executor or an explicit main/root rescue');
     if (LUNA_EXECUTOR_ROLES.has(role)) {
       if (node.execution_risk !== 'delegable') throw new ControllerError('A Luna executor requires delegable routing metadata');
       if (node.execution_owner !== taskPath) throw new ControllerError('Luna executor claim must match node execution_owner');
@@ -2572,14 +2544,14 @@ async function claimNode(parameters, activateImmediately = false) {
     addEvent(state, 'node_claimed', { node_id: nodeId, agent_task_path: taskPath, agent_thread_id: threadId, agent_role: role, claim_id: activeClaim.claim_id, reviewer_slot: cohortLane?.slot ?? null, attempt: activeClaim.attempt, fallback_reason: fallbackReason });
     if (activateImmediately) addEvent(state, 'node_started', { node_id: nodeId, agent_task_path: taskPath, agent_thread_id: threadId, agent_role: role, claim_id: activeClaim.claim_id, reviewer_slot: cohortLane?.slot ?? null, native_agent_started: true });
     await writeState(filePath, state);
-    return { task_id: state.task_id, node, reviewer_slot: cohortLane?.slot ?? null, claim_id: activeClaim.claim_id };
+    return { task_id: state.task_id, execution_routing_policy_version: state.execution_routing_policy_version, node, reviewer_slot: cohortLane?.slot ?? null, claim_id: activeClaim.claim_id };
   });
 }
 
 function requireActiveClaim(node, parameters) {
   const claimId = requiredString(parameters.claim_id, 'claim_id');
-  if (!node || node.status !== RUNNING) throw new ControllerError(`Only a running node accepts this operation: ${parameters.node_id}`);
-  if (!node.claim_id || node.claim_id !== claimId) throw new ControllerError(`Claim does not own node: ${parameters.node_id}; do not guess claim_id—use the exact value returned by workflow_start or workflow_status`);
+  if (!node || node.status !== RUNNING) throw failedPrecondition(`Only a running node accepts this operation: ${parameters.node_id}`, 'node_id', 'workflow_status');
+  if (!node.claim_id || node.claim_id !== claimId) throw failedPrecondition(`Claim does not own node: ${parameters.node_id}; do not guess claim_id—use the exact value returned by workflow_start or workflow_status`, 'claim_id', 'workflow_status');
   return claimId;
 }
 
@@ -2587,7 +2559,7 @@ function activeClaimForOperation(state, node, parameters) {
   if (isCohortReviewNode(state, node)) {
     const claimId = requiredString(parameters.claim_id, 'claim_id');
     const lane = cohortLaneForClaim(node, claimId);
-    if (!lane || lane.status !== RUNNING) throw new ControllerError(`Claim does not own an active Terra cohort lane: ${parameters.node_id}`);
+    if (!lane || lane.status !== RUNNING) throw failedPrecondition(`Claim does not own an active Terra cohort lane: ${parameters.node_id}`, 'claim_id', 'workflow_status');
     return lane;
   }
   requireActiveClaim(node, parameters);
@@ -2929,7 +2901,7 @@ async function completeNode(parameters) {
     if (!activeClaim.activation_at || activeClaim.heartbeat_count < 1) throw new ControllerError('An unactivated node cannot be completed; the claiming agent must first call workflow_heartbeat or workflow_start');
     const expectedAttestation = expectedCompletionAttestation(node, activeClaim, status, parameters.completion_attestation);
     if (parameters.completion_attestation !== expectedAttestation) {
-      throw new ControllerError(`workflow_complete requires completion_attestation=${expectedAttestation}; main/root must use the active claim returned by workflow_start and only declare native_agent_finished after confirming the native agent is Completed`);
+      throw invalidArgument(`workflow_complete requires completion_attestation=${expectedAttestation}; main/root must use the active claim returned by workflow_start and only declare native_agent_finished after confirming the native agent is Completed`, 'completion_attestation', expectedAttestation, parameters.completion_attestation);
     }
     const reviewNode = isReviewNode(node, state.routing_schema_version);
     if (cohortNode) {
@@ -2982,7 +2954,7 @@ async function completeNode(parameters) {
     if (reviewNode && status === 'skipped') throw new ControllerError('A review node cannot be skipped');
     if (reviewNode) {
       const recordedReview = state.reviews.find(review => review.node_id === node.id && review.claim_id === node.claim_id);
-      if (!recordedReview) throw new ControllerError('A non-cohort review node requires a recorded review for its active claim; main/root must first call workflow_record_review with the reviewer JSON and this exact claim_id, then call workflow_complete after the reviewer is Completed');
+      if (!recordedReview) throw failedPrecondition('A non-cohort review node requires a recorded review for its active claim; main/root must first call workflow_record_review with the reviewer JSON and this exact claim_id, then call workflow_complete after the reviewer is Completed', 'review', 'workflow_record_review');
       if (recordedReview) {
         const expectedStatus = recordedReview.verdict === 'pass' ? SUCCEEDED : recordedReview.verdict === 'fail' ? 'failed' : recordedReview.verdict === 'unavailable' ? 'unavailable' : null;
         if (status !== expectedStatus) throw new ControllerError('Non-cohort review completion status must match the recorded review verdict');
@@ -3212,6 +3184,73 @@ async function rescueNode(parameters) {
     bumpWorkflowRevision(state, 'root_rescue', { node_id: nodeId, prior_claim_id: claimId, prior_execution_owner: priorExecutionOwner, replacement_execution_owner: replacement, reason, previous_agent_stopped: true, rescue_role: ROOT_RESCUE_ROLE });
     await writeState(filePath, state);
     return { task_id: state.task_id, node, recovery_package: packet, rescue_role: ROOT_RESCUE_ROLE, ready_nodes: readyNodes(state) };
+  });
+}
+
+async function escalateDelegableExecution(parameters) {
+  const [filePath, currentState] = await readTask(parameters);
+  const nodeId = requiredIdentifier(parameters.node_id, 'node_id');
+  const claimId = requiredString(parameters.claim_id, 'claim_id');
+  const reason = requiredString(parameters.reason, 'reason');
+  const routingReason = requiredString(parameters.routing_reason, 'routing_reason');
+  const qualityGuard = requiredString(parameters.quality_guard, 'quality_guard');
+  const rawAssessment = await readWorkflowJson(parameters.assurance_assessment, { label: 'Assurance assessment', maxBytes: MAX_REVIEW_BYTES, workspace: currentState.workspace, objectOnly: true });
+  const nextAssessment = assuranceAssessment(rawAssessment);
+  retryConfirmation(parameters);
+  return withActiveWorkspaceStateLock(filePath, async state => {
+    const node = state.nodes[nodeId];
+    const eligibleStatuses = new Set([RUNNING, 'failed', 'blocked', 'unavailable', 'abandoned']);
+    if (!node || !eligibleStatuses.has(node.status) || node.claim_id !== claimId) {
+      throw new ControllerError(`Claim does not own a stopped or failed node eligible for protected takeover: ${nodeId}`);
+    }
+    if (isReviewNode(node, state.routing_schema_version)) throw new ControllerError('A review node cannot be escalated to protected execution');
+    if (node.execution_risk !== 'delegable') throw new ControllerError('Only a delegable node can be escalated to protected execution');
+    if (!LUNA_EXECUTOR_ROLES.has(node.agent_role)) throw new ControllerError('Protected takeover requires a prior Luna executor attempt');
+    if (node.rescue_role) throw new ControllerError(`Node already has an active rescue role: ${nodeId}`);
+    const requiredLevel = assuranceLevelForAssessment(nextAssessment);
+    if (requiredLevel !== state.assurance_level) {
+      throw new ControllerError(`Protected takeover assurance_assessment requires ${requiredLevel ?? 'a non-controlled persistent'} assurance; use workflow_raise_assurance before takeover when Sol escalation is required`);
+    }
+    nodeAttemptAvailability(node, nodeId);
+    const replacement = replacementExecutionOwner(state, node, parameters);
+    const priorExecutionOwner = node.execution_owner;
+    const priorIntegrationOwner = node.integration_owner;
+    const priorRoutingReason = node.routing_reason;
+    const priorQualityGuard = node.quality_guard;
+    const priorAssessment = state.assurance_assessment;
+    const stale = staleNodes(state).find(candidate => candidate.id === nodeId && candidate.claim_id === claimId) ?? { reason: 'explicit_protected_takeover' };
+
+    node.execution_risk = 'protected';
+    node.agent_type = PROTECTED_EXECUTOR_ROLE;
+    node.routing_reason = routingReason;
+    node.quality_guard = qualityGuard;
+    node.integration_owner = replacement;
+    rebindExecutionOwner(node, replacement);
+    state.assurance_assessment = nextAssessment;
+    const packet = recoveryPacket(state, node, stale, reason, priorExecutionOwner);
+    node.recovery_history.push({ at: utcNow(), ...packet.previous_attempt });
+    if (node.recovery_history.length > MAX_TOTAL_NODE_ATTEMPTS) node.recovery_history.splice(0, node.recovery_history.length - MAX_TOTAL_NODE_ATTEMPTS);
+    clearRescueRouting(node);
+    clearAttemptForRetry(node);
+    bumpWorkflowRevision(state, 'delegable_execution_escalated_to_protected', {
+      node_id: nodeId,
+      prior_claim_id: claimId,
+      prior_agent_role: packet.previous_attempt.agent_role,
+      prior_execution_owner: priorExecutionOwner,
+      prior_integration_owner: priorIntegrationOwner,
+      prior_routing_reason: priorRoutingReason,
+      prior_quality_guard: priorQualityGuard,
+      prior_assurance_assessment: priorAssessment,
+      assurance_assessment: nextAssessment,
+      replacement_execution_owner: replacement,
+      replacement_integration_owner: node.integration_owner,
+      reason,
+      routing_reason: routingReason,
+      quality_guard: qualityGuard,
+      previous_agent_stopped: true,
+    });
+    await writeState(filePath, state);
+    return { task_id: state.task_id, assurance_level: state.assurance_level, assurance_assessment: state.assurance_assessment, node, recovery_package: packet, protected_takeover: true, ready_nodes: readyNodes(state) };
   });
 }
 
@@ -3596,15 +3635,89 @@ export async function pruneExpiredTasksAtMcpStartup({ max_batches = 8 } = {}) {
   };
 }
 
+function repairInputContract(state, reviewNode) {
+  const base = {
+    action: null,
+    required_fields: ['source_review_claim_id', 'repaired_by', 'addressed_findings', 'verification_evidence', 'workspace_fingerprint'],
+    source_review_claim_id: null,
+    blocking_finding_ids: [],
+    instruction: 'No failed current-protocol review is eligible for workflow_record_repair. Refresh workflow_status or workflow_audit_context after the workflow state changes.',
+  };
+  const eligible = (sourceClaimId, blockingFindingIds, instruction, alreadyRecordedInstruction) => {
+    if (!sourceClaimId) return base;
+    if (state.repair_records.some(record => record.source_review_claim_id === sourceClaimId)) {
+      return { ...base, instruction: alreadyRecordedInstruction };
+    }
+    return {
+      ...base,
+      action: 'record_repair',
+      source_review_claim_id: sourceClaimId,
+      blocking_finding_ids: blockingFindingIds,
+      instruction,
+    };
+  };
+  if (!isReviewProtocolState(state) || !reviewNode) return base;
+  if (isCohortReviewNode(state, reviewNode) && reviewNode.status === 'failed') {
+    const aggregate = reviewNode.review_gate.cohort.aggregate;
+    if (!aggregate || aggregate.verdict !== 'fail') {
+      return { ...base, instruction: 'The failed Terra cohort has no finalized failed aggregate yet; refresh workflow_audit_context before recording a repair.' };
+    }
+    const sourceClaimId = `cohort:${reviewNode.review_gate.cohort.round_id}`;
+    return eligible(
+      sourceClaimId,
+      aggregate.findings.filter(finding => finding.severity === 'blocking').map(finding => finding.finding_ref),
+      'Use this failed Terra cohort source claim and every listed finding_ref exactly once, then call workflow_retry to advance the repaired protocol stage.',
+      'This failed Terra cohort already has a repair record; use workflow_retry to advance the repaired protocol stage.',
+    );
+  }
+  const stage = protocolStageForNode(reviewNode);
+  if (stage === 'sol_max_initial' && reviewNode.status === 'failed') {
+    return { ...base, instruction: 'A failed Sol/max initial review is not repairable yet. Call workflow_retry first so the controller freezes the max closure charter.' };
+  }
+  if (isMaxClosureNode(state, reviewNode) && reviewNode.status === 'blocked' && validMaxReviewCharter(state, state.max_review_charter)) {
+    const charter = state.max_review_charter;
+    if (['initial_repair_required', 'repair_required'].includes(charter.status)) {
+      return eligible(
+        charter.pending_repair_source_claim_id,
+        charter.blocking_finding_ids,
+        'Use the frozen max-review charter source claim and every listed blocking finding exactly once, then call workflow_retry to open the closure review.',
+        'This frozen max-review source already has a repair record; use workflow_retry to open the closure review.',
+      );
+    }
+  }
+  if ((stage === 'terra_single' || (reviewNode.kind === 'total_review' && !isMaxReviewNode(reviewNode))) && reviewNode.status === 'failed') {
+    const sourceReview = protocolLatestFailedReview(state, reviewNode);
+    return eligible(
+      sourceReview?.claim_id ?? null,
+      sourceReview?.findings?.filter(finding => finding.severity === 'blocking').map(finding => finding.id) ?? [],
+      'Use this current failed review claim and every listed blocking finding exactly once, then call workflow_retry to advance the repaired protocol stage.',
+      'This current failed review already has a repair record; use workflow_retry to advance the repaired protocol stage.',
+    );
+  }
+  return base;
+}
+
 async function auditContext(parameters) {
   const [, state] = await readTask(parameters);
-  return { task_id: state.task_id, workspace_claims: state.workspace_claims, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), assurance_assessment: state.assurance_assessment, review_protocol_version: state.review_protocol_version, review_entry_stage: state.review_entry_stage, review_context: state.review_context, review_history_digest: protocolReviewHistoryDigest(state, { excludeActiveCohortPhase: true }), goal: state.goal, requirements: state.requirements, scope: state.scope, non_goals: state.non_goals, nodes: Object.values(state.nodes), participants: state.participants, reviews: externallyVisibleReviews(state), repair_records: state.repair_records, max_review_charter: state.max_review_charter ?? null, workflow_snapshot: workflowSnapshot(state), workspace_fingerprint: await workspaceFingerprint(state.workspace, state.workspace_claims) };
+  const reviewNode = reviewNodesForState(state)[0] ?? null;
+  const activeLanes = reviewNode && isCohortReviewNode(state, reviewNode)
+    ? Object.values(reviewNode.review_gate.cohort.lanes).filter(lane => lane.status === RUNNING).map(lane => ({ claim_id: lane.claim_id, auditor_task: lane.agent_task_path, auditor_role: lane.agent_role, reviewer_slot: lane.slot, phase: reviewNode.review_gate.cohort.phase }))
+    : reviewNode?.status === RUNNING ? [{ claim_id: reviewNode.claim_id, auditor_task: reviewNode.agent_task_path, auditor_role: reviewNode.agent_role, reviewer_slot: null, phase: null }] : [];
+  const reviewInputContract = {
+    action: activeLanes.length ? 'record_review' : null,
+    required_fields: ['auditor_task', 'auditor_role', 'claim_id', 'verdict', 'findings', 'requirement_coverage', 'workflow_snapshot', 'workspace_fingerprint', 'scope_and_regression', 'verification_gaps', 'residual_risk', 'independent_assessment', 'history_reconciliation', 'review_history_digest'],
+    requirement_ids: state.requirements.map(item => item.id),
+    active_claims: activeLanes,
+    instruction: activeLanes.length ? 'Use one active claim exactly once. Reuse workflow_snapshot, workspace_fingerprint, and review_history_digest from this response. On a validation error, correct the reported field or refresh this context; do not guess and retry.' : 'No active review claim is eligible for workflow_record_review.',
+  };
+  return { task_id: state.task_id, workspace_claims: state.workspace_claims, execution_routing_policy_version: state.execution_routing_policy_version, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), assurance_assessment: state.assurance_assessment, review_protocol_version: state.review_protocol_version, review_entry_stage: state.review_entry_stage, review_context: state.review_context, review_history_digest: protocolReviewHistoryDigest(state, { excludeActiveCohortPhase: true }), goal: state.goal, requirements: state.requirements, scope: state.scope, non_goals: state.non_goals, nodes: Object.values(state.nodes), participants: state.participants, reviews: externallyVisibleReviews(state), repair_records: state.repair_records, max_review_charter: state.max_review_charter ?? null, workflow_snapshot: workflowSnapshot(state), workspace_fingerprint: await workspaceFingerprint(state.workspace, state.workspace_claims), review_input_contract: reviewInputContract, repair_input_contract: repairInputContract(state, reviewNode) };
 }
 
 function requireRequirementCoverage(state, coverage, label) {
   const expectedIds = new Set(state.requirements.map(item => item.id));
   if (!coverage || typeof coverage !== 'object' || Array.isArray(coverage) || Object.keys(coverage).length !== expectedIds.size || [...expectedIds].some(id => !hasOwn(coverage, id) || !nonEmptyReviewValue(coverage[id]))) {
-    throw new ControllerError(`${label} must provide non-empty coverage for every requirement`);
+    const prefix = label === 'Review' ? 'review' : 'repair';
+    throw invalidArgument(`${label} must provide non-empty coverage for every requirement`, `${prefix}.requirement_coverage`, [...expectedIds]);
   }
   return coverage;
 }
@@ -3718,25 +3831,25 @@ async function recordReview(parameters) {
     const activeClaim = activeClaimForOperation(state, reviewNode, { node_id: reviewNode.id, claim_id: review.claim_id });
     if (!activeClaim.activation_at || activeClaim.heartbeat_count < 1) throw new ControllerError('Reviewer must activate its claim with workflow_heartbeat before recording a review');
     if (role === FALLBACK_ROLE && !review.fallback_reason) throw new ControllerError('Terra fallback review requires fallback_reason');
-    if (!['pass', 'fail', 'unavailable'].includes(verdict)) throw new ControllerError('Review verdict must be pass, fail, or unavailable');
+    if (!['pass', 'fail', 'unavailable'].includes(verdict)) throw invalidArgument('Review verdict must be pass, fail, or unavailable', 'review.verdict', ['pass', 'fail', 'unavailable'], verdict);
     const findings = reviewFindings(state, review.findings, verdict);
     const closureReview = isMaxClosureNode(state, reviewNode) && maxClosureReview(state, reviewNode);
     const repairRegressions = closureReview ? maxClosureRepairRegressions(state, review, findings) : [];
     if (!closureReview && hasOwn(review, 'repair_regressions')) throw new ControllerError('repair_regressions is only valid for a max closure review');
     const coverage = requireRequirementCoverage(state, review.requirement_coverage, 'Review');
     const snapshot = workflowSnapshot(state);
-    if (!sameJson(review.workflow_snapshot, snapshot)) throw new ControllerError('Review workflow_snapshot does not match the current task state');
+    if (!sameJson(review.workflow_snapshot, snapshot)) throw failedPrecondition('Review workflow_snapshot does not match the current task state', 'review.workflow_snapshot', 'refresh_audit_context');
     const unfinished = unfinishedMaterialNodes(state);
-    if (unfinished.length) throw new ControllerError(`Review cannot be recorded before all work nodes finish: ${unfinished.map(node => node.id).join(', ')}`);
+    if (unfinished.length) throw failedPrecondition(`Review cannot be recorded before all work nodes finish: ${unfinished.map(node => node.id).join(', ')}`, 'review.workflow_snapshot', 'wait_for_work_nodes');
     const fingerprint = workspaceFingerprintFromPreflight(state, fingerprintPreflight, 'Review');
-    if (!sameJson(review.workspace_fingerprint, fingerprint)) throw new ControllerError('Review fingerprint does not match the current workspace');
+    if (!sameJson(review.workspace_fingerprint, fingerprint)) throw failedPrecondition('Review fingerprint does not match the current workspace', 'review.workspace_fingerprint', 'refresh_audit_context');
     const scopeAndRegression = requiredReviewValue(review.scope_and_regression, 'scope_and_regression');
     const verificationGaps = requiredReviewValue(review.verification_gaps, 'verification_gaps');
     const residualRisk = requiredReviewValue(review.residual_risk, 'residual_risk');
     const independentAssessment = isReviewProtocolState(state) ? requiredReviewValue(review.independent_assessment, 'independent_assessment') : review.independent_assessment ?? null;
     const historyReconciliation = isReviewProtocolState(state) ? requiredReviewValue(review.history_reconciliation, 'history_reconciliation') : review.history_reconciliation ?? null;
     const reviewHistoryDigest = isReviewProtocolState(state) ? requiredString(review.review_history_digest, 'review_history_digest') : review.review_history_digest ?? null;
-    if (isReviewProtocolState(state) && reviewHistoryDigest !== protocolReviewHistoryDigest(state, { excludeActiveCohortPhase: Boolean(cohortLane) })) throw new ControllerError('review_history_digest does not match the complete current review and repair history');
+    if (isReviewProtocolState(state) && reviewHistoryDigest !== protocolReviewHistoryDigest(state, { excludeActiveCohortPhase: Boolean(cohortLane) })) throw failedPrecondition('review_history_digest does not match the complete current review and repair history', 'review.review_history_digest', 'refresh_audit_context');
     if (state.reviews.length >= MAX_REVIEWS) throw new ControllerError(`Task exceeded the ${MAX_REVIEWS}-review limit; create a replacement workflow task`);
     let reviewPhase = null; let reviewerSlot = null;
     if (cohortLane) {
@@ -3748,7 +3861,7 @@ async function recordReview(parameters) {
         const otherSlot = COHORT_SLOTS.find(slot => slot !== reviewerSlot);
         const blindClaimId = reviewNode.review_gate.cohort.lanes[otherSlot]?.blind_review_claim_id;
         const blindReview = state.reviews.find(item => item.node_id === reviewNode.id && item.review_phase === 'blind' && item.reviewer_slot === otherSlot && item.claim_id === blindClaimId);
-        if (!Array.isArray(targets) || targets.length !== 1 || targets[0] !== blindReview?.claim_id) throw new ControllerError('A Terra cohort cross-questioning review must challenge the other lane blind review exactly once');
+        if (!Array.isArray(targets) || targets.length !== 1 || targets[0] !== blindReview?.claim_id) throw failedPrecondition('A Terra cohort cross-questioning review must challenge the other lane blind review exactly once', 'review.challenge_targets', 'refresh_audit_context');
       } else if (hasOwn(review, 'challenge_targets')) {
         throw new ControllerError('challenge_targets is only valid during Terra cohort cross_questioning');
       }
@@ -3849,7 +3962,6 @@ async function closeCheck(parameters) {
       reasons,
     };
     if (reasons.length) return;
-    state.workspace_lease.workspace_claims ??= state.workspace_claims;
     state.workspace_lease.status = 'released';
     state.workspace_lease.released_at = utcNow();
     state.closed_revision = state.workflow_revision;
@@ -3895,6 +4007,11 @@ export async function dispatch(command, parameters) {
       await releaseWriteLocksAfterNodeLifecycle(parameters, 'root_rescue');
       return [result, 0];
     }
+    case 'escalate-execution': {
+      const result = await escalateDelegableExecution(parameters);
+      await releaseWriteLocksAfterNodeLifecycle(parameters, 'delegable_execution_escalated_to_protected');
+      return [result, 0];
+    }
     case 'audit-context': return [await auditContext(parameters), 0];
     case 'record-review': return [await recordReview(parameters), 0]; case 'record-repair': return [await recordRepair(parameters), 0]; case 'close-check': return closeCheck(parameters);
     case 'release-workspace': return [await releaseWorkspaceLease(parameters), 0];
@@ -3924,8 +4041,20 @@ function parseCli(argumentsList) {
 }
 
 export async function main() {
-  try { const parameters = parseCli(process.argv.slice(2)); const { command, ...rest } = parameters; const [result, exitCode] = await dispatch(command, rest); process.stdout.write(`${JSON.stringify(result, null, 2)}\n`); process.exitCode = exitCode; }
-  catch (error) { process.stderr.write(`${JSON.stringify({ error: error.message })}\n`); process.exitCode = 1; }
+  try {
+    const parameters = parseCli(process.argv.slice(2));
+    const { command, ...rest } = parameters;
+    const [result, exitCode] = await dispatch(command, rest);
+    const taskId = result?.task_id ?? result?.task?.task_id ?? 'n/a';
+    const nodeId = result?.node?.id ?? result?.node_id ?? null;
+    const outcome = result?.close_allowed === true ? 'close_allowed' : result?.close_allowed === false ? 'not_closeable' : result?.node?.status ?? result?.status ?? 'completed';
+    process.stdout.write(`workflow ${command}: task=${taskId}${nodeId ? ` node=${nodeId}` : ''} outcome=${outcome} exit_code=${exitCode}\n`);
+    process.exitCode = exitCode;
+  } catch (error) {
+    const code = error instanceof ControllerError ? error.code : 'INTERNAL_ERROR';
+    process.stderr.write(`workflow failed [${code}]: ${error.message}\n`);
+    process.exitCode = 1;
+  }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) await main();

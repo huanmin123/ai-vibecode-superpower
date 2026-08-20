@@ -20,10 +20,10 @@
 
 ## 权威来源
 
-- 全局行为规范：`codex-global-config/AGENTS.md`；安装后对应 `<CODEX_HOME>/AGENTS.md`。
+- 全局行为规范：`codex-global-config/AGENTS.md`；安装后对应用户级 Codex home 中的 `AGENTS.md`。
 - 工作流路由、交接与验收：`plugins/agnets-workflow/skills/orchestrate-model-workflow/SKILL.md`。
 - role 本地权限与输出边界：`codex-global-config/agents/ai-vibecode-superpower/`。
-- 安装与合并逻辑：`install-codex.ps1`、`install-codex.sh`；不要直接编辑已安装的 `<CODEX_HOME>` 副本作为最终修改。
+- 安装与合并逻辑：`install-codex.ps1`、`install-codex.sh`；不要直接编辑已安装的全局副本作为最终修改。
 
 ## 修改与验证
 

@@ -1,6 +1,6 @@
 {
   "name": "agnets-workflow",
-  "version": "0.2.1+codex.20260819130000",
+  "version": "0.2.1+codex.20260820095530",
   "description": "\u4e3a Codex \u63d0\u4f9b\u7edf\u4e00\u7684\u591a\u4ee3\u7406\u5de5\u4f5c\u6d41\u3001\u9879\u76ee\u5de5\u5177\u94fe\u7684\u53d7\u63a7\u63a5\u5165\u4e0e\u7ef4\u62a4\u3001\u4ee5\u53ca\u6301\u4e45\u5316\u603b\u4f53\u9a8c\u6536\u80fd\u529b\u3002",
   "author": {
     "name": "Local developer"

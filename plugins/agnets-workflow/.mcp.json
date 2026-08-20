@@ -3,18 +3,14 @@
     "workflow-controller": {
       "command": "node",
       "args": [
-        "-e",
-        "const fs=require('node:fs'),path=require('node:path'),{pathToFileURL}=require('node:url');const home=process.env.CODEX_HOME||((process.platform==='win32'?(process.env.USERPROFILE||process.env.HOME):(process.env.HOME||process.env.USERPROFILE))&&path.join(process.platform==='win32'?(process.env.USERPROFILE||process.env.HOME):(process.env.HOME||process.env.USERPROFILE),'.codex'));if(!home)throw new Error('CODEX_HOME, HOME, or USERPROFILE is required');const plugin=path.join(home,'plugins','cache','ai-vibecode-superpower-local','agnets-workflow');if(!fs.existsSync(plugin))throw new Error('Managed agnets-workflow plugin cache was not found');const candidates=fs.readdirSync(plugin,{withFileTypes:true}).filter(entry=>entry.isDirectory()).map(entry=>path.join(plugin,entry.name,'scripts','workflow_controller_mcp.mjs')).filter(fs.existsSync);if(candidates.length!==1)throw new Error(`Managed agnets-workflow cache is ambiguous (${candidates.length} candidates); reinstall before starting the MCP server`);import(pathToFileURL(candidates[0]).href).then(({main})=>main()).catch(error=>{console.error(error.stack||error);process.exitCode=1})"
+        "./scripts/workflow_controller_mcp.mjs"
       ],
+      "cwd": ".",
       "startup_timeout_sec": 120,
       "tool_timeout_sec": 660,
-      "env_vars": [
-        "CODEX_HOME",
-        "HOME",
-        "USERPROFILE",
-        "HOMEDRIVE",
-        "HOMEPATH"
-      ]
+      "env": {
+        "CODEX_HOME": "<CODEX_HOME>"
+      }
     }
   }
 }

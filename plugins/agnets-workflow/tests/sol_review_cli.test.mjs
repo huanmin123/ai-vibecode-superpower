@@ -401,7 +401,7 @@ test('closes a workflow-bound evidence validation failure as unavailable before 
     assert.equal(result.workflow_completion.completed, true);
     const persisted = JSON.parse(await readFile(result.result_path, 'utf8'));
     await assert.rejects(fsPromises.lstat(stateDir), error => error?.code === 'ENOENT');
-    assert.ok(result.result_path.includes(`${path.sep}state${path.sep}agnets-workflow${path.sep}artifacts${path.sep}`));
+    assert.ok(result.result_path.includes(`${path.sep}state${path.sep}agnets-workflow${path.sep}current${path.sep}artifacts${path.sep}`));
     assert.equal(persisted.workflow_completion.completed, true);
     const state = await readTaskState(await workflowStatePath(stateDir));
     assert.equal(state.nodes['total-review'].status, 'unavailable');
@@ -650,7 +650,7 @@ test('records a Windows stdin bridge error instead of accepting the review', asy
 test('rejects a workflow-bound result path outside the review artifact directory', async () => {
   const item = await fixture();
   try {
-    const stateDir = path.join(item.codexHome, 'state', 'agnets-workflow', 'namespaces', 'a'.repeat(64));
+    const stateDir = stateDirFor(path.join(item.root, 'workspace'));
     await assert.rejects(
       runSolReview([
         '--result', path.join(item.root, 'state.sqlite'),
@@ -707,7 +707,7 @@ test('rejects a global workflow artifact directory containing a Windows junction
   const item = await fixture();
   let junction = null;
   try {
-    const stateDir = path.join(item.codexHome, 'state', 'agnets-workflow', 'namespaces', 'b'.repeat(64)); const outside = path.join(item.root, 'outside-results');
+    const stateDir = stateDirFor(path.join(item.root, 'workspace')); const outside = path.join(item.root, 'outside-results');
     const taskPath = globalWorkflowArtifactTaskPath(stateDir, 'review-task');
     await mkdir(path.dirname(taskPath), { recursive: true }); await mkdir(outside);
     junction = taskPath;

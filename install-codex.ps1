@@ -581,6 +581,78 @@ function Invoke-InstallRollback {
     return $errors
 }
 
+function Get-ManagedModelProviderSettings {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $settings = [ordered]@{
+        'request_max_retries' = $null
+        'stream_max_retries' = $null
+        'stream_idle_timeout_ms' = $null
+        'websocket_connect_timeout_ms' = $null
+    }
+    foreach ($line in Get-Content -LiteralPath $Path) {
+        if ($line -cmatch '^\s*([A-Za-z][A-Za-z0-9_-]*)\s*=\s*(.+)$' -and $settings.Keys -ccontains $Matches[1]) {
+            $settings[$Matches[1]] = $Matches[2].Trim()
+        }
+    }
+    foreach ($key in $settings.Keys) {
+        if ([string]::IsNullOrWhiteSpace($settings[$key])) { throw "Missing managed model provider setting: $key" }
+    }
+    return $settings
+}
+
+function Merge-ManagedModelProviderSettings {
+    param(
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Settings,
+        [Parameter(Mandatory)][string]$ExistingPath,
+        [Parameter(Mandatory)][string]$OutputPath
+    )
+
+    $output = [System.Collections.Generic.List[string]]::new()
+    $section = ''
+    $providerSection = $false
+    $providerFound = $false
+    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+
+    function Add-MissingProviderSettings {
+        if (-not $providerSection) { return }
+        foreach ($key in $Settings.Keys) {
+            if (-not $seen.Contains($key)) {
+                $output.Add("$key = $($Settings[$key])")
+                [void]$seen.Add($key)
+            }
+        }
+    }
+
+    foreach ($line in Get-Content -LiteralPath $ExistingPath) {
+        if ($line -cmatch '^\s*\[\[[^\]]+\]\]\s*(?:#.*)?$') {
+            Add-MissingProviderSettings
+            $section = '__other__'; $providerSection = $false; $seen.Clear(); $output.Add($line); continue
+        }
+        if ($line -cmatch '^\s*\[([^\]]+)\]\s*(?:#.*)?$') {
+            Add-MissingProviderSettings
+            $section = $Matches[1].Trim()
+            $providerSection = $section -cmatch '^model_providers\.(?:[A-Za-z0-9_-]+|"[^"]+"|''[^'']+'')$'
+            if ($providerSection) { $providerFound = $true }
+            $seen.Clear(); $output.Add($line); continue
+        }
+        if ($providerSection -and $line -cmatch '^\s*([A-Za-z][A-Za-z0-9_-]*)\s*=') {
+            $key = $Matches[1]
+            if ($Settings.Keys -ccontains $key -and -not $seen.Contains($key)) {
+                $output.Add("$key = $($Settings[$key])")
+                [void]$seen.Add($key)
+                continue
+            }
+        }
+        $output.Add($line)
+    }
+    Add-MissingProviderSettings
+    if (-not $providerFound) {
+        Write-Warning "No [model_providers.<provider-id>] table found in $ExistingPath; skipped managed model provider settings."
+    }
+    Set-Content -LiteralPath $OutputPath -Value $output
+}
+
 function Get-CodexCliPath {
     foreach ($commandName in @('codex.cmd', 'codex.exe')) {
         $command = Get-Command $commandName -All -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -606,16 +678,150 @@ function Assert-WorkflowControllerNode {
     }
 }
 
+function Assert-CodexDesktopStopped {
+    $running = @(Get-CimInstance Win32_Process -Filter "Name = 'codex.exe'" -ErrorAction Stop | Where-Object {
+        $_.CommandLine -match '(?i)(?:^|\s)app-server(?:\s|$)'
+    })
+    if ($running.Count -eq 0) { return }
+    $processSummary = ($running | ForEach-Object { "PID $($_.ProcessId)" }) -join ', '
+    throw "Codex Desktop is still running ($processSummary). Exit every Codex Desktop window and wait for its app-server processes to stop before installing; otherwise the live app can overwrite plugin registration and keep the previous MCP cache loaded."
+}
+
+function Get-ManagedPluginIdentity {
+    param(
+        [Parameter(Mandatory)][string]$PluginSource,
+        [Parameter(Mandatory)][string]$PluginName
+    )
+
+    Assert-NoReparsePointsInTree -Path $PluginSource
+    $manifestPath = Join-Path $PluginSource '.codex-plugin\plugin.json'
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+        throw "Missing managed plugin manifest: $manifestPath"
+    }
+    try {
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        throw "Invalid managed plugin manifest: $manifestPath ($($_.Exception.Message))"
+    }
+    if ($manifest.name -ne $PluginName) {
+        throw "Managed plugin manifest name does not match expected plugin: $manifestPath"
+    }
+    if ($manifest.version -isnot [string] -or [string]::IsNullOrWhiteSpace($manifest.version) -or $manifest.version -notmatch '^[0-9A-Za-z][0-9A-Za-z.+_-]*$') {
+        throw "Managed plugin manifest has an unsafe or empty version: $manifestPath"
+    }
+    return [pscustomobject]@{
+        Version = $manifest.version
+        Source = (Get-AbsolutePath -Path $PluginSource)
+    }
+}
+
+function Get-ManagedPluginFileHashes {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [string]$CodexHome,
+        [switch]$ExpandMcpHome
+    )
+
+    Assert-NoReparsePointsInTree -Path $Root
+    $absoluteRoot = (Get-AbsolutePath -Path $Root).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+    $hashes = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($file in Get-ChildItem -LiteralPath $absoluteRoot -Recurse -File -Force) {
+        $relative = $file.FullName.Substring($absoluteRoot.Length).TrimStart([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar).Replace('\', '/')
+        if ([string]::IsNullOrWhiteSpace($relative) -or $hashes.ContainsKey($relative)) {
+            throw "Invalid managed plugin file layout: $absoluteRoot"
+        }
+        if ($ExpandMcpHome -and $relative -eq '.mcp.json') {
+            if ([string]::IsNullOrWhiteSpace($CodexHome)) { throw 'CodexHome is required when expanding the plugin MCP descriptor' }
+            $content = [System.IO.File]::ReadAllText($file.FullName)
+            $expanded = $content.Replace('<CODEX_HOME>', $CodexHome.Replace('\', '/'))
+            $sha256 = [System.Security.Cryptography.SHA256]::Create()
+            try {
+                $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($expanded)
+                $hashes[$relative] = (($sha256.ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') }) -join '')
+            } finally {
+                $sha256.Dispose()
+            }
+        } else {
+            $hashes[$relative] = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
+    }
+    return $hashes
+}
+
+function Expand-ManagedPluginMcpHome {
+    param(
+        [Parameter(Mandatory)][string]$CachePath,
+        [Parameter(Mandatory)][string]$CodexHome
+    )
+
+    if (-not (Test-Path -LiteralPath $CachePath -PathType Container)) { return }
+    Assert-NoReparsePointsInTree -Path $CachePath
+    $descriptorPath = Join-Path $CachePath '.mcp.json'
+    if (-not (Test-Path -LiteralPath $descriptorPath -PathType Leaf)) { throw "Missing installed MCP descriptor: $descriptorPath" }
+    $content = [System.IO.File]::ReadAllText($descriptorPath)
+    $expanded = $content.Replace('<CODEX_HOME>', $CodexHome.Replace('\', '/'))
+    if ($expanded -ne $content) {
+        [System.IO.File]::WriteAllText($descriptorPath, $expanded, [System.Text.UTF8Encoding]::new($false))
+    }
+    $descriptor = Get-Content -LiteralPath $descriptorPath -Raw | ConvertFrom-Json -ErrorAction Stop
+    $configuredHome = $descriptor.mcpServers.'workflow-controller'.env.CODEX_HOME
+    if ($configuredHome -isnot [string] -or -not (Test-SamePath -Left $configuredHome -Right $CodexHome)) {
+        throw "Installed workflow-controller MCP does not contain the resolved Codex home: $descriptorPath"
+    }
+    if ($null -ne $descriptor.mcpServers.'workflow-controller'.env_vars) {
+        throw "Installed workflow-controller MCP must not inherit Codex home variables: $descriptorPath"
+    }
+}
+
+function Test-ManagedPluginCacheMatchesSource {
+    param(
+        [Parameter(Mandatory)][string]$PluginSource,
+        [Parameter(Mandatory)][string]$CachePath,
+        [Parameter(Mandatory)][string]$CodexHome
+    )
+
+    if (-not (Test-Path -LiteralPath $CachePath -PathType Container)) { return $false }
+    try { Expand-ManagedPluginMcpHome -CachePath $CachePath -CodexHome $CodexHome }
+    catch { return $false }
+    $sourceHashes = Get-ManagedPluginFileHashes -Root $PluginSource -CodexHome $CodexHome -ExpandMcpHome
+    $cacheHashes = Get-ManagedPluginFileHashes -Root $CachePath
+    if ($sourceHashes.Count -ne $cacheHashes.Count) { return $false }
+    foreach ($relative in $sourceHashes.Keys) {
+        if (-not $cacheHashes.ContainsKey($relative) -or $cacheHashes[$relative] -ne $sourceHashes[$relative]) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Test-ManagedPluginIsActive {
+    param(
+        [Parameter(Mandatory)][string]$CodexCli,
+        [Parameter(Mandatory)][string]$PluginName,
+        [Parameter(Mandatory)][string]$MarketplaceName,
+        [Parameter(Mandatory)][string]$PluginVersion
+    )
+
+    $pluginIdentity = "$PluginName@$MarketplaceName"
+    $pluginOutput = (& $CodexCli plugin list 2>&1 | Out-String)
+    if ($LASTEXITCODE -ne 0) { return $false }
+    $pattern = '(?m)^\s*' + [System.Text.RegularExpressions.Regex]::Escape($pluginIdentity) + '\s+installed,\s+enabled\s+' + [System.Text.RegularExpressions.Regex]::Escape($PluginVersion) + '\s+'
+    return $pluginOutput -match $pattern
+}
+
 function Install-ManagedPlugin {
     param(
         [Parameter(Mandatory)][string]$CodexHome,
         [Parameter(Mandatory)][string]$MarketplaceRoot,
         [Parameter(Mandatory)][string]$PluginName,
-        [Parameter(Mandatory)][string]$MarketplaceName
+        [Parameter(Mandatory)][string]$MarketplaceName,
+        [Parameter(Mandatory)][string]$PluginSource
     )
 
     $codexCli = Get-CodexCliPath
     Assert-WorkflowControllerNode
+    $plugin = Get-ManagedPluginIdentity -PluginSource $PluginSource -PluginName $PluginName
+    $cachePath = Join-Path (Join-Path (Join-Path (Join-Path $CodexHome 'plugins\cache') $MarketplaceName) $PluginName) $plugin.Version
     $hadCodexHome = Test-Path Env:CODEX_HOME
     $previousCodexHome = $env:CODEX_HOME
     try {
@@ -626,12 +832,30 @@ function Install-ManagedPlugin {
         if ($LASTEXITCODE -ne 0 -or $marketplaceOutput -notmatch ('(?m)^\s*' + [System.Text.RegularExpressions.Regex]::Escape($MarketplaceName) + '\s+')) {
             throw "Codex did not retain marketplace registration after add: $MarketplaceName. Output: $marketplaceOutput"
         }
-        & $codexCli plugin add "$PluginName@$MarketplaceName"
-        if ($LASTEXITCODE -ne 0) { throw "Could not install managed plugin: $PluginName@$MarketplaceName" }
-        $pluginIdentity = "$PluginName@$MarketplaceName"
-        $pluginOutput = (& $codexCli plugin list 2>&1 | Out-String)
-        if ($LASTEXITCODE -ne 0 -or $pluginOutput -notmatch [System.Text.RegularExpressions.Regex]::Escape($pluginIdentity)) {
-            throw "Codex did not retain managed plugin installation after add: $pluginIdentity. Output: $pluginOutput"
+        $cacheMatches = Test-ManagedPluginCacheMatchesSource -PluginSource $plugin.Source -CachePath $cachePath -CodexHome $CodexHome
+        $pluginActive = Test-ManagedPluginIsActive -CodexCli $codexCli -PluginName $PluginName -MarketplaceName $MarketplaceName -PluginVersion $plugin.Version
+        if (-not ($cacheMatches -and $pluginActive)) {
+            $pluginAddOutput = (& $codexCli plugin add "$PluginName@$MarketplaceName" 2>&1 | Out-String)
+            if ($LASTEXITCODE -ne 0) {
+                $cacheMatches = Test-ManagedPluginCacheMatchesSource -PluginSource $plugin.Source -CachePath $cachePath -CodexHome $CodexHome
+                $pluginActive = Test-ManagedPluginIsActive -CodexCli $codexCli -PluginName $PluginName -MarketplaceName $MarketplaceName -PluginVersion $plugin.Version
+                if (-not ($cacheMatches -and $pluginActive)) {
+                    throw "Could not install managed plugin: $PluginName@$MarketplaceName. Codex CLI output: $pluginAddOutput"
+                }
+                Write-Warning "Codex reported an error while cleaning an older plugin cache entry, but the requested plugin cache and active configuration were verified. Original output: $pluginAddOutput"
+            }
+        }
+        # Codex plugin add may rewrite config.toml from an in-memory snapshot.
+        # Register once more after it so the final durable config keeps both the
+        # enabled plugin and its marketplace.
+        & $codexCli plugin marketplace add $MarketplaceRoot
+        if ($LASTEXITCODE -ne 0) { throw "Could not retain plugin marketplace after install: $MarketplaceRoot" }
+        $marketplaceOutput = (& $codexCli plugin marketplace list 2>&1 | Out-String)
+        if ($LASTEXITCODE -ne 0 -or $marketplaceOutput -notmatch ('(?m)^\s*' + [System.Text.RegularExpressions.Regex]::Escape($MarketplaceName) + '\s+')) {
+            throw "Codex did not retain marketplace registration after plugin install: $MarketplaceName. Output: $marketplaceOutput"
+        }
+        if (-not (Test-ManagedPluginCacheMatchesSource -PluginSource $plugin.Source -CachePath $cachePath -CodexHome $CodexHome) -or -not (Test-ManagedPluginIsActive -CodexCli $codexCli -PluginName $PluginName -MarketplaceName $MarketplaceName -PluginVersion $plugin.Version)) {
+            throw "Codex did not retain the exact managed plugin version after add: $PluginName@$MarketplaceName ($($plugin.Version))"
         }
     } finally {
         if ($hadCodexHome) {
@@ -673,6 +897,7 @@ function Remove-RetiredWorkflowPlugin {
 $scriptRoot = Split-Path -Parent $PSCommandPath
 $sourceAgents = Join-Path $scriptRoot 'codex-global-config\AGENTS.md'
 $sourceConfig = Join-Path $scriptRoot 'codex-global-config\config.toml'
+$sourceModelProviderSettings = Join-Path $scriptRoot 'codex-global-config\model-provider-settings.toml'
 $sourceDocs = Join-Path $scriptRoot 'codex-global-config\docs'
 $managedAgentRoleDirectoryName = 'ai-vibecode-superpower'
 $sourceAgentRoles = Join-Path $scriptRoot "codex-global-config\agents\$managedAgentRoleDirectoryName"
@@ -710,6 +935,7 @@ $managedStandaloneSkillNames = @(
 
 if (-not (Test-Path -LiteralPath $sourceAgents -PathType Leaf)) { throw "Missing source file: $sourceAgents" }
 if (-not (Test-Path -LiteralPath $sourceConfig -PathType Leaf)) { throw "Missing source file: $sourceConfig" }
+if (-not (Test-Path -LiteralPath $sourceModelProviderSettings -PathType Leaf)) { throw "Missing source file: $sourceModelProviderSettings" }
 if (-not (Test-Path -LiteralPath $sourceDocs -PathType Container)) { throw "Missing source directory: $sourceDocs" }
 if (-not (Test-Path -LiteralPath $sourceAgentRoles -PathType Container)) { throw "Missing source directory: $sourceAgentRoles" }
 if (-not (Test-Path -LiteralPath $sourceAgentRoleManifest -PathType Leaf)) { throw "Missing source file: $sourceAgentRoleManifest" }
@@ -740,6 +966,7 @@ if ([System.IO.Path]::GetPathRoot($codexHome).TrimEnd([System.IO.Path]::Director
     throw "Refusing to install into a filesystem root: $codexHome"
 }
 Assert-NoReparsePoints -Path $codexHome
+Assert-CodexDesktopStopped
 
 $agentsTarget = Join-Path $codexHome 'agents'
 $targetAgentRoles = Join-Path $agentsTarget $managedAgentRoleDirectoryName
@@ -795,9 +1022,12 @@ try {
     $mergedConfig = Join-Path $stageRoot 'merged-config.toml'
     Assert-InstallTarget -Path $configTarget -Kind File
     Assert-SafeTomlMergeInput -Path (Join-Path $stageRoot 'template-config.toml')
+    Assert-SafeTomlMergeInput -Path $sourceModelProviderSettings
     if (Test-Path -LiteralPath $configTarget -PathType Leaf) { Assert-SafeTomlMergeInput -Path $configTarget }
     $managedSettings = Get-ManagedTomlSettings -Path (Join-Path $stageRoot 'template-config.toml')
     Merge-ManagedTomlSettings -Settings $managedSettings -ExistingPath $configTarget -OutputPath $mergedConfig
+    $managedModelProviderSettings = Get-ManagedModelProviderSettings -Path $sourceModelProviderSettings
+    Merge-ManagedModelProviderSettings -Settings $managedModelProviderSettings -ExistingPath $mergedConfig -OutputPath $mergedConfig
     Assert-SafeTomlMergeInput -Path $mergedConfig
 
     $transactionTargets.Add([pscustomobject]@{ Name = 'AGENTS.md'; Target = (Join-Path $codexHome 'AGENTS.md'); Candidate = (Join-Path $stageRoot 'AGENTS.md'); Kind = 'File'; Operation = 'Replace'; WasPresent = $false; BackedUp = $false; InstallStarted = $false })
@@ -855,10 +1085,14 @@ try {
 
     # Plugin commands update config.toml. Run them only after its staged version
     # is installed, while the transaction can still restore the previous config.
-    Install-ManagedPlugin -CodexHome $codexHome -MarketplaceRoot $scriptRoot -PluginName $managedPluginName -MarketplaceName $managedMarketplaceName
+    Install-ManagedPlugin -CodexHome $codexHome -MarketplaceRoot $scriptRoot -PluginName $managedPluginName -MarketplaceName $managedMarketplaceName -PluginSource $sourcePlugin
 
     # Do not leave the retired controller installed beside the v3-only plugin.
     Remove-RetiredWorkflowPlugin -CodexHome $codexHome
+
+    Assert-SafeTomlMergeInput -Path $configTarget
+    Merge-ManagedModelProviderSettings -Settings $managedModelProviderSettings -ExistingPath $configTarget -OutputPath $configTarget
+    Assert-SafeTomlMergeInput -Path $configTarget
 
     foreach ($target in $transactionTargets.Where({ $_.Operation -eq 'Remove' })) {
         if ($target.WasPresent) {

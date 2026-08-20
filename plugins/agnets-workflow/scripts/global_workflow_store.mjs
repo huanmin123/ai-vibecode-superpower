@@ -19,7 +19,11 @@ const MAX_DATABASE_BYTES = 512 * 1024 * 1024;
 const DEFAULT_PAGE_SIZE = 4_096;
 const MAX_DATABASE_PAGES = Math.floor(MAX_DATABASE_BYTES / DEFAULT_PAGE_SIZE);
 const APPLICATION_ID = 0x41475746; // "AGWF"
-const USER_VERSION = 4;
+// This directory is an intentional clean boundary.  Older controller stores
+// remain untouched at the former location and are never opened, scanned, or
+// migrated by the current controller.
+const CURRENT_STORE_DIRECTORY = 'current';
+const USER_VERSION = 5;
 const GLOBAL_ARTIFACT_DIRECTORY = 'artifacts';
 const PRUNE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const PRUNE_INDEX_NAME = 'task_state_prune_after_idx';
@@ -59,18 +63,18 @@ function defaultCodexHome() {
 }
 
 export function globalWorkflowStorePath() {
-  return path.join(defaultCodexHome(), 'state', 'agnets-workflow', 'workflow.sqlite');
+  return path.join(defaultCodexHome(), 'state', 'agnets-workflow', CURRENT_STORE_DIRECTORY, 'workflow.sqlite');
 }
 
 export function globalWorkflowArtifactRoot() {
-  return path.join(defaultCodexHome(), 'state', 'agnets-workflow', GLOBAL_ARTIFACT_DIRECTORY);
+  return path.join(defaultCodexHome(), 'state', 'agnets-workflow', CURRENT_STORE_DIRECTORY, GLOBAL_ARTIFACT_DIRECTORY);
 }
 
 export function globalWorkflowArtifactRootForHome(codexHome) {
   if (typeof codexHome !== 'string' || !codexHome.trim() || !path.isAbsolute(codexHome)) {
     throw storeError('CODEX_HOME must be an absolute path');
   }
-  return path.join(path.resolve(codexHome), 'state', 'agnets-workflow', GLOBAL_ARTIFACT_DIRECTORY);
+  return path.join(path.resolve(codexHome), 'state', 'agnets-workflow', CURRENT_STORE_DIRECTORY, GLOBAL_ARTIFACT_DIRECTORY);
 }
 
 function artifactSegment(value, label) {

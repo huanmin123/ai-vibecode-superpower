@@ -43,6 +43,7 @@ test('controller accepts only the current v3 manifest and SQLite state path', as
   const source = await readFile(controller, 'utf8');
   assert.match(source, /routing_schema_version must be 3/);
   assert.match(source, /Current global controller state does not exist/);
+  assert.doesNotMatch(source, /migrate.*Terra.*Delegable|route_migration/);
   assert.doesNotMatch(source, new RegExp(['avsp', 'luna', 'high', 'writer'].join('_')));
   assert.doesNotMatch(source, /record-verification/);
   assert.match(source, /const initialState = normalizeState\(await loadState\(filePath\)\)/);
@@ -63,6 +64,170 @@ test('v3 requires an explicit justification for a workspace-wide write claim', a
       () => dispatch('init', { manifest: manifestPath, }),
       error => error instanceof ControllerError && /global_write_justification is required/.test(error.message),
     );
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test('v3 surfaces structured manifest validation errors for review context and workspace claims', async () => {
+  const { ControllerError, dispatch } = await import('../scripts/workflow_controller.mjs');
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-manifest-errors-'));
+  const workspace = path.join(temp, 'workspace');
+  const manifestPath = path.join(temp, 'manifest.json');
+  try {
+    await mkdir(workspace, { recursive: true });
+    const invalidContext = v3Manifest(workspace, { task_id: 'invalid-context', review_context: { environment: 'test', scenarios: [], boundaries: 'workspace' } });
+    await writeFile(manifestPath, JSON.stringify(invalidContext));
+    await assert.rejects(
+      () => dispatch('init', { manifest: manifestPath }),
+      error => error instanceof ControllerError
+        && error.code === 'INVALID_ARGUMENT'
+        && error.field_errors[0]?.path === 'review_context.scenarios'
+        && /scenarios must be a non-empty array/.test(error.message),
+    );
+    const invalidClaim = v3Manifest(workspace, { task_id: 'invalid-claim', workspace_claims: [{ mode: 'write', prefix: 'frontend/src/views/common_tools/hosts/' }] });
+    await writeFile(manifestPath, JSON.stringify(invalidClaim));
+    await assert.rejects(
+      () => dispatch('init', { manifest: manifestPath }),
+      error => error instanceof ControllerError
+        && error.code === 'INVALID_ARGUMENT'
+        && error.field_errors[0]?.path === 'workspace_claims[].prefix'
+        && /Invalid workspace_claim prefix/.test(error.message),
+    );
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test('delegable work starts with Luna and can only move to Terra through a protected takeover', async () => {
+  const { ControllerError, dispatch } = await import('../scripts/workflow_controller.mjs');
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-luna-routing-'));
+  const workspace = path.join(temp, 'workspace');
+  const stateDir = stateDirFor(workspace);
+  const manifestPath = path.join(temp, 'manifest.json');
+  const work = { id: 'work', kind: 'implementation', execution_risk: 'delegable', routing_reason: 'The implementation steps, rollback, and verification are fixed.', execution_owner: '/root/luna-executor', integration_owner: '/root', quality_guard: 'Run the focused verification command.' };
+  const review = { id: 'review', kind: 'quality_review', depends_on: ['work'], execution_risk: 'read_only', routing_reason: 'Independent quality gate', execution_owner: '/root/reviewer', integration_owner: '/root', quality_guard: 'Review requirements and evidence' };
+  try {
+    await mkdir(workspace, { recursive: true });
+    await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace, { task_id: 'direct-terra-delegable', nodes: [{ ...work, agent_type: 'avsp_terra_high' }, review] })));
+    await assert.rejects(
+      () => dispatch('init', { manifest: manifestPath }),
+      error => error instanceof ControllerError && /delegable node agent_type must be a Luna executor/.test(error.message),
+    );
+
+    await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace, { task_id: 'luna-to-protected', nodes: [work, review] })));
+    const [initialized] = await dispatch('init', { manifest: manifestPath });
+    assert.equal(initialized.task.nodes.find(node => node.id === 'work').agent_type, 'avsp_luna_high_executor');
+
+    const [luna] = await dispatch('start', { task_id: 'luna-to-protected', node_id: 'work', agent_task_path: '/root/luna-executor', agent_role: 'avsp_luna_high_executor', native_agent_started: true, state_dir: stateDir });
+    await dispatch('acquire-write-lock', { task_id: 'luna-to-protected', node_id: 'work', claim_id: luna.claim_id, write_prefixes: ['src/feature.mjs'], purpose: 'Apply the delegated implementation.', state_dir: stateDir });
+    await assert.rejects(
+      () => dispatch('escalate-execution', { task_id: 'luna-to-protected', node_id: 'work', claim_id: luna.claim_id, reason: 'A newly discovered compatibility boundary invalidates the original rollback plan.', routing_reason: 'Compatibility impact is no longer bounded by the delegable contract.', quality_guard: 'Run the compatibility regression suite before integration.', assurance_assessment: assessment('terra'), replacement_agent_task_path: '/root/terra-takeover', previous_agent_stopped: false, state_dir: stateDir }),
+      error => error instanceof ControllerError && /previous_agent_stopped must be true/.test(error.message),
+    );
+    await assert.rejects(
+      () => dispatch('escalate-execution', { task_id: 'luna-to-protected', node_id: 'work', claim_id: luna.claim_id, reason: 'A newly discovered compatibility boundary invalidates the original rollback plan.', routing_reason: 'Compatibility impact is no longer bounded by the delegable contract.', quality_guard: 'Run the compatibility regression suite before integration.', assurance_assessment: assessment('sol'), replacement_agent_task_path: '/root/terra-takeover', previous_agent_stopped: true, state_dir: stateDir }),
+      error => error instanceof ControllerError && /requires sol assurance/.test(error.message),
+    );
+
+    const [takeover] = await dispatch('escalate-execution', { task_id: 'luna-to-protected', node_id: 'work', claim_id: luna.claim_id, reason: 'A newly discovered compatibility boundary invalidates the original rollback plan.', routing_reason: 'Compatibility impact is no longer bounded by the delegable contract.', quality_guard: 'Run the compatibility regression suite before integration.', assurance_assessment: assessment('terra'), replacement_agent_task_path: '/root/terra-takeover', previous_agent_stopped: true, state_dir: stateDir });
+    assert.equal(takeover.protected_takeover, true);
+    assert.equal(takeover.node.execution_risk, 'protected');
+    assert.equal(takeover.node.agent_type, 'avsp_terra_high');
+    assert.equal(takeover.node.execution_owner, '/root/terra-takeover');
+    assert.equal(takeover.node.integration_owner, '/root/terra-takeover');
+    assert.equal(takeover.recovery_package.previous_attempt.agent_role, 'avsp_luna_high_executor');
+    assert.equal(takeover.recovery_package.node.execution_risk, 'protected');
+    assert.equal(takeover.assurance_assessment.uncertainty.status, 'partial');
+    assert.equal(takeover.assurance_assessment.selection_reason, 'Current evidence determines the assurance level.');
+    const [status] = await dispatch('status', { task_id: 'luna-to-protected', state_dir: stateDir });
+    assert.deepEqual(status.active_write_locks, []);
+
+    const [terra] = await dispatch('start', { task_id: 'luna-to-protected', node_id: 'work', agent_task_path: '/root/terra-takeover', agent_role: 'avsp_terra_high', native_agent_started: true, state_dir: stateDir });
+    assert.equal(terra.node.agent_role, 'avsp_terra_high');
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test('old workflow state is rejected without automatic migration', async () => {
+  const { ControllerError, dispatch } = await import('../scripts/workflow_controller.mjs');
+  const { readGlobalTaskState, writeGlobalTaskState } = await import('../scripts/global_workflow_store.mjs');
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-unsupported-routing-policy-'));
+  const workspace = path.join(temp, 'workspace');
+  const stateDir = stateDirFor(workspace);
+  const manifestPath = path.join(temp, 'manifest.json');
+  try {
+    await mkdir(workspace, { recursive: true });
+    await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace, { task_id: 'unsupported-routing-policy' })));
+    const [initialized] = await dispatch('init', { manifest: manifestPath });
+    const logicalPath = path.join(initialized.task_key.namespace, `${initialized.task_key.task_id}.sqlite`);
+    const oldState = await readGlobalTaskState(logicalPath);
+    delete oldState.execution_routing_policy_version;
+    await writeGlobalTaskState(logicalPath, oldState);
+    await assert.rejects(
+      () => dispatch('status', { task_id: 'unsupported-routing-policy', state_dir: stateDir }),
+      error => error instanceof ControllerError
+        && error.code === 'UNSUPPORTED_WORKFLOW_STATE'
+        && error.field_errors[0]?.path === 'execution_routing_policy_version'
+        && error.recovery?.action === 'start_new_workflow',
+    );
+    const retained = await readGlobalTaskState(logicalPath);
+    assert.equal(Object.hasOwn(retained, 'execution_routing_policy_version'), false);
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test('current workflow store never opens a former global store and init does not enumerate a large workspace', async () => {
+  const { ControllerError, dispatch } = await import('../scripts/workflow_controller.mjs');
+  const { globalWorkflowStorePath } = await import('../scripts/global_workflow_store.mjs');
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-clean-store-and-large-workspace-'));
+  const workspace = path.join(temp, 'workspace');
+  const manifestPath = path.join(temp, 'manifest.json');
+  const formerStore = path.join(isolatedCodexHome, 'state', 'agnets-workflow', 'workflow.sqlite');
+  try {
+    await mkdir(path.join(workspace, 'large-tree'), { recursive: true });
+    for (let index = 0; index < 256; index++) await writeFile(path.join(workspace, 'large-tree', `file-${index}.txt`), String(index));
+    await mkdir(path.dirname(formerStore), { recursive: true });
+    await writeFile(formerStore, 'not a SQLite database and not current state');
+    await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace, { task_id: 'large-workspace', workspace_claims: [{ mode: 'write', prefix: '.' }] })));
+    const [initialized] = await dispatch('init', { manifest: manifestPath });
+    assert.equal(initialized.database_path, globalWorkflowStorePath());
+    assert.match(initialized.database_path, /[\\/]state[\\/]agnets-workflow[\\/]current[\\/]workflow\.sqlite$/);
+    assert.equal(await readFile(formerStore, 'utf8'), 'not a SQLite database and not current state');
+    const source = await readFile(controller, 'utf8');
+    assert.doesNotMatch(source, /MAX_FINGERPRINT_FILES|function walkFiles|createReadStream\(/);
+    assert.equal(initialized.task.workspace_claims[0].prefix, '.');
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test('current state rejects missing required fields instead of defaulting them', async () => {
+  const { ControllerError, dispatch } = await import('../scripts/workflow_controller.mjs');
+  const { readGlobalTaskState, writeGlobalTaskState } = await import('../scripts/global_workflow_store.mjs');
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-strict-current-state-'));
+  const workspace = path.join(temp, 'workspace');
+  const stateDir = stateDirFor(workspace);
+  const manifestPath = path.join(temp, 'manifest.json');
+  try {
+    await mkdir(workspace, { recursive: true });
+    await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace, { task_id: 'strict-current-state' })));
+    const [initialized] = await dispatch('init', { manifest: manifestPath });
+    const logicalPath = path.join(initialized.task_key.namespace, `${initialized.task_key.task_id}.sqlite`);
+    const stored = await readGlobalTaskState(logicalPath);
+    delete stored.nodes.work.recovery_history;
+    await writeGlobalTaskState(logicalPath, stored);
+    await assert.rejects(
+      () => dispatch('status', { task_id: 'strict-current-state', state_dir: stateDir }),
+      error => error instanceof ControllerError
+        && error.code === 'UNSUPPORTED_WORKFLOW_STATE'
+        && error.field_errors[0]?.path === 'nodes.work.recovery_history'
+        && error.recovery?.action === 'start_new_workflow',
+    );
+    const retained = await readGlobalTaskState(logicalPath);
+    assert.equal(Object.hasOwn(retained.nodes.work, 'recovery_history'), false);
   } finally {
     await rm(temp, { recursive: true, force: true });
   }
@@ -118,7 +283,10 @@ test('v3 rejects an unsafe quality_review manifest before any task state is crea
     await writeFile(manifestPath, JSON.stringify(manifest));
     await assert.rejects(
       () => dispatch('init', { manifest: manifestPath, }),
-      error => error instanceof ControllerError && /quality_review node must be read_only; set execution_risk/.test(error.message),
+      error => error instanceof ControllerError
+        && error.code === 'INVALID_ARGUMENT'
+        && error.field_errors[0]?.path === 'nodes[].execution_risk'
+        && /quality_review node must be read_only; set execution_risk/.test(error.message),
     );
     assert.equal(existsSync(stateDir), false);
   } finally {
@@ -141,10 +309,21 @@ test('v3 runtime initializes current manifests and rejects non-v3 schema states'
     const [work] = await dispatch('claim', { task_id: 'feature', node_id: 'work', agent_task_path: '/root/work', agent_role: 'avsp_terra_high', state_dir: stateDir });
     const resultPath = path.join(temp, 'work-result.json');
     await writeFile(resultPath, JSON.stringify({ changed: true }));
+    await assert.rejects(
+      () => dispatch('checkpoint', { task_id: 'feature', node_id: 'work', claim_id: 'wrong-claim', checkpoint: { progress: 'not owned' }, state_dir: stateDir }),
+      error => error instanceof ControllerError
+        && error.code === 'FAILED_PRECONDITION'
+        && error.field_errors[0]?.path === 'claim_id'
+        && error.recovery?.action === 'workflow_status',
+    );
     await dispatch('heartbeat', { task_id: 'feature', node_id: 'work', claim_id: work.claim_id, state_dir: stateDir });
     await assert.rejects(
       () => dispatch('complete', { task_id: 'feature', node_id: 'work', claim_id: work.claim_id, status: 'succeeded', result: resultPath, state_dir: stateDir }),
-      error => error instanceof ControllerError && /requires completion_attestation=native_agent_finished.*main\/root.*Completed/.test(error.message),
+      error => error instanceof ControllerError
+        && error.code === 'INVALID_ARGUMENT'
+        && error.field_errors[0]?.path === 'completion_attestation'
+        && error.field_errors[0]?.expected === 'native_agent_finished'
+        && /requires completion_attestation=native_agent_finished.*main\/root.*Completed/.test(error.message),
     );
     const [beforeCompletion] = await dispatch('status', { task_id: 'feature', state_dir: stateDir });
     assert.equal(beforeCompletion.nodes.find(node => node.id === 'work').status, 'running');
@@ -330,17 +509,17 @@ test('new workflow initialization ignores a materialized state_dir without scann
   const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-unrecognized-local-state-'));
   const workspace = path.join(temp, 'workspace');
   const stateDir = stateDirFor(workspace);
-  const legacyStateDir = path.join(workspace, '.codex', 'workflow-controller');
+  const unmanagedProjectStateDir = path.join(workspace, '.codex', 'workflow-controller');
   const manifestPath = path.join(temp, 'manifest.json');
   const localFiles = [
-    path.join(legacyStateDir, 'feature.sqlite'),
-    path.join(legacyStateDir, 'workflow.sqlite'),
-    path.join(legacyStateDir, 'feature.json'),
-    path.join(legacyStateDir, 'workspace-lease.json'),
+    path.join(unmanagedProjectStateDir, 'feature.sqlite'),
+    path.join(unmanagedProjectStateDir, 'workflow.sqlite'),
+    path.join(unmanagedProjectStateDir, 'feature.json'),
+    path.join(unmanagedProjectStateDir, 'workspace-lease.json'),
     path.join(workspace, '.codex-workflow-controller-authority.json'),
   ];
   try {
-    await mkdir(legacyStateDir, { recursive: true });
+    await mkdir(unmanagedProjectStateDir, { recursive: true });
     const contents = new Map();
     for (const localPath of localFiles) {
       const value = `unrecognized local state: ${path.basename(localPath)}`;
@@ -484,6 +663,39 @@ test('v3 non-cohort review completion accepts only its exact recorded verdict/st
       assert.equal(before.nodes.find(node => node.id === 'review').status, 'running');
       const [completed] = await dispatch('complete', { task_id: taskId, node_id: 'review', claim_id: review.claim_id, status: accepted, result: resultPath, completion_attestation: 'native_agent_finished', state_dir: stateDir });
       assert.equal(completed.node.status, accepted);
+      if (taskId === 'fail-pair') {
+        const [repairContext] = await dispatch('audit-context', { task_id: taskId, state_dir: stateDir });
+        assert.equal(repairContext.repair_input_contract.action, 'record_repair');
+        assert.equal(repairContext.repair_input_contract.source_review_claim_id, review.claim_id);
+        assert.deepEqual(repairContext.repair_input_contract.blocking_finding_ids, ['blocking-1']);
+        await dispatch('record-repair', {
+          task_id: taskId,
+          state_dir: stateDir,
+          repair: {
+            source_review_claim_id: review.claim_id,
+            repaired_by: '/root/fail-pair-repair',
+            addressed_findings: [{ finding_id: 'blocking-1', resolution: 'The missing behavior was implemented.', verification_evidence: 'The focused regression passes.' }],
+            verification_evidence: 'The focused regression passes.',
+            workspace_fingerprint: repairContext.workspace_fingerprint,
+          },
+        });
+        const [afterRepair] = await dispatch('audit-context', { task_id: taskId, state_dir: stateDir });
+        assert.equal(afterRepair.repair_input_contract.action, null);
+        assert.equal(afterRepair.repair_input_contract.source_review_claim_id, null);
+        assert.match(afterRepair.repair_input_contract.instruction, /already has a repair record/);
+        await dispatch('retry', {
+          task_id: taskId,
+          node_id: 'review',
+          reason: 'Advance only after the recorded repair.',
+          replacement_agent_task_path: '/root/fail-pair-cohort',
+          previous_agent_stopped: true,
+          state_dir: stateDir,
+        });
+        const [afterAdvance] = await dispatch('audit-context', { task_id: taskId, state_dir: stateDir });
+        assert.equal(afterAdvance.repair_input_contract.action, null);
+        assert.equal(afterAdvance.repair_input_contract.source_review_claim_id, null);
+        assert.match(afterAdvance.repair_input_contract.instruction, /No failed current-protocol review/);
+      }
     }
     await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace, { task_id: 'missing-record' })));
     await dispatch('init', { manifest: manifestPath, });
@@ -492,14 +704,22 @@ test('v3 non-cohort review completion accepts only its exact recorded verdict/st
     const [review] = await dispatch('start', { task_id: 'missing-record', node_id: 'review', agent_task_path: '/root/reviewer', agent_role: 'avsp_terra_xhigh', native_agent_started: true, state_dir: stateDir });
     await assert.rejects(
       () => dispatch('complete', { task_id: 'missing-record', node_id: 'review', claim_id: review.claim_id, status: 'succeeded', result: resultPath, completion_attestation: 'native_agent_finished', state_dir: stateDir }),
-      error => error instanceof ControllerError && /requires a recorded review.*workflow_record_review.*exact claim_id/.test(error.message),
+      error => error instanceof ControllerError
+        && error.code === 'FAILED_PRECONDITION'
+        && error.field_errors[0]?.path === 'review'
+        && error.recovery?.action === 'workflow_record_review'
+        && /requires a recorded review.*workflow_record_review.*exact claim_id/.test(error.message),
     );
     const [afterMissingRecord] = await dispatch('status', { task_id: 'missing-record', state_dir: stateDir });
     assert.equal(afterMissingRecord.nodes.find(node => node.id === 'review').status, 'running');
     assert.equal(afterMissingRecord.reviews.length, 0);
     await assert.rejects(
       () => dispatch('complete', { task_id: 'missing-record', node_id: 'review', claim_id: review.claim_id, status: 'unavailable', result: resultPath, completion_attestation: 'native_agent_finished', state_dir: stateDir }),
-      error => error instanceof ControllerError && /requires a recorded review.*workflow_record_review.*exact claim_id/.test(error.message),
+      error => error instanceof ControllerError
+        && error.code === 'FAILED_PRECONDITION'
+        && error.field_errors[0]?.path === 'review'
+        && error.recovery?.action === 'workflow_record_review'
+        && /requires a recorded review.*workflow_record_review.*exact claim_id/.test(error.message),
     );
   } finally {
     await rm(temp, { recursive: true, force: true });
@@ -556,9 +776,16 @@ test('v3 max closure abandon and stale requeue restore the frozen charter for a 
     await recordRepair(xhighClaim);
     await dispatch('retry', { task_id: 'max-closure', node_id: 'review', reason: 'advance after repaired xhigh finding', replacement_agent_task_path: '/root/sol-max-initial', previous_agent_stopped: true, state_dir: stateDir });
     const maxInitialClaim = await recordFailure('avsp_sol_max', '/root/sol-max-initial');
+    const [beforeFreeze] = await dispatch('audit-context', { task_id: 'max-closure', state_dir: stateDir });
+    assert.equal(beforeFreeze.repair_input_contract.action, null);
+    assert.match(beforeFreeze.repair_input_contract.instruction, /workflow_retry first/);
     const [frozen] = await dispatch('retry', { task_id: 'max-closure', node_id: 'review', reason: 'freeze max initial failure into closure charter', replacement_agent_task_path: '/root/sol-max-closure', previous_agent_stopped: true, state_dir: stateDir });
     assert.equal(frozen.node.review_gate.stage, 'sol_max_closure');
     assert.equal(frozen.max_review_charter.status, 'initial_repair_required');
+    const [frozenContext] = await dispatch('audit-context', { task_id: 'max-closure', state_dir: stateDir });
+    assert.equal(frozenContext.repair_input_contract.action, 'record_repair');
+    assert.equal(frozenContext.repair_input_contract.source_review_claim_id, maxInitialClaim);
+    assert.deepEqual(frozenContext.repair_input_contract.blocking_finding_ids, ['blocking-1']);
     await recordRepair(maxInitialClaim);
     await dispatch('retry', { task_id: 'max-closure', node_id: 'review', reason: 'open repaired max closure for its reviewer', replacement_agent_task_path: '/root/sol-max-closure', previous_agent_stopped: true, state_dir: stateDir });
 
