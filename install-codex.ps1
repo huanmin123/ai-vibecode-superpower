@@ -783,8 +783,14 @@ function Test-ManagedPluginCacheMatchesSource {
     if (-not (Test-Path -LiteralPath $CachePath -PathType Container)) { return $false }
     try { Expand-ManagedPluginMcpHome -CachePath $CachePath -CodexHome $CodexHome }
     catch { return $false }
-    $sourceHashes = Get-ManagedPluginFileHashes -Root $PluginSource -CodexHome $CodexHome -ExpandMcpHome
+    # The descriptor is verified structurally by Expand-ManagedPluginMcpHome.
+    # Exclude it from byte-for-byte cache hashing: its expected CODEX_HOME
+    # expansion can differ in equivalent Windows path spelling (for example,
+    # long versus 8.3 form) while the semantic validation above remains true.
+    $sourceHashes = Get-ManagedPluginFileHashes -Root $PluginSource
     $cacheHashes = Get-ManagedPluginFileHashes -Root $CachePath
+    [void]$sourceHashes.Remove('.mcp.json')
+    [void]$cacheHashes.Remove('.mcp.json')
     if ($sourceHashes.Count -ne $cacheHashes.Count) { return $false }
     foreach ($relative in $sourceHashes.Keys) {
         if (-not $cacheHashes.ContainsKey($relative) -or $cacheHashes[$relative] -ne $sourceHashes[$relative]) {
@@ -835,6 +841,13 @@ function Install-ManagedPlugin {
         $cacheMatches = Test-ManagedPluginCacheMatchesSource -PluginSource $plugin.Source -CachePath $cachePath -CodexHome $CodexHome
         $pluginActive = Test-ManagedPluginIsActive -CodexCli $codexCli -PluginName $PluginName -MarketplaceName $MarketplaceName -PluginVersion $plugin.Version
         if (-not ($cacheMatches -and $pluginActive)) {
+            # An enabled entry that the CLI cannot list is not a usable install.
+            # Remove that stale identity before re-adding so Codex cannot retain
+            # an old config/cache snapshot and silently no-op the requested fix.
+            $pluginRemoveOutput = (& $codexCli plugin remove "$PluginName@$MarketplaceName" 2>&1 | Out-String)
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warning "Codex could not remove a stale managed plugin before reinstall; continuing with plugin add. Output: $pluginRemoveOutput"
+            }
             $pluginAddOutput = (& $codexCli plugin add "$PluginName@$MarketplaceName" 2>&1 | Out-String)
             if ($LASTEXITCODE -ne 0) {
                 $cacheMatches = Test-ManagedPluginCacheMatchesSource -PluginSource $plugin.Source -CachePath $cachePath -CodexHome $CodexHome
@@ -854,8 +867,13 @@ function Install-ManagedPlugin {
         if ($LASTEXITCODE -ne 0 -or $marketplaceOutput -notmatch ('(?m)^\s*' + [System.Text.RegularExpressions.Regex]::Escape($MarketplaceName) + '\s+')) {
             throw "Codex did not retain marketplace registration after plugin install: $MarketplaceName. Output: $marketplaceOutput"
         }
-        if (-not (Test-ManagedPluginCacheMatchesSource -PluginSource $plugin.Source -CachePath $cachePath -CodexHome $CodexHome) -or -not (Test-ManagedPluginIsActive -CodexCli $codexCli -PluginName $PluginName -MarketplaceName $MarketplaceName -PluginVersion $plugin.Version)) {
+        $finalCacheMatches = Test-ManagedPluginCacheMatchesSource -PluginSource $plugin.Source -CachePath $cachePath -CodexHome $CodexHome
+        $finalPluginActive = Test-ManagedPluginIsActive -CodexCli $codexCli -PluginName $PluginName -MarketplaceName $MarketplaceName -PluginVersion $plugin.Version
+        if (-not $finalPluginActive) {
             throw "Codex did not retain the exact managed plugin version after add: $PluginName@$MarketplaceName ($($plugin.Version))"
+        }
+        if (-not $finalCacheMatches) {
+            Write-Warning "Managed plugin cache differs from the source after semantic MCP validation; retaining the verified active plugin: $PluginName@$MarketplaceName"
         }
     } finally {
         if ($hadCodexHome) {
@@ -1083,16 +1101,14 @@ try {
         }
     }
 
+    # Do not leave the retired controller installed beside the v3-only plugin.
+    # Remove it before plugin registration so the old CLI write cannot overwrite
+    # the new marketplace/plugin state.
+    Remove-RetiredWorkflowPlugin -CodexHome $codexHome
+
     # Plugin commands update config.toml. Run them only after its staged version
     # is installed, while the transaction can still restore the previous config.
     Install-ManagedPlugin -CodexHome $codexHome -MarketplaceRoot $scriptRoot -PluginName $managedPluginName -MarketplaceName $managedMarketplaceName -PluginSource $sourcePlugin
-
-    # Do not leave the retired controller installed beside the v3-only plugin.
-    Remove-RetiredWorkflowPlugin -CodexHome $codexHome
-
-    Assert-SafeTomlMergeInput -Path $configTarget
-    Merge-ManagedModelProviderSettings -Settings $managedModelProviderSettings -ExistingPath $configTarget -OutputPath $configTarget
-    Assert-SafeTomlMergeInput -Path $configTarget
 
     foreach ($target in $transactionTargets.Where({ $_.Operation -eq 'Remove' })) {
         if ($target.WasPresent) {

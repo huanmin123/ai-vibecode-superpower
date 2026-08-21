@@ -6,7 +6,7 @@
     "node": ">=22.5.0"
   },
   "scripts": {
-    "test": "node --test tests/agent_toolchain_configure.test.mjs tests/global_workflow_store.test.mjs tests/workflow_controller.test.mjs tests/workflow_controller_mcp.test.mjs tests/sol_review_cli.test.mjs",
+    "test": "node --test tests/agent_toolchain_configure.test.mjs tests/global_workflow_store.test.mjs tests/install_contract.test.mjs tests/workflow_controller.test.mjs tests/workflow_controller_mcp.test.mjs tests/sol_review_cli.test.mjs",
     "check": "node --check scripts/global_workflow_store.mjs && node --check scripts/workflow_controller.mjs && node --check scripts/workflow_controller_mcp.mjs && node --check scripts/sol_review_cli.mjs"
   }
 }

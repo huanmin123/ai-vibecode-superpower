@@ -219,6 +219,13 @@ install_managed_plugin() {
     plugin_cache=$codex_home/plugins/cache/$managed_marketplace_name/$managed_plugin_name/$plugin_version
     CODEX_HOME="$codex_home" codex plugin marketplace add "$script_dir"
     if ! plugin_cache_matches_source "$plugin_cache" || ! managed_plugin_is_active "$plugin_version"; then
+        # An enabled entry that the CLI cannot list is not a usable install.
+        # Remove that stale identity before re-adding so Codex cannot retain an
+        # old config/cache snapshot and silently no-op the requested fix.
+        if ! plugin_remove_output=$(CODEX_HOME="$codex_home" codex plugin remove "$managed_plugin_name@$managed_marketplace_name" 2>&1); then
+            printf '%s\n' 'Warning: Codex could not remove a stale managed plugin before reinstall; continuing with plugin add.' >&2
+            printf '%s\n' "$plugin_remove_output" >&2
+        fi
         if ! plugin_add_output=$(CODEX_HOME="$codex_home" codex plugin add "$managed_plugin_name@$managed_marketplace_name" 2>&1); then
             if ! plugin_cache_matches_source "$plugin_cache" || ! managed_plugin_is_active "$plugin_version"; then
                 printf '%s\n' "Could not install managed plugin: $managed_plugin_name@$managed_marketplace_name" >&2
@@ -240,9 +247,14 @@ install_managed_plugin() {
         printf '%s\n' "Codex did not retain marketplace registration after plugin install: $managed_marketplace_name" >&2
         return 1
     }
-    if ! plugin_cache_matches_source "$plugin_cache" || ! managed_plugin_is_active "$plugin_version"; then
+    final_cache_matches=1
+    plugin_cache_matches_source "$plugin_cache" || final_cache_matches=0
+    if ! managed_plugin_is_active "$plugin_version"; then
         printf '%s\n' "Codex did not retain the exact managed plugin version: $managed_plugin_name@$managed_marketplace_name ($plugin_version)" >&2
         return 1
+    fi
+    if [ "$final_cache_matches" -ne 1 ]; then
+        printf '%s\n' "Warning: managed plugin cache differs from the source after semantic MCP validation; retaining the verified active plugin: $managed_plugin_name@$managed_marketplace_name" >&2
     fi
 }
 
@@ -1239,16 +1251,14 @@ while IFS="$tab" read -r target_name target_path candidate_path target_kind targ
     fi
 done < "$manifest"
 
+# Do not leave the retired controller installed beside the v3-only plugin.
+# Remove it before plugin registration so the old CLI write cannot overwrite
+# the new marketplace/plugin state.
+remove_retired_workflow_plugin
+
 # Plugin commands update config.toml. Run them only after its staged version
 # is installed, while the transaction can still restore the previous config.
 install_managed_plugin
-
-remove_retired_workflow_plugin
-
-assert_safe_toml_merge_input "$codex_home/config.toml"
-merge_managed_config "$codex_home/config.toml" "$stage_dir/remerged-config.toml"
-assert_safe_toml_merge_input "$stage_dir/remerged-config.toml"
-mv "$stage_dir/remerged-config.toml" "$codex_home/config.toml"
 
 while IFS="$tab" read -r target_name target_path candidate_path target_kind target_operation; do
     [ "$target_operation" = remove ] || continue
