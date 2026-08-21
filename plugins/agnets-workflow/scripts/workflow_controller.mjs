@@ -3266,7 +3266,7 @@ async function abandonNode(parameters) {
       lane.status = 'abandoned';
       lane.result = { summary: 'Terra cohort lane abandoned after explicit reconciliation.', reason, abandoned_at: utcNow(), claim_id: lane.claim_id };
       node.status = 'abandoned';
-      addEvent(state, 'node_abandoned', { node_id: nodeId, reviewer_slot: slot, claim_id, reason, previous_agent_stopped: true });
+      addEvent(state, 'node_abandoned', { node_id: nodeId, reviewer_slot: slot, claim_id: claimId, reason, previous_agent_stopped: true });
       await writeState(filePath, state);
       return { task_id: state.task_id, node };
     }

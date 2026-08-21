@@ -618,6 +618,31 @@ test('v3 retries an abandoned ordinary protocol review at the same stage with a 
   }
 });
 
+test('v3 abandons a Terra cohort lane after its reviewer stops', async () => {
+  const { dispatch } = await import('../scripts/workflow_controller.mjs');
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-abandoned-cohort-'));
+  const workspace = path.join(temp, 'workspace');
+  const stateDir = stateDirFor(workspace);
+  const manifestPath = path.join(temp, 'manifest.json');
+  const resultPath = path.join(temp, 'work-result.json');
+  try {
+    await mkdir(workspace, { recursive: true });
+    await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace, { review_entry_stage: 'terra_cohort' })));
+    await dispatch('init', { manifest: manifestPath });
+    const [work] = await dispatch('start', { task_id: 'feature', node_id: 'work', agent_task_path: '/root/work', agent_role: 'avsp_terra_high', native_agent_started: true, state_dir: stateDir });
+    await writeFile(resultPath, JSON.stringify({ changed: true }));
+    await dispatch('complete', { task_id: 'feature', node_id: 'work', claim_id: work.claim_id, status: 'succeeded', result: resultPath, completion_attestation: 'native_agent_finished', state_dir: stateDir });
+    const [review] = await dispatch('start', { task_id: 'feature', node_id: 'review', reviewer_slot: 'coverage', agent_task_path: '/root/cohort-coverage', agent_role: 'avsp_terra_xhigh', native_agent_started: true, state_dir: stateDir });
+    const [abandoned] = await dispatch('abandon', { task_id: 'feature', node_id: 'review', reviewer_slot: 'coverage', claim_id: review.claim_id, reason: 'cohort reviewer stopped before recording a review', previous_agent_stopped: true, state_dir: stateDir });
+    assert.equal(abandoned.node.status, 'abandoned');
+    assert.equal(abandoned.node.review_gate.cohort.lanes.coverage.status, 'abandoned');
+    const [status] = await dispatch('status', { task_id: 'feature', state_dir: stateDir });
+    assert.deepEqual(status.stale_nodes, []);
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
 test('v3 non-cohort review completion accepts only its exact recorded verdict/status pair', async () => {
   const { ControllerError, dispatch } = await import('../scripts/workflow_controller.mjs');
   const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-review-matrix-'));
