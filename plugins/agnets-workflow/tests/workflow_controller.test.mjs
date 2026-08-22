@@ -35,7 +35,7 @@ function v3Manifest(workspace, overrides = {}) {
   const work = { execution_risk: 'protected', routing_reason: 'bounded change', execution_owner: '/root/work', integration_owner: '/root', quality_guard: 'targeted verification' };
   const review = { execution_risk: 'read_only', routing_reason: 'independent quality gate', execution_owner: '/root/reviewer', integration_owner: '/root', quality_guard: 'requirements and evidence review' };
   return {
-    task_id: 'feature', workspace, workspace_claims: [{ mode: 'write', prefix: '.' }], global_write_justification: 'The fixture intentionally validates a workspace-wide claim.', goal: 'Validate the v3-only workflow contract.', requirements: [{ id: 'R1', text: 'Only v3 manifests are accepted.' }], scope: [], non_goals: [], routing_schema_version: 3, assurance_level: 'terra', assurance_assessment: assessment('terra'), review_context: { environment: 'local test workspace', scenarios: ['current protocol'], boundaries: 'declared workspace only' }, review_entry_stage: 'terra_single', nodes: [{ id: 'work', kind: 'implementation', ...work }, { id: 'review', kind: 'quality_review', depends_on: ['work'], ...review }], ...overrides,
+    task_id: 'feature', coordinator_task_path: '/root', coordinator_thread_id: '01a0193d-6e8f-78a2-815a-19afa3358256', workspace, workspace_claims: [{ mode: 'write', prefix: '.' }], global_write_justification: 'The fixture intentionally validates a workspace-wide claim.', goal: 'Validate the v3-only workflow contract.', requirements: [{ id: 'R1', text: 'Only v3 manifests are accepted.' }], scope: [], non_goals: [], routing_schema_version: 3, assurance_level: 'terra', assurance_assessment: assessment('terra'), review_context: { environment: 'local test workspace', scenarios: ['current protocol'], boundaries: 'declared workspace only' }, review_entry_stage: 'terra_single', nodes: [{ id: 'work', kind: 'implementation', ...work }, { id: 'review', kind: 'quality_review', depends_on: ['work'], ...review }], ...overrides,
   };
 }
 
@@ -660,7 +660,7 @@ test('v3 non-cohort review completion accepts only its exact recorded verdict/st
     const [review] = await dispatch('start', { task_id: taskId, node_id: 'review', agent_task_path: reviewer, agent_role: 'avsp_terra_xhigh', native_agent_started: true, state_dir: stateDir });
     const [context] = await dispatch('audit-context', { task_id: taskId, state_dir: stateDir });
     const payload = {
-      auditor_task: reviewer, auditor_role: 'avsp_terra_xhigh', claim_id: review.claim_id, verdict,
+      auditor_task: reviewer, auditor_role: 'avsp_terra_xhigh', claim_id: review.claim_id, coordinator_task_path: '/root', coordinator_thread_id: '01a0193d-6e8f-78a2-815a-19afa3358256', verdict,
       findings: verdict === 'fail' ? [{ id: 'blocking-1', severity: 'blocking', requirement_id: 'R1', summary: 'A required behavior is absent.', evidence: 'Targeted test fails.' }] : [],
       requirement_coverage: { R1: verdict === 'pass' ? 'covered' : verdict === 'fail' ? 'not covered' : 'unavailable to assess' },
       workflow_snapshot: context.workflow_snapshot, workspace_fingerprint: context.workspace_fingerprint,
@@ -669,6 +669,12 @@ test('v3 non-cohort review completion accepts only its exact recorded verdict/st
     };
     const reviewPath = path.join(temp, `${taskId}-review.json`);
     await writeFile(reviewPath, JSON.stringify(payload));
+    const wrongBindingPath = path.join(temp, `${taskId}-wrong-binding-review.json`);
+    await writeFile(wrongBindingPath, JSON.stringify({ ...payload, coordinator_thread_id: '01a0193d-6e8f-78a2-815a-19afa3358257' }));
+    await assert.rejects(
+      () => dispatch('record-review', { task_id: taskId, review: wrongBindingPath, state_dir: stateDir }),
+      error => error instanceof ControllerError && /coordinator binding does not match/.test(error.message),
+    );
     await dispatch('record-review', { task_id: taskId, review: reviewPath, state_dir: stateDir });
     return { review, reviewPath };
   };
@@ -765,7 +771,7 @@ test('v3 max closure abandon and stale requeue restore the frozen charter for a 
     const [claim] = await dispatch('start', { task_id: 'max-closure', node_id: 'review', agent_task_path: reviewer, agent_role: role, native_agent_started: true, state_dir: stateDir });
     const [context] = await dispatch('audit-context', { task_id: 'max-closure', state_dir: stateDir });
     await writeFile(reviewPath, JSON.stringify({
-      auditor_task: reviewer, auditor_role: role, claim_id: claim.claim_id, verdict: 'fail',
+      auditor_task: reviewer, auditor_role: role, claim_id: claim.claim_id, coordinator_task_path: '/root', coordinator_thread_id: '01a0193d-6e8f-78a2-815a-19afa3358256', verdict: 'fail',
       findings: [{ id: 'blocking-1', severity: 'blocking', requirement_id: 'R1', summary: 'A guarded requirement is not met.', evidence: 'Focused failure evidence.' }],
       requirement_coverage: { R1: 'not met' }, workflow_snapshot: context.workflow_snapshot, workspace_fingerprint: context.workspace_fingerprint,
       scope_and_regression: 'within scope', verification_gaps: 'blocking issue', residual_risk: 'not accepted', independent_assessment: 'Independent failed assessment.', history_reconciliation: 'History does not remove the blocker.', review_history_digest: context.review_history_digest,

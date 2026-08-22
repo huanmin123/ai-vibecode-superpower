@@ -50,7 +50,7 @@ role 会先应用，但 child 随后继承父 turn 的 approval policy 和 permi
 
 跨文件、未知根因或需扫描的任务，若能拆出独立只读证据域，默认先派 `avsp_luna_high`；单文件且改法明确时可跳过并记录理由。主控保留设计、授权、集成和最终判断。
 
-持久化复杂任务使用 `routing_schema_version=3`，必须声明 `assurance_level`、结构化 `assurance_assessment`、`review_context`（精确含非空 `environment`、`scenarios`、`boundaries`）和 `review_entry_stage`。`review_entry_stage` 只能是 `terra_single`、`terra_cohort`、`sol_high` 或 `sol_xhigh`：常规任务从 `terra_single` 开始；已有中等复杂度、跨域或需挑战单审固化风险时从 `terra_cohort` 开始；高度复杂、证据冲突或低可信 oracle 时可直接从 `sol_high` 或 `sol_xhigh` 开始。不得直接进入 `sol_max`，它只能来自前级有效失败后的受控链。全部 assurance 维度为 `controlled` 时不应初始化持久化复杂任务；任一为 `partial` 且没有 `unknown` 时门级必须是 `terra`，任一为 `unknown` 时必须是 `sol`。一个任务仍只有一个末端审核节点，cohort 是该节点内部的并行 lane，不是第二个质量门。Sol 仅在所选 Sol 实际不可用时使用 Terra fallback。共享写入、外部副作用或不可恢复变更仍为 `protected`，由 Terra 处理。
+持久化复杂任务使用 `routing_schema_version=3`，必须声明顶层 `coordinator_task_path` 与 `coordinator_thread_id`（UUID 字符串）、`assurance_level`、结构化 `assurance_assessment`、`review_context`（精确含非空 `environment`、`scenarios`、`boundaries`）和 `review_entry_stage`。审核包必须携带这两个绑定字段，审核 JSON 必须原样回显并只发送给绑定协调者；这是插件侧声明与校验，不等于宿主认证。`review_entry_stage` 只能是 `terra_single`、`terra_cohort`、`sol_high` 或 `sol_xhigh`：常规任务从 `terra_single` 开始；已有中等复杂度、跨域或需挑战单审固化风险时从 `terra_cohort` 开始；高度复杂、证据冲突或低可信 oracle 时可直接从 `sol_high` 或 `sol_xhigh` 开始。不得直接进入 `sol_max`，它只能来自前级有效失败后的受控链。全部 assurance 维度为 `controlled` 时不应初始化持久化复杂任务；任一为 `partial` 且没有 `unknown` 时门级必须是 `terra`，任一为 `unknown` 时必须是 `sol`。一个任务仍只有一个末端审核节点，cohort 是该节点内部的并行 lane，不是第二个质量门。Sol 仅在所选 Sol 实际不可用时使用 Terra fallback。共享写入、外部副作用或不可恢复变更仍为 `protected`，由 Terra 处理。
 
 ### 通用委派约束
 

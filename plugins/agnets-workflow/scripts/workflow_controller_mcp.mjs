@@ -14,9 +14,9 @@ const reviewFindingSchema = {
 };
 const reviewObjectSchema = {
   type: 'object', additionalProperties: false,
-  required: ['auditor_task', 'auditor_role', 'claim_id', 'verdict', 'findings', 'requirement_coverage', 'workflow_snapshot', 'workspace_fingerprint', 'scope_and_regression', 'verification_gaps', 'residual_risk', 'independent_assessment', 'history_reconciliation', 'review_history_digest'],
+  required: ['auditor_task', 'auditor_role', 'claim_id', 'coordinator_task_path', 'coordinator_thread_id', 'verdict', 'findings', 'requirement_coverage', 'workflow_snapshot', 'workspace_fingerprint', 'scope_and_regression', 'verification_gaps', 'residual_risk', 'independent_assessment', 'history_reconciliation', 'review_history_digest'],
   properties: {
-    auditor_task: { type: 'string', minLength: 1 }, auditor_role: { type: 'string', minLength: 1 }, claim_id: { type: 'string', minLength: 1 }, verdict: { enum: ['pass', 'fail', 'unavailable'] }, findings: { type: 'array', maxItems: 64, items: reviewFindingSchema },
+    auditor_task: { type: 'string', minLength: 1 }, auditor_role: { type: 'string', minLength: 1 }, claim_id: { type: 'string', minLength: 1 }, coordinator_task_path: { type: 'string', minLength: 1 }, coordinator_thread_id: { type: 'string', minLength: 1 }, verdict: { enum: ['pass', 'fail', 'unavailable'] }, findings: { type: 'array', maxItems: 64, items: reviewFindingSchema },
     requirement_coverage: { type: 'object', minProperties: 1, additionalProperties: reviewValueSchema }, workflow_snapshot: { type: 'object' }, workspace_fingerprint: { type: 'object' }, scope_and_regression: reviewValueSchema, verification_gaps: reviewValueSchema, residual_risk: reviewValueSchema, independent_assessment: reviewValueSchema, history_reconciliation: reviewValueSchema, review_history_digest: { type: 'string', minLength: 1 }, fallback_reason: { type: 'string', minLength: 1 }, challenge_targets: { type: 'array', minItems: 1, maxItems: 1, items: { type: 'string', minLength: 1 } }, repair_regressions: { type: 'array', items: { type: 'object' } },
   },
 };
@@ -24,7 +24,7 @@ const repairFindingSchema = { type: 'object', additionalProperties: false, requi
 const repairObjectSchema = { type: 'object', additionalProperties: false, required: ['source_review_claim_id', 'repaired_by', 'addressed_findings', 'verification_evidence', 'workspace_fingerprint'], properties: { source_review_claim_id: { type: 'string', minLength: 1 }, repaired_by: { type: 'string', minLength: 1 }, addressed_findings: { type: 'array', items: repairFindingSchema }, verification_evidence: reviewValueSchema, workspace_fingerprint: { type: 'object' } } };
 
 export const TOOLS = [
-  ['workflow_init', '从 JSON 清单创建持久化 DAG；v3 可用 review_entry_stage 直接从 terra_single、terra_cohort、sol_high 或 sol_xhigh 开始，并必须给出 review_context.environment/scenarios/boundaries。控制器从 manifest.workspace 自动派生全局 state_dir 并在结果中返回；项目内不使用任何工作流路径或状态。', ['manifest'], { manifest: { description: 'v3 工作流清单对象、内联 JSON 对象字符串或普通 JSON 文件路径。requirements 必须为 [{id,text}]；每个 assurance 维度为 {status,evidence:string[],rationale}，字段名为 impact/recoverability/uncertainty/verifiability/coupling，另含 selection_reason；节点使用 id（不是 node_id）及完整路由字段。', anyOf: [{ type: 'object' }, { type: 'string' }] } }],
+  ['workflow_init', '从 JSON 清单创建持久化 DAG；v3 可用 review_entry_stage 直接从 terra_single、terra_cohort、sol_high 或 sol_xhigh 开始，并必须给出 review_context.environment/scenarios/boundaries 以及顶层 coordinator_task_path 与 coordinator_thread_id(UUID)。控制器从 manifest.workspace 自动派生全局 state_dir 并在结果中返回；项目内不使用任何工作流路径或状态。', ['manifest'], { manifest: { description: 'v3 工作流清单对象、内联 JSON 对象字符串或普通 JSON 文件路径。requirements 必须为 [{id,text}]，并明确顶层 coordinator_task_path 与 coordinator_thread_id(UUID)；每个 assurance 维度为 {status,evidence:string[],rationale}，字段名为 impact/recoverability/uncertainty/verifiability/coupling，另含 selection_reason；节点使用 id（不是 node_id）及完整路由字段。', anyOf: [{ type: 'object' }, { type: 'string' }] } }],
   ['workflow_raise_assurance', '在末端质量门开始前，按结构化新证据将 v3 Terra assurance 提高到 Sol，并把同一个未认领门重绑定为 sol_high；不得降级或新增第二个审核门。', ['task_id', 'target_assurance_level', 'reason', 'assurance_assessment', 'replacement_agent_task_path', 'integration_owner', 'state_dir'], { task_id: { type: 'string' }, target_assurance_level: { enum: ['sol'] }, reason: { type: 'string' }, assurance_assessment: { anyOf: [{ type: 'object' }, { type: 'string' }], description: '五个风险维度分别含 status、evidence、rationale，并含 selection_reason；优先传内联 JSON 对象，外部文件不得位于目标 workspace 内。' }, replacement_agent_task_path: { type: 'string', description: '预留给新末端审核者的独立 agent task path。' }, integration_owner: { type: 'string', description: '负责该末端门集成与关闭的真实协调者 task path。' }, state_dir: { type: 'string' } }],
   ['workflow_rebind_pending', '确认预定实例已停止或未启动后，为未认领的 pending 节点换绑 execution_owner；保留原因和旧 owner。', ['task_id', 'node_id', 'reason', 'replacement_agent_task_path', 'previous_agent_stopped', 'state_dir'], { task_id: { type: 'string' }, node_id: { type: 'string' }, reason: { type: 'string' }, replacement_agent_task_path: { type: 'string' }, previous_agent_stopped: { type: 'boolean', const: true }, state_dir: { type: 'string' } }],
   ['workflow_invalidate_gate', '末端 pass 在关闭前因任务快照或工作区变化失效时，保留旧记录并受控重开质量门；审核门必须绑定新的独立 reviewer，terra_cohort 可指定首个重开 lane。', ['task_id', 'reason', 'replacement_agent_task_path', 'state_dir'], { task_id: { type: 'string' }, reason: { type: 'string' }, replacement_agent_task_path: { type: 'string', description: '审核门失效时必填。' }, reviewer_slot: { enum: ['coverage', 'adversarial'], description: '仅重开 v3 terra_cohort 时可选，指定预留给替代审核者的首个 lane，默认 coverage。' }, state_dir: { type: 'string' } }],
@@ -43,7 +43,7 @@ export const TOOLS = [
   ['workflow_rescue', '确认 Luna executor 已停止后，把一个正在运行的 delegable 节点显式转交 main/root 救援；记录原 claim、原因、替代路径和恢复包，不伪装为 Luna 已完成。', ['task_id', 'node_id', 'claim_id', 'reason', 'replacement_agent_task_path', 'previous_agent_stopped', 'state_dir'], { task_id: { type: 'string' }, node_id: { type: 'string' }, claim_id: { type: 'string' }, reason: { type: 'string' }, replacement_agent_task_path: { type: 'string' }, previous_agent_stopped: { type: 'boolean', const: true }, state_dir: { type: 'string' } }],
   ['workflow_escalate_execution', '仅在确认 Luna executor 已停止且新证据使既有 delegable 契约不再受控时，由 main/root 将该 claim 升级为 protected Terra 执行；调用前必须形成新的完整执行契约及当前 assurance_assessment。保留旧 claim 与理由、释放其写锁，并返回 Terra 的恢复包；不得用于审核节点、范围扩大或绕过 Luna 的初始委派。若评估要求 Sol，先调用 workflow_raise_assurance。', ['task_id', 'node_id', 'claim_id', 'reason', 'routing_reason', 'quality_guard', 'assurance_assessment', 'replacement_agent_task_path', 'previous_agent_stopped', 'state_dir'], { task_id: { type: 'string' }, node_id: { type: 'string' }, claim_id: { type: 'string' }, reason: { type: 'string', description: '新证据为何使 delegable 风险不再受控。' }, routing_reason: { type: 'string', description: '新的 protected 路由理由；不得仅以实现复杂度为由。' }, quality_guard: { type: 'string', description: 'Terra 接管后的验证或证据要求。' }, assurance_assessment: { anyOf: [{ type: 'object' }, { type: 'string' }], description: '当前五维 assurance assessment；若其中存在 unknown，先按受控流程提升至 Sol。' }, replacement_agent_task_path: { type: 'string', description: '新的 avsp_terra_high 执行者任务路径。' }, previous_agent_stopped: { type: 'boolean', const: true }, state_dir: { type: 'string' } }],
   ['workflow_audit_context', '为独立审核构建完整证据包，包含目标、环境/场景/边界、当前状态、全部审核与修复历史。', ['task_id', 'state_dir'], { task_id: { type: 'string' }, state_dir: { type: 'string' } }],
-  ['workflow_record_review', '只由 main/root 调用：先等待审核代理返回审核 JSON，再用 workflow_start 返回的同一 claim_id 记录；成功后才能 workflow_complete。对象输入必须严格匹配 review schema；requirement_coverage 以每个需求 ID 为键，findings 项只能含 id/severity/requirement_id/summary/evidence。动态 claim、快照、指纹和 review_history_digest 必须从 workflow_audit_context 原样复用；失败后不要猜字段重试。', ['task_id', 'review', 'state_dir'], { task_id: { type: 'string' }, review: { anyOf: [reviewObjectSchema, { type: 'string' }], description: '内联审核对象的静态字段契约；字符串仅可为内联 JSON 或目标 workspace 外的 JSON 文件路径。' }, state_dir: { type: 'string' } }],
+  ['workflow_record_review', '只由 main/root 调用：先等待审核代理返回审核 JSON，再用 workflow_start 返回的同一 claim_id 记录；成功后才能 workflow_complete。审核 JSON 必须携带并回显 coordinator_task_path 与 coordinator_thread_id，且只能匹配当前任务绑定。对象输入必须严格匹配 review schema；requirement_coverage 以每个需求 ID 为键，findings 项只能含 id/severity/requirement_id/summary/evidence。动态 claim、快照、指纹和 review_history_digest 必须从 workflow_audit_context 原样复用；失败后不要猜字段重试。', ['task_id', 'review', 'state_dir'], { task_id: { type: 'string' }, review: { anyOf: [reviewObjectSchema, { type: 'string' }], description: '内联审核对象的静态字段契约；字符串仅可为内联 JSON 或目标 workspace 外的 JSON 文件路径。' }, state_dir: { type: 'string' } }],
   ['workflow_record_repair', '只由 main/root 调用：仅在当前任务已有已记录的 failed review 后记录修复。对象输入必须严格匹配 repair schema；source_review_claim_id 和 addressed_findings 必须来自最新失败审核。失败后不要猜字段重试。', ['task_id', 'repair', 'state_dir'], { task_id: { type: 'string' }, repair: { anyOf: [repairObjectSchema, { type: 'string' }], description: '内联修复对象的静态字段契约；动态 source claim、blocking finding 和 workspace_fingerprint 必须从当前状态原样复用。' }, state_dir: { type: 'string' } }],
   ['workflow_close_check', '返回所有节点是否已完成、总审是否仍一致，并在通过时释放工作区租约。', ['task_id', 'state_dir'], { task_id: { type: 'string' }, state_dir: { type: 'string' } }],
   ['workflow_release_workspace', '中断后确认原执行者已停止，且没有运行节点时显式释放工作区租约。', ['task_id', 'previous_agent_stopped', 'state_dir'], { task_id: { type: 'string' }, previous_agent_stopped: { type: 'boolean', const: true }, state_dir: { type: 'string' } }],
@@ -201,6 +201,8 @@ function compactReview(review) {
   return definedObject([
     ['auditor_task', review.auditor_task],
     ['auditor_role', review.auditor_role],
+    ['coordinator_task_path', review.coordinator_task_path],
+    ['coordinator_thread_id', review.coordinator_thread_id],
     ['node_id', review.node_id],
     ['claim_id', review.claim_id],
     ['verdict', review.verdict],
@@ -227,6 +229,8 @@ function compactMaxReviewCharter(charter) {
 function workflowObservation(result) {
   return {
     task_id: result.task_id,
+    coordinator_task_path: result.coordinator_task_path ?? null,
+    coordinator_thread_id: result.coordinator_thread_id ?? null,
     workspace_claims: result.workspace_claims ?? null,
     workspace_lease_status: result.workspace_lease?.status ?? null,
     execution_routing_policy_version: result.execution_routing_policy_version ?? null,
@@ -284,6 +288,8 @@ function compactStatus(result) {
       ['database_path', result.workspace_lease.database_path],
       ['task_key', result.workspace_lease.task_key],
     ]) : null],
+    ['coordinator_task_path', result.coordinator_task_path],
+    ['coordinator_thread_id', result.coordinator_thread_id],
     ['execution_routing_policy_version', result.execution_routing_policy_version],
     ['assurance_level', result.assurance_level],
     ['assurance_assessment', result.assurance_assessment],

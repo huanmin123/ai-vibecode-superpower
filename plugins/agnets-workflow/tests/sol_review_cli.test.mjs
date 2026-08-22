@@ -36,7 +36,7 @@ function solAssessment() {
 
 function v3ReviewManifest(workspace, { goal, requirements, agentType = 'avsp_sol_high', executionOwner = '/root/sol-reviewer' }) {
   return {
-    task_id: 'review-task', workspace, workspace_claims: [{ mode: 'read', prefix: '.' }], goal, requirements, scope: [], non_goals: [], routing_schema_version: 3,
+    task_id: 'review-task', coordinator_task_path: '/root', coordinator_thread_id: '01a0193d-6e8f-78a2-815a-19afa3358256', workspace, workspace_claims: [{ mode: 'read', prefix: '.' }], goal, requirements, scope: [], non_goals: [], routing_schema_version: 3,
     assurance_level: 'sol', assurance_assessment: solAssessment(), review_context: { environment: 'isolated test workspace', scenarios: ['workflow-bound Sol review'], boundaries: 'declared workspace only' },
     review_entry_stage: agentType === 'avsp_sol_xhigh' ? 'sol_xhigh' : 'sol_high',
     nodes: [{ id: 'total-review', kind: 'total_review', agent_type: agentType, depends_on: [], execution_risk: 'read_only', routing_reason: 'independent final quality gate', execution_owner: executionOwner, integration_owner: '/root', quality_guard: 'requirements and evidence review' }],
@@ -835,7 +835,7 @@ test('keeps a workflow-bound Sol review running past the soft deadline and saves
       queueMicrotask(() => {
         child.stdout.emit('data', Buffer.from('partial review output\n'));
         child.stdout.emit('data', Buffer.from(`${JSON.stringify({
-          auditor_task: '/root/timeout-review', auditor_role: 'avsp_sol_high', claim_id: claim.node.claim_id, verdict: 'pass',
+          auditor_task: '/root/timeout-review', auditor_role: 'avsp_sol_high', claim_id: claim.node.claim_id, coordinator_task_path: '/root', coordinator_thread_id: '01a0193d-6e8f-78a2-815a-19afa3358256', verdict: 'pass',
           requirement_coverage: { R1: 'timeout result is persisted' }, workflow_snapshot: auditContext.workflow_snapshot, workspace_fingerprint: auditContext.workspace_fingerprint, scope_and_regression: 'none', verification_gaps: 'none', residual_risk: 'none',
         })}\n`));
         child.stderr.emit('data', Buffer.from('partial diagnostics\n'));
@@ -868,7 +868,7 @@ test('keeps a workflow-bound Sol review running past the soft deadline and saves
     assert.equal(state.nodes['total-review'].result, null);
     const review = path.join(item.root, 'review.json');
     await writeFile(review, JSON.stringify({
-      auditor_task: '/root/timeout-review', auditor_role: 'avsp_sol_high', claim_id: claim.node.claim_id, verdict: 'pass',
+          auditor_task: '/root/timeout-review', auditor_role: 'avsp_sol_high', claim_id: claim.node.claim_id, coordinator_task_path: '/root', coordinator_thread_id: '01a0193d-6e8f-78a2-815a-19afa3358256', verdict: 'pass',
       requirement_coverage: { R1: 'timeout result is persisted' }, workflow_snapshot: auditContext.workflow_snapshot, workspace_fingerprint: auditContext.workspace_fingerprint, scope_and_regression: 'none', verification_gaps: 'none', residual_risk: 'none', independent_assessment: 'The supplied evidence supports the requirement.', history_reconciliation: 'No prior review or repair record changes this conclusion.', review_history_digest: auditContext.review_history_digest,
     }));
     await dispatch('record-review', { state_dir: stateDir, task_id: 'review-task', review });
@@ -930,7 +930,7 @@ test('rejects a nested review object after an unclosed string prefix', async () 
   const item = await fixture();
   try {
     const review = {
-      auditor_task: '/root/review', auditor_role: 'avsp_sol_high', claim_id: 'review-claim', verdict: 'pass',
+      auditor_task: '/root/review', auditor_role: 'avsp_sol_high', claim_id: 'review-claim', coordinator_task_path: '/root', coordinator_thread_id: '01a0193d-6e8f-78a2-815a-19afa3358256', verdict: 'pass',
       requirement_coverage: { R1: 'covered' }, workflow_snapshot: { revision: 1 }, workspace_fingerprint: { value: 'fingerprint' }, scope_and_regression: 'none', verification_gaps: 'none', residual_risk: 'none',
     };
     const spawnProcess = () => {
@@ -975,7 +975,7 @@ test('rejects empty review fields and coverage values that contradict the final 
     ];
     for (const override of invalidReviews) {
       const review = {
-        auditor_task: '/root/review', auditor_role: 'avsp_sol_high', claim_id: 'review-claim', verdict: 'pass',
+      auditor_task: '/root/review', auditor_role: 'avsp_sol_high', claim_id: 'review-claim', coordinator_task_path: '/root', coordinator_thread_id: '01a0193d-6e8f-78a2-815a-19afa3358256', verdict: 'pass',
         requirement_coverage: { R1: 'covered' }, workflow_snapshot: { revision: 1 }, workspace_fingerprint: { value: 'fingerprint' }, scope_and_regression: 'none', verification_gaps: 'none', residual_risk: 'none', ...override,
       };
       const spawnProcess = () => {
@@ -997,7 +997,7 @@ test('rejects a fail review that does not identify a blocking finding', async ()
   const item = await fixture();
   try {
     const review = {
-      auditor_task: '/root/review', auditor_role: 'avsp_sol_high', claim_id: 'review-claim', verdict: 'fail',
+      auditor_task: '/root/review', auditor_role: 'avsp_sol_high', claim_id: 'review-claim', coordinator_task_path: '/root', coordinator_thread_id: '01a0193d-6e8f-78a2-815a-19afa3358256', verdict: 'fail',
       requirement_coverage: { R1: 'failed' }, workflow_snapshot: { revision: 1 }, workspace_fingerprint: { value: 'fingerprint' }, scope_and_regression: 'reviewed', verification_gaps: 'blocking gap', residual_risk: 'not accepted',
     };
     const spawnProcess = () => {
@@ -1018,7 +1018,7 @@ test('accepts a fail review with a structured blocking finding', async () => {
   const item = await fixture();
   try {
     const review = {
-      auditor_task: '/root/review', auditor_role: 'avsp_sol_high', claim_id: 'review-claim', verdict: 'fail',
+      auditor_task: '/root/review', auditor_role: 'avsp_sol_high', claim_id: 'review-claim', coordinator_task_path: '/root', coordinator_thread_id: '01a0193d-6e8f-78a2-815a-19afa3358256', verdict: 'fail',
       findings: [{ id: 'R1-blocking', severity: 'blocking', requirement_id: 'R1', summary: 'Required behavior is not satisfied.', evidence: 'Observed mismatch in the supplied evidence.' }],
       requirement_coverage: { R1: 'failed' }, workflow_snapshot: { revision: 1 }, workspace_fingerprint: { value: 'fingerprint' }, scope_and_regression: 'reviewed', verification_gaps: 'blocking gap', residual_risk: 'not accepted',
     };
@@ -1040,7 +1040,7 @@ test('rejects a finding identifier longer than the controller limit', async () =
   const item = await fixture();
   try {
     const review = {
-      auditor_task: '/root/review', auditor_role: 'avsp_sol_high', claim_id: 'review-claim', verdict: 'fail',
+      auditor_task: '/root/review', auditor_role: 'avsp_sol_high', claim_id: 'review-claim', coordinator_task_path: '/root', coordinator_thread_id: '01a0193d-6e8f-78a2-815a-19afa3358256', verdict: 'fail',
       findings: [{ id: `F${'a'.repeat(80)}`, severity: 'blocking', requirement_id: 'R1', summary: 'Required behavior is not satisfied.', evidence: 'Observed mismatch in the supplied evidence.' }],
       requirement_coverage: { R1: 'failed' }, workflow_snapshot: { revision: 1 }, workspace_fingerprint: { value: 'fingerprint' }, scope_and_regression: 'reviewed', verification_gaps: 'blocking gap', residual_risk: 'not accepted',
     };
@@ -1072,7 +1072,7 @@ test('rejects inherited coverage for a workflow requirement named toString', asy
       const child = new EventEmitter(); child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
       queueMicrotask(() => {
         child.stdout.emit('data', Buffer.from(`${JSON.stringify({
-          auditor_task: '/root/to-string-review', auditor_role: 'avsp_sol_high', claim_id: claim.node.claim_id, verdict: 'pass',
+          auditor_task: '/root/to-string-review', auditor_role: 'avsp_sol_high', claim_id: claim.node.claim_id, coordinator_task_path: context.coordinator_task_path, coordinator_thread_id: context.coordinator_thread_id, verdict: 'pass',
           requirement_coverage: { R1: 'wrong inherited coverage' }, workflow_snapshot: context.workflow_snapshot, workspace_fingerprint: context.workspace_fingerprint, scope_and_regression: 'none', verification_gaps: 'none', residual_risk: 'none',
         })}\n`));
         child.emit('exit', 0, null); child.stdout.emit('end'); child.stderr.emit('end');
@@ -1103,7 +1103,7 @@ test('marks a structurally complete workflow review unavailable when its audit c
       const child = new EventEmitter(); child.pid = 4246; child.stdout = new EventEmitter(); child.stderr = new EventEmitter();
       queueMicrotask(() => {
         child.stdout.emit('data', Buffer.from(`${JSON.stringify({
-          auditor_task: '/root/mismatched-review', auditor_role: 'avsp_sol_high', claim_id: claim.node.claim_id, verdict: 'pass',
+          auditor_task: '/root/mismatched-review', auditor_role: 'avsp_sol_high', claim_id: claim.node.claim_id, coordinator_task_path: auditContext.coordinator_task_path, coordinator_thread_id: auditContext.coordinator_thread_id, verdict: 'pass',
           requirement_coverage: { R1: 'review context must match' }, workflow_snapshot: auditContext.workflow_snapshot, workspace_fingerprint: { changed: true }, scope_and_regression: 'none', verification_gaps: 'none', residual_risk: 'none',
         })}\n`));
         child.emit('exit', 0, null); child.stdout.emit('end'); child.stderr.emit('end');

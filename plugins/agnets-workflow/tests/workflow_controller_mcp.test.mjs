@@ -34,7 +34,7 @@ function solAssessment() {
 
 function v3McpManifest(workspace, taskId = 'mcp-task') {
   return {
-    task_id: taskId, workspace, workspace_claims: [{ mode: 'read', prefix: '.' }], goal: 'Exercise the v3 MCP protocol.', requirements: [{ id: 'R1', text: 'MCP persists and reports current state.' }], scope: [], non_goals: [], routing_schema_version: 3,
+    task_id: taskId, coordinator_task_path: '/root', coordinator_thread_id: '01a0193d-6e8f-78a2-815a-19afa3358256', workspace, workspace_claims: [{ mode: 'read', prefix: '.' }], goal: 'Exercise the v3 MCP protocol.', requirements: [{ id: 'R1', text: 'MCP persists and reports current state.' }], scope: [], non_goals: [], routing_schema_version: 3,
     assurance_level: 'sol', assurance_assessment: solAssessment(), review_context: { environment: 'isolated MCP test workspace', scenarios: ['stdio request and wait'], boundaries: 'declared workspace only' }, review_entry_stage: 'sol_high',
     nodes: [{ id: 'total-review', kind: 'total_review', agent_type: 'avsp_sol_high', depends_on: [], execution_risk: 'read_only', routing_reason: 'independent final review', execution_owner: taskId === 'mcp-task' ? '/root/mcp-sol-review' : `/root/${taskId}-sol-review`, integration_owner: '/root', quality_guard: 'validate MCP state response' }],
   };
@@ -233,6 +233,8 @@ test('MCP serves v3 workflow state over stdio and releases a cancelled wait', as
     const repairSchema = repairTool.inputSchema.properties.repair.anyOf[0];
     assert.equal(reviewSchema.type, 'object');
     assert.ok(reviewSchema.required.includes('requirement_coverage'));
+    assert.ok(reviewSchema.required.includes('coordinator_task_path'));
+    assert.ok(reviewSchema.required.includes('coordinator_thread_id'));
     assert.deepEqual(reviewSchema.properties.verdict.enum, ['pass', 'fail', 'unavailable']);
     assert.deepEqual(reviewSchema.properties.findings.items.required, ['id', 'severity', 'requirement_id', 'summary', 'evidence']);
     assert.deepEqual(reviewSchema.properties.findings.items.properties.severity.enum, ['blocking', 'advisory']);
@@ -362,7 +364,7 @@ test('MCP returns field-level review errors and accepts one corrected payload fr
     assert.deepEqual(context.review_input_contract.requirement_ids, ['R1']);
     assert.equal(context.review_input_contract.active_claims[0].claim_id, started.claim_id);
     const baseReview = {
-      auditor_task: '/root/review-contract-sol-review', auditor_role: 'avsp_sol_high', claim_id: started.claim_id,
+      auditor_task: '/root/review-contract-sol-review', auditor_role: 'avsp_sol_high', claim_id: started.claim_id, coordinator_task_path: context.coordinator_task_path, coordinator_thread_id: context.coordinator_thread_id,
       findings: [], requirement_coverage: { R1: 'reviewed' }, workflow_snapshot: context.workflow_snapshot, workspace_fingerprint: context.workspace_fingerprint,
       scope_and_regression: 'within declared scope', verification_gaps: 'none', residual_risk: 'accepted', independent_assessment: 'independent pass assessment', history_reconciliation: 'no prior reviews', review_history_digest: context.review_history_digest,
     };

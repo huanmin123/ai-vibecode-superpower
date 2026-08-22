@@ -156,6 +156,7 @@ const ROOT_RESCUE_SELF_COMPLETION = 'root_rescue_self_completion';
 const NATIVE_AGENT_EXIT_CONFIRMED = 'native_agent_exit_confirmed';
 const NATIVE_AGENT_START_FAILED = 'native_agent_start_failed';
 const taskStateTransactionContext = new AsyncLocalStorage();
+const COORDINATOR_THREAD_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 
 function requiredString(value, name) {
   if (typeof value !== 'string' || !value.trim()) {
@@ -163,6 +164,14 @@ function requiredString(value, name) {
     throw invalidArgument(`${name} must be a non-empty string`, name, 'non-empty string', actual);
   }
   return value.trim();
+}
+
+function requiredCoordinatorThreadId(value, name = 'coordinator_thread_id') {
+  const threadId = requiredString(value, name);
+  if (!COORDINATOR_THREAD_ID_PATTERN.test(threadId)) {
+    throw invalidArgument(`${name} must be a UUID string`, name, 'UUID string', threadId);
+  }
+  return threadId;
 }
 
 function requiredIdentifier(value, name) {
@@ -316,6 +325,57 @@ function reviewContextValue(value, label = 'review_context') {
   if (!Array.isArray(value.scenarios) || !value.scenarios.length || value.scenarios.some(item => !nonEmptyReviewValue(item))) throw invalidArgument(`${label}.scenarios must be a non-empty array of non-empty values`, `${label}.scenarios`, 'non-empty array of non-empty values', Array.isArray(value.scenarios) ? `array(${value.scenarios.length})` : typeof value.scenarios);
   if (!nonEmptyReviewValue(value.boundaries)) throw invalidArgument(`${label}.boundaries must be non-empty`, `${label}.boundaries`, 'non-empty string, array, or object');
   return structuredClone(value);
+}
+
+function legacyCoordinatorBinding(reviewContext) {
+  const seed = reviewContext?.boundaries?.coordinator_binding;
+  if (!seed || typeof seed !== 'object' || Array.isArray(seed)) return { coordinator_task_path: null, coordinator_thread_id: null };
+  const coordinatorTaskPath = typeof seed.coordinator_task_path === 'string' && seed.coordinator_task_path.trim()
+    ? seed.coordinator_task_path.trim()
+    : null;
+  const coordinatorThreadId = typeof seed.coordinator_thread_id === 'string' && COORDINATOR_THREAD_ID_PATTERN.test(seed.coordinator_thread_id.trim())
+    ? seed.coordinator_thread_id.trim()
+    : null;
+  return coordinatorTaskPath && coordinatorThreadId
+    ? { coordinator_task_path: coordinatorTaskPath, coordinator_thread_id: coordinatorThreadId }
+    : { coordinator_task_path: null, coordinator_thread_id: null };
+}
+
+function normalizeStateCoordinatorBinding(state) {
+  if (!hasOwn(state, 'coordinator_task_path') && !hasOwn(state, 'coordinator_thread_id')) {
+    const legacy = legacyCoordinatorBinding(state.review_context);
+    state.coordinator_task_path = legacy.coordinator_task_path;
+    state.coordinator_thread_id = legacy.coordinator_thread_id;
+  } else {
+    if (!hasOwn(state, 'coordinator_task_path')) state.coordinator_task_path = null;
+    if (!hasOwn(state, 'coordinator_thread_id')) state.coordinator_thread_id = null;
+  }
+  if (state.coordinator_task_path !== null) {
+    if (typeof state.coordinator_task_path !== 'string' || !state.coordinator_task_path.trim()) {
+      throw unsupportedWorkflowState('Task coordinator_task_path must be null or a non-empty string', 'coordinator_task_path', 'null or non-empty string', state.coordinator_task_path);
+    }
+    state.coordinator_task_path = state.coordinator_task_path.trim();
+  }
+  if (state.coordinator_thread_id !== null) {
+    if (typeof state.coordinator_thread_id !== 'string' || !COORDINATOR_THREAD_ID_PATTERN.test(state.coordinator_thread_id.trim())) {
+      throw unsupportedWorkflowState('Task coordinator_thread_id must be null or a UUID string', 'coordinator_thread_id', 'null or UUID string', state.coordinator_thread_id);
+    }
+    state.coordinator_thread_id = state.coordinator_thread_id.trim();
+  }
+}
+
+function assertReviewCoordinatorBinding(state, review) {
+  const coordinatorTaskPath = typeof review?.coordinator_task_path === 'string' ? review.coordinator_task_path.trim() : '';
+  const coordinatorThreadId = typeof review?.coordinator_thread_id === 'string' ? review.coordinator_thread_id.trim() : '';
+  if (!coordinatorTaskPath) throw invalidArgument('Review coordinator_task_path must be a non-empty string', 'review.coordinator_task_path', 'non-empty string', coordinatorTaskPath || typeof review?.coordinator_task_path);
+  if (!coordinatorThreadId || !COORDINATOR_THREAD_ID_PATTERN.test(coordinatorThreadId)) throw invalidArgument('Review coordinator_thread_id must be a UUID string', 'review.coordinator_thread_id', 'UUID string', coordinatorThreadId || typeof review?.coordinator_thread_id);
+  if (!state.coordinator_task_path || !state.coordinator_thread_id) {
+    throw failedPrecondition('Active review requires a complete coordinator binding in the workflow state', 'review.coordinator_task_path', 'refresh_audit_context');
+  }
+  if (coordinatorTaskPath !== state.coordinator_task_path || coordinatorThreadId !== state.coordinator_thread_id) {
+    throw failedPrecondition('Review coordinator binding does not match the current workflow coordinator', 'review.coordinator_task_path', 'refresh_audit_context');
+  }
+  return { coordinator_task_path: coordinatorTaskPath, coordinator_thread_id: coordinatorThreadId };
 }
 
 function reviewFindings(state, value, verdict) {
@@ -1376,6 +1436,8 @@ function workflowSnapshotMaterial(state, { includeAssurance = true, excludeAllRe
     }));
   const material = {
     task_id: state.task_id,
+    coordinator_task_path: state.coordinator_task_path,
+    coordinator_thread_id: state.coordinator_thread_id,
     execution_routing_policy_version: state.execution_routing_policy_version,
     goal: state.goal,
     requirements: [...state.requirements].sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0),
@@ -1478,6 +1540,11 @@ function nodeRecord(raw, options = {}) {
 
 function normalizeState(state) {
   if (!state || typeof state !== 'object' || Array.isArray(state)) throw new ControllerError('Task state must be an object');
+  // Older v3 states may carry the coordinator binding only in
+  // review_context.boundaries.coordinator_binding. Read those states without
+  // guessing a current thread; an active review still fails closed when the
+  // binding is absent.
+  normalizeStateCoordinatorBinding(state);
   const requiredStateFields = [
     'version', 'routing_schema_version', 'execution_routing_policy_version', 'assurance_level', 'assurance_assessment',
     'review_protocol_version', 'review_entry_stage', 'review_context', 'task_id', 'workspace', 'workspace_claims', 'goal',
@@ -1551,9 +1618,11 @@ function normalizeState(state) {
 }
 
 async function makeState(manifest) {
-  const required = ['task_id', 'workspace', 'goal', 'requirements'];
-  if (!manifest || typeof manifest !== 'object' || required.some(key => !hasOwn(manifest, key))) throw new ControllerError('Manifest requires task_id, workspace, goal, and requirements');
+  const required = ['task_id', 'workspace', 'goal', 'requirements', 'coordinator_task_path', 'coordinator_thread_id'];
+  if (!manifest || typeof manifest !== 'object' || required.some(key => !hasOwn(manifest, key))) throw new ControllerError('Manifest requires task_id, workspace, goal, requirements, coordinator_task_path, and coordinator_thread_id');
   const taskId = requiredIdentifier(manifest.task_id, 'task_id');
+  const coordinatorTaskPath = requiredString(manifest.coordinator_task_path, 'coordinator_task_path');
+  const coordinatorThreadId = requiredCoordinatorThreadId(manifest.coordinator_thread_id);
   const routingSchemaVersion = manifest.routing_schema_version;
   if (routingSchemaVersion !== REVIEW_PROTOCOL_VERSION) throw new ControllerError('routing_schema_version must be 3');
   const assuranceLevel = requiredString(manifest.assurance_level, 'assurance_level');
@@ -1600,7 +1669,7 @@ async function makeState(manifest) {
   const created = utcNow();
   const events = [{ at: created, type: 'task_initialized', workflow_revision: 0 }];
   if (normalizedReviewDependencies.length) events.push({ at: created, type: 'review_direct_dependencies_completed', node_id: reviewNodes(nodes, routingSchemaVersion)[0].id, added_dependencies: normalizedReviewDependencies, workflow_revision: 0 });
-  const state = { version: VERSION, routing_schema_version: REVIEW_PROTOCOL_VERSION, execution_routing_policy_version: CURRENT_EXECUTION_ROUTING_POLICY_VERSION, assurance_level: assuranceLevel, assurance_assessment: assuranceAssessmentValue, review_protocol_version: REVIEW_PROTOCOL_VERSION, review_entry_stage: reviewEntryStage, review_context: reviewContext, task_id: taskId, workspace, workspace_claims: workspaceClaims, ...(globalWriteReason === null ? {} : { global_write_justification: globalWriteReason }), goal, requirements, scope: manifest.scope ?? [], non_goals: manifest.non_goals ?? [], nodes, participants: [], reviews: [], repair_records: [], max_review_charter: null, events, workflow_revision: 0, closed_revision: null, closed_at: null, created_at: created, updated_at: created, workspace_lease: null };
+  const state = { version: VERSION, routing_schema_version: REVIEW_PROTOCOL_VERSION, execution_routing_policy_version: CURRENT_EXECUTION_ROUTING_POLICY_VERSION, assurance_level: assuranceLevel, assurance_assessment: assuranceAssessmentValue, review_protocol_version: REVIEW_PROTOCOL_VERSION, review_entry_stage: reviewEntryStage, review_context: reviewContext, coordinator_task_path: coordinatorTaskPath, coordinator_thread_id: coordinatorThreadId, task_id: taskId, workspace, workspace_claims: workspaceClaims, ...(globalWriteReason === null ? {} : { global_write_justification: globalWriteReason }), goal, requirements, scope: manifest.scope ?? [], non_goals: manifest.non_goals ?? [], nodes, participants: [], reviews: [], repair_records: [], max_review_charter: null, events, workflow_revision: 0, closed_revision: null, closed_at: null, created_at: created, updated_at: created, workspace_lease: null };
   return state;
 }
 
@@ -1659,7 +1728,7 @@ function staleNodes(state, now = Date.now()) {
 
 function compactState(state) {
   const workspaceLease = publicWorkspaceLease(state);
-  return { task_id: state.task_id, ...(workspaceLease ? { state_path: workspaceLease.state_path, database_path: workspaceLease.database_path, task_key: workspaceLease.task_key } : {}), workspace: state.workspace, workspace_claims: state.workspace_claims, workspace_lease: workspaceLease, execution_routing_policy_version: state.execution_routing_policy_version, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), assurance_assessment: state.assurance_assessment, review_protocol_version: state.review_protocol_version, review_entry_stage: state.review_entry_stage, review_context: state.review_context, goal: state.goal, nodes: Object.values(state.nodes), ready_nodes: readyNodes(state), stale_nodes: staleNodes(state), participants: state.participants, reviews: externallyVisibleReviews(state), repair_records: state.repair_records, workflow_revision: state.workflow_revision, updated_at: state.updated_at };
+  return { task_id: state.task_id, ...(workspaceLease ? { state_path: workspaceLease.state_path, database_path: workspaceLease.database_path, task_key: workspaceLease.task_key } : {}), workspace: state.workspace, workspace_claims: state.workspace_claims, workspace_lease: workspaceLease, coordinator_task_path: state.coordinator_task_path, coordinator_thread_id: state.coordinator_thread_id, execution_routing_policy_version: state.execution_routing_policy_version, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), assurance_assessment: state.assurance_assessment, review_protocol_version: state.review_protocol_version, review_entry_stage: state.review_entry_stage, review_context: state.review_context, goal: state.goal, nodes: Object.values(state.nodes), ready_nodes: readyNodes(state), stale_nodes: staleNodes(state), participants: state.participants, reviews: externallyVisibleReviews(state), repair_records: state.repair_records, workflow_revision: state.workflow_revision, updated_at: state.updated_at };
 }
 
 function doctorCheck(id, status, detail) { return { id, status, detail }; }
@@ -3701,16 +3770,16 @@ async function auditContext(parameters) {
   const [, state] = await readTask(parameters);
   const reviewNode = reviewNodesForState(state)[0] ?? null;
   const activeLanes = reviewNode && isCohortReviewNode(state, reviewNode)
-    ? Object.values(reviewNode.review_gate.cohort.lanes).filter(lane => lane.status === RUNNING).map(lane => ({ claim_id: lane.claim_id, auditor_task: lane.agent_task_path, auditor_role: lane.agent_role, reviewer_slot: lane.slot, phase: reviewNode.review_gate.cohort.phase }))
-    : reviewNode?.status === RUNNING ? [{ claim_id: reviewNode.claim_id, auditor_task: reviewNode.agent_task_path, auditor_role: reviewNode.agent_role, reviewer_slot: null, phase: null }] : [];
+    ? Object.values(reviewNode.review_gate.cohort.lanes).filter(lane => lane.status === RUNNING).map(lane => ({ claim_id: lane.claim_id, auditor_task: lane.agent_task_path, auditor_role: lane.agent_role, reviewer_slot: lane.slot, phase: reviewNode.review_gate.cohort.phase, coordinator_task_path: state.coordinator_task_path, coordinator_thread_id: state.coordinator_thread_id }))
+    : reviewNode?.status === RUNNING ? [{ claim_id: reviewNode.claim_id, auditor_task: reviewNode.agent_task_path, auditor_role: reviewNode.agent_role, reviewer_slot: null, phase: null, coordinator_task_path: state.coordinator_task_path, coordinator_thread_id: state.coordinator_thread_id }] : [];
   const reviewInputContract = {
     action: activeLanes.length ? 'record_review' : null,
-    required_fields: ['auditor_task', 'auditor_role', 'claim_id', 'verdict', 'findings', 'requirement_coverage', 'workflow_snapshot', 'workspace_fingerprint', 'scope_and_regression', 'verification_gaps', 'residual_risk', 'independent_assessment', 'history_reconciliation', 'review_history_digest'],
+    required_fields: ['auditor_task', 'auditor_role', 'claim_id', 'coordinator_task_path', 'coordinator_thread_id', 'verdict', 'findings', 'requirement_coverage', 'workflow_snapshot', 'workspace_fingerprint', 'scope_and_regression', 'verification_gaps', 'residual_risk', 'independent_assessment', 'history_reconciliation', 'review_history_digest'],
     requirement_ids: state.requirements.map(item => item.id),
     active_claims: activeLanes,
     instruction: activeLanes.length ? 'Use one active claim exactly once. Reuse workflow_snapshot, workspace_fingerprint, and review_history_digest from this response. On a validation error, correct the reported field or refresh this context; do not guess and retry.' : 'No active review claim is eligible for workflow_record_review.',
   };
-  return { task_id: state.task_id, workspace_claims: state.workspace_claims, execution_routing_policy_version: state.execution_routing_policy_version, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), assurance_assessment: state.assurance_assessment, review_protocol_version: state.review_protocol_version, review_entry_stage: state.review_entry_stage, review_context: state.review_context, review_history_digest: protocolReviewHistoryDigest(state, { excludeActiveCohortPhase: true }), goal: state.goal, requirements: state.requirements, scope: state.scope, non_goals: state.non_goals, nodes: Object.values(state.nodes), participants: state.participants, reviews: externallyVisibleReviews(state), repair_records: state.repair_records, max_review_charter: state.max_review_charter ?? null, workflow_snapshot: workflowSnapshot(state), workspace_fingerprint: await workspaceFingerprint(state.workspace, state.workspace_claims), review_input_contract: reviewInputContract, repair_input_contract: repairInputContract(state, reviewNode) };
+  return { task_id: state.task_id, coordinator_task_path: state.coordinator_task_path, coordinator_thread_id: state.coordinator_thread_id, workspace_claims: state.workspace_claims, execution_routing_policy_version: state.execution_routing_policy_version, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), assurance_assessment: state.assurance_assessment, review_protocol_version: state.review_protocol_version, review_entry_stage: state.review_entry_stage, review_context: state.review_context, review_history_digest: protocolReviewHistoryDigest(state, { excludeActiveCohortPhase: true }), goal: state.goal, requirements: state.requirements, scope: state.scope, non_goals: state.non_goals, nodes: Object.values(state.nodes), participants: state.participants, reviews: externallyVisibleReviews(state), repair_records: state.repair_records, max_review_charter: state.max_review_charter ?? null, workflow_snapshot: workflowSnapshot(state), workspace_fingerprint: await workspaceFingerprint(state.workspace, state.workspace_claims), review_input_contract: reviewInputContract, repair_input_contract: repairInputContract(state, reviewNode) };
 }
 
 function requireRequirementCoverage(state, coverage, label) {
@@ -3818,6 +3887,7 @@ async function recordReview(parameters) {
   const review = await readWorkflowJson(parameters.review, { label: 'Review', maxBytes: MAX_REVIEW_BYTES, workspace: currentState.workspace, objectOnly: true });
   const fingerprintPreflight = await prepareWorkspaceFingerprint(filePath);
   return withActiveWorkspaceStateLock(filePath, async state => {
+    const coordinatorBinding = assertReviewCoordinatorBinding(state, review);
     const auditor = String(review.auditor_task ?? ''); const role = String(review.auditor_role ?? ''); const verdict = String(review.verdict ?? '');
     const reviewNode = Object.values(state.nodes).find(node => isReviewNode(node, state.routing_schema_version) && (node.status === RUNNING || isCohortReviewNode(state, node)) && (node.agent_task_path === auditor || activeCohortLaneForTask(node, auditor)));
     const cohortLane = reviewNode && isCohortReviewNode(state, reviewNode) ? activeCohortLaneForTask(reviewNode, auditor) : null;
@@ -3868,7 +3938,7 @@ async function recordReview(parameters) {
     } else if (hasOwn(review, 'challenge_targets')) {
       throw new ControllerError('challenge_targets is only valid during Terra cohort cross_questioning');
     }
-    const stored = { auditor_task: auditor, auditor_role: role, node_id: reviewNode.id, claim_id: activeClaim.claim_id, review_kind: reviewNode.kind, review_phase: reviewPhase, reviewer_slot: reviewerSlot, verdict, findings, repair_regressions: repairRegressions, requirement_coverage: coverage, scope_and_regression: scopeAndRegression, verification_gaps: verificationGaps, residual_risk: residualRisk, independent_assessment: independentAssessment, history_reconciliation: historyReconciliation, review_history_digest: reviewHistoryDigest, fallback_reason: review.fallback_reason ?? null, workflow_snapshot: snapshot, workspace_fingerprint: fingerprint, recorded_at: utcNow() };
+    const stored = { auditor_task: auditor, auditor_role: role, coordinator_task_path: coordinatorBinding.coordinator_task_path, coordinator_thread_id: coordinatorBinding.coordinator_thread_id, node_id: reviewNode.id, claim_id: activeClaim.claim_id, review_kind: reviewNode.kind, review_phase: reviewPhase, reviewer_slot: reviewerSlot, verdict, findings, repair_regressions: repairRegressions, requirement_coverage: coverage, scope_and_regression: scopeAndRegression, verification_gaps: verificationGaps, residual_risk: residualRisk, independent_assessment: independentAssessment, history_reconciliation: historyReconciliation, review_history_digest: reviewHistoryDigest, fallback_reason: review.fallback_reason ?? null, workflow_snapshot: snapshot, workspace_fingerprint: fingerprint, recorded_at: utcNow() };
     if (closureReview) {
       const charter = requireMaxReviewCharter(state, reviewNode);
       const blocking = findings.filter(finding => finding.severity === 'blocking');
@@ -3885,7 +3955,7 @@ async function recordReview(parameters) {
       addEvent(state, 'max_review_closure_recorded_pending_completion', { node_id: reviewNode.id, claim_id: reviewNode.claim_id, verdict });
     }
     state.reviews.push(stored); addEvent(state, reviewNode.kind === 'total_review' ? 'total_review_recorded' : 'quality_review_recorded', { auditor_task: auditor, verdict }); await writeState(filePath, state);
-    return { task_id: state.task_id, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), review: stored };
+    return { task_id: state.task_id, coordinator_task_path: state.coordinator_task_path, coordinator_thread_id: state.coordinator_thread_id, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), review: stored };
   });
 }
 
@@ -3919,6 +3989,7 @@ async function closeReasons(state, { workspaceFingerprint: precomputedFingerprin
   if (!review) reasons.push(reviewNode?.kind === QUALITY_REVIEW_KIND ? 'no quality_review' : 'no total review'); else {
     if (review.verdict !== 'pass') reasons.push(`latest review verdict is ${review.verdict}`);
     if (!reviewNode || review.node_id !== reviewNode.id || review.claim_id !== reviewNode.claim_id || review.auditor_task !== reviewNode.agent_task_path || review.auditor_role !== reviewNode.agent_role) reasons.push(`latest review does not belong to the succeeded ${reviewDescription} node`);
+    if (review.coordinator_task_path !== state.coordinator_task_path || review.coordinator_thread_id !== state.coordinator_thread_id) reasons.push(`latest review does not match the workflow coordinator binding`);
     if (!workflowSnapshotMatchesState(review.workflow_snapshot, state)) reasons.push(`task state changed after ${reviewDescription}`);
     const currentFingerprint = precomputedFingerprint ?? await workspaceFingerprint(state.workspace, state.workspace_claims);
     if (!sameJson(review.workspace_fingerprint, currentFingerprint)) reasons.push(`workspace changed after ${reviewDescription}`);

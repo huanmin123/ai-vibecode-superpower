@@ -41,6 +41,7 @@ const SOL_REVIEW_ROLE_EFFORTS = new Map([
 ]);
 const DEFAULT_SOL_REVIEW_ROLE = 'avsp_sol_high';
 const REVIEW_REQUIRED_FIELDS = ['auditor_task', 'auditor_role', 'claim_id', 'verdict', 'requirement_coverage', 'workflow_snapshot', 'workspace_fingerprint', 'scope_and_regression', 'verification_gaps', 'residual_risk'];
+const WORKFLOW_REVIEW_REQUIRED_FIELDS = [...REVIEW_REQUIRED_FIELDS.slice(0, 3), 'coordinator_task_path', 'coordinator_thread_id', ...REVIEW_REQUIRED_FIELDS.slice(3)];
 const REVIEW_FINDING_FIELDS = ['id', 'severity', 'requirement_id', 'summary', 'evidence'];
 const REVIEW_FINDING_SEVERITIES = new Set(['blocking', 'advisory']);
 const MAX_REVIEW_FINDINGS = 64;
@@ -285,9 +286,12 @@ function reviewOutputContract(workflow, reviewRole) {
     ? `Set claim_id to exactly "${workflow.claim_id}".`
     : 'Set claim_id to a non-empty value; use "unavailable-not-provided" for an independent review without a workflow claim.';
   const role = `Set auditor_role to exactly "${reviewRole}".`;
+  const coordinator = workflow
+    ? 'Set coordinator_task_path and coordinator_thread_id to exactly the values from the workflow contract; these identify the bound coordinator and are not the reviewer agent_thread_id.'
+    : 'Set coordinator_task_path and coordinator_thread_id to non-empty values only when a coordinator binding was supplied.';
   return [
     'Final response contract: return exactly one final JSON object, with no Markdown or prose after it.',
-    `auditor_task, auditor_role, and claim_id must be non-empty strings. requirement_coverage, workflow_snapshot, and workspace_fingerprint must be non-empty objects. scope_and_regression, verification_gaps, and residual_risk must be non-empty strings, arrays, or objects. verdict must be pass, fail, or unavailable. When verdict is fail, findings must be a non-empty array containing at least one blocking finding. Every finding must contain exactly id, severity, requirement_id, summary, and evidence; id must be unique, start with a letter, contain only letters, digits, dot, underscore, or hyphen, and be at most 80 characters, severity must be blocking or advisory, requirement_id must be a covered requirement id or null, and summary and evidence must be non-empty. A pass may contain advisory findings but cannot contain blocking findings. An unavailable result cannot contain findings. ${claim} ${role}`,
+    `auditor_task, auditor_role, and claim_id must be non-empty strings; workflow-bound reviews must also provide non-empty coordinator_task_path and coordinator_thread_id. requirement_coverage, workflow_snapshot, and workspace_fingerprint must be non-empty objects. scope_and_regression, verification_gaps, and residual_risk must be non-empty strings, arrays, or objects. verdict must be pass, fail, or unavailable. When verdict is fail, findings must be a non-empty array containing at least one blocking finding. Every finding must contain exactly id, severity, requirement_id, summary, and evidence; id must be unique, start with a letter, contain only letters, digits, dot, underscore, or hyphen, and be at most 80 characters, severity must be blocking or advisory, requirement_id must be a covered requirement id or null, and summary and evidence must be non-empty. A pass may contain advisory findings but cannot contain blocking findings. An unavailable result cannot contain findings. ${claim} ${role} ${coordinator}`,
   ].join(' ');
 }
 
@@ -743,6 +747,8 @@ async function readWorkflowReviewContract(workflow) {
       auditor_task: node.agent_task_path,
       auditor_role: node.agent_role,
       claim_id: node.claim_id,
+      coordinator_task_path: context.coordinator_task_path,
+      coordinator_thread_id: context.coordinator_thread_id,
       requirement_ids: context.requirements.map(requirement => requirement.id),
       workflow_snapshot: context.workflow_snapshot,
       workspace_fingerprint: context.workspace_fingerprint,
@@ -761,12 +767,14 @@ function validateReviewOutput(stdout, workflowContract) {
   while (trailingEnd >= 0 && /\s/.test(text[trailingEnd])) trailingEnd -= 1;
   const terminal = values.filter(candidate => candidate.end === trailingEnd);
   if (!terminal.length) return { valid: false, reason: 'review output must end with a final JSON object' };
-  const candidate = terminal.find(item => REVIEW_REQUIRED_FIELDS.every(field => Object.prototype.hasOwnProperty.call(item.value, field))) ?? terminal.at(-1);
+  const requiredFields = workflowContract ? WORKFLOW_REVIEW_REQUIRED_FIELDS : REVIEW_REQUIRED_FIELDS;
+  const candidate = terminal.find(item => requiredFields.every(field => Object.prototype.hasOwnProperty.call(item.value, field))) ?? terminal.at(-1);
   const value = candidate.value;
-  const missing = REVIEW_REQUIRED_FIELDS.filter(field => !Object.prototype.hasOwnProperty.call(value, field));
+  const missing = requiredFields.filter(field => !Object.prototype.hasOwnProperty.call(value, field));
   if (missing.length) return { valid: false, reason: `review output is missing required fields: ${missing.join(', ')}` };
   if (!REVIEW_VERDICTS.has(value.verdict)) return { valid: false, reason: 'review output verdict must be pass, fail, or unavailable' };
   if (!nonEmptyString(value.auditor_task) || !nonEmptyString(value.auditor_role) || !nonEmptyString(value.claim_id)) return { valid: false, reason: 'review output auditor_task, auditor_role, and claim_id must be non-empty strings' };
+  if (workflowContract && (!nonEmptyString(value.coordinator_task_path) || !nonEmptyString(value.coordinator_thread_id))) return { valid: false, reason: 'review output coordinator_task_path and coordinator_thread_id must be non-empty strings' };
   if (!nonEmptyObject(value.requirement_coverage) || !nonEmptyObject(value.workflow_snapshot) || !nonEmptyObject(value.workspace_fingerprint)) return { valid: false, reason: 'review output requirement_coverage, workflow_snapshot, and workspace_fingerprint must be non-empty objects' };
   if (Object.values(value.requirement_coverage).some(item => !nonEmptyReviewValue(item))) return { valid: false, reason: 'review output requirement_coverage values must be non-empty strings, arrays, or objects' };
   if (!nonEmptyReviewValue(value.scope_and_regression) || !nonEmptyReviewValue(value.verification_gaps) || !nonEmptyReviewValue(value.residual_risk)) return { valid: false, reason: 'review output scope_and_regression, verification_gaps, and residual_risk must be non-empty strings, arrays, or objects' };
@@ -775,6 +783,7 @@ function validateReviewOutput(stdout, workflowContract) {
   if (findingError) return { valid: false, reason: findingError };
   if (workflowContract) {
     if (value.auditor_task !== workflowContract.auditor_task || value.auditor_role !== workflowContract.auditor_role || value.claim_id !== workflowContract.claim_id) return { valid: false, reason: 'review output auditor identity or claim_id does not match the active workflow review' };
+    if (value.coordinator_task_path !== workflowContract.coordinator_task_path || value.coordinator_thread_id !== workflowContract.coordinator_thread_id) return { valid: false, reason: 'review output coordinator binding does not match the active workflow review' };
     const expectedIds = new Set(workflowContract.requirement_ids);
     if (Object.keys(value.requirement_coverage).length !== expectedIds.size || [...expectedIds].some(id => !Object.prototype.hasOwnProperty.call(value.requirement_coverage, id) || !nonEmptyReviewValue(value.requirement_coverage[id]))) return { valid: false, reason: 'review output does not cover every workflow requirement' };
     if (!sameJson(value.workflow_snapshot, workflowContract.workflow_snapshot)) return { valid: false, reason: 'review output workflow_snapshot does not match the current workflow' };
@@ -968,6 +977,8 @@ async function recordUnavailableWorkflowReview(workflow, resultPath, authority =
     auditor_task: node.agent_task_path,
     auditor_role: node.agent_role,
     claim_id: node.claim_id,
+    coordinator_task_path: context.coordinator_task_path,
+    coordinator_thread_id: context.coordinator_thread_id,
     verdict: 'unavailable',
     findings: [],
     requirement_coverage: Object.fromEntries(context.requirements.map(requirement => [requirement.id, 'Reviewer unavailable before assessment.'])),
