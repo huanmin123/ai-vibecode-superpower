@@ -150,6 +150,38 @@ test('delegable work starts with Luna and can only move to Terra through a prote
   }
 });
 
+test('Luna read-only fallback is scoped to one claim and does not change later primary claims', async () => {
+  const { dispatch } = await import('../scripts/workflow_controller.mjs');
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-luna-fallback-scope-'));
+  const workspace = path.join(temp, 'workspace');
+  const stateDir = stateDirFor(workspace);
+  const manifestPath = path.join(temp, 'manifest.json');
+  const resultPath = path.join(temp, 'work-result.json');
+  const work = { id: 'work', kind: 'implementation', execution_risk: 'protected', routing_reason: 'Prepare the independent read-only nodes.', execution_owner: '/root/work', integration_owner: '/root', quality_guard: 'Run the focused verification command.' };
+  const lunaOne = { id: 'luna-one', kind: 'implementation', depends_on: ['work'], agent_type: 'avsp_luna_high', execution_risk: 'read_only', routing_reason: 'Independent read-only evidence lane.', execution_owner: '/root/luna-one', integration_owner: '/root', quality_guard: 'Record the evidence for the first lane.' };
+  const lunaTwo = { id: 'luna-two', kind: 'implementation', depends_on: ['work'], agent_type: 'avsp_luna_high', execution_risk: 'read_only', routing_reason: 'Independent read-only evidence lane.', execution_owner: '/root/luna-two', integration_owner: '/root', quality_guard: 'Record the evidence for the second lane.' };
+  const review = { id: 'review', kind: 'quality_review', depends_on: ['luna-one', 'luna-two'], execution_risk: 'read_only', routing_reason: 'Independent quality gate', execution_owner: '/root/reviewer', integration_owner: '/root', quality_guard: 'Review requirements and evidence' };
+  try {
+    await mkdir(workspace, { recursive: true });
+    await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace, { task_id: 'luna-fallback-scope', nodes: [work, lunaOne, lunaTwo, review] })));
+    await dispatch('init', { manifest: manifestPath });
+    const [workClaim] = await dispatch('start', { task_id: 'luna-fallback-scope', node_id: 'work', agent_task_path: '/root/work', agent_role: 'avsp_terra_high', native_agent_started: true, state_dir: stateDir });
+    await writeFile(resultPath, JSON.stringify({ prepared: true }));
+    await dispatch('complete', { task_id: 'luna-fallback-scope', node_id: 'work', claim_id: workClaim.claim_id, status: 'succeeded', result: resultPath, completion_attestation: 'native_agent_finished', state_dir: stateDir });
+
+    const [fallback] = await dispatch('start', { task_id: 'luna-fallback-scope', node_id: 'luna-one', agent_task_path: '/root/luna-one', agent_role: 'avsp_terra_low_readonly', fallback_reason: 'The configured Luna model is explicitly unavailable for this attempt.', native_agent_started: true, state_dir: stateDir });
+    assert.equal(fallback.node.agent_type, 'avsp_luna_high');
+    assert.equal(fallback.node.agent_role, 'avsp_terra_low_readonly');
+    await dispatch('complete', { task_id: 'luna-fallback-scope', node_id: 'luna-one', claim_id: fallback.claim_id, status: 'succeeded', result: { evidence: 'fallback attempt completed' }, completion_attestation: 'native_agent_finished', state_dir: stateDir });
+
+    const [primary] = await dispatch('start', { task_id: 'luna-fallback-scope', node_id: 'luna-two', agent_task_path: '/root/luna-two', agent_role: 'avsp_luna_high', native_agent_started: true, state_dir: stateDir });
+    assert.equal(primary.node.agent_type, 'avsp_luna_high');
+    assert.equal(primary.node.agent_role, 'avsp_luna_high');
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
 test('old workflow state is rejected without automatic migration', async () => {
   const { ControllerError, dispatch } = await import('../scripts/workflow_controller.mjs');
   const { readGlobalTaskState, writeGlobalTaskState } = await import('../scripts/global_workflow_store.mjs');
