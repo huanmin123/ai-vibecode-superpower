@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { mkdirSync } from 'node:fs';
 import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
@@ -34,9 +35,22 @@ function solAssessment() {
 
 function v3McpManifest(workspace, taskId = 'mcp-task') {
   return {
-    task_id: taskId, coordinator_task_path: '/root', coordinator_thread_id: '01a0193d-6e8f-78a2-815a-19afa3358256', workspace, workspace_claims: [{ mode: 'read', prefix: '.' }], goal: 'Exercise the v3 MCP protocol.', requirements: [{ id: 'R1', text: 'MCP persists and reports current state.' }], scope: [], non_goals: [], routing_schema_version: 3,
+    task_id: taskId, application_id: `test-app-${createHash('sha256').update(path.resolve(workspace)).digest('hex').slice(0, 12)}`, release_id: taskId, task_kind: 'workflow', coordinator_task_path: '/root', coordinator_thread_id: '01a0193d-6e8f-78a2-815a-19afa3358256', workspace, workspace_claims: [{ mode: 'read', prefix: '.' }], goal: 'Exercise the v3 MCP protocol.', requirements: [{ id: 'R1', text: 'MCP persists and reports current state.' }], scope: [], non_goals: [], routing_schema_version: 3,
     assurance_level: 'sol', assurance_assessment: solAssessment(), review_context: { environment: 'isolated MCP test workspace', scenarios: ['stdio request and wait'], boundaries: 'declared workspace only' }, review_entry_stage: 'sol_high',
     nodes: [{ id: 'total-review', kind: 'total_review', agent_type: 'avsp_sol_high', depends_on: [], execution_risk: 'read_only', routing_reason: 'independent final review', execution_owner: taskId === 'mcp-task' ? '/root/mcp-sol-review' : `/root/${taskId}-sol-review`, integration_owner: '/root', quality_guard: 'validate MCP state response' }],
+  };
+}
+
+function v3McpWriteManifest(workspace, taskId = 'mcp-write-task') {
+  const manifest = v3McpManifest(workspace, taskId);
+  return {
+    ...manifest,
+    workspace_claims: [{ mode: 'write', prefix: '.' }],
+    global_write_justification: 'The fixture acquires a minimal write lock to verify wait deltas.',
+    nodes: [
+      { id: 'work', kind: 'implementation', depends_on: [], execution_risk: 'protected', routing_reason: 'bounded lock test', execution_owner: `/root/${taskId}-work`, integration_owner: '/root', quality_guard: 'verify lock observation' },
+      { ...manifest.nodes[0], depends_on: ['work'] },
+    ],
   };
 }
 
@@ -272,13 +286,13 @@ test('MCP serves v3 workflow state over stdio and releases a cancelled wait', as
     assert.deepEqual(summary.workspace_lease.task_key, inlineResult.task_key);
     assert.deepEqual(summary.status_counts, { pending: 1 });
     const hintWait = server.request({ method: 'tools/call', params: { name: 'workflow_wait', arguments: { task_id: 'mcp-task', state_dir: stateDir, after_cursor: summary.cursor, timeout_sec: 1 } } });
-    const otherStarted = await server.request({ method: 'tools/call', params: { name: 'workflow_start', arguments: { task_id: 'mcp-object-task', node_id: 'total-review', agent_task_path: '/root/mcp-object-task-sol-review', agent_role: 'avsp_sol_high', native_agent_started: true, state_dir: stateDir } } });
+    const otherStarted = await server.request({ method: 'tools/call', params: { name: 'workflow_start', arguments: { task_id: 'mcp-object-task', node_id: 'total-review', agent_task_path: '/root/mcp-object-task-sol-review', agent_thread_id: '01a0193d-6e8f-78a2-815a-19afa3358261', agent_role: 'avsp_sol_high', native_agent_started: true, state_dir: stateDir } } });
     const otherHint = resultObject(await hintWait);
     assert.equal(otherHint.changed, false);
     assert.equal(otherHint.cursor, summary.cursor);
     await server.request({ method: 'tools/call', params: { name: 'workflow_heartbeat', arguments: { task_id: 'mcp-object-task', node_id: 'total-review', claim_id: resultObject(otherStarted).node.claim_id, state_dir: stateDir } } });
-    const waiting = server.request({ method: 'tools/call', params: { name: 'workflow_wait', arguments: { task_id: 'mcp-task', state_dir: stateDir, after_cursor: summary.cursor, timeout_sec: 30 } } });
-    const started = await server.request({ method: 'tools/call', params: { name: 'workflow_start', arguments: { task_id: 'mcp-task', node_id: 'total-review', agent_task_path: '/root/mcp-sol-review', agent_role: 'avsp_sol_high', native_agent_started: true, state_dir: stateDir } } });
+    const waiting = server.request({ method: 'tools/call', params: { name: 'workflow_wait', arguments: { task_id: 'mcp-task', state_dir: stateDir, after_cursor: summary.cursor, timeout_sec: 30, detail: 'full' } } });
+    const started = await server.request({ method: 'tools/call', params: { name: 'workflow_start', arguments: { task_id: 'mcp-task', node_id: 'total-review', agent_task_path: '/root/mcp-sol-review', agent_thread_id: '01a0193d-6e8f-78a2-815a-19afa3358262', agent_role: 'avsp_sol_high', native_agent_started: true, state_dir: stateDir } } });
     const startedResult = resultObject(started);
     const startedNode = startedResult.node;
     assert.equal(startedResult.task_id, 'mcp-task');
@@ -290,7 +304,7 @@ test('MCP serves v3 workflow state over stdio and releases a cancelled wait', as
     assert.equal(changed.changed, true);
     assert.equal(changed.reason, 'state_changed');
     assert.equal(changed.task_id, 'mcp-task');
-    assert.equal(changed.running_nodes[0].id, 'total-review');
+    assert.equal(changed.status.nodes[0].id, 'total-review');
     const heartbeat = await server.request({ method: 'tools/call', params: { name: 'workflow_heartbeat', arguments: { task_id: 'mcp-task', node_id: 'total-review', claim_id: startedNode.claim_id, state_dir: stateDir } } });
     assert.equal(heartbeat.result.isError, undefined);
 
@@ -303,7 +317,7 @@ test('MCP serves v3 workflow state over stdio and releases a cancelled wait', as
     server.notify({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: cancelled.requestId } });
     const afterCancellation = await server.request({ method: 'tools/call', params: { name: 'workflow_status', arguments: { task_id: 'mcp-task', state_dir: stateDir } } });
     assert.equal(resultObject(afterCancellation).task_id, 'mcp-task');
-    const resumed = server.request({ method: 'tools/call', params: { name: 'workflow_wait', arguments: { task_id: 'mcp-task', state_dir: stateDir, after_cursor: currentSummary.cursor, timeout_sec: 30 } } });
+    const resumed = server.request({ method: 'tools/call', params: { name: 'workflow_wait', arguments: { task_id: 'mcp-task', state_dir: stateDir, after_cursor: currentSummary.cursor, timeout_sec: 30, detail: 'full' } } });
     const resumedDuplicate = await server.request({ method: 'tools/call', params: { name: 'workflow_wait', arguments: { task_id: 'mcp-task', state_dir: stateDir, after_cursor: currentSummary.cursor, timeout_sec: 30 } } });
     assert.equal(resumedDuplicate.result.isError, true);
     assert.match(resultObject(resumedDuplicate).error, /already active/);
@@ -357,7 +371,7 @@ test('MCP returns field-level review errors and accepts one corrected payload fr
     await mkdir(workspace, { recursive: true });
     const initialized = await server.request({ method: 'tools/call', params: { name: 'workflow_init', arguments: { manifest: v3McpManifest(workspace, 'review-contract') } } });
     assert.equal(initialized.result.isError, undefined);
-    const started = resultObject(await server.request({ method: 'tools/call', params: { name: 'workflow_start', arguments: { task_id: 'review-contract', node_id: 'total-review', agent_task_path: '/root/review-contract-sol-review', agent_role: 'avsp_sol_high', native_agent_started: true, state_dir: stateDir } } }));
+    const started = resultObject(await server.request({ method: 'tools/call', params: { name: 'workflow_start', arguments: { task_id: 'review-contract', node_id: 'total-review', agent_task_path: '/root/review-contract-sol-review', agent_thread_id: '01a0193d-6e8f-78a2-815a-19afa3358263', agent_role: 'avsp_sol_high', native_agent_started: true, state_dir: stateDir } } }));
     await server.request({ method: 'tools/call', params: { name: 'workflow_heartbeat', arguments: { task_id: 'review-contract', node_id: 'total-review', claim_id: started.claim_id, state_dir: stateDir } } });
     const context = resultObject(await server.request({ method: 'tools/call', params: { name: 'workflow_audit_context', arguments: { task_id: 'review-contract', state_dir: stateDir } } }));
     assert.equal(context.review_input_contract.action, 'record_review');
@@ -393,7 +407,7 @@ test('MCP workflow_wait rechecks a one-second lease at its deadline', async () =
     await mkdir(workspace, { recursive: true });
     const initialized = await server.request({ method: 'tools/call', params: { name: 'workflow_init', arguments: { manifest: v3McpManifest(workspace, 'mcp-deadline-task') } } });
     assert.equal(initialized.result.isError, undefined);
-    const started = await server.request({ method: 'tools/call', params: { name: 'workflow_start', arguments: { task_id: 'mcp-deadline-task', node_id: 'total-review', agent_task_path: '/root/mcp-deadline-task-sol-review', agent_role: 'avsp_sol_high', native_agent_started: true, lease_duration_sec: 1, state_dir: stateDir } } });
+    const started = await server.request({ method: 'tools/call', params: { name: 'workflow_start', arguments: { task_id: 'mcp-deadline-task', node_id: 'total-review', agent_task_path: '/root/mcp-deadline-task-sol-review', agent_thread_id: '01a0193d-6e8f-78a2-815a-19afa3358264', agent_role: 'avsp_sol_high', native_agent_started: true, lease_duration_sec: 1, state_dir: stateDir } } });
     assert.equal(started.result.isError, undefined, JSON.stringify(started));
     const status = await server.request({ method: 'tools/call', params: { name: 'workflow_status', arguments: { task_id: 'mcp-deadline-task', state_dir: stateDir } } });
     const cursor = resultObject(status).cursor;
@@ -404,7 +418,151 @@ test('MCP workflow_wait rechecks a one-second lease at its deadline', async () =
     assert.equal(result.changed, true);
     assert.equal(result.reason, 'state_changed');
     assert.ok(elapsed < 3_500, `stale lease was observed after ${elapsed}ms`);
-    assert.ok(result.stale_nodes.some(node => node.id === 'total-review'));
+    assert.ok(result.changed_nodes.some(node => node.id === 'total-review'));
+  } finally {
+    await closeMcp(server.child);
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test('MCP workflow_wait reports an activated claim without a verified native thread instead of waiting for its lease', async () => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-mcp-unbound-thread-'));
+  const workspace = path.join(temp, 'workspace');
+  const stateDir = stateDirFor(workspace);
+  const server = startMcp();
+  try {
+    await mkdir(workspace, { recursive: true });
+    const initialized = await server.request({ method: 'tools/call', params: { name: 'workflow_init', arguments: { manifest: v3McpManifest(workspace, 'mcp-unbound-thread') } } });
+    assert.equal(initialized.result.isError, undefined);
+    await server.request({ method: 'tools/call', params: { name: 'workflow_start', arguments: { task_id: 'mcp-unbound-thread', node_id: 'total-review', agent_task_path: '/root/mcp-unbound-thread-sol-review', agent_role: 'avsp_sol_high', native_agent_started: true, lease_duration_sec: 3_600, state_dir: stateDir } } });
+    const status = resultObject(await server.request({ method: 'tools/call', params: { name: 'workflow_status', arguments: { task_id: 'mcp-unbound-thread', state_dir: stateDir } } }));
+    assert.equal(status.wait_reason, 'native_thread_unverified');
+    assert.equal(status.waiting_reason, 'native_thread_unverified');
+    const startedAt = Date.now();
+    const waited = resultObject(await server.request({ method: 'tools/call', params: { name: 'workflow_wait', arguments: { task_id: 'mcp-unbound-thread', state_dir: stateDir, after_cursor: status.cursor, timeout_sec: 5 } } }));
+    assert.ok(Date.now() - startedAt < 2_000, 'an unbound native claim must not sleep for its lease');
+    assert.equal(waited.changed, false);
+    assert.equal(waited.reason, 'native_thread_unverified');
+    assert.equal(waited.wait_reason, 'native_thread_unverified');
+    assert.equal(waited.reconciliation_required, true);
+    assert.equal(waited.changed_nodes.length, 0);
+    assert.equal(waited.events.length, 0);
+  } finally {
+    await closeMcp(server.child);
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test('MCP keeps a live heartbeat path observable when the native thread id is unavailable', async () => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-mcp-unverified-active-'));
+  const workspace = path.join(temp, 'workspace');
+  const stateDir = stateDirFor(workspace);
+  const server = startMcp();
+  try {
+    await mkdir(workspace, { recursive: true });
+    const initialized = await server.request({ method: 'tools/call', params: { name: 'workflow_init', arguments: { manifest: v3McpManifest(workspace, 'mcp-unverified-active') } } });
+    assert.equal(initialized.result.isError, undefined);
+    const started = resultObject(await server.request({ method: 'tools/call', params: { name: 'workflow_start', arguments: { task_id: 'mcp-unverified-active', node_id: 'total-review', agent_task_path: '/root/mcp-unverified-active-sol-review', agent_role: 'avsp_sol_high', native_agent_started: true, lease_duration_sec: 3_600, state_dir: stateDir } } }));
+    await server.request({ method: 'tools/call', params: { name: 'workflow_heartbeat', arguments: { task_id: 'mcp-unverified-active', node_id: 'total-review', claim_id: started.claim_id, state_dir: stateDir } } });
+    const status = resultObject(await server.request({ method: 'tools/call', params: { name: 'workflow_status', arguments: { task_id: 'mcp-unverified-active', state_dir: stateDir } } }));
+    assert.equal(status.wait_reason, 'native_thread_unverified');
+    assert.equal(status.nodes[0].heartbeat_count, 2);
+    const waited = resultObject(await server.request({ method: 'tools/call', params: { name: 'workflow_wait', arguments: { task_id: 'mcp-unverified-active', state_dir: stateDir, after_cursor: status.cursor, timeout_sec: 5 } } }));
+    assert.equal(waited.reason, 'native_thread_unverified');
+    assert.equal(waited.changed_nodes.length, 0);
+    assert.equal(waited.events.length, 0);
+  } finally {
+    await closeMcp(server.child);
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test('MCP workflow_wait surfaces activation timeout as stale instead of an opaque timeout', async () => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-mcp-activation-timeout-'));
+  const workspace = path.join(temp, 'workspace');
+  const stateDir = stateDirFor(workspace);
+  const server = startMcp();
+  try {
+    await mkdir(workspace, { recursive: true });
+    const initialized = await server.request({ method: 'tools/call', params: { name: 'workflow_init', arguments: { manifest: v3McpManifest(workspace, 'mcp-activation-timeout') } } });
+    assert.equal(initialized.result.isError, undefined);
+    await server.request({ method: 'tools/call', params: { name: 'workflow_claim', arguments: { task_id: 'mcp-activation-timeout', node_id: 'total-review', agent_task_path: '/root/mcp-activation-timeout-sol-review', agent_role: 'avsp_sol_high', activation_timeout_sec: 1, state_dir: stateDir } } });
+    const status = resultObject(await server.request({ method: 'tools/call', params: { name: 'workflow_status', arguments: { task_id: 'mcp-activation-timeout', state_dir: stateDir } } }));
+    assert.equal(status.wait_reason, 'activation_pending');
+    const waited = resultObject(await server.request({ method: 'tools/call', params: { name: 'workflow_wait', arguments: { task_id: 'mcp-activation-timeout', state_dir: stateDir, after_cursor: status.cursor, timeout_sec: 5 } } }));
+    assert.equal(waited.changed, true);
+    assert.equal(waited.reason, 'state_changed');
+    assert.equal(waited.wait_reason, 'stale');
+    assert.equal(waited.changed_nodes[0].id, 'total-review');
+    assert.deepEqual(waited.events, []);
+    assert.equal(waited.observed_changes.stale_nodes[0].id, 'total-review');
+  } finally {
+    await closeMcp(server.child);
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test('MCP exposes workspace overview and wait defaults to event summary with explicit full detail', async () => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-mcp-overview-summary-'));
+  const workspace = path.join(temp, 'workspace');
+  const stateDir = stateDirFor(workspace);
+  const server = startMcp();
+  try {
+    await mkdir(workspace, { recursive: true });
+    const initialized = await server.request({ method: 'tools/call', params: { name: 'workflow_init', arguments: { manifest: v3McpManifest(workspace, 'summary-task') } } });
+    assert.equal(initialized.result.isError, undefined);
+    const status = resultObject(await server.request({ method: 'tools/call', params: { name: 'workflow_status', arguments: { task_id: 'summary-task', state_dir: stateDir } } }));
+    const wait = resultObject(await server.request({ method: 'tools/call', params: { name: 'workflow_wait', arguments: { task_id: 'summary-task', state_dir: stateDir, after_cursor: status.cursor, timeout_sec: 1 } } }));
+    assert.equal(wait.changed, false);
+    assert.ok(Array.isArray(wait.events));
+    assert.equal(wait.nodes, undefined);
+    assert.equal(wait.running_nodes, undefined);
+    const started = resultObject(await server.request({ method: 'tools/call', params: { name: 'workflow_start', arguments: { task_id: 'summary-task', node_id: 'total-review', agent_task_path: '/root/summary-task-sol-review', agent_thread_id: '01a0193d-6e8f-78a2-815a-19afa3358257', agent_role: 'avsp_sol_high', native_agent_started: true, state_dir: stateDir } } }));
+    const changed = resultObject(await server.request({ method: 'tools/call', params: { name: 'workflow_wait', arguments: { task_id: 'summary-task', state_dir: stateDir, after_cursor: status.cursor, timeout_sec: 1 } } }));
+    assert.equal(changed.changed, true);
+    assert.deepEqual(changed.events.map(event => event.type), ['node_claimed', 'node_started']);
+    assert.equal(changed.changed_nodes[0].id, 'total-review');
+    assert.ok(started.claim_id);
+    const repeated = resultObject(await server.request({ method: 'tools/call', params: { name: 'workflow_wait', arguments: { task_id: 'summary-task', state_dir: stateDir, after_cursor: changed.cursor, timeout_sec: 1 } } }));
+    assert.equal(repeated.changed, false);
+    assert.deepEqual(repeated.events, []);
+    const full = resultObject(await server.request({ method: 'tools/call', params: { name: 'workflow_wait', arguments: { task_id: 'summary-task', state_dir: stateDir, after_cursor: status.cursor, timeout_sec: 1, detail: 'full' } } }));
+    assert.ok(full.status.nodes);
+    const overview = resultObject(await server.request({ method: 'tools/call', params: { name: 'workflow_workspace_overview', arguments: { workspace } } }));
+    assert.ok(overview.workspace.endsWith(`${path.sep}workspace`));
+    assert.equal(overview.task_count, 1);
+    assert.equal(overview.current_executors[0].node_id, 'total-review');
+  } finally {
+    await closeMcp(server.child);
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test('MCP workflow_wait reports derived write-lock changes without fabricating stale events', async () => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-mcp-lock-summary-'));
+  const workspace = path.join(temp, 'workspace');
+  const stateDir = stateDirFor(workspace);
+  const server = startMcp();
+  try {
+    await mkdir(workspace, { recursive: true });
+    const initialized = await server.request({ method: 'tools/call', params: { name: 'workflow_init', arguments: { manifest: v3McpWriteManifest(workspace) } } });
+    assert.equal(initialized.result.isError, undefined);
+    const started = resultObject(await server.request({ method: 'tools/call', params: { name: 'workflow_start', arguments: { task_id: 'mcp-write-task', node_id: 'work', agent_task_path: '/root/mcp-write-task-work', agent_thread_id: '01a0193d-6e8f-78a2-815a-19afa3358260', agent_role: 'avsp_terra_high', native_agent_started: true, state_dir: stateDir } } }));
+    const beforeLock = resultObject(await server.request({ method: 'tools/call', params: { name: 'workflow_status', arguments: { task_id: 'mcp-write-task', state_dir: stateDir } } }));
+    const acquired = resultObject(await server.request({ method: 'tools/call', params: { name: 'workflow_acquire_write_lock', arguments: { task_id: 'mcp-write-task', node_id: 'work', claim_id: started.claim_id, write_prefixes: ['src'], purpose: 'verify wait lock observation', state_dir: stateDir } } }));
+    assert.equal(acquired.active_lock_count, 1);
+    const changed = resultObject(await server.request({ method: 'tools/call', params: { name: 'workflow_wait', arguments: { task_id: 'mcp-write-task', state_dir: stateDir, after_cursor: beforeLock.cursor, timeout_sec: 1 } } }));
+    assert.equal(changed.changed, true);
+    assert.deepEqual(changed.events, []);
+    assert.deepEqual(changed.changed_nodes, []);
+    assert.equal(changed.observed_changes.active_write_locks.length, 1);
+    const lockId = acquired.acquired[0].lock_id;
+    const beforeRelease = resultObject(await server.request({ method: 'tools/call', params: { name: 'workflow_status', arguments: { task_id: 'mcp-write-task', state_dir: stateDir } } }));
+    await server.request({ method: 'tools/call', params: { name: 'workflow_release_write_lock', arguments: { task_id: 'mcp-write-task', node_id: 'work', claim_id: started.claim_id, lock_ids: [lockId], state_dir: stateDir } } });
+    const released = resultObject(await server.request({ method: 'tools/call', params: { name: 'workflow_wait', arguments: { task_id: 'mcp-write-task', state_dir: stateDir, after_cursor: beforeRelease.cursor, timeout_sec: 1 } } }));
+    assert.equal(released.changed, true);
+    assert.deepEqual(released.events, []);
+    assert.deepEqual(released.observed_changes.active_write_locks, []);
   } finally {
     await closeMcp(server.child);
     await rm(temp, { recursive: true, force: true });

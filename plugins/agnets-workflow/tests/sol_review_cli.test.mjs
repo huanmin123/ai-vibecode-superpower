@@ -36,7 +36,7 @@ function solAssessment() {
 
 function v3ReviewManifest(workspace, { goal, requirements, agentType = 'avsp_sol_high', executionOwner = '/root/sol-reviewer' }) {
   return {
-    task_id: 'review-task', coordinator_task_path: '/root', coordinator_thread_id: '01a0193d-6e8f-78a2-815a-19afa3358256', workspace, workspace_claims: [{ mode: 'read', prefix: '.' }], goal, requirements, scope: [], non_goals: [], routing_schema_version: 3,
+    task_id: 'review-task', application_id: 'sol-review-test-application', release_id: 'sol-review-test-release', task_kind: 'workflow', coordinator_task_path: '/root', coordinator_thread_id: '01a0193d-6e8f-78a2-815a-19afa3358256', workspace, workspace_claims: [{ mode: 'read', prefix: '.' }], goal, requirements, scope: [], non_goals: [], routing_schema_version: 3,
     assurance_level: 'sol', assurance_assessment: solAssessment(), review_context: { environment: 'isolated test workspace', scenarios: ['workflow-bound Sol review'], boundaries: 'declared workspace only' },
     review_entry_stage: agentType === 'avsp_sol_xhigh' ? 'sol_xhigh' : 'sol_high',
     nodes: [{ id: 'total-review', kind: 'total_review', agent_type: agentType, depends_on: [], execution_risk: 'read_only', routing_reason: 'independent final quality gate', execution_owner: executionOwner, integration_owner: '/root', quality_guard: 'requirements and evidence review' }],

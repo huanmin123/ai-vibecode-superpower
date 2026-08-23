@@ -24,11 +24,11 @@ const repairFindingSchema = { type: 'object', additionalProperties: false, requi
 const repairObjectSchema = { type: 'object', additionalProperties: false, required: ['source_review_claim_id', 'repaired_by', 'addressed_findings', 'verification_evidence', 'workspace_fingerprint'], properties: { source_review_claim_id: { type: 'string', minLength: 1 }, repaired_by: { type: 'string', minLength: 1 }, addressed_findings: { type: 'array', items: repairFindingSchema }, verification_evidence: reviewValueSchema, workspace_fingerprint: { type: 'object' } } };
 
 export const TOOLS = [
-  ['workflow_init', '从 JSON 清单创建持久化 DAG；v3 可用 review_entry_stage 直接从 terra_single、terra_cohort、sol_high 或 sol_xhigh 开始，并必须给出 review_context.environment/scenarios/boundaries 以及顶层 coordinator_task_path 与 coordinator_thread_id(UUID)。控制器从 manifest.workspace 自动派生全局 state_dir 并在结果中返回；项目内不使用任何工作流路径或状态。', ['manifest'], { manifest: { description: 'v3 工作流清单对象、内联 JSON 对象字符串或普通 JSON 文件路径。requirements 必须为 [{id,text}]，并明确顶层 coordinator_task_path 与 coordinator_thread_id(UUID)；每个 assurance 维度为 {status,evidence:string[],rationale}，字段名为 impact/recoverability/uncertainty/verifiability/coupling，另含 selection_reason；节点使用 id（不是 node_id）及完整路由字段。', anyOf: [{ type: 'object' }, { type: 'string' }] } }],
+  ['workflow_init', '从 JSON 清单创建持久化 DAG；必须固定 application_id + release_id，task_kind=release_main 的发布主任务会拒绝同工作区旧 active/failed 任务；v3 可用 review_entry_stage 直接从 terra_single、terra_cohort、sol_high 或 sol_xhigh 开始，并必须给出 review_context.environment/scenarios/boundaries 以及顶层 coordinator_task_path 与 coordinator_thread_id(UUID)。控制器从 manifest.workspace 自动派生全局 state_dir 并在结果中返回；项目内不使用任何工作流路径或状态。', ['manifest'], { manifest: { description: 'v3 工作流清单对象、内联 JSON 对象字符串或普通 JSON 文件路径。必须包含 application_id、release_id；发布主任务使用 task_kind=release_main。requirements 必须为 [{id,text}]，并明确顶层 coordinator_task_path 与 coordinator_thread_id(UUID)；每个 assurance 维度为 {status,evidence:string[],rationale}，字段名为 impact/recoverability/uncertainty/verifiability/coupling，另含 selection_reason；节点使用 id（不是 node_id）及完整路由字段。', anyOf: [{ type: 'object' }, { type: 'string' }] } }],
   ['workflow_raise_assurance', '在末端质量门开始前，按结构化新证据将 v3 Terra assurance 提高到 Sol，并把同一个未认领门重绑定为 sol_high；不得降级或新增第二个审核门。', ['task_id', 'target_assurance_level', 'reason', 'assurance_assessment', 'replacement_agent_task_path', 'integration_owner', 'state_dir'], { task_id: { type: 'string' }, target_assurance_level: { enum: ['sol'] }, reason: { type: 'string' }, assurance_assessment: { anyOf: [{ type: 'object' }, { type: 'string' }], description: '五个风险维度分别含 status、evidence、rationale，并含 selection_reason；优先传内联 JSON 对象，外部文件不得位于目标 workspace 内。' }, replacement_agent_task_path: { type: 'string', description: '预留给新末端审核者的独立 agent task path。' }, integration_owner: { type: 'string', description: '负责该末端门集成与关闭的真实协调者 task path。' }, state_dir: { type: 'string' } }],
   ['workflow_rebind_pending', '确认预定实例已停止或未启动后，为未认领的 pending 节点换绑 execution_owner；保留原因和旧 owner。', ['task_id', 'node_id', 'reason', 'replacement_agent_task_path', 'previous_agent_stopped', 'state_dir'], { task_id: { type: 'string' }, node_id: { type: 'string' }, reason: { type: 'string' }, replacement_agent_task_path: { type: 'string' }, previous_agent_stopped: { type: 'boolean', const: true }, state_dir: { type: 'string' } }],
   ['workflow_invalidate_gate', '末端 pass 在关闭前因任务快照或工作区变化失效时，保留旧记录并受控重开质量门；审核门必须绑定新的独立 reviewer，terra_cohort 可指定首个重开 lane。', ['task_id', 'reason', 'replacement_agent_task_path', 'state_dir'], { task_id: { type: 'string' }, reason: { type: 'string' }, replacement_agent_task_path: { type: 'string', description: '审核门失效时必填。' }, reviewer_slot: { enum: ['coverage', 'adversarial'], description: '仅重开 v3 terra_cohort 时可选，指定预留给替代审核者的首个 lane，默认 coverage。' }, state_dir: { type: 'string' } }],
-  ['workflow_reconcile_workspace', '恢复指定初始化任务留下的工作区租约；必须提供 workspace、task_id 和 state_dir。', ['workspace', 'task_id', 'state_dir'], { workspace: { type: 'string' }, task_id: { type: 'string' }, state_dir: { type: 'string' } }],
+  ['workflow_reconcile_workspace', '恢复指定初始化任务留下的工作区租约；必须提供 workspace、task_id 和 state_dir。对旧 active/failed 任务，先显式完成节点 abandon/retry 或 workflow_release_workspace，再创建新的发布主任务。', ['workspace', 'task_id', 'state_dir'], { workspace: { type: 'string' }, task_id: { type: 'string' }, state_dir: { type: 'string' } }],
   ['workflow_ready', '返回所有依赖均已成功的 DAG 节点。', ['task_id', 'state_dir'], { task_id: { type: 'string' }, state_dir: { type: 'string' } }],
   ['workflow_claim', '认领就绪节点并返回 claim_id；v3 terra_cohort 必须提供 coverage 或 adversarial reviewer_slot，两个 lane 可并行。', ['task_id', 'node_id', 'agent_task_path', 'agent_role', 'state_dir'], { task_id: { type: 'string' }, node_id: { type: 'string' }, agent_task_path: { type: 'string' }, agent_thread_id: { type: 'string' }, agent_role: { type: 'string' }, reviewer_slot: { enum: ['coverage', 'adversarial'], description: '仅 v3 terra_cohort 必填。' }, fallback_reason: { type: 'string' }, lease_duration_sec: { type: 'integer', minimum: 1 }, activation_timeout_sec: { type: 'integer', minimum: 1 }, state_dir: { type: 'string' } }],
   ['workflow_start', '由已开始回合的原生代理原子认领并激活节点；返回的 claim_id 必须原样保存并用于 heartbeat、record_review 与 complete，禁止猜测。旧工作流状态不会自动读取、迁移或接管；v3 terra_cohort 必须提供 coverage 或 adversarial reviewer_slot。', ['task_id', 'node_id', 'agent_task_path', 'agent_role', 'native_agent_started', 'state_dir'], { task_id: { type: 'string' }, node_id: { type: 'string' }, agent_task_path: { type: 'string' }, agent_thread_id: { type: 'string' }, agent_role: { type: 'string' }, reviewer_slot: { enum: ['coverage', 'adversarial'], description: '仅 v3 terra_cohort 必填。' }, fallback_reason: { type: 'string' }, native_agent_started: { type: 'boolean', const: true, description: '仅在原生 agent 已开始当前回合后传入。' }, lease_duration_sec: { type: 'integer', minimum: 1 }, activation_timeout_sec: { type: 'integer', minimum: 1 }, state_dir: { type: 'string' } }],
@@ -49,11 +49,12 @@ export const TOOLS = [
   ['workflow_release_workspace', '中断后确认原执行者已停止，且没有运行节点时显式释放工作区租约。', ['task_id', 'previous_agent_stopped', 'state_dir'], { task_id: { type: 'string' }, previous_agent_stopped: { type: 'boolean', const: true }, state_dir: { type: 'string' } }],
   ['workflow_stale', '列出未在启动期限内产生首个心跳或之后失去心跳的运行节点，并返回当前工作区的实际写锁；不会自动接管或过期释放。', ['task_id', 'state_dir'], { task_id: { type: 'string' }, state_dir: { type: 'string' } }],
   ['workflow_status', '默认返回适合轮询的任务摘要及当前工作区实际写锁；仅在排障或审计需要完整参与者、结果和审核记录时设 detail=full。', ['task_id', 'state_dir'], { task_id: { type: 'string' }, state_dir: { type: 'string' }, detail: { enum: ['summary', 'full'], description: '默认 summary；full 返回控制器完整状态视图。' } }],
-  ['workflow_wait', '按 workflow_status 或上次 workflow_wait 返回的 cursor 被动等待可操作变化；每次必须传 workflow_init/status 返回的同一非空 task_id 与 state_dir。忽略普通 heartbeat，默认 300 秒、最大 600 秒。', ['task_id', 'state_dir', 'after_cursor'], { task_id: { type: 'string', minLength: 1, description: '复用 workflow_init/status 返回的 task_id，不能为空。' }, state_dir: { type: 'string' }, after_cursor: { type: 'string', description: '最近 workflow_status 或 workflow_wait 返回的 cursor。' }, timeout_sec: { type: 'integer', minimum: 1, maximum: 600, description: '等待上限，默认 300 秒。' } }],
+  ['workflow_wait', '按 workflow_status 或上次 workflow_wait 返回的 cursor 被动等待可操作变化；默认只返回事件摘要、变化节点和无事件时的 observed_changes 派生观察，只有 detail=full 才返回完整当前状态。每次必须传 workflow_init/status 返回的同一非空 task_id 与 state_dir。忽略普通 heartbeat，默认 300 秒、最大 600 秒。', ['task_id', 'state_dir', 'after_cursor'], { task_id: { type: 'string', minLength: 1, description: '复用 workflow_init/status 返回的 task_id，不能为空。' }, state_dir: { type: 'string' }, after_cursor: { type: 'string', description: '最近 workflow_status 或 workflow_wait 返回的 cursor。' }, timeout_sec: { type: 'integer', minimum: 1, maximum: 600, description: '等待上限，默认 300 秒。' }, detail: { enum: ['summary', 'full'], description: '默认 summary 事件摘要；full 返回完整当前状态。' } }],
+  ['workflow_workspace_overview', '只读返回一个工作区的紧凑总览：当前执行者、失联任务、失败任务和租约截止时间；不会返回完整 DAG、结果或审核正文。', ['workspace'], { workspace: { type: 'string', minLength: 1 } }],
   ['workflow_doctor', '只读诊断指定任务的用户级全局 SQLite 状态、工作区租约、过期节点与受控重派前提；诊断结果以 database_path 和 task_key 定位任务，不会修改或删除状态。', ['task_id', 'state_dir'], { task_id: { type: 'string' }, state_dir: { type: 'string' } }],
 ].map(([name, description, required, properties]) => ({ name, description, inputSchema: { type: 'object', required, properties } }));
 
-export const TOOL_COMMANDS = Object.fromEntries([['workflow_init', 'init'], ['workflow_raise_assurance', 'raise-assurance'], ['workflow_rebind_pending', 'rebind-pending'], ['workflow_invalidate_gate', 'invalidate-gate'], ['workflow_reconcile_workspace', 'reconcile-workspace'], ['workflow_ready', 'ready'], ['workflow_claim', 'claim'], ['workflow_start', 'start'], ['workflow_acquire_write_lock', 'acquire-write-lock'], ['workflow_release_write_lock', 'release-write-lock'], ['workflow_complete', 'complete'], ['workflow_heartbeat', 'heartbeat'], ['workflow_checkpoint', 'checkpoint'], ['workflow_abandon', 'abandon'], ['workflow_retry', 'retry'], ['workflow_requeue_stale', 'requeue-stale'], ['workflow_rescue', 'rescue'], ['workflow_escalate_execution', 'escalate-execution'], ['workflow_audit_context', 'audit-context'], ['workflow_record_review', 'record-review'], ['workflow_record_repair', 'record-repair'], ['workflow_close_check', 'close-check'], ['workflow_release_workspace', 'release-workspace'], ['workflow_stale', 'stale'], ['workflow_status', 'status'], ['workflow_wait', 'wait'], ['workflow_doctor', 'doctor']]);
+export const TOOL_COMMANDS = Object.fromEntries([['workflow_init', 'init'], ['workflow_raise_assurance', 'raise-assurance'], ['workflow_rebind_pending', 'rebind-pending'], ['workflow_invalidate_gate', 'invalidate-gate'], ['workflow_reconcile_workspace', 'reconcile-workspace'], ['workflow_ready', 'ready'], ['workflow_claim', 'claim'], ['workflow_start', 'start'], ['workflow_acquire_write_lock', 'acquire-write-lock'], ['workflow_release_write_lock', 'release-write-lock'], ['workflow_complete', 'complete'], ['workflow_heartbeat', 'heartbeat'], ['workflow_checkpoint', 'checkpoint'], ['workflow_abandon', 'abandon'], ['workflow_retry', 'retry'], ['workflow_requeue_stale', 'requeue-stale'], ['workflow_rescue', 'rescue'], ['workflow_escalate_execution', 'escalate-execution'], ['workflow_audit_context', 'audit-context'], ['workflow_record_review', 'record-review'], ['workflow_record_repair', 'record-repair'], ['workflow_close_check', 'close-check'], ['workflow_release_workspace', 'release-workspace'], ['workflow_stale', 'stale'], ['workflow_status', 'status'], ['workflow_wait', 'wait'], ['workflow_workspace_overview', 'workspace-overview'], ['workflow_doctor', 'doctor']]);
 let writeTail = Promise.resolve();
 const write = payload => {
   const line = `${JSON.stringify(payload)}\n`;
@@ -186,6 +187,9 @@ function compactNode(node, fallbackReason = null) {
       status: lane.status,
       claim_id: lane.claim_id,
       agent_task_path: lane.agent_task_path,
+      agent_thread_id: lane.agent_thread_id,
+      agent_role: lane.agent_role,
+      attempt: lane.attempt,
       claimed_at: lane.claimed_at,
       activation_at: lane.activation_at,
       activation_deadline_at: lane.activation_deadline_at,
@@ -229,6 +233,9 @@ function compactMaxReviewCharter(charter) {
 function workflowObservation(result) {
   return {
     task_id: result.task_id,
+    application_id: result.application_id ?? null,
+    release_id: result.release_id ?? null,
+    task_kind: result.task_kind ?? null,
     coordinator_task_path: result.coordinator_task_path ?? null,
     coordinator_thread_id: result.coordinator_thread_id ?? null,
     workspace_claims: result.workspace_claims ?? null,
@@ -264,16 +271,27 @@ function workflowObservation(result) {
 }
 
 function workflowCursor(result) {
-  return createHash('sha256').update(JSON.stringify(workflowObservation(result))).digest('hex');
+  const digest = createHash('sha256').update(JSON.stringify(workflowObservation(result))).digest('hex');
+  const eventCount = Array.isArray(result.events) ? result.events.length : 0;
+  return `${eventCount.toString(16).padStart(16, '0')}${digest.slice(16)}`;
 }
 
-function compactStatus(result) {
+function workflowCursorEventCount(cursor) {
+  if (typeof cursor !== 'string' || !/^[a-f0-9]{64}$/.test(cursor)) return null;
+  const count = Number.parseInt(cursor.slice(0, 16), 16);
+  return Number.isSafeInteger(count) ? count : null;
+}
+
+function compactStatus(result, { includeEvents = false } = {}) {
   const participantsByClaim = new Map((result.participants ?? []).map(participant => [participant.claim_id, participant]));
   const nodes = (result.nodes ?? []).map(node => compactNode(node, participantsByClaim.get(node.claim_id)?.fallback_reason));
   const status_counts = Object.create(null);
   for (const node of nodes) status_counts[node.status] = (status_counts[node.status] ?? 0) + 1;
-  return definedObject([
+  const compacted = definedObject([
     ['task_id', result.task_id],
+    ['application_id', result.application_id],
+    ['release_id', result.release_id],
+    ['task_kind', result.task_kind],
     ['cursor', workflowCursor(result)],
     ['state_path', result.state_path],
     ['database_path', result.database_path],
@@ -295,6 +313,7 @@ function compactStatus(result) {
     ['assurance_assessment', result.assurance_assessment],
     ['effective_assurance_level', result.effective_assurance_level],
     ['workflow_revision', result.workflow_revision],
+    ...(includeEvents ? [['events', result.events ?? []]] : []),
     ['status_counts', status_counts],
     ['nodes', nodes],
     ['ready_nodes', (result.ready_nodes ?? []).map(compactReadyNode)],
@@ -307,6 +326,10 @@ function compactStatus(result) {
     ['max_review_charter', compactMaxReviewCharter(result.max_review_charter)],
     ['updated_at', result.updated_at],
   ]);
+  const waitReason = workflowWaitingReason(compacted);
+  compacted.wait_reason = waitReason;
+  compacted.waiting_reason = waitReason;
+  return compacted;
 }
 
 function compactNodeEnvelope(result, fallbackReason = null, stateDir = null) {
@@ -338,6 +361,15 @@ export function compactMcpResult(toolName, result, argumentsValue = {}) {
     return argumentsValue.detail === 'full' ? result : compactStatus(result);
   }
   if (toolName === 'workflow_init') return { state_dir: result.state_dir, state_path: result.state_path, database_path: result.database_path, task_key: result.task_key, task: compactStatus(result.task) };
+  if (toolName === 'workflow_workspace_overview') return {
+    workspace: result.workspace,
+    task_count: result.task_count,
+    current_executors: result.current_executors ?? [],
+    stale_tasks: result.stale_tasks ?? [],
+    failed_tasks: result.failed_tasks ?? [],
+    lease_deadlines: result.lease_deadlines ?? [],
+    tasks: result.tasks ?? [],
+  };
   if (toolName === 'workflow_raise_assurance') return {
     task_id: result.task_id,
     prior_assurance_level: result.prior_assurance_level,
@@ -443,16 +475,12 @@ function waitForTaskStateSignal(_stateDir, _taskId, _controlPath, timeoutMs, sig
 
 function recommendedWaitSeconds(summary) {
   if (summary.ready_nodes?.length || summary.stale_nodes?.length) return 0;
-  const running = summary.nodes?.filter(node => node.status === 'running') ?? [];
-  if (!running.length) return DEFAULT_WORKFLOW_WAIT_SEC;
+  if (workflowWaitingReason(summary) === 'native_thread_unverified') return 0;
+  if (!runningObservations(summary).length) return DEFAULT_WORKFLOW_WAIT_SEC;
   const now = Date.now();
-  const deadlines = running.flatMap(node => {
-    const heartbeat = Date.parse(node.heartbeat_at ?? node.claimed_at);
-    if (!Number.isFinite(heartbeat) || !node.lease_duration_sec) return [];
-    return [heartbeat + node.lease_duration_sec * 1000];
-  });
-  if (!deadlines.length) return DEFAULT_WORKFLOW_WAIT_SEC;
-  return Math.max(0, Math.min(DEFAULT_WORKFLOW_WAIT_SEC, Math.ceil((Math.min(...deadlines) - now) / 1000)));
+  const deadline = nextWorkflowDeadlineMs(summary);
+  if (deadline === null) return DEFAULT_WORKFLOW_WAIT_SEC;
+  return Math.max(0, Math.min(DEFAULT_WORKFLOW_WAIT_SEC, Math.ceil((deadline - now) / 1000)));
 }
 
 export function nextWorkflowDeadlineMs(summary) {
@@ -472,6 +500,78 @@ export function nextWorkflowDeadlineMs(summary) {
   return deadlines.length ? Math.min(...deadlines) : null;
 }
 
+const TERMINAL_NODE_STATUSES = new Set(['succeeded', 'failed', 'blocked', 'skipped', 'unavailable', 'abandoned']);
+
+function runningObservations(summary) {
+  const observations = [];
+  for (const node of summary.nodes ?? []) {
+    const lanes = (node.cohort_lanes ?? []).filter(lane => lane.status === 'running');
+    if (lanes.length) {
+      for (const lane of lanes) observations.push({ ...lane, node_id: node.id, kind: node.kind, status: lane.status, agent_role: node.agent_role ?? null });
+    } else if (node.status === 'running') {
+      observations.push({ ...node, node_id: node.id, kind: node.kind });
+    }
+  }
+  return observations;
+}
+
+function observationWaitingReason(observation) {
+  if (observation.status !== 'running') return null;
+  // The host may start a real native turn without exposing its child thread
+  // id to the controller. Missing binding is therefore an observable
+  // reconciliation state, not proof that the agent is absent.
+  if (observation.activation_at && !observation.agent_thread_id) return 'native_thread_unverified';
+  if (!observation.activation_at || observation.heartbeat_count === 0) return 'activation_pending';
+  if (!observation.heartbeat_at) return 'heartbeat_missing';
+  return 'running';
+}
+
+function workflowWaitingReason(summary) {
+  if (summary.stale_nodes?.length) return 'stale';
+  if (summary.ready_nodes?.length) return 'ready';
+  const running = runningObservations(summary);
+  if (running.some(observation => observationWaitingReason(observation) === 'native_thread_unverified')) return 'native_thread_unverified';
+  if (running.some(observation => observationWaitingReason(observation) === 'activation_pending')) return 'activation_pending';
+  if (running.length) return 'running';
+  if ((summary.nodes ?? []).some(node => TERMINAL_NODE_STATUSES.has(node.status))) return 'terminal';
+  return 'pending';
+}
+
+function compactRunningObservation(observation) {
+  return {
+    id: observation.node_id ?? observation.id,
+    slot: observation.slot ?? null,
+    kind: observation.kind ?? null,
+    agent_task_path: observation.agent_task_path ?? null,
+    agent_thread_id: observation.agent_thread_id ?? null,
+    agent_role: observation.agent_role ?? null,
+    claim_id: observation.claim_id ?? null,
+    attempt: observation.attempt ?? null,
+    claimed_at: observation.claimed_at ?? null,
+    activation_at: observation.activation_at ?? null,
+    activation_deadline_at: observation.activation_deadline_at ?? null,
+    heartbeat_at: observation.heartbeat_at ?? null,
+    heartbeat_count: observation.heartbeat_count ?? null,
+    lease_duration_sec: observation.lease_duration_sec ?? null,
+    waiting_reason: observationWaitingReason(observation),
+    native_binding_status: observation.agent_thread_id ? 'bound' : 'unverified',
+    reconciliation_required: !observation.agent_thread_id,
+  };
+}
+
+function compactTerminalObservation(node) {
+  return definedObject([
+    ['id', node.id],
+    ['status', node.status],
+    ['agent_task_path', node.agent_task_path],
+    ['agent_thread_id', node.agent_thread_id],
+    ['agent_role', node.agent_role],
+    ['claim_id', node.claim_id],
+    ['attempt', node.attempt],
+    ['result_present', node.result_present],
+  ]);
+}
+
 function sameTaskSignal(left, right) {
   return Boolean(left && right)
     && left.instance_id === right.instance_id
@@ -479,22 +579,62 @@ function sameTaskSignal(left, right) {
     && left.workspace_change_counter === right.workspace_change_counter;
 }
 
-function workflowWaitResult(summary, changed, reason) {
-  const terminal = new Set(['succeeded', 'failed', 'blocked', 'skipped', 'unavailable', 'abandoned']);
+function compactEvent(event) {
+  return definedObject([
+    ['at', event?.at], ['type', event?.type], ['workflow_revision', event?.workflow_revision],
+    ['task_id', event?.task_id], ['node_id', event?.node_id], ['claim_id', event?.claim_id],
+    ['status', event?.status], ['reason', event?.reason], ['reviewer_slot', event?.reviewer_slot],
+  ]);
+}
+
+function changedEventsFromSummary(summary, changed, previousCursor) {
+  if (!changed) return [];
+  const events = summary.events ?? [];
+  const previousCount = workflowCursorEventCount(previousCursor);
+  if (previousCount === null || previousCount > events.length) return events.slice(-8);
+  return events.slice(previousCount);
+}
+
+function changedNodesFromEvents(summary, changed, events) {
+  const ids = new Set((changed ? events : []).map(event => event?.node_id).filter(Boolean));
+  if (changed && !events.length) for (const node of summary.stale_nodes ?? []) if (node.id) ids.add(node.id);
+  return (summary.nodes ?? []).filter(node => ids.has(node.id)).map(node => definedObject([
+    ['id', node.id], ['status', node.status], ['claim_id', node.claim_id], ['agent_task_path', node.agent_task_path], ['agent_role', node.agent_role], ['attempt', node.attempt],
+  ]));
+}
+
+function observedChangesFromSummary(summary, changed, events) {
+  if (!changed || events.length) return null;
+  const observed = {
+    stale_nodes: summary.stale_nodes ?? [],
+    active_write_locks: summary.active_write_locks ?? [],
+  };
+  return observed;
+}
+
+function workflowWaitResult(summary, changed, reason, detail = 'summary', previousCursor = null, fullState = null) {
+  const waitReason = workflowWaitingReason(summary);
+  const changedEvents = changedEventsFromSummary(summary, changed, previousCursor);
+  const observedChanges = observedChangesFromSummary(summary, changed, changedEvents);
+  if (detail === 'full') return definedObject([
+    ['changed', changed], ['reason', reason], ['wait_reason', waitReason], ['waiting_reason', waitReason],
+    ['previous_cursor', previousCursor], ['task_id', summary.task_id], ['cursor', summary.cursor],
+    ['status', fullState ?? summary], ['recommended_wait_sec', recommendedWaitSeconds(summary)],
+    ['reconciliation_required', waitReason === 'native_thread_unverified'],
+  ]);
   return definedObject([
     ['changed', changed],
     ['reason', reason],
+    ['wait_reason', waitReason],
+    ['waiting_reason', waitReason],
     ['task_id', summary.task_id],
+    ['previous_cursor', previousCursor],
     ['cursor', summary.cursor],
-    ['assurance_level', summary.assurance_level],
-    ['effective_assurance_level', summary.effective_assurance_level],
-    ['status_counts', summary.status_counts],
-    ['ready_nodes', summary.ready_nodes],
-    ['stale_nodes', summary.stale_nodes],
-    ['running_nodes', summary.nodes.filter(node => node.status === 'running').map(node => definedObject([['id', node.id], ['agent_role', node.agent_role], ['claim_id', node.claim_id], ['attempt', node.attempt]]))],
-    ['terminal_nodes', summary.nodes.filter(node => terminal.has(node.status)).map(node => definedObject([['id', node.id], ['status', node.status], ['attempt', node.attempt], ['result_present', node.result_present]]))],
-    ['latest_review', summary.latest_review],
+    ['events', changedEvents.map(compactEvent)],
+    ['changed_nodes', changedNodesFromEvents(summary, changed, changedEvents)],
+    ['observed_changes', observedChanges],
     ['recommended_wait_sec', recommendedWaitSeconds(summary)],
+    ['reconciliation_required', waitReason === 'native_thread_unverified'],
   ]);
 }
 
@@ -511,6 +651,8 @@ async function waitForWorkflowChange(parameters, signal) {
     });
   }
   if (!/^[a-f0-9]{64}$/.test(afterCursor)) throw new ControllerError('after_cursor must be a workflow_status or workflow_wait cursor');
+  const detail = parameters.detail ?? 'summary';
+  if (!['summary', 'full'].includes(detail)) throw new ControllerError('workflow_wait.detail must be summary or full');
   const timeoutSec = workflowWaitTimeout(parameters.timeout_sec);
   // Reserve a lexical key before the first filesystem await. This closes the
   // small event-loop window where two concurrent requests could both pass the
@@ -537,10 +679,17 @@ async function waitForWorkflowChange(parameters, signal) {
     for (;;) {
       if (signal?.aborted) throw new WorkflowWaitCancelled();
       const [state] = await dispatch('status', { task_id: taskId, state_dir: stateDir });
-      const summary = compactStatus(state);
-      if (summary.cursor !== afterCursor) return workflowWaitResult(summary, true, 'state_changed');
+      const summary = compactStatus(state, { includeEvents: true });
+      if (summary.cursor !== afterCursor) return workflowWaitResult(summary, true, 'state_changed', detail, afterCursor, state);
+      // A missing thread binding is not proof that a native turn is absent.
+      // Return a bounded, explicitly unverified observation so the
+      // coordinator can check the host's native status before any requeue or
+      // rebind; never treat this as stale, unavailable, or successful.
+      if (workflowWaitingReason(summary) === 'native_thread_unverified') {
+        return workflowWaitResult(summary, false, 'native_thread_unverified', detail, afterCursor, state);
+      }
       const remainingMs = deadline - Date.now();
-      if (remainingMs <= 0) return workflowWaitResult(summary, false, 'timeout');
+      if (remainingMs <= 0) return workflowWaitResult(summary, false, 'timeout', detail, afterCursor, state);
       const workspace = state.workspace;
       const taskStatePath = path.join(stateDir, `${taskId}.sqlite`);
       taskSignal ??= await readGlobalTaskChangeToken(taskStatePath, workspace);

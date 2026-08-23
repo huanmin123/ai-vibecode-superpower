@@ -10,6 +10,7 @@ import {
   globalWorkflowArtifactRoot,
   globalWorkflowArtifactTaskPath,
   globalWorkflowStorePath,
+  bindGlobalApplication,
   createGlobalWorkspaceControl as createWorkspaceControl,
   globalWorkspaceControlExists as workspaceControlExists,
   ensureGlobalNamespaceIdentity,
@@ -20,6 +21,7 @@ import {
   finalizeGlobalTaskPruneJob,
   readGlobalTaskState as readTaskState,
   readGlobalWorkspaceControl as readWorkspaceControl,
+  taskNamespaceKey,
   taskStoreKey,
   withGlobalTaskStateTransaction as withTaskStateTransaction,
   withGlobalWorkspaceControlTransaction as withWorkspaceControlTransaction,
@@ -79,6 +81,7 @@ const MAX_REQUIREMENTS = 64;
 const MAX_NODE_ATTEMPTS = 8;
 const MAX_UNAVAILABLE_ATTEMPTS = 8;
 const MAX_TOTAL_NODE_ATTEMPTS = MAX_NODE_ATTEMPTS + MAX_UNAVAILABLE_ATTEMPTS;
+const WORKFLOW_TASK_KINDS = new Set(['workflow', 'release_main']);
 const MAX_REVIEWS = 16;
 const MAX_REPAIR_RECORDS = MAX_REVIEWS;
 const MAX_REVIEW_FINDINGS = 64;
@@ -1436,6 +1439,9 @@ function workflowSnapshotMaterial(state, { includeAssurance = true, excludeAllRe
     }));
   const material = {
     task_id: state.task_id,
+    application_id: state.application_id,
+    release_id: state.release_id,
+    task_kind: state.task_kind,
     coordinator_task_path: state.coordinator_task_path,
     coordinator_thread_id: state.coordinator_thread_id,
     execution_routing_policy_version: state.execution_routing_policy_version,
@@ -1547,13 +1553,16 @@ function normalizeState(state) {
   normalizeStateCoordinatorBinding(state);
   const requiredStateFields = [
     'version', 'routing_schema_version', 'execution_routing_policy_version', 'assurance_level', 'assurance_assessment',
-    'review_protocol_version', 'review_entry_stage', 'review_context', 'task_id', 'workspace', 'workspace_claims', 'goal',
+    'review_protocol_version', 'review_entry_stage', 'review_context', 'application_id', 'release_id', 'task_kind', 'release_main', 'task_id', 'workspace', 'workspace_claims', 'goal',
     'requirements', 'scope', 'non_goals', 'nodes', 'participants', 'reviews', 'repair_records', 'max_review_charter',
     'events', 'workflow_revision', 'closed_revision', 'closed_at', 'created_at', 'updated_at', 'workspace_lease',
   ];
   const missingStateField = requiredStateFields.find(field => !hasOwn(state, field));
   if (missingStateField) throw unsupportedWorkflowState(`Task state is missing required current field: ${missingStateField}`, missingStateField, 'present', 'missing');
   if (!state.nodes || typeof state.nodes !== 'object' || Array.isArray(state.nodes) || !Object.keys(state.nodes).length) throw new ControllerError('Task state must contain nodes');
+  requiredIdentifier(state.application_id, 'application_id');
+  requiredIdentifier(state.release_id, 'release_id');
+  if (!WORKFLOW_TASK_KINDS.has(state.task_kind) || state.release_main !== (state.task_kind === 'release_main')) throw unsupportedWorkflowState('Task application/release metadata is invalid', 'task_kind', 'workflow or release_main', state.task_kind);
   state.workspace_claims = normalizeStoredWorkspaceClaims(state.workspace_claims);
   if (!Array.isArray(state.events)) throw unsupportedWorkflowState('Task state events must be an array', 'events', 'array', typeof state.events);
   if (!Number.isSafeInteger(state.workflow_revision) || state.workflow_revision < 0) throw unsupportedWorkflowState('Task state workflow_revision must be a non-negative integer', 'workflow_revision', 'non-negative integer', state.workflow_revision);
@@ -1618,9 +1627,15 @@ function normalizeState(state) {
 }
 
 async function makeState(manifest) {
-  const required = ['task_id', 'workspace', 'goal', 'requirements', 'coordinator_task_path', 'coordinator_thread_id'];
-  if (!manifest || typeof manifest !== 'object' || required.some(key => !hasOwn(manifest, key))) throw new ControllerError('Manifest requires task_id, workspace, goal, requirements, coordinator_task_path, and coordinator_thread_id');
+  const required = ['task_id', 'workspace', 'goal', 'requirements', 'coordinator_task_path', 'coordinator_thread_id', 'application_id', 'release_id'];
+  if (!manifest || typeof manifest !== 'object' || required.some(key => !hasOwn(manifest, key))) throw new ControllerError('Manifest requires task_id, workspace, goal, requirements, application_id, release_id, coordinator_task_path, and coordinator_thread_id');
   const taskId = requiredIdentifier(manifest.task_id, 'task_id');
+  const applicationId = requiredIdentifier(manifest.application_id, 'application_id');
+  const releaseId = requiredIdentifier(manifest.release_id, 'release_id');
+  const taskKind = requiredString(manifest.task_kind ?? (manifest.release_main === true ? 'release_main' : 'workflow'), 'task_kind');
+  if (!WORKFLOW_TASK_KINDS.has(taskKind)) throw invalidArgument('task_kind must be workflow or release_main', 'task_kind', 'workflow or release_main', taskKind);
+  if (hasOwn(manifest, 'release_main') && typeof manifest.release_main !== 'boolean') throw invalidArgument('release_main must be a boolean when provided', 'release_main', 'boolean', typeof manifest.release_main);
+  if (hasOwn(manifest, 'release_main') && manifest.release_main !== (taskKind === 'release_main')) throw invalidArgument('release_main must match task_kind=release_main', 'release_main', taskKind === 'release_main', manifest.release_main);
   const coordinatorTaskPath = requiredString(manifest.coordinator_task_path, 'coordinator_task_path');
   const coordinatorThreadId = requiredCoordinatorThreadId(manifest.coordinator_thread_id);
   const routingSchemaVersion = manifest.routing_schema_version;
@@ -1669,7 +1684,7 @@ async function makeState(manifest) {
   const created = utcNow();
   const events = [{ at: created, type: 'task_initialized', workflow_revision: 0 }];
   if (normalizedReviewDependencies.length) events.push({ at: created, type: 'review_direct_dependencies_completed', node_id: reviewNodes(nodes, routingSchemaVersion)[0].id, added_dependencies: normalizedReviewDependencies, workflow_revision: 0 });
-  const state = { version: VERSION, routing_schema_version: REVIEW_PROTOCOL_VERSION, execution_routing_policy_version: CURRENT_EXECUTION_ROUTING_POLICY_VERSION, assurance_level: assuranceLevel, assurance_assessment: assuranceAssessmentValue, review_protocol_version: REVIEW_PROTOCOL_VERSION, review_entry_stage: reviewEntryStage, review_context: reviewContext, coordinator_task_path: coordinatorTaskPath, coordinator_thread_id: coordinatorThreadId, task_id: taskId, workspace, workspace_claims: workspaceClaims, ...(globalWriteReason === null ? {} : { global_write_justification: globalWriteReason }), goal, requirements, scope: manifest.scope ?? [], non_goals: manifest.non_goals ?? [], nodes, participants: [], reviews: [], repair_records: [], max_review_charter: null, events, workflow_revision: 0, closed_revision: null, closed_at: null, created_at: created, updated_at: created, workspace_lease: null };
+  const state = { version: VERSION, routing_schema_version: REVIEW_PROTOCOL_VERSION, execution_routing_policy_version: CURRENT_EXECUTION_ROUTING_POLICY_VERSION, assurance_level: assuranceLevel, assurance_assessment: assuranceAssessmentValue, review_protocol_version: REVIEW_PROTOCOL_VERSION, review_entry_stage: reviewEntryStage, review_context: reviewContext, application_id: applicationId, release_id: releaseId, task_kind: taskKind, release_main: taskKind === 'release_main', coordinator_task_path: coordinatorTaskPath, coordinator_thread_id: coordinatorThreadId, task_id: taskId, workspace, workspace_claims: workspaceClaims, ...(globalWriteReason === null ? {} : { global_write_justification: globalWriteReason }), goal, requirements, scope: manifest.scope ?? [], non_goals: manifest.non_goals ?? [], nodes, participants: [], reviews: [], repair_records: [], max_review_charter: null, events, workflow_revision: 0, closed_revision: null, closed_at: null, created_at: created, updated_at: created, workspace_lease: null };
   return state;
 }
 
@@ -1728,7 +1743,7 @@ function staleNodes(state, now = Date.now()) {
 
 function compactState(state) {
   const workspaceLease = publicWorkspaceLease(state);
-  return { task_id: state.task_id, ...(workspaceLease ? { state_path: workspaceLease.state_path, database_path: workspaceLease.database_path, task_key: workspaceLease.task_key } : {}), workspace: state.workspace, workspace_claims: state.workspace_claims, workspace_lease: workspaceLease, coordinator_task_path: state.coordinator_task_path, coordinator_thread_id: state.coordinator_thread_id, execution_routing_policy_version: state.execution_routing_policy_version, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), assurance_assessment: state.assurance_assessment, review_protocol_version: state.review_protocol_version, review_entry_stage: state.review_entry_stage, review_context: state.review_context, goal: state.goal, nodes: Object.values(state.nodes), ready_nodes: readyNodes(state), stale_nodes: staleNodes(state), participants: state.participants, reviews: externallyVisibleReviews(state), repair_records: state.repair_records, workflow_revision: state.workflow_revision, updated_at: state.updated_at };
+  return { task_id: state.task_id, application_id: state.application_id, release_id: state.release_id, task_kind: state.task_kind, release_main: state.release_main, ...(workspaceLease ? { state_path: workspaceLease.state_path, database_path: workspaceLease.database_path, task_key: workspaceLease.task_key } : {}), workspace: state.workspace, workspace_claims: state.workspace_claims, workspace_lease: workspaceLease, coordinator_task_path: state.coordinator_task_path, coordinator_thread_id: state.coordinator_thread_id, execution_routing_policy_version: state.execution_routing_policy_version, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), assurance_assessment: state.assurance_assessment, review_protocol_version: state.review_protocol_version, review_entry_stage: state.review_entry_stage, review_context: state.review_context, goal: state.goal, nodes: Object.values(state.nodes), ready_nodes: readyNodes(state), stale_nodes: staleNodes(state), participants: state.participants, reviews: externallyVisibleReviews(state), repair_records: state.repair_records, max_review_charter: state.max_review_charter, events: state.events, workflow_revision: state.workflow_revision, updated_at: state.updated_at };
 }
 
 function doctorCheck(id, status, detail) { return { id, status, detail }; }
@@ -2027,6 +2042,64 @@ async function compactStateWithActiveWriteLocks(state) {
   return { ...compactState(state), active_write_locks: await activeWorkspaceWriteLocks(state) };
 }
 
+function workspaceLeaseDeadline(node) {
+  if (node?.activation_at && node?.heartbeat_at && Number.isFinite(Date.parse(node.heartbeat_at)) && Number.isFinite(Number(node.lease_duration_sec))) {
+    return new Date(Date.parse(node.heartbeat_at) + Number(node.lease_duration_sec) * 1000).toISOString();
+  }
+  return node?.activation_deadline_at ?? null;
+}
+
+function workspaceOverviewTask(state) {
+  const executors = [];
+  const failedNodes = [];
+  const stale = staleNodes(state);
+  const failedStatuses = new Set(['failed', 'blocked', 'unavailable', 'abandoned']);
+  for (const node of Object.values(state.nodes ?? {})) {
+    const cohort = isCohortReviewNode(state, node);
+    const allLanes = cohort ? cohortLanes(node) : [];
+    const lanes = allLanes.filter(lane => lane.status === RUNNING);
+    const observations = lanes.length ? lanes.map(lane => ({ ...lane, node_id: node.id })) : node.status === RUNNING ? [{ ...node, node_id: node.id }] : [];
+    for (const observation of observations) executors.push({
+      task_id: state.task_id, node_id: observation.node_id, reviewer_slot: observation.slot ?? null,
+      agent_task_path: observation.agent_task_path ?? null, agent_thread_id: observation.agent_thread_id ?? null,
+      agent_role: observation.agent_role ?? null, claim_id: observation.claim_id ?? null,
+      status: observation.status, heartbeat_at: observation.heartbeat_at ?? null, lease_deadline_at: workspaceLeaseDeadline(observation),
+    });
+    if (cohort) {
+      const failedLanes = allLanes.filter(lane => failedStatuses.has(lane.status));
+      for (const lane of failedLanes) failedNodes.push({
+        task_id: state.task_id, node_id: node.id, reviewer_slot: lane.slot, status: lane.status,
+        claim_id: lane.claim_id ?? null, attempt: lane.attempt ?? null,
+      });
+      if (!failedLanes.length && failedStatuses.has(node.status)) failedNodes.push({ task_id: state.task_id, node_id: node.id, status: node.status, claim_id: node.claim_id ?? null, attempt: node.attempt ?? null });
+    } else if (failedStatuses.has(node.status)) {
+      failedNodes.push({ task_id: state.task_id, node_id: node.id, status: node.status, claim_id: node.claim_id ?? null, attempt: node.attempt ?? null });
+    }
+  }
+  return {
+    task_id: state.task_id, application_id: state.application_id, release_id: state.release_id, task_kind: state.task_kind,
+    lease_status: state.workspace_lease?.status ?? null, current_executors: executors,
+    stale_tasks: stale.map(node => ({ task_id: state.task_id, node_id: node.id, reviewer_slot: node.reviewer_slot ?? null, reason: node.reason, claim_id: node.claim_id ?? null, lease_deadline_at: node.activation_deadline_at ?? null })),
+    failed_tasks: failedNodes,
+    lease_deadlines: executors.filter(item => item.lease_deadline_at).map(item => ({ task_id: item.task_id, node_id: item.node_id, reviewer_slot: item.reviewer_slot, lease_deadline_at: item.lease_deadline_at })),
+  };
+}
+
+async function workspaceOverview(parameters) {
+  const workspace = await canonicalWorkspace(parameters.workspace);
+  const states = await listGlobalTaskStatesForWorkspace(workspace);
+  const tasks = states.map(entry => workspaceOverviewTask(normalizeState(entry.state)));
+  return {
+    workspace,
+    task_count: tasks.length,
+    current_executors: tasks.flatMap(task => task.current_executors),
+    stale_tasks: tasks.flatMap(task => task.stale_tasks),
+    failed_tasks: tasks.flatMap(task => task.failed_tasks),
+    lease_deadlines: tasks.flatMap(task => task.lease_deadlines),
+    tasks: tasks.map(task => ({ task_id: task.task_id, application_id: task.application_id, release_id: task.release_id, task_kind: task.task_kind, lease_status: task.lease_status })),
+  };
+}
+
 async function writeWorkspaceLeaseRegistry(context, leasePath, lease) {
   if (!context || typeof context !== 'object' || typeof context.save !== 'function') throw new ControllerError(`Workspace control transaction is required: ${leasePath}`);
   await validateWorkspaceLease(lease, leasePath);
@@ -2308,6 +2381,42 @@ async function releaseWorkspaceLease(parameters, { closeAllowed = false } = {}) 
   });
 }
 
+function releaseMainConflict(state) {
+  if (!state || typeof state !== 'object') return { task_id: null, reason: 'unreadable task state' };
+  const statuses = Object.values(state.nodes ?? {}).map(node => node?.status);
+  const failed = statuses.filter(status => ['failed', 'blocked', 'unavailable', 'abandoned'].includes(status));
+  const active = state.workspace_lease?.status === 'active';
+  if (!active && !failed.length) return null;
+  return {
+    task_id: state.task_id,
+    application_id: state.application_id ?? null,
+    release_id: state.release_id ?? null,
+    lease_status: state.workspace_lease?.status ?? null,
+    failed_nodes: failed,
+    reason: active ? 'active' : 'failed',
+  };
+}
+
+async function assertReleaseMainAdmission(state, lease) {
+  if (!state.release_main) return;
+  const conflicts = [];
+  const candidates = await listGlobalTaskStatesForWorkspace(state.workspace);
+  for (const entry of candidates) {
+    if (entry.task_id === state.task_id && entry.namespace_key === taskNamespaceKey(state.workspace_lease.state_path)) continue;
+    try {
+      const candidate = normalizeState(entry.state);
+      const conflict = releaseMainConflict(candidate);
+      if (conflict) conflicts.push(conflict);
+    } catch (error) {
+      conflicts.push({ task_id: entry.task_id, reason: 'unreadable task state', error: error.message });
+    }
+  }
+  if (conflicts.length) {
+    const details = conflicts.map(conflict => `${conflict.task_id}(${conflict.reason})`).join(', ');
+    throw new ControllerError(`release_main cannot start while this workspace has active or failed task(s): ${details}; explicitly reconcile/abandon or retry and release those tasks before creating a new release main task`);
+  }
+}
+
 async function initTask(parameters) {
   const manifest = await readManifest(parameters.manifest);
   const state = await makeState(manifest);
@@ -2328,6 +2437,7 @@ async function initTask(parameters) {
     if (lease.active_tasks.length >= MAX_WORKSPACE_ACTIVE_TASKS) throw new ControllerError(`Workspace lease exceeds the ${MAX_WORKSPACE_ACTIVE_TASKS}-active-task limit`);
     const existingStatePath = lease.active_tasks.find(entry => entry.task_key === taskKey(filePath));
     if (existingStatePath) throw new ControllerError(`Workspace state path already has an active lease entry: ${filePath}; reconcile this exact workspace/task/state_dir entry before initializing again`);
+    await assertReleaseMainAdmission(state, lease);
     lease.active_tasks.push(entry);
     lease.updated_at = utcNow();
   }, { allowAuthorityCreation: true, stateDirectory: path.dirname(filePath) });
@@ -2348,6 +2458,27 @@ async function initTask(parameters) {
       throw wrapped;
     }
     throw writeError;
+  }
+
+  try {
+    await bindGlobalApplication(state.application_id, state.workspace);
+  } catch (bindingError) {
+    let cleanupError = null;
+    try {
+      await removeReleasedWorkspaceLeaseEntry(state, filePath);
+      await deleteTaskState(filePath);
+    } catch (error) {
+      cleanupError = error;
+    }
+    if (cleanupError) {
+      const wrapped = new ControllerError(`Application binding failed after task state creation and cleanup failed; run workflow_reconcile: ${bindingError.message}; cleanup failed: ${cleanupError.message}`);
+      wrapped.cause = bindingError;
+      throw wrapped;
+    }
+    if (/^APPLICATION_WORKSPACE_BOUND:/.test(String(bindingError?.message ?? ''))) {
+      throw new ControllerError(`${String(bindingError.message).replace(/^APPLICATION_WORKSPACE_BOUND:\s*/, '')}; cross-application workspace path is rejected`, { cause: bindingError });
+    }
+    throw bindingError;
   }
 
   try {
@@ -3988,6 +4119,7 @@ async function closeReasons(state, { workspaceFingerprint: precomputedFingerprin
   const review = state.reviews.at(-1);
   if (!review) reasons.push(reviewNode?.kind === QUALITY_REVIEW_KIND ? 'no quality_review' : 'no total review'); else {
     if (review.verdict !== 'pass') reasons.push(`latest review verdict is ${review.verdict}`);
+    if (review.verdict === 'unavailable') reasons.push('latest review is unavailable; retry is required before closure');
     if (!reviewNode || review.node_id !== reviewNode.id || review.claim_id !== reviewNode.claim_id || review.auditor_task !== reviewNode.agent_task_path || review.auditor_role !== reviewNode.agent_role) reasons.push(`latest review does not belong to the succeeded ${reviewDescription} node`);
     if (review.coordinator_task_path !== state.coordinator_task_path || review.coordinator_thread_id !== state.coordinator_thread_id) reasons.push(`latest review does not match the workflow coordinator binding`);
     if (!workflowSnapshotMatchesState(review.workflow_snapshot, state)) reasons.push(`task state changed after ${reviewDescription}`);
@@ -4094,6 +4226,7 @@ export async function dispatch(command, parameters) {
       const [, state] = await readTask(parameters);
       return [await compactStateWithActiveWriteLocks(state), 0];
     }
+    case 'workspace-overview': return [await workspaceOverview(parameters), 0];
     case 'doctor': return [await doctorTask(parameters), 0]; case 'fingerprint': return [{ workspace_fingerprint: await workspaceFingerprint(parameters.workspace, parameters.workspace_claims) }, 0];
     default: throw new ControllerError(`Unknown command: ${command}`);
   }

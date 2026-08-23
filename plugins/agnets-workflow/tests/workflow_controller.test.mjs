@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { DatabaseSync } from 'node:sqlite';
@@ -35,7 +36,7 @@ function v3Manifest(workspace, overrides = {}) {
   const work = { execution_risk: 'protected', routing_reason: 'bounded change', execution_owner: '/root/work', integration_owner: '/root', quality_guard: 'targeted verification' };
   const review = { execution_risk: 'read_only', routing_reason: 'independent quality gate', execution_owner: '/root/reviewer', integration_owner: '/root', quality_guard: 'requirements and evidence review' };
   return {
-    task_id: 'feature', coordinator_task_path: '/root', coordinator_thread_id: '01a0193d-6e8f-78a2-815a-19afa3358256', workspace, workspace_claims: [{ mode: 'write', prefix: '.' }], global_write_justification: 'The fixture intentionally validates a workspace-wide claim.', goal: 'Validate the v3-only workflow contract.', requirements: [{ id: 'R1', text: 'Only v3 manifests are accepted.' }], scope: [], non_goals: [], routing_schema_version: 3, assurance_level: 'terra', assurance_assessment: assessment('terra'), review_context: { environment: 'local test workspace', scenarios: ['current protocol'], boundaries: 'declared workspace only' }, review_entry_stage: 'terra_single', nodes: [{ id: 'work', kind: 'implementation', ...work }, { id: 'review', kind: 'quality_review', depends_on: ['work'], ...review }], ...overrides,
+    task_id: 'feature', application_id: `test-app-${createHash('sha256').update(path.resolve(workspace)).digest('hex').slice(0, 12)}`, release_id: 'test-release', task_kind: 'workflow', coordinator_task_path: '/root', coordinator_thread_id: '01a0193d-6e8f-78a2-815a-19afa3358256', workspace, workspace_claims: [{ mode: 'write', prefix: '.' }], global_write_justification: 'The fixture intentionally validates a workspace-wide claim.', goal: 'Validate the v3-only workflow contract.', requirements: [{ id: 'R1', text: 'Only v3 manifests are accepted.' }], scope: [], non_goals: [], routing_schema_version: 3, assurance_level: 'terra', assurance_assessment: assessment('terra'), review_context: { environment: 'local test workspace', scenarios: ['current protocol'], boundaries: 'declared workspace only' }, review_entry_stage: 'terra_single', nodes: [{ id: 'work', kind: 'implementation', ...work }, { id: 'review', kind: 'quality_review', depends_on: ['work'], ...review }], ...overrides,
   };
 }
 
@@ -175,6 +176,35 @@ test('Luna read-only fallback is scoped to one claim and does not change later p
     await dispatch('complete', { task_id: 'luna-fallback-scope', node_id: 'luna-one', claim_id: fallback.claim_id, status: 'succeeded', result: { evidence: 'fallback attempt completed' }, completion_attestation: 'native_agent_finished', state_dir: stateDir });
 
     const [primary] = await dispatch('start', { task_id: 'luna-fallback-scope', node_id: 'luna-two', agent_task_path: '/root/luna-two', agent_role: 'avsp_luna_high', native_agent_started: true, state_dir: stateDir });
+    assert.equal(primary.node.agent_type, 'avsp_luna_high');
+    assert.equal(primary.node.agent_role, 'avsp_luna_high');
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test('Retry and rebind preserve the node primary route after a claim-scoped Luna fallback', async () => {
+  const { dispatch } = await import('../scripts/workflow_controller.mjs');
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-fallback-retry-primary-'));
+  const workspace = path.join(temp, 'workspace');
+  const stateDir = stateDirFor(workspace);
+  const manifestPath = path.join(temp, 'manifest.json');
+  const work = { id: 'work', kind: 'implementation', execution_risk: 'protected', routing_reason: 'Prepare the fallback retry fixture.', execution_owner: '/root/work', integration_owner: '/root', quality_guard: 'targeted fixture verification' };
+  const luna = { id: 'luna', kind: 'implementation', depends_on: ['work'], agent_type: 'avsp_luna_high', execution_risk: 'read_only', routing_reason: 'Independent read-only evidence lane.', execution_owner: '/root/luna', integration_owner: '/root', quality_guard: 'Record the evidence.' };
+  const review = { id: 'review', kind: 'quality_review', depends_on: ['luna'], execution_risk: 'read_only', routing_reason: 'Independent quality gate', execution_owner: '/root/reviewer', integration_owner: '/root', quality_guard: 'Review the evidence.' };
+  try {
+    await mkdir(workspace, { recursive: true });
+    await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace, { task_id: 'fallback-retry-primary', nodes: [work, luna, review] })));
+    await dispatch('init', { manifest: manifestPath });
+    const [workClaim] = await dispatch('start', { task_id: 'fallback-retry-primary', node_id: 'work', agent_task_path: '/root/work', agent_role: 'avsp_terra_high', native_agent_started: true, state_dir: stateDir });
+    await dispatch('complete', { task_id: 'fallback-retry-primary', node_id: 'work', claim_id: workClaim.claim_id, status: 'succeeded', result: { prepared: true }, completion_attestation: 'native_agent_finished', state_dir: stateDir });
+    const [fallback] = await dispatch('start', { task_id: 'fallback-retry-primary', node_id: 'luna', agent_task_path: '/root/luna', agent_role: 'avsp_terra_low_readonly', fallback_reason: 'Configured Luna primary is unavailable for this claim.', native_agent_started: true, state_dir: stateDir });
+    assert.equal(fallback.node.agent_type, 'avsp_luna_high');
+    await dispatch('complete', { task_id: 'fallback-retry-primary', node_id: 'luna', claim_id: fallback.claim_id, status: 'unavailable', result: { unavailable: true }, completion_attestation: 'native_agent_finished', state_dir: stateDir });
+    const [retried] = await dispatch('retry', { task_id: 'fallback-retry-primary', node_id: 'luna', reason: 'Retry the unavailable claim with its primary route.', replacement_agent_task_path: '/root/luna-retry', previous_agent_stopped: true, state_dir: stateDir });
+    assert.equal(retried.node.agent_type, 'avsp_luna_high');
+    assert.equal(retried.node.execution_owner, '/root/luna-retry');
+    const [primary] = await dispatch('start', { task_id: 'fallback-retry-primary', node_id: 'luna', agent_task_path: '/root/luna-retry', agent_role: 'avsp_luna_high', native_agent_started: true, state_dir: stateDir });
     assert.equal(primary.node.agent_type, 'avsp_luna_high');
     assert.equal(primary.node.agent_role, 'avsp_luna_high');
   } finally {
@@ -670,6 +700,8 @@ test('v3 abandons a Terra cohort lane after its reviewer stops', async () => {
     assert.equal(abandoned.node.review_gate.cohort.lanes.coverage.status, 'abandoned');
     const [status] = await dispatch('status', { task_id: 'feature', state_dir: stateDir });
     assert.deepEqual(status.stale_nodes, []);
+    const [overview] = await dispatch('workspace-overview', { workspace });
+    assert.deepEqual(overview.failed_tasks, [{ task_id: 'feature', node_id: 'review', reviewer_slot: 'coverage', status: 'abandoned', claim_id: review.claim_id, attempt: 1 }]);
   } finally {
     await rm(temp, { recursive: true, force: true });
   }
@@ -1083,6 +1115,79 @@ test('v3 startup prune advances past a full retained batch to a later eligible t
     } finally {
       inspected.close();
     }
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test('workflow init binds application/release metadata, gates release mains, and exposes a compact workspace overview', async () => {
+  const { ControllerError, dispatch } = await import('../scripts/workflow_controller.mjs');
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-release-admission-'));
+  const workspace = path.join(temp, 'workspace');
+  const otherWorkspace = path.join(temp, 'other-workspace');
+  const stateDir = stateDirFor(workspace);
+  const oldManifestPath = path.join(temp, 'old.json');
+  const releaseManifestPath = path.join(temp, 'release.json');
+  const otherManifestPath = path.join(temp, 'other.json');
+  const phantomManifestPath = path.join(temp, 'phantom.json');
+  try {
+    await mkdir(otherWorkspace, { recursive: true });
+    const applicationId = 'release-admission-app';
+    await writeFile(oldManifestPath, JSON.stringify(v3Manifest(workspace, { task_id: 'old-active', application_id: applicationId, release_id: 'old-release' })));
+    await dispatch('init', { manifest: oldManifestPath });
+
+    await writeFile(releaseManifestPath, JSON.stringify(v3Manifest(workspace, { task_id: 'release-main', application_id: applicationId, release_id: 'new-release', task_kind: 'release_main' })));
+    await assert.rejects(
+      () => dispatch('init', { manifest: releaseManifestPath }),
+      error => error instanceof ControllerError && /release_main cannot start while this workspace has active or failed task/.test(error.message),
+    );
+
+    await dispatch('release-workspace', { task_id: 'old-active', previous_agent_stopped: true, state_dir: stateDir });
+    const phantomApplicationId = 'failed-init-binding-must-not-stick';
+    await writeFile(phantomManifestPath, JSON.stringify(v3Manifest(workspace, { task_id: 'old-active', application_id: phantomApplicationId, release_id: 'phantom-release' })));
+    await assert.rejects(() => dispatch('init', { manifest: phantomManifestPath }), error => error instanceof ControllerError && /Task already exists/.test(error.message));
+    await writeFile(phantomManifestPath, JSON.stringify(v3Manifest(otherWorkspace, { task_id: 'phantom-other', application_id: phantomApplicationId, release_id: 'phantom-other-release' })));
+    const [phantomOther] = await dispatch('init', { manifest: phantomManifestPath });
+    assert.equal(phantomOther.task.task_id, 'phantom-other');
+    await writeFile(otherManifestPath, JSON.stringify(v3Manifest(otherWorkspace, { task_id: 'cross-path', application_id: applicationId, release_id: 'other-release' })));
+    await assert.rejects(
+      () => dispatch('init', { manifest: otherManifestPath }),
+      error => error instanceof ControllerError && /already bound to workspace/.test(error.message),
+    );
+    const [initialized] = await dispatch('init', { manifest: releaseManifestPath });
+    assert.equal(initialized.task.application_id, applicationId);
+    assert.equal(initialized.task.release_id, 'new-release');
+    assert.equal(initialized.task.task_kind, 'release_main');
+    const [started] = await dispatch('start', { task_id: 'release-main', node_id: 'work', agent_task_path: '/root/work', agent_role: 'avsp_terra_high', native_agent_started: true, state_dir: stateDir });
+    assert.ok(started.claim_id);
+
+    const [overview] = await dispatch('workspace-overview', { workspace });
+    assert.equal(overview.task_count, 2);
+    assert.equal(overview.current_executors[0].task_id, 'release-main');
+    assert.equal(overview.current_executors[0].node_id, 'work');
+    assert.ok(overview.lease_deadlines[0].lease_deadline_at);
+
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test('release_main admission still sees failed tasks after their workspace lease is released', async () => {
+  const { ControllerError, dispatch } = await import('../scripts/workflow_controller.mjs');
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-release-failed-admission-'));
+  const workspace = path.join(temp, 'workspace');
+  const stateDir = stateDirFor(workspace);
+  const applicationId = 'release-failed-admission-app';
+  try {
+    const manifest = v3Manifest(workspace, { task_id: 'failed-old', application_id: applicationId, release_id: 'old-release' });
+    await dispatch('init', { manifest });
+    const [started] = await dispatch('start', { task_id: 'failed-old', node_id: 'work', agent_task_path: '/root/work', agent_role: 'avsp_terra_high', native_agent_started: true, state_dir: stateDir });
+    await dispatch('complete', { task_id: 'failed-old', node_id: 'work', claim_id: started.claim_id, status: 'failed', result: { failed: true }, completion_attestation: 'native_agent_finished', state_dir: stateDir });
+    await dispatch('release-workspace', { task_id: 'failed-old', previous_agent_stopped: true, state_dir: stateDir });
+    await assert.rejects(
+      () => dispatch('init', { manifest: v3Manifest(workspace, { task_id: 'new-release', application_id: applicationId, release_id: 'new-release', task_kind: 'release_main' }) }),
+      error => error instanceof ControllerError && /release_main cannot start while this workspace has active or failed task/.test(error.message),
+    );
   } finally {
     await rm(temp, { recursive: true, force: true });
   }

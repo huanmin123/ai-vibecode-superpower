@@ -311,9 +311,29 @@ function requirePruneIndex(database) {
 
 function requireStoreMetadata(database, version, databasePath) {
   const meta = database.prepare("SELECT key, value FROM store_meta ORDER BY key").all();
-  if (meta.length !== 2 || meta[0]?.key !== 'schema_version' || meta[0]?.value !== String(version) || meta[1]?.key !== 'store_id' || !/^[a-f0-9]{32}$/.test(meta[1]?.value ?? '')) {
+  const schemaVersion = meta.find(row => row.key === 'schema_version');
+  const storeId = meta.find(row => row.key === 'store_id');
+  const unknown = meta.filter(row => row.key !== 'schema_version' && row.key !== 'store_id' && !/^application_binding:[a-f0-9]{64}$/.test(row.key ?? ''));
+  const bindingsValid = meta.filter(row => /^application_binding:[a-f0-9]{64}$/.test(row.key ?? ''))
+    .every(row => {
+      try {
+        const value = JSON.parse(row.value);
+        return value && typeof value === 'object' && !Array.isArray(value)
+          && typeof value.application_id === 'string' && value.application_id.trim()
+          && typeof value.workspace === 'string' && path.isAbsolute(value.workspace)
+          && typeof value.bound_at === 'string' && Number.isFinite(Date.parse(value.bound_at))
+          && applicationBindingKey(value.application_id) === row.key;
+      } catch {
+        return false;
+      }
+    });
+  if (!schemaVersion || schemaVersion.value !== String(version) || !storeId || !/^[a-f0-9]{32}$/.test(storeId.value ?? '') || unknown.length || !bindingsValid) {
     throw storeError(`Global workflow store metadata is invalid: ${databasePath}`);
   }
+}
+
+function applicationBindingKey(applicationId) {
+  return `application_binding:${createHash('sha256').update(applicationId).digest('hex')}`;
 }
 
 function schemaMarkers(database) {
@@ -706,6 +726,33 @@ export async function listGlobalTaskStatesForWorkspace(workspace) {
     return database.prepare("SELECT namespace_key, task_id, payload FROM task_state WHERE CASE WHEN json_valid(payload) THEN json_extract(payload, '$.workspace') END = ? ORDER BY namespace_key, task_id").all(workspace)
       .map(row => ({ namespace_key: row.namespace_key, task_id: row.task_id, state: parsePayload(row.payload, `Global task state ${row.namespace_key}/${row.task_id}`) }))
       .filter(entry => entry.state?.workspace === workspace);
+  });
+}
+
+// Application identifiers are durable global bindings. The binding lives in
+// store_meta rather than task_state so pruning a closed task cannot release it.
+export async function bindGlobalApplication(applicationId, workspace) {
+  if (typeof applicationId !== 'string' || !applicationId.trim()) throw storeError('application_id must be a non-empty string');
+  if (typeof workspace !== 'string' || !workspace.trim() || !path.isAbsolute(workspace)) throw storeError('workspace must be an absolute path');
+  const value = applicationId.trim();
+  const canonicalWorkspace = path.resolve(workspace).normalize('NFC');
+  const key = applicationBindingKey(value);
+  return withWriter(database => {
+    const row = database.prepare('SELECT value FROM store_meta WHERE key = ?').get(key);
+    if (row) {
+      let binding;
+      try { binding = JSON.parse(row.value); } catch (cause) { throw storeError(`Application binding metadata is invalid: ${key}`, cause); }
+      if (binding?.application_id !== value || typeof binding.workspace !== 'string' || !path.isAbsolute(binding.workspace)) {
+        throw storeError(`Application binding metadata is invalid: ${key}`);
+      }
+      if (pathKey(binding.workspace) !== pathKey(canonicalWorkspace)) {
+        throw storeError(`APPLICATION_WORKSPACE_BOUND: application_id ${value} is already bound to workspace ${binding.workspace}`);
+      }
+      return binding;
+    }
+    const binding = { application_id: value, workspace: canonicalWorkspace, bound_at: new Date().toISOString() };
+    database.prepare('INSERT INTO store_meta (key, value) VALUES (?, ?)').run(key, JSON.stringify(binding));
+    return binding;
   });
 }
 
