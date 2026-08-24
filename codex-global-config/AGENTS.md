@@ -36,3 +36,12 @@
 5. **截图须经用户明确允许**：开发、测试、调试和验证期间不得主动截取屏幕、浏览器或应用界面；仅在用户明确允许截图时执行。
 6. **复杂开发使用 `$orchestrate-model-workflow`**：复杂开发、跨文件实现或修复、架构设计、漏洞或 Bug 诊断、按方案实施、复审和验收应使用该 skill，由其路由取证、实施、复审和验收；简单问答、纯只读查询和单文件低风险整理不触发；交付时说明实际改动、验证证据与未解决问题。
 7. **未经授权不得改变工作边界**：严禁私自创建或切换到新的 Git 分支、工作树（`git worktree`）或其他工作目录；此类操作容易造成代码遗漏、忘记合并或提交后丢失。只有用户明确授权或主动要求时才可执行；否则必须在当前工作区的当前分支完成工作，不得隐式复制、迁移或分散代码。
+
+## 工具调用契约
+
+- `functions.wait` 只能复用当前活动 `functions.exec` 返回的真实 `cell_id`；不得填入 agent、task 或自行猜测的标识。
+- 异步 agent 使用 `collaboration.wait_agent` 被动等待；持久化 workflow 使用 `workflow_wait`，并原样复用 `workflow_status` 或上一次 `workflow_wait` 返回的 `cursor`。不得用固定短间隔轮询替代这些等待入口。
+- `collaboration.send_message` 的 `target` 和 `message` 必须都是非空字符串；字段缺失或为空必须保留原始失败，不得假装投递成功。
+- `request_user_input` 仅由 main/root 调用；子 agent 不得直接向用户发起输入请求，应把缺失选择返回给协调者。
+- `functions.exec` 内嵌工具的 payload 必须按目标工具 schema 传入 object；不得把 object 展平为参数、传入路径代替对象或静默改变字段名。工具失败时保留原始错误、已尝试操作和缺失条件，不得静默重试、吞错或报告成功。
+- fallback 证据使用结构化 `fallback_error`；Luna provider 原始 `model` 只接受 `gpt-5.6-luna`，`fallback_reason` 仅是操作摘要，不得改写或注入 provider error。

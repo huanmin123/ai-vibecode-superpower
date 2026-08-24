@@ -149,8 +149,8 @@ test('PowerShell installer preserves marketplace and plugin state after plugin a
       await run(powershell, ['-NoLogo', '-NoProfile', '-Command', '& { function Get-CimInstance { @() }; & $args[0] }', '--', powerShellInstaller], { env: environment });
     } catch (error) {
       const state = await readFile(statePath, 'utf8').catch(() => 'state file was not created');
-      const descriptor = await readFile(path.join(codexHome, 'plugins', 'cache', marketplace, plugin, '0.2.1+codex.20260820095530', '.mcp.json'), 'utf8').catch(() => 'descriptor was not created');
-      const cache = path.join(codexHome, 'plugins', 'cache', marketplace, plugin, '0.2.1+codex.20260820095530');
+      const descriptor = await readFile(path.join(codexHome, 'plugins', 'cache', marketplace, plugin, '0.2.2+codex.20260824000100', '.mcp.json'), 'utf8').catch(() => 'descriptor was not created');
+      const cache = path.join(codexHome, 'plugins', 'cache', marketplace, plugin, '0.2.2+codex.20260824000100');
       const diagnostic = String.raw`param([string]$source,[string]$cache,[string]$homePath)
         $homePath = ((Get-Content -LiteralPath (Join-Path $cache '.mcp.json') -Raw | ConvertFrom-Json).mcpServers.'workflow-controller'.env.CODEX_HOME)
         function H([string]$root,[bool]$expand) { $r=@{}; $a=[IO.Path]::GetFullPath($root).TrimEnd([IO.Path]::DirectorySeparatorChar,[IO.Path]::AltDirectorySeparatorChar); foreach($f in Get-ChildItem -LiteralPath $a -Recurse -File -Force) { $rel=$f.FullName.Substring($a.Length).TrimStart([IO.Path]::DirectorySeparatorChar,[IO.Path]::AltDirectorySeparatorChar).Replace('\','/'); if($expand -and $rel -eq '.mcp.json') { $c=[IO.File]::ReadAllText($f.FullName).Replace('<CODEX_HOME>',$homePath.Replace('\','/')); $s=[Security.Cryptography.SHA256]::Create(); try {$r[$rel]= (($s.ComputeHash([Text.UTF8Encoding]::new($false).GetBytes($c))|% {$_.ToString('x2')}) -join '')} finally {$s.Dispose()} } else {$r[$rel]=(Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash.ToLowerInvariant()} }; return $r }

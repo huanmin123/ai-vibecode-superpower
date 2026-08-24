@@ -204,6 +204,7 @@ test('MCP startup silently prunes only expired fully closed tasks across namespa
     server = startMcp();
     const initialized = await server.request({ method: 'initialize', params: {} });
     assert.equal(initialized.result.serverInfo.name, 'agnets-workflow');
+    assert.equal(initialized.result.serverInfo.version, '0.2.2');
     const toolList = await server.request({ method: 'tools/list', params: {} });
     assert.equal(toolList.result.tools.some(tool => tool.name === 'workflow_prune_expired'), false);
     await waitUntil(async () => !(await globalTaskStateExists(eligible.logicalPath)));
@@ -267,7 +268,7 @@ test('MCP serves v3 workflow state over stdio and releases a cancelled wait', as
     const inline = await server.request({ method: 'tools/call', params: { name: 'workflow_init', arguments: { manifest: JSON.stringify(v3McpManifest(workspace)) } } });
     const inlineResult = resultObject(inline);
     assert.equal(inlineResult.task.task_id, 'mcp-task');
-    assert.equal(inlineResult.task.execution_routing_policy_version, 2);
+    assert.equal(inlineResult.task.execution_routing_policy_version, 3);
     assert.equal(inlineResult.database_path, inlineResult.state_path);
     assert.deepEqual(inlineResult.task_key, { namespace: await canonicalStateNamespace(stateDir), task_id: 'mcp-task' });
     assert.equal(inlineResult.database_path, path.join(isolatedCodexHome, 'state', 'agnets-workflow', 'current', 'workflow.sqlite'));
@@ -532,6 +533,43 @@ test('MCP exposes workspace overview and wait defaults to event summary with exp
     assert.ok(overview.workspace.endsWith(`${path.sep}workspace`));
     assert.equal(overview.task_count, 1);
     assert.equal(overview.current_executors[0].node_id, 'total-review');
+  } finally {
+    await closeMcp(server.child);
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test('MCP workspace overview preserves unsupported legacy task diagnostics', async () => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-mcp-overview-unsupported-'));
+  const workspace = path.join(temp, 'workspace');
+  const stateDir = stateDirFor(workspace);
+  const server = startMcp();
+  try {
+    await mkdir(workspace, { recursive: true });
+    const legacy = resultObject(await server.request({ method: 'tools/call', params: { name: 'workflow_init', arguments: { manifest: v3McpManifest(workspace, 'legacy-overview') } } }));
+    await server.request({ method: 'tools/call', params: { name: 'workflow_release_workspace', arguments: { task_id: 'legacy-overview', previous_agent_stopped: true, state_dir: stateDir } } });
+    const { readGlobalTaskState, writeGlobalTaskState } = await import('../scripts/global_workflow_store.mjs');
+    const legacyPath = path.join(legacy.task_key.namespace, 'legacy-overview.sqlite');
+    const legacyState = await readGlobalTaskState(legacyPath);
+    delete legacyState.application_id;
+    await writeGlobalTaskState(legacyPath, legacyState);
+    await server.request({ method: 'tools/call', params: { name: 'workflow_init', arguments: { manifest: v3McpManifest(workspace, 'current-overview') } } });
+
+    const overview = resultObject(await server.request({ method: 'tools/call', params: { name: 'workflow_workspace_overview', arguments: { workspace } } }));
+    assert.equal(overview.task_count, 1);
+    assert.equal(overview.tasks[0].task_id, 'current-overview');
+    assert.equal(overview.unsupported_tasks.length, 1);
+    assert.equal(overview.unsupported_tasks[0].task_id, 'legacy-overview');
+    assert.equal(overview.unsupported_tasks[0].namespace.toLowerCase(), legacy.task_key.namespace.toLowerCase());
+    assert.deepEqual({
+      error_code: overview.unsupported_tasks[0].error_code,
+      field_errors: overview.unsupported_tasks[0].field_errors,
+      recovery: overview.unsupported_tasks[0].recovery,
+    }, {
+      error_code: 'UNSUPPORTED_WORKFLOW_STATE',
+      field_errors: [{ path: 'application_id', code: 'unsupported_state', expected: 'present', actual: 'missing', message: 'Task state is missing required current field: application_id' }],
+      recovery: { action: 'start_new_workflow' },
+    });
   } finally {
     await closeMcp(server.child);
     await rm(temp, { recursive: true, force: true });
