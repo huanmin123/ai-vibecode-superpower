@@ -27,6 +27,7 @@ import {
   withGlobalWorkspaceControlTransaction as withWorkspaceControlTransaction,
   writeGlobalTaskState as writeTaskState,
 } from './global_workflow_store.mjs';
+import { validateFallbackEvidence } from './workflow_error.mjs';
 
 export const VERSION = 1;
 const REVIEW_PROTOCOL_VERSION = 3;
@@ -69,7 +70,10 @@ const READ_ONLY_FALLBACK_ROLES = new Map([
 ]);
 const READ_ONLY_FALLBACK_ROLE_SET = new Set([...READ_ONLY_FALLBACK_ROLES.values(), FALLBACK_ROLE]);
 const PROTECTED_EXECUTOR_ROLE = 'avsp_terra_high';
-const CURRENT_EXECUTION_ROUTING_POLICY_VERSION = 2;
+// application_id, release_id, task_kind, and release_main became persisted
+// compatibility fields in policy v3.  Reject v2 task state rather than
+// inferring or migrating those fields from a historical workflow.
+const CURRENT_EXECUTION_ROUTING_POLICY_VERSION = 3;
 const ROUTING_FIELDS = ['execution_risk', 'routing_reason', 'execution_owner', 'integration_owner', 'quality_guard'];
 const GLOBAL_WORKSPACE_CONTROL_FILENAME = 'workflow.sqlite';
 const MAX_MANIFEST_BYTES = 1 * 1024 * 1024;
@@ -2088,7 +2092,23 @@ function workspaceOverviewTask(state) {
 async function workspaceOverview(parameters) {
   const workspace = await canonicalWorkspace(parameters.workspace);
   const states = await listGlobalTaskStatesForWorkspace(workspace);
-  const tasks = states.map(entry => workspaceOverviewTask(normalizeState(entry.state)));
+  const tasks = [];
+  const unsupportedTasks = [];
+  for (const entry of states) {
+    try {
+      tasks.push(workspaceOverviewTask(normalizeState(entry.state)));
+    } catch (error) {
+      const controllerError = asControllerError(error);
+      if (controllerError.code !== 'UNSUPPORTED_WORKFLOW_STATE') throw error;
+      unsupportedTasks.push({
+        task_id: entry.task_id,
+        namespace: entry.namespace_key,
+        error_code: controllerError.code,
+        field_errors: controllerError.field_errors,
+        recovery: controllerError.recovery,
+      });
+    }
+  }
   return {
     workspace,
     task_count: tasks.length,
@@ -2097,6 +2117,7 @@ async function workspaceOverview(parameters) {
     failed_tasks: tasks.flatMap(task => task.failed_tasks),
     lease_deadlines: tasks.flatMap(task => task.lease_deadlines),
     tasks: tasks.map(task => ({ task_id: task.task_id, application_id: task.application_id, release_id: task.release_id, task_kind: task.task_kind, lease_status: task.lease_status })),
+    unsupported_tasks: unsupportedTasks,
   };
 }
 
@@ -2707,12 +2728,21 @@ async function claimNode(parameters, activateImmediately = false) {
     const solFallback = SOL_ROLES.has(node.agent_type) && role === FALLBACK_ROLE && node.rescue_role === null && (node.kind === 'total_review' || node.execution_risk === 'read_only');
     const fallbackRole = lunaFallback || solFallback;
     const fallbackReason = optionalString(parameters.fallback_reason, 'fallback_reason');
+    let fallbackError = null;
     if (node.kind === 'total_review' && !SOL_ROLES.has(role) && role !== FALLBACK_ROLE) throw new ControllerError('A total_review node requires a Sol role or the configured Terra fallback');
     if (node.kind === 'total_review' && role === FALLBACK_ROLE && !solFallback) throw new ControllerError('The total-review Terra role is fallback-only for a configured Sol reviewer');
     if (reviewNode && node.kind === QUALITY_REVIEW_KIND && role !== TERRA_REVIEW_ROLE) throw new ControllerError('A quality_review node requires avsp_terra_xhigh');
     if (node.kind !== 'total_review' && READ_ONLY_FALLBACK_ROLE_SET.has(role) && !fallbackRole) throw new ControllerError('The Terra read-only role is fallback-only for its configured Luna or Sol reviewer');
     if (expectedAgentType && expectedAgentType !== role && !fallbackRole) throw new ControllerError(`Node agent_type must match claimed role: ${expectedAgentType}`);
     if (fallbackRole && !fallbackReason) throw new ControllerError('Terra fallback requires fallback_reason');
+    if (parameters.fallback_error !== undefined && parameters.fallback_error !== null) {
+      if (!fallbackRole) throw invalidArgument('fallback_error is only valid for a fallback claim', 'fallback_error', 'fallback claim');
+      try {
+        fallbackError = validateFallbackEvidence({ fallbackReason, fallbackError: parameters.fallback_error, fallbackModel: lunaFallback ? 'gpt-5.6-luna' : null });
+      } catch (error) {
+        throw invalidArgument(error.message, 'fallback_error', 'structured provider error with code/provider/model/upstream_status/request_id/message');
+      }
+    }
     // Total reviews are read-only guards, not protected execution work.
     if (node.execution_risk === 'protected' && node.kind !== 'total_review' && role !== PROTECTED_EXECUTOR_ROLE) throw new ControllerError('Only avsp_terra_high can claim protected work');
     if (node.execution_risk === 'read_only' && node.kind !== 'total_review' && !READ_ONLY_ROLES.has(role)) throw new ControllerError('A read_only node requires a configured read-only role');
@@ -2740,8 +2770,8 @@ async function claimNode(parameters, activateImmediately = false) {
     }
     if (isMaxClosureNode(state, node)) state.max_review_charter.active_closure_claim_id = node.claim_id;
     const activeClaim = cohortLane ?? node;
-    state.participants.push({ agent_task_path: taskPath, agent_thread_id: threadId, agent_role: role, node_id: nodeId, claim_id: activeClaim.claim_id, attempt: activeClaim.attempt, reviewer_slot: cohortLane?.slot ?? null, fallback_reason: fallbackReason });
-    addEvent(state, 'node_claimed', { node_id: nodeId, agent_task_path: taskPath, agent_thread_id: threadId, agent_role: role, claim_id: activeClaim.claim_id, reviewer_slot: cohortLane?.slot ?? null, attempt: activeClaim.attempt, fallback_reason: fallbackReason });
+    state.participants.push({ agent_task_path: taskPath, agent_thread_id: threadId, agent_role: role, node_id: nodeId, claim_id: activeClaim.claim_id, attempt: activeClaim.attempt, reviewer_slot: cohortLane?.slot ?? null, fallback_reason: fallbackReason, fallback_error: fallbackError });
+    addEvent(state, 'node_claimed', { node_id: nodeId, agent_task_path: taskPath, agent_thread_id: threadId, agent_role: role, claim_id: activeClaim.claim_id, reviewer_slot: cohortLane?.slot ?? null, attempt: activeClaim.attempt, fallback_reason: fallbackReason, fallback_error: fallbackError });
     if (activateImmediately) addEvent(state, 'node_started', { node_id: nodeId, agent_task_path: taskPath, agent_thread_id: threadId, agent_role: role, claim_id: activeClaim.claim_id, reviewer_slot: cohortLane?.slot ?? null, native_agent_started: true });
     await writeState(filePath, state);
     return { task_id: state.task_id, execution_routing_policy_version: state.execution_routing_policy_version, node, reviewer_slot: cohortLane?.slot ?? null, claim_id: activeClaim.claim_id };

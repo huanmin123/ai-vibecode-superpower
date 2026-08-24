@@ -8,6 +8,11 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
+// Keep the new fixture tests in the repository's default npm test enumeration
+// without changing package.json (the plugin manifest intentionally stays stable).
+await import('./session_meta_aggregate.test.mjs');
+await import('./workflow_error.test.mjs');
+
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const previousCodexHome = process.env.CODEX_HOME;
 const isolatedCodexHome = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-controller-codex-home-'));
@@ -40,6 +45,18 @@ function v3Manifest(workspace, overrides = {}) {
   };
 }
 
+test('global and workflow guidance state the required tool invocation contracts', async () => {
+  const globalAgents = await readFile(path.resolve(root, '..', '..', 'codex-global-config', 'AGENTS.md'), 'utf8');
+  const orchestrateSkill = await readFile(path.join(root, 'skills', 'orchestrate-model-workflow', 'SKILL.md'), 'utf8');
+  const controllerSkill = await readFile(path.join(root, 'skills', 'workflow-controller', 'SKILL.md'), 'utf8');
+  const guidance = `${globalAgents}\n${orchestrateSkill}\n${controllerSkill}`;
+  for (const contract of [
+    '`functions.wait`', '`cell_id`', '`collaboration.wait_agent`', '`workflow_wait`', '`cursor`',
+    '`collaboration.send_message`', '`target`', '`message`', '`request_user_input`', 'main/root',
+    '`functions.exec`', 'payload', '不得静默重试', '`fallback_error`', 'gpt-5.6-luna', '`fallback_reason`',
+  ]) assert.ok(guidance.includes(contract), `missing tool contract text: ${contract}`);
+});
+
 test('controller accepts only the current v3 manifest and SQLite state path', async () => {
   const source = await readFile(controller, 'utf8');
   assert.match(source, /routing_schema_version must be 3/);
@@ -48,6 +65,29 @@ test('controller accepts only the current v3 manifest and SQLite state path', as
   assert.doesNotMatch(source, new RegExp(['avsp', 'luna', 'high', 'writer'].join('_')));
   assert.doesNotMatch(source, /record-verification/);
   assert.match(source, /const initialState = normalizeState\(await loadState\(filePath\)\)/);
+});
+
+test('policy v3 establishes the persisted application and release metadata contract', async () => {
+  const packageJson = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));
+  const pluginManifest = JSON.parse(await readFile(path.join(root, '.codex-plugin', 'plugin.json'), 'utf8'));
+  const mcpSource = await readFile(path.join(root, 'scripts', 'workflow_controller_mcp.mjs'), 'utf8');
+  assert.equal(packageJson.version, '0.2.2');
+  assert.equal(pluginManifest.version, '0.2.2+codex.20260824000100');
+  assert.match(mcpSource, /serverInfo: \{ name: 'agnets-workflow', version: '0\.2\.2' \}/);
+  const { dispatch } = await import('../scripts/workflow_controller.mjs');
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-policy-v3-'));
+  const workspace = path.join(temp, 'workspace');
+  try {
+    await mkdir(workspace, { recursive: true });
+    const [initialized] = await dispatch('init', { manifest: v3Manifest(workspace, { task_id: 'policy-v3-current' }) });
+    assert.equal(initialized.task.execution_routing_policy_version, 3);
+    assert.equal(initialized.task.application_id, v3Manifest(workspace).application_id);
+    assert.equal(initialized.task.release_id, 'test-release');
+    assert.equal(initialized.task.task_kind, 'workflow');
+    assert.equal(initialized.task.release_main, false);
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
 });
 
 test('v3 requires an explicit justification for a workspace-wide write claim', async () => {
@@ -212,7 +252,36 @@ test('Retry and rebind preserve the node primary route after a claim-scoped Luna
   }
 });
 
-test('old workflow state is rejected without automatic migration', async () => {
+test('Luna fallback rejects a wrong structured provider model and persists accepted evidence', async () => {
+  const { ControllerError, dispatch } = await import('../scripts/workflow_controller.mjs');
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-fallback-error-'));
+  const workspace = path.join(temp, 'workspace');
+  const stateDir = stateDirFor(workspace);
+  const manifestPath = path.join(temp, 'manifest.json');
+  const work = { id: 'work', kind: 'implementation', execution_risk: 'protected', routing_reason: 'Prepare fallback evidence.', execution_owner: '/root/work', integration_owner: '/root', quality_guard: 'targeted verification' };
+  const luna = { id: 'luna', kind: 'implementation', depends_on: ['work'], agent_type: 'avsp_luna_high', execution_risk: 'read_only', routing_reason: 'Read-only fallback evidence.', execution_owner: '/root/luna', integration_owner: '/root', quality_guard: 'Record evidence.' };
+  const review = { id: 'review', kind: 'quality_review', depends_on: ['luna'], execution_risk: 'read_only', routing_reason: 'Independent quality gate', execution_owner: '/root/reviewer', integration_owner: '/root', quality_guard: 'Review evidence.' };
+  const providerError = { code: 'UPSTREAM_TIMEOUT', provider: 'hu', model: 'gpt-5.6-luna', upstream_status: '504', request_id: 'req-1', message: 'timeout', vendor_field: 'keep' };
+  try {
+    await mkdir(workspace, { recursive: true });
+    await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace, { task_id: 'fallback-error', nodes: [work, luna, review] })));
+    await dispatch('init', { manifest: manifestPath });
+    const [workClaim] = await dispatch('start', { task_id: 'fallback-error', node_id: 'work', agent_task_path: '/root/work', agent_role: 'avsp_terra_high', native_agent_started: true, state_dir: stateDir });
+    await dispatch('complete', { task_id: 'fallback-error', node_id: 'work', claim_id: workClaim.claim_id, status: 'succeeded', result: { prepared: true }, completion_attestation: 'native_agent_finished', state_dir: stateDir });
+    await assert.rejects(
+      () => dispatch('start', { task_id: 'fallback-error', node_id: 'luna', agent_task_path: '/root/luna', agent_role: 'avsp_terra_low_readonly', fallback_reason: 'primary unavailable', fallback_error: { ...providerError, model: 'gpt-5.6-terra' }, native_agent_started: true, state_dir: stateDir }),
+      error => error instanceof ControllerError && error.code === 'INVALID_ARGUMENT' && /model must be gpt-5.6-luna/.test(error.message),
+    );
+    const [fallback] = await dispatch('start', { task_id: 'fallback-error', node_id: 'luna', agent_task_path: '/root/luna', agent_role: 'avsp_terra_low_readonly', fallback_reason: 'primary unavailable', fallback_error: providerError, native_agent_started: true, state_dir: stateDir });
+    const [status] = await dispatch('status', { task_id: 'fallback-error', state_dir: stateDir, detail: 'full' });
+    const participant = status.participants.find(item => item.claim_id === fallback.claim_id);
+    assert.equal(participant.fallback_error.request_id, 'req-1');
+    assert.equal(participant.fallback_error.vendor_field, 'keep');
+    assert.equal(status.events.find(event => event.type === 'node_claimed' && event.claim_id === fallback.claim_id).fallback_error.message, 'timeout');
+  } finally { await rm(temp, { recursive: true, force: true }); }
+});
+
+test('policy v2 and missing-policy workflow state are rejected without automatic migration', async () => {
   const { ControllerError, dispatch } = await import('../scripts/workflow_controller.mjs');
   const { readGlobalTaskState, writeGlobalTaskState } = await import('../scripts/global_workflow_store.mjs');
   const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-unsupported-routing-policy-'));
@@ -225,7 +294,7 @@ test('old workflow state is rejected without automatic migration', async () => {
     const [initialized] = await dispatch('init', { manifest: manifestPath });
     const logicalPath = path.join(initialized.task_key.namespace, `${initialized.task_key.task_id}.sqlite`);
     const oldState = await readGlobalTaskState(logicalPath);
-    delete oldState.execution_routing_policy_version;
+    oldState.execution_routing_policy_version = 2;
     await writeGlobalTaskState(logicalPath, oldState);
     await assert.rejects(
       () => dispatch('status', { task_id: 'unsupported-routing-policy', state_dir: stateDir }),
@@ -235,7 +304,18 @@ test('old workflow state is rejected without automatic migration', async () => {
         && error.recovery?.action === 'start_new_workflow',
     );
     const retained = await readGlobalTaskState(logicalPath);
-    assert.equal(Object.hasOwn(retained, 'execution_routing_policy_version'), false);
+    assert.equal(retained.execution_routing_policy_version, 2);
+    delete retained.execution_routing_policy_version;
+    await writeGlobalTaskState(logicalPath, retained);
+    await assert.rejects(
+      () => dispatch('status', { task_id: 'unsupported-routing-policy', state_dir: stateDir }),
+      error => error instanceof ControllerError
+        && error.code === 'UNSUPPORTED_WORKFLOW_STATE'
+        && error.field_errors[0]?.path === 'execution_routing_policy_version'
+        && error.recovery?.action === 'start_new_workflow',
+    );
+    const missingRetained = await readGlobalTaskState(logicalPath);
+    assert.equal(Object.hasOwn(missingRetained, 'execution_routing_policy_version'), false);
   } finally {
     await rm(temp, { recursive: true, force: true });
   }
@@ -1167,6 +1247,67 @@ test('workflow init binds application/release metadata, gates release mains, and
     assert.equal(overview.current_executors[0].node_id, 'work');
     assert.ok(overview.lease_deadlines[0].lease_deadline_at);
 
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test('workspace overview isolates unsupported legacy task state while retaining current v3 tasks', async () => {
+  const { ControllerError, dispatch } = await import('../scripts/workflow_controller.mjs');
+  const { readGlobalTaskState, writeGlobalTaskState } = await import('../scripts/global_workflow_store.mjs');
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-overview-unsupported-'));
+  const workspace = path.join(temp, 'workspace');
+  const stateDir = stateDirFor(workspace);
+  const legacyManifestPath = path.join(temp, 'legacy.json');
+  const currentManifestPath = path.join(temp, 'current.json');
+  try {
+    await mkdir(workspace, { recursive: true });
+    await writeFile(legacyManifestPath, JSON.stringify(v3Manifest(workspace, { task_id: 'legacy-malformed', release_id: 'legacy-release' })));
+    const [legacy] = await dispatch('init', { manifest: legacyManifestPath });
+    await dispatch('release-workspace', { task_id: 'legacy-malformed', previous_agent_stopped: true, state_dir: stateDir });
+
+    const legacyPath = path.join(legacy.task_key.namespace, `${legacy.task_key.task_id}.sqlite`);
+    const legacyState = await readGlobalTaskState(legacyPath);
+    delete legacyState.application_id;
+    await writeGlobalTaskState(legacyPath, legacyState);
+
+    await writeFile(currentManifestPath, JSON.stringify(v3Manifest(workspace, { task_id: 'current-v3', release_id: 'current-release' })));
+    await dispatch('init', { manifest: currentManifestPath });
+    const [started] = await dispatch('start', { task_id: 'current-v3', node_id: 'work', agent_task_path: '/root/work', agent_role: 'avsp_terra_high', native_agent_started: true, state_dir: stateDir });
+
+    const [overview] = await dispatch('workspace-overview', { workspace });
+    assert.equal(overview.task_count, 1);
+    assert.deepEqual(overview.tasks, [{ task_id: 'current-v3', application_id: legacyState.application_id ?? v3Manifest(workspace).application_id, release_id: 'current-release', task_kind: 'workflow', lease_status: 'active' }]);
+    assert.deepEqual(overview.unsupported_tasks, [{
+      task_id: 'legacy-malformed',
+      namespace: legacy.task_key.namespace.toLowerCase(),
+      error_code: 'UNSUPPORTED_WORKFLOW_STATE',
+      field_errors: [{ path: 'application_id', code: 'unsupported_state', expected: 'present', actual: 'missing', message: 'Task state is missing required current field: application_id' }],
+      recovery: { action: 'start_new_workflow' },
+    }]);
+    assert.equal(overview.current_executors[0].task_id, 'current-v3');
+
+    await assert.rejects(
+      () => dispatch('status', { task_id: 'legacy-malformed', state_dir: stateDir }),
+      error => error instanceof ControllerError
+        && error.code === 'UNSUPPORTED_WORKFLOW_STATE'
+        && error.field_errors[0]?.path === 'application_id'
+        && error.recovery?.action === 'start_new_workflow',
+    );
+    const retained = await readGlobalTaskState(legacyPath);
+    assert.equal(Object.hasOwn(retained, 'application_id'), false);
+    assert.ok(started.claim_id);
+
+    const currentPath = path.join(legacy.task_key.namespace, 'current-v3.sqlite');
+    const currentState = await readGlobalTaskState(currentPath);
+    currentState.routing_schema_version = 2;
+    await writeGlobalTaskState(currentPath, currentState);
+    await assert.rejects(
+      () => dispatch('workspace-overview', { workspace }),
+      error => error instanceof ControllerError
+        && error.code === 'WORKFLOW_ERROR'
+        && /routing_schema_version=3/.test(error.message),
+    );
   } finally {
     await rm(temp, { recursive: true, force: true });
   }
