@@ -172,6 +172,119 @@ test('lineage admission blocks terminated tasks and enforces task and attempt bu
   }
 });
 
+test('lineage admission keeps ledger protections after state loss and rejects uncertain or conflicting lineage policy', async () => {
+  const { ControllerError, dispatch } = await import('../scripts/workflow_controller.mjs');
+  const { deleteGlobalTaskState, globalWorkflowStorePath, readGlobalTaskState, writeGlobalTaskState } = await import('../scripts/global_workflow_store.mjs');
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-lineage-hardening-'));
+  try {
+    const budgetWorkspace = path.join(temp, 'budget-workspace');
+    await mkdir(budgetWorkspace, { recursive: true });
+    const firstPath = path.join(temp, 'budget-first.json');
+    await writeFile(firstPath, JSON.stringify(v3Manifest(budgetWorkspace, { task_id: 'budget-first', lineage_budget: { max_tasks: 1 } })));
+    const [first] = await dispatch('init', { manifest: firstPath });
+    await dispatch('release-workspace', { task_id: 'budget-first', previous_agent_stopped: true, state_dir: stateDirFor(budgetWorkspace) });
+    await deleteGlobalTaskState(path.join(first.task_key.namespace, 'budget-first.sqlite'));
+    const secondPath = path.join(temp, 'budget-second.json');
+    await writeFile(secondPath, JSON.stringify(v3Manifest(budgetWorkspace, { task_id: 'budget-second', lineage_budget: { max_tasks: 1 } })));
+    await assert.rejects(() => dispatch('init', { manifest: secondPath }), error => error instanceof ControllerError && /max_tasks budget exhausted/.test(error.message));
+
+    const policyWorkspace = path.join(temp, 'policy-workspace');
+    await mkdir(policyWorkspace, { recursive: true });
+    const policyFirstPath = path.join(temp, 'policy-first.json');
+    await writeFile(policyFirstPath, JSON.stringify(v3Manifest(policyWorkspace, { task_id: 'policy-first', lineage_budget: { max_tasks: 2 } })));
+    await dispatch('init', { manifest: policyFirstPath });
+    const policySecondPath = path.join(temp, 'policy-second.json');
+    await writeFile(policySecondPath, JSON.stringify(v3Manifest(policyWorkspace, { task_id: 'policy-second' })));
+    await assert.rejects(() => dispatch('init', { manifest: policySecondPath }), error => error instanceof ControllerError && /lineage_budget conflicts/.test(error.message));
+
+    const corruptWorkspace = path.join(temp, 'corrupt-workspace');
+    await mkdir(corruptWorkspace, { recursive: true });
+    const corruptFirstPath = path.join(temp, 'corrupt-first.json');
+    await writeFile(corruptFirstPath, JSON.stringify(v3Manifest(corruptWorkspace, { task_id: 'corrupt-first' })));
+    const [corruptFirst] = await dispatch('init', { manifest: corruptFirstPath });
+    await dispatch('release-workspace', { task_id: 'corrupt-first', previous_agent_stopped: true, state_dir: stateDirFor(corruptWorkspace) });
+    const corruptStatePath = path.join(corruptFirst.task_key.namespace, 'corrupt-first.sqlite');
+    const corruptState = await readGlobalTaskState(corruptStatePath);
+    delete corruptState.application_id;
+    await writeGlobalTaskState(corruptStatePath, corruptState);
+    const corruptSecondPath = path.join(temp, 'corrupt-second.json');
+    await writeFile(corruptSecondPath, JSON.stringify(v3Manifest(corruptWorkspace, { task_id: 'corrupt-second' })));
+    await assert.rejects(() => dispatch('init', { manifest: corruptSecondPath }), error => error instanceof ControllerError && /Cannot establish lineage admission/.test(error.message));
+
+    const attemptsWorkspace = path.join(temp, 'attempts-workspace');
+    await mkdir(attemptsWorkspace, { recursive: true });
+    const attemptsFirstPath = path.join(temp, 'attempts-first.json');
+    await writeFile(attemptsFirstPath, JSON.stringify(v3Manifest(attemptsWorkspace, { task_id: 'attempts-first', lineage_budget: { max_attempts: 2 } })));
+    const [attemptsFirst] = await dispatch('init', { manifest: attemptsFirstPath });
+    const attemptsStateDir = stateDirFor(attemptsWorkspace);
+    const [attempt] = await dispatch('start', { task_id: 'attempts-first', node_id: 'work', agent_task_path: '/root/work', agent_role: 'avsp_terra_high', native_agent_started: true, state_dir: attemptsStateDir });
+    await dispatch('abandon', { task_id: 'attempts-first', node_id: 'work', claim_id: attempt.claim_id, reason: 'test attempt consumption', previous_agent_stopped: true, state_dir: attemptsStateDir });
+    await dispatch('release-workspace', { task_id: 'attempts-first', previous_agent_stopped: true, state_dir: attemptsStateDir });
+    await deleteGlobalTaskState(path.join(attemptsFirst.task_key.namespace, 'attempts-first.sqlite'));
+    const attemptsSecondPath = path.join(temp, 'attempts-second.json');
+    await writeFile(attemptsSecondPath, JSON.stringify(v3Manifest(attemptsWorkspace, { task_id: 'attempts-second', lineage_budget: { max_attempts: 2 } })));
+    await assert.rejects(() => dispatch('init', { manifest: attemptsSecondPath }), error => error instanceof ControllerError && /max_attempts budget exhausted/.test(error.message));
+
+    const scopeWorkspace = path.join(temp, 'scope-workspace');
+    await mkdir(scopeWorkspace, { recursive: true });
+    const scopeFirstPath = path.join(temp, 'scope-first.json');
+    await writeFile(scopeFirstPath, JSON.stringify(v3Manifest(scopeWorkspace, { task_id: 'scope-first' })));
+    const [scopeFirst] = await dispatch('init', { manifest: scopeFirstPath });
+    const scopeStatePath = path.join(scopeFirst.task_key.namespace, 'scope-first.sqlite');
+    const scopeState = await readGlobalTaskState(scopeStatePath);
+    scopeState.nodes.review.review_gate.scope_decision_required = true;
+    await writeGlobalTaskState(scopeStatePath, scopeState);
+    await dispatch('release-workspace', { task_id: 'scope-first', previous_agent_stopped: true, state_dir: stateDirFor(scopeWorkspace) });
+    await deleteGlobalTaskState(scopeStatePath);
+    const scopeSecondPath = path.join(temp, 'scope-second.json');
+    await writeFile(scopeSecondPath, JSON.stringify(v3Manifest(scopeWorkspace, { task_id: 'scope-second' })));
+    await assert.rejects(() => dispatch('init', { manifest: scopeSecondPath }), error => error instanceof ControllerError && /requires a scope decision/.test(error.message));
+
+    const legacyWorkspace = path.join(temp, 'legacy-workspace');
+    await mkdir(legacyWorkspace, { recursive: true });
+    const legacyFirstPath = path.join(temp, 'legacy-first.json');
+    await writeFile(legacyFirstPath, JSON.stringify(v3Manifest(legacyWorkspace, { task_id: 'legacy-first' })));
+    const [legacyFirst] = await dispatch('init', { manifest: legacyFirstPath });
+    await dispatch('release-workspace', { task_id: 'legacy-first', previous_agent_stopped: true, state_dir: stateDirFor(legacyWorkspace) });
+    await deleteGlobalTaskState(path.join(legacyFirst.task_key.namespace, 'legacy-first.sqlite'));
+    const lineageKey = createHash('sha256').update([legacyFirst.task.workspace, legacyFirst.task.coordinator_task_path, legacyFirst.task.coordinator_thread_id].join('\u0000'), 'utf8').digest('hex');
+    const store = new DatabaseSync(globalWorkflowStorePath());
+    try {
+      const row = store.prepare('SELECT payload FROM workspace_control WHERE workspace = ?').get(legacyFirst.task.workspace);
+      const control = JSON.parse(row.payload);
+      delete control.lineage_ledger[lineageKey].lineage_budget;
+      delete control.lineage_ledger[lineageKey].lineage_budget_known;
+      store.prepare('UPDATE workspace_control SET payload = ? WHERE workspace = ?').run(JSON.stringify(control), legacyFirst.task.workspace);
+    } finally {
+      store.close();
+    }
+    const legacySecondPath = path.join(temp, 'legacy-second.json');
+    await writeFile(legacySecondPath, JSON.stringify(v3Manifest(legacyWorkspace, { task_id: 'legacy-second' })));
+    await assert.rejects(() => dispatch('init', { manifest: legacySecondPath }), error => error instanceof ControllerError && /budget policy is unknown/.test(error.message));
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test('concurrent lineage initialization admits only the budgeted reservation', async () => {
+  const { dispatch } = await import('../scripts/workflow_controller.mjs');
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-lineage-concurrent-'));
+  const workspace = path.join(temp, 'workspace');
+  try {
+    await mkdir(workspace, { recursive: true });
+    const manifests = await Promise.all([0, 1, 2, 3].map(async index => {
+      const manifest = path.join(temp, `concurrent-${index}.json`);
+      await writeFile(manifest, JSON.stringify(v3Manifest(workspace, { task_id: `concurrent-${index}`, lineage_budget: { max_tasks: 1 } })));
+      return manifest;
+    }));
+    const results = await Promise.allSettled(manifests.map(manifest => dispatch('init', { manifest })));
+    assert.equal(results.filter(result => result.status === 'fulfilled').length, 1);
+    assert.equal(results.filter(result => result.status === 'rejected' && /max_tasks budget exhausted/.test(result.reason?.message)).length, 3);
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
 test('v3 requires an explicit justification for a workspace-wide write claim', async () => {
   const { ControllerError, dispatch } = await import('../scripts/workflow_controller.mjs');
   const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-claim-scope-'));
@@ -864,6 +977,34 @@ test('v3 abandons a Terra cohort lane after its reviewer stops', async () => {
     assert.deepEqual(status.stale_nodes, []);
     const [overview] = await dispatch('workspace-overview', { workspace });
     assert.deepEqual(overview.failed_tasks, [{ task_id: 'feature', node_id: 'review', reviewer_slot: 'coverage', status: 'abandoned', claim_id: review.claim_id, attempt: 1 }]);
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test('v3 retries each abandoned Terra cohort lane independently', async () => {
+  const { dispatch } = await import('../scripts/workflow_controller.mjs');
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-retry-cohort-'));
+  const workspace = path.join(temp, 'workspace');
+  const stateDir = stateDirFor(workspace);
+  const manifestPath = path.join(temp, 'manifest.json');
+  const resultPath = path.join(temp, 'work-result.json');
+  try {
+    await mkdir(workspace, { recursive: true });
+    await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace, { review_entry_stage: 'terra_cohort' })));
+    await dispatch('init', { manifest: manifestPath });
+    const [work] = await dispatch('start', { task_id: 'feature', node_id: 'work', agent_task_path: '/root/work', agent_role: 'avsp_terra_high', native_agent_started: true, state_dir: stateDir });
+    await writeFile(resultPath, JSON.stringify({ changed: true }));
+    await dispatch('complete', { task_id: 'feature', node_id: 'work', claim_id: work.claim_id, status: 'succeeded', result: resultPath, completion_attestation: 'native_agent_finished', state_dir: stateDir });
+    const [coverage] = await dispatch('start', { task_id: 'feature', node_id: 'review', reviewer_slot: 'coverage', agent_task_path: '/root/cohort-coverage', agent_role: 'avsp_terra_xhigh', native_agent_started: true, state_dir: stateDir });
+    const [adversarial] = await dispatch('start', { task_id: 'feature', node_id: 'review', reviewer_slot: 'adversarial', agent_task_path: '/root/cohort-adversarial', agent_role: 'avsp_terra_xhigh', native_agent_started: true, state_dir: stateDir });
+    await dispatch('abandon', { task_id: 'feature', node_id: 'review', reviewer_slot: 'coverage', claim_id: coverage.claim_id, reason: 'coverage reviewer stopped', previous_agent_stopped: true, state_dir: stateDir });
+    await dispatch('abandon', { task_id: 'feature', node_id: 'review', reviewer_slot: 'adversarial', claim_id: adversarial.claim_id, reason: 'adversarial reviewer stopped', previous_agent_stopped: true, state_dir: stateDir });
+    await dispatch('retry', { task_id: 'feature', node_id: 'review', reviewer_slot: 'coverage', replacement_agent_task_path: '/root/cohort-coverage-retry', reason: 'replace coverage reviewer', previous_agent_stopped: true, state_dir: stateDir });
+    const [retried] = await dispatch('retry', { task_id: 'feature', node_id: 'review', reviewer_slot: 'adversarial', replacement_agent_task_path: '/root/cohort-adversarial-retry', reason: 'replace adversarial reviewer', previous_agent_stopped: true, state_dir: stateDir });
+    assert.equal(retried.node.status, 'running');
+    assert.equal(retried.node.review_gate.cohort.lanes.coverage.status, 'pending');
+    assert.equal(retried.node.review_gate.cohort.lanes.adversarial.status, 'pending');
   } finally {
     await rm(temp, { recursive: true, force: true });
   }

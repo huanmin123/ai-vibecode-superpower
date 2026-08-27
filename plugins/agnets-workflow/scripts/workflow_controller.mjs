@@ -1909,7 +1909,20 @@ function normalizeWorkspaceLeaseLocks(lease, leasePath) {
   if (!hasOwn(lease, 'lineage_ledger')) lease.lineage_ledger = {};
   if (!lease.lineage_ledger || typeof lease.lineage_ledger !== 'object' || Array.isArray(lease.lineage_ledger)) throw new ControllerError(`Unsupported lineage ledger: ${leasePath}`);
   for (const [key, entry] of Object.entries(lease.lineage_ledger)) {
-    if (!/^[0-9a-f]{64}$/u.test(key) || !entry || typeof entry !== 'object' || Array.isArray(entry) || !Number.isSafeInteger(entry.task_count) || entry.task_count < 0 || !Number.isSafeInteger(entry.attempt_count) || entry.attempt_count < 0 || typeof entry.terminated !== 'boolean' || typeof entry.scope_decision_required !== 'boolean') throw new ControllerError(`Unsupported lineage ledger entry: ${leasePath}`);
+    const base = new Set(['task_count', 'attempt_count', 'terminated', 'scope_decision_required']);
+    const current = new Set([...base, 'lineage_budget']);
+    const known = new Set([...current, 'lineage_budget_known']);
+    if (!/^[0-9a-f]{64}$/u.test(key) || !entry || typeof entry !== 'object' || Array.isArray(entry) || (!hasExactFields(entry, base) && !hasExactFields(entry, current) && !hasExactFields(entry, known)) || !Number.isSafeInteger(entry.task_count) || entry.task_count < 0 || !Number.isSafeInteger(entry.attempt_count) || entry.attempt_count < 0 || typeof entry.terminated !== 'boolean' || typeof entry.scope_decision_required !== 'boolean') throw new ControllerError(`Unsupported lineage ledger entry: ${leasePath}`);
+    if (!hasOwn(entry, 'lineage_budget')) {
+      entry.lineage_budget = null;
+      entry.lineage_budget_known = false;
+    } else if (!hasOwn(entry, 'lineage_budget_known')) {
+      // This schema revision already persisted the policy explicitly.
+      entry.lineage_budget_known = true;
+    } else if (typeof entry.lineage_budget_known !== 'boolean') {
+      throw new ControllerError(`Unsupported lineage ledger entry: ${leasePath}`);
+    }
+    entry.lineage_budget = normalizeLineageBudget(entry.lineage_budget, `workspace lineage ledger ${key}.lineage_budget`);
   }
 }
 
@@ -2208,9 +2221,35 @@ function lineageAttemptCount(state) {
   return Math.max(1, attempts);
 }
 
+function lineageScopeDecisionRequired(state) {
+  if (state?.max_review_charter?.scope_decision_required === true) return true;
+  return Object.values(state?.nodes ?? {}).some(node => node?.review_gate?.scope_decision_required === true);
+}
+
+async function consumeLineageAttempt(state, filePath) {
+  return withWorkspaceLeaseLock(state.workspace, async (_leasePath, authorityContext) => {
+    const key = lineageKeyForState(state);
+    const ledger = authorityContext.lease.lineage_ledger[key];
+    if (!ledger) throw new ControllerError(`Cannot claim a node without a lineage ledger entry: ${key}`);
+    if (ledger.terminated) throw new ControllerError(`Cannot claim a node in terminated lineage: ${key}`);
+    if (ledger.scope_decision_required) throw new ControllerError(`Cannot claim a node in lineage requiring a scope decision: ${key}`);
+    if (!ledger.lineage_budget_known) {
+      // A surviving current task proves the policy for its own ledger entry.
+      ledger.lineage_budget = state.lineage_budget;
+      ledger.lineage_budget_known = true;
+    }
+    const attempts = Math.max(ledger.attempt_count, lineageAttemptCount(state));
+    if (ledger.lineage_budget?.max_attempts !== undefined && attempts >= ledger.lineage_budget.max_attempts) {
+      throw new ControllerError(`Cannot claim a node in lineage ${key}: max_attempts budget exhausted (${attempts}/${ledger.lineage_budget.max_attempts})`);
+    }
+    ledger.attempt_count = attempts + 1;
+  }, { allowAuthorityCreation: false, stateDirectory: path.dirname(filePath) });
+}
+
 function lineageAdmission(state, candidates, lease, filePath) {
   const key = lineageKeyForState(state);
-  const ledger = lease.lineage_ledger?.[key] ?? { task_count: 0, attempt_count: 0, terminated: false, scope_decision_required: false };
+  const storedLedger = lease.lineage_ledger?.[key] ?? null;
+  const ledger = storedLedger ?? { task_count: 0, attempt_count: 0, terminated: false, scope_decision_required: false, lineage_budget: null, lineage_budget_known: true };
   if (ledger.terminated) throw new ControllerError(`Cannot initialize task in lineage ${key}: lineage is terminated (ledger)`);
   if (ledger.scope_decision_required) throw new ControllerError(`Cannot initialize task in lineage ${key}: lineage requires a scope decision (ledger)`);
   const matching = [];
@@ -2241,13 +2280,16 @@ function lineageAdmission(state, candidates, lease, filePath) {
     const reason = lineageBlockedReason(item.candidate);
     if (reason) throw new ControllerError(`Cannot initialize task in lineage ${key}: ${reason} (${item.task_id})`);
   }
-  const budgets = [...matching.map(item => item.candidate.lineage_budget), state.lineage_budget];
+  if (storedLedger && !ledger.lineage_budget_known && matching.length === 0) {
+    throw new ControllerError(`Cannot initialize task in lineage ${key}: lineage budget policy is unknown; controlled recovery is required`);
+  }
+  const budgets = [...(storedLedger && ledger.lineage_budget_known ? [ledger.lineage_budget] : []), ...matching.map(item => item.candidate.lineage_budget), state.lineage_budget];
   const budget = budgets[0] ?? null;
   if (budgets.some(candidate => !sameJson(candidate, budget))) throw new ControllerError(`Cannot initialize task in lineage ${key}: lineage_budget conflicts with an existing task`);
   if (budget?.max_tasks !== undefined && taskCount >= budget.max_tasks) throw new ControllerError(`Cannot initialize task in lineage ${key}: max_tasks budget exhausted (${taskCount}/${budget.max_tasks})`);
   const attempts = Math.max(ledger.attempt_count, matching.reduce((total, item) => total + lineageAttemptCount(item.candidate), 0) + reserved.filter(entry => !seen.has(entry.task_id)).length);
   if (budget?.max_attempts !== undefined && attempts >= budget.max_attempts) throw new ControllerError(`Cannot initialize task in lineage ${key}: max_attempts budget exhausted (${attempts}/${budget.max_attempts})`);
-  return { key, task_count: taskCount + 1, attempt_count: attempts + 1 };
+  return { key, task_count: taskCount + 1, attempt_count: attempts + 1, lineage_budget: budget, lineage_budget_known: true };
 }
 
 function workspaceLeaseMatches(lease, state, filePath) {
@@ -2477,6 +2519,10 @@ async function removeReleasedWorkspaceLeaseEntry(state, filePath) {
     const matchingEntries = workspaceLeaseStatePathOwners(lease, filePath)
       .filter(entry => workspaceLeaseEntryMatches(entry, state, filePath, { activeOnly: false }));
     if (!matchingEntries.length) return { removed: false, lease_path: leasePath };
+    const lineageKey = lineageKeyForState(state);
+    const lineage = lease.lineage_ledger[lineageKey];
+    if (!lineage) throw new ControllerError(`Cannot release workspace lease without a lineage ledger entry: ${lineageKey}`);
+    lineage.scope_decision_required ||= lineageScopeDecisionRequired(state);
     authorityContext.lease.active_tasks = authorityContext.lease.active_tasks.filter(entry => !workspaceLeaseEntryMatches(entry, state, filePath, { activeOnly: false }));
     authorityContext.lease.active_locks = authorityContext.lease.active_locks.filter(lock => !sameStatePath(lock.state_path, filePath));
     authorityContext.lease.updated_at = utcNow();
@@ -2573,7 +2619,7 @@ async function initTask(parameters) {
     await assertReleaseMainAdmission(state, lease);
     const candidates = await listGlobalTaskStatesForWorkspace(state.workspace);
     const lineage = lineageAdmission(state, candidates, lease, filePath);
-    lease.lineage_ledger[lineage.key] = { task_count: lineage.task_count, attempt_count: lineage.attempt_count, terminated: false, scope_decision_required: false };
+    lease.lineage_ledger[lineage.key] = { task_count: lineage.task_count, attempt_count: lineage.attempt_count, terminated: false, scope_decision_required: false, lineage_budget: lineage.lineage_budget, lineage_budget_known: lineage.lineage_budget_known };
     lease.active_tasks.push(entry);
     lease.updated_at = utcNow();
   }, { allowAuthorityCreation: true, stateDirectory: path.dirname(filePath) });
@@ -2876,6 +2922,7 @@ async function claimNode(parameters, activateImmediately = false) {
       charter.active_closure_claim_id = null;
     }
     nodeAttemptAvailability(cohortLane ?? node, nodeId);
+    await consumeLineageAttempt(state, filePath);
     const now = utcNow();
     if (cohortLane) {
       cohortLane.status = RUNNING; cohortLane.reserved_agent_task_path = null; cohortLane.agent_task_path = taskPath; cohortLane.agent_thread_id = threadId; cohortLane.agent_role = role; cohortLane.claim_id = randomUUID(); if (node.review_gate.cohort.phase === 'blind') cohortLane.blind_review_claim_id = cohortLane.claim_id; else cohortLane.cross_review_claim_id = cohortLane.claim_id; cohortLane.claimed_at = now; cohortLane.activation_at = activateImmediately ? now : null; cohortLane.activation_deadline_at = activateImmediately ? null : new Date(Date.now() + activationTimeoutSec * 1000).toISOString(); cohortLane.heartbeat_at = now; cohortLane.heartbeat_count = activateImmediately ? 1 : 0; cohortLane.lease_duration_sec = leaseDurationSec; cohortLane.attempt += 1; cohortLane.attempt_budget_used += 1;
@@ -3637,10 +3684,10 @@ async function retryNode(parameters) {
     const node = state.nodes[nodeId];
     const protocolNode = isReviewProtocolState(state) && protocolReviewNode(state) === node;
     const reviewNode = isReviewNode(node, state.routing_schema_version);
-    if (protocolNode && isCohortReviewNode(state, node) && ['unavailable', 'abandoned'].includes(node.status)) {
+    if (protocolNode && isCohortReviewNode(state, node)) {
       const slot = requiredString(parameters.reviewer_slot, 'reviewer_slot');
       const lane = node.review_gate.cohort.lanes[slot];
-      if (!lane || lane.status !== node.status) throw new ControllerError('Only the matching unavailable or abandoned Terra cohort lane can be retried');
+      if (!lane || !['unavailable', 'abandoned'].includes(lane.status)) throw new ControllerError('Only an unavailable or abandoned Terra cohort lane can be retried');
       retryConfirmation(parameters); nodeAttemptAvailability(lane, nodeId);
       const replacement = requiredString(parameters.replacement_agent_task_path, 'replacement_agent_task_path');
       if (participantPaths(state).has(replacement)) throw new ControllerError('A replacement Terra cohort reviewer must not be a prior participant');
