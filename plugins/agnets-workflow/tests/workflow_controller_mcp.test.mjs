@@ -546,7 +546,9 @@ test('MCP workspace overview preserves unsupported legacy task diagnostics', asy
   const server = startMcp();
   try {
     await mkdir(workspace, { recursive: true });
-    const legacy = resultObject(await server.request({ method: 'tools/call', params: { name: 'workflow_init', arguments: { manifest: v3McpManifest(workspace, 'legacy-overview') } } }));
+    const legacyManifest = v3McpManifest(workspace, 'legacy-overview');
+    legacyManifest.coordinator_task_path = '/legacy-overview';
+    const legacy = resultObject(await server.request({ method: 'tools/call', params: { name: 'workflow_init', arguments: { manifest: legacyManifest } } }));
     await server.request({ method: 'tools/call', params: { name: 'workflow_release_workspace', arguments: { task_id: 'legacy-overview', previous_agent_stopped: true, state_dir: stateDir } } });
     const { readGlobalTaskState, writeGlobalTaskState } = await import('../scripts/global_workflow_store.mjs');
     const legacyPath = path.join(legacy.task_key.namespace, 'legacy-overview.sqlite');

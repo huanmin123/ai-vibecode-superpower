@@ -136,6 +136,9 @@ function parsePayload(value, label) {
 // workspace lease before the short finalization transaction.
 function pruneAfterForState(state) {
   if (!state || typeof state !== 'object' || Array.isArray(state)) return null;
+  // A terminated lineage is a durable admission tombstone. Retention cleanup
+  // must never remove its last task state and reopen the lineage.
+  if (state.lineage_status === 'terminated') return null;
   if (!Number.isSafeInteger(state.workflow_revision) || state.workflow_revision < 0 || state.closed_revision !== state.workflow_revision) return null;
   if (state.workspace_lease?.status !== 'released') return null;
   if (!state.nodes || typeof state.nodes !== 'object' || Array.isArray(state.nodes)) return null;
@@ -184,8 +187,21 @@ async function verifyDirectoryChain(directoryPath) {
   let current = leaf;
   let finalMetadata = null;
   for (;;) {
-    const metadata = await fs.lstat(current, { bigint: true });
-    if (metadata.isSymbolicLink() || !metadata.isDirectory()) throw storeError(`Global workflow store parent is not a regular directory: ${current}`);
+    let metadata = await fs.lstat(current, { bigint: true });
+    if (metadata.isSymbolicLink()) {
+      // macOS exposes /var as a system-managed canonical link to /private/var.
+      // It is safe to follow this one link, while continuing to reject every
+      // user-controlled link in the store parent chain.
+      let target;
+      try { target = await fs.realpath(current); }
+      catch (cause) { throw storeError(`Global workflow store parent is not a regular directory: ${current}`, cause); }
+      const allowedSystemVar = process.platform === 'darwin'
+        && current === '/var'
+        && path.resolve(target) === '/private/var';
+      if (!allowedSystemVar) throw storeError(`Global workflow store parent is not a regular directory: ${current}`);
+      metadata = await fs.stat(current, { bigint: true });
+    }
+    if (!metadata.isDirectory()) throw storeError(`Global workflow store parent is not a regular directory: ${current}`);
     if (current === leaf) finalMetadata = metadata;
     const next = path.dirname(current);
     if (next === current) break;

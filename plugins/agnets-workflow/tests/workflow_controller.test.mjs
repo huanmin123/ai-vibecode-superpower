@@ -90,6 +90,88 @@ test('policy v3 establishes the persisted application and release metadata contr
   }
 });
 
+test('lineage termination metadata is explicit and optional budgets fail closed', async () => {
+  const { dispatch } = await import('../scripts/workflow_controller.mjs');
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-lineage-'));
+  const workspace = path.join(temp, 'workspace');
+  try {
+    await mkdir(workspace, { recursive: true });
+    const valid = v3Manifest(workspace, { lineage_budget: { max_tasks: 2, max_attempts: 4 } });
+    const manifest = path.join(temp, 'manifest.json'); await writeFile(manifest, JSON.stringify(valid));
+    const [initialized] = await dispatch('init', { manifest });
+    assert.equal(initialized.task.lineage_status, 'active');
+    assert.deepEqual(initialized.task.lineage_budget, { max_tasks: 2, max_attempts: 4 });
+    const invalidManifest = path.join(temp, 'invalid.json');
+    await mkdir(path.join(temp, 'other'), { recursive: true });
+    await writeFile(invalidManifest, JSON.stringify(v3Manifest(path.join(temp, 'other'), { lineage_budget: { max_tasks: -1 } })));
+    await assert.rejects(dispatch('init', { manifest: invalidManifest }), /lineage_budget\.max_tasks must be a non-negative safe integer/);
+  } finally { await rm(temp, { recursive: true, force: true }); }
+});
+
+test('lineage admission blocks terminated tasks and enforces task and attempt budgets', async () => {
+  const { ControllerError, dispatch } = await import('../scripts/workflow_controller.mjs');
+  const { readGlobalTaskState, writeGlobalTaskState } = await import('../scripts/global_workflow_store.mjs');
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-lineage-admission-'));
+  const workspace = path.join(temp, 'workspace');
+  const stateDir = stateDirFor(workspace);
+  try {
+    await mkdir(workspace, { recursive: true });
+    const firstPath = path.join(temp, 'first.json');
+    await writeFile(firstPath, JSON.stringify(v3Manifest(workspace, { task_id: 'lineage-first', lineage_budget: { max_tasks: 1 } })));
+    const [first] = await dispatch('init', { manifest: firstPath });
+    const secondPath = path.join(temp, 'second.json');
+    await writeFile(secondPath, JSON.stringify(v3Manifest(workspace, { task_id: 'lineage-second', lineage_budget: { max_tasks: 1 } })));
+    await assert.rejects(
+      () => dispatch('init', { manifest: secondPath }),
+      error => error instanceof ControllerError && /max_tasks budget exhausted/.test(error.message),
+    );
+
+    await dispatch('release-workspace', { task_id: 'lineage-first', previous_agent_stopped: true, state_dir: stateDir });
+    const logicalPath = path.join(first.task_key.namespace, 'lineage-first.sqlite');
+    const terminated = await readGlobalTaskState(logicalPath);
+    terminated.lineage_status = 'terminated';
+    terminated.closed_revision = terminated.workflow_revision;
+    terminated.closed_at = new Date().toISOString();
+    await writeGlobalTaskState(logicalPath, terminated);
+    await assert.rejects(
+      () => dispatch('init', { manifest: secondPath }),
+      error => error instanceof ControllerError && /lineage is terminated/.test(error.message),
+    );
+
+    const scopeWorkspace = path.join(temp, 'scope-workspace');
+    await mkdir(scopeWorkspace, { recursive: true });
+    const scopeFirstPath = path.join(temp, 'scope-first.json');
+    await writeFile(scopeFirstPath, JSON.stringify(v3Manifest(scopeWorkspace, { task_id: 'scope-first' })));
+    const [scopeFirst] = await dispatch('init', { manifest: scopeFirstPath });
+    const scopeStateDir = stateDirFor(scopeWorkspace);
+    await dispatch('release-workspace', { task_id: 'scope-first', previous_agent_stopped: true, state_dir: scopeStateDir });
+    const scopeLogicalPath = path.join(scopeFirst.task_key.namespace, 'scope-first.sqlite');
+    const scopeState = await readGlobalTaskState(scopeLogicalPath);
+    scopeState.nodes.review.review_gate.scope_decision_required = true;
+    await writeGlobalTaskState(scopeLogicalPath, scopeState);
+    const scopeSecondPath = path.join(temp, 'scope-second.json');
+    await writeFile(scopeSecondPath, JSON.stringify(v3Manifest(scopeWorkspace, { task_id: 'scope-second' })));
+    await assert.rejects(
+      () => dispatch('init', { manifest: scopeSecondPath }),
+      error => error instanceof ControllerError && /lineage requires a scope decision/.test(error.message),
+    );
+
+    const attemptsWorkspace = path.join(temp, 'attempts-workspace');
+    await mkdir(attemptsWorkspace, { recursive: true });
+    const attemptsFirstPath = path.join(temp, 'attempts-first.json');
+    await writeFile(attemptsFirstPath, JSON.stringify(v3Manifest(attemptsWorkspace, { task_id: 'attempts-first', lineage_budget: { max_attempts: 1 } })));
+    await dispatch('init', { manifest: attemptsFirstPath });
+    const attemptsSecondPath = path.join(temp, 'attempts-second.json');
+    await writeFile(attemptsSecondPath, JSON.stringify(v3Manifest(attemptsWorkspace, { task_id: 'attempts-second', lineage_budget: { max_attempts: 1 } })));
+    await assert.rejects(
+      () => dispatch('init', { manifest: attemptsSecondPath }),
+      error => error instanceof ControllerError && /max_attempts budget exhausted/.test(error.message),
+    );
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
 test('v3 requires an explicit justification for a workspace-wide write claim', async () => {
   const { ControllerError, dispatch } = await import('../scripts/workflow_controller.mjs');
   const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-v3-claim-scope-'));
@@ -1262,7 +1344,7 @@ test('workspace overview isolates unsupported legacy task state while retaining 
   const currentManifestPath = path.join(temp, 'current.json');
   try {
     await mkdir(workspace, { recursive: true });
-    await writeFile(legacyManifestPath, JSON.stringify(v3Manifest(workspace, { task_id: 'legacy-malformed', release_id: 'legacy-release' })));
+    await writeFile(legacyManifestPath, JSON.stringify(v3Manifest(workspace, { task_id: 'legacy-malformed', release_id: 'legacy-release', coordinator_task_path: '/legacy', coordinator_thread_id: '01a0193d-6e8f-78a2-815a-19afa3358257' })));
     const [legacy] = await dispatch('init', { manifest: legacyManifestPath });
     await dispatch('release-workspace', { task_id: 'legacy-malformed', previous_agent_stopped: true, state_dir: stateDir });
 
@@ -1280,7 +1362,7 @@ test('workspace overview isolates unsupported legacy task state while retaining 
     assert.deepEqual(overview.tasks, [{ task_id: 'current-v3', application_id: legacyState.application_id ?? v3Manifest(workspace).application_id, release_id: 'current-release', task_kind: 'workflow', lease_status: 'active' }]);
     assert.deepEqual(overview.unsupported_tasks, [{
       task_id: 'legacy-malformed',
-      namespace: legacy.task_key.namespace.toLowerCase(),
+      namespace: legacy.task_key.namespace,
       error_code: 'UNSUPPORTED_WORKFLOW_STATE',
       field_errors: [{ path: 'application_id', code: 'unsupported_state', expected: 'present', actual: 'missing', message: 'Task state is missing required current field: application_id' }],
       recovery: { action: 'start_new_workflow' },

@@ -164,6 +164,23 @@ const NATIVE_AGENT_EXIT_CONFIRMED = 'native_agent_exit_confirmed';
 const NATIVE_AGENT_START_FAILED = 'native_agent_start_failed';
 const taskStateTransactionContext = new AsyncLocalStorage();
 const COORDINATOR_THREAD_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+const LINEAGE_STATUSES = new Set(['active', 'terminated']);
+
+function normalizeLineageBudget(value, label = 'lineage_budget') {
+  if (value === undefined || value === null) return null;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw invalidArgument(`${label} must be an object or null`, label, 'object or null', typeof value);
+  const allowed = ['max_tasks', 'max_attempts'];
+  const keys = Object.keys(value);
+  if (!keys.length || keys.some(key => !allowed.includes(key))) throw invalidArgument(`${label} may contain only max_tasks and max_attempts`, label, 'object with max_tasks and/or max_attempts');
+  const budget = {};
+  for (const key of allowed) {
+    if (!hasOwn(value, key)) continue;
+    if (!Number.isSafeInteger(value[key]) || value[key] < 0) throw invalidArgument(`${label}.${key} must be a non-negative safe integer`, `${label}.${key}`, 'non-negative safe integer', value[key]);
+    budget[key] = value[key];
+  }
+  if (!Object.keys(budget).length) throw invalidArgument(`${label} must define max_tasks or max_attempts`, label, 'non-empty budget object');
+  return budget;
+}
 
 function requiredString(value, name) {
   if (typeof value !== 'string' || !value.trim()) {
@@ -1555,10 +1572,18 @@ function normalizeState(state) {
   // guessing a current thread; an active review still fails closed when the
   // binding is absent.
   normalizeStateCoordinatorBinding(state);
+  // v3 states written before lineage hardening remain readable with an
+  // explicitly active lineage and no optional budget.
+  if (!hasOwn(state, 'lineage_status')) {
+    state.lineage_status = state.workspace_lease?.status === 'released' && state.closed_revision !== null && state.closed_at !== null
+      ? 'terminated'
+      : 'active';
+  }
+  if (!hasOwn(state, 'lineage_budget')) state.lineage_budget = null;
   const requiredStateFields = [
     'version', 'routing_schema_version', 'execution_routing_policy_version', 'assurance_level', 'assurance_assessment',
     'review_protocol_version', 'review_entry_stage', 'review_context', 'application_id', 'release_id', 'task_kind', 'release_main', 'task_id', 'workspace', 'workspace_claims', 'goal',
-    'requirements', 'scope', 'non_goals', 'nodes', 'participants', 'reviews', 'repair_records', 'max_review_charter',
+    'requirements', 'scope', 'non_goals', 'nodes', 'participants', 'reviews', 'repair_records', 'max_review_charter', 'lineage_status', 'lineage_budget',
     'events', 'workflow_revision', 'closed_revision', 'closed_at', 'created_at', 'updated_at', 'workspace_lease',
   ];
   const missingStateField = requiredStateFields.find(field => !hasOwn(state, field));
@@ -1574,6 +1599,8 @@ function normalizeState(state) {
   if (state.closed_at !== null && !validTimestamp(state.closed_at)) throw unsupportedWorkflowState('Task state closed_at must be null or an ISO timestamp', 'closed_at', 'null or ISO timestamp', state.closed_at);
   if (!validTimestamp(state.created_at) || !validTimestamp(state.updated_at)) throw unsupportedWorkflowState('Task state timestamps are invalid', !validTimestamp(state.created_at) ? 'created_at' : 'updated_at', 'ISO timestamp', !validTimestamp(state.created_at) ? state.created_at : state.updated_at);
   if (!Array.isArray(state.repair_records)) throw new ControllerError('Task repair_records must be an array');
+  if (!LINEAGE_STATUSES.has(state.lineage_status)) throw unsupportedWorkflowState('Task lineage_status must be active or terminated', 'lineage_status', 'active or terminated', state.lineage_status);
+  state.lineage_budget = normalizeLineageBudget(state.lineage_budget);
   if (state.routing_schema_version !== REVIEW_PROTOCOL_VERSION) throw new ControllerError('Task state must use routing_schema_version=3');
   if (state.execution_routing_policy_version !== CURRENT_EXECUTION_ROUTING_POLICY_VERSION) {
     throw new ControllerError('Task state has an unsupported execution routing policy version; old workflow state is not read or migrated automatically', {
@@ -1623,6 +1650,9 @@ function normalizeState(state) {
   if (!['active', 'released'].includes(state.workspace_lease.status) || !validTimestamp(state.workspace_lease.acquired_at)) throw unsupportedWorkflowState('Task workspace lease is invalid', 'workspace_lease', 'current active or released lease', 'invalid');
   if (state.workspace_lease.status === 'released' && (!hasOwn(state.workspace_lease, 'released_at') || !validTimestamp(state.workspace_lease.released_at))) throw unsupportedWorkflowState('Released task workspace lease requires released_at', 'workspace_lease.released_at', 'ISO timestamp', state.workspace_lease.released_at ?? 'missing');
   if (state.workspace_lease.status === 'active' && hasOwn(state.workspace_lease, 'released_at')) throw unsupportedWorkflowState('Active task workspace lease must not carry released_at', 'workspace_lease.released_at', 'absent', state.workspace_lease.released_at);
+  if (state.lineage_status === 'terminated' && (state.workspace_lease.status !== 'released' || state.closed_revision === null || state.closed_at === null)) {
+    throw unsupportedWorkflowState('Terminated lineage requires a released workspace lease and closed revision/timestamp', 'lineage_status', 'active or consistently terminated', state.lineage_status);
+  }
   state.workspace_lease.workspace_claims = normalizeStoredWorkspaceClaims(state.workspace_lease.workspace_claims);
   if (!sameJson(state.workspace_lease.workspace_claims, state.workspace_claims)) throw unsupportedWorkflowState('Task workspace lease claims do not match task claims', 'workspace_lease.workspace_claims', state.workspace_claims, state.workspace_lease.workspace_claims);
   validateNodes(state.nodes);
@@ -1688,7 +1718,7 @@ async function makeState(manifest) {
   const created = utcNow();
   const events = [{ at: created, type: 'task_initialized', workflow_revision: 0 }];
   if (normalizedReviewDependencies.length) events.push({ at: created, type: 'review_direct_dependencies_completed', node_id: reviewNodes(nodes, routingSchemaVersion)[0].id, added_dependencies: normalizedReviewDependencies, workflow_revision: 0 });
-  const state = { version: VERSION, routing_schema_version: REVIEW_PROTOCOL_VERSION, execution_routing_policy_version: CURRENT_EXECUTION_ROUTING_POLICY_VERSION, assurance_level: assuranceLevel, assurance_assessment: assuranceAssessmentValue, review_protocol_version: REVIEW_PROTOCOL_VERSION, review_entry_stage: reviewEntryStage, review_context: reviewContext, application_id: applicationId, release_id: releaseId, task_kind: taskKind, release_main: taskKind === 'release_main', coordinator_task_path: coordinatorTaskPath, coordinator_thread_id: coordinatorThreadId, task_id: taskId, workspace, workspace_claims: workspaceClaims, ...(globalWriteReason === null ? {} : { global_write_justification: globalWriteReason }), goal, requirements, scope: manifest.scope ?? [], non_goals: manifest.non_goals ?? [], nodes, participants: [], reviews: [], repair_records: [], max_review_charter: null, events, workflow_revision: 0, closed_revision: null, closed_at: null, created_at: created, updated_at: created, workspace_lease: null };
+  const state = { version: VERSION, routing_schema_version: REVIEW_PROTOCOL_VERSION, execution_routing_policy_version: CURRENT_EXECUTION_ROUTING_POLICY_VERSION, assurance_level: assuranceLevel, assurance_assessment: assuranceAssessmentValue, review_protocol_version: REVIEW_PROTOCOL_VERSION, review_entry_stage: reviewEntryStage, review_context: reviewContext, application_id: applicationId, release_id: releaseId, task_kind: taskKind, release_main: taskKind === 'release_main', coordinator_task_path: coordinatorTaskPath, coordinator_thread_id: coordinatorThreadId, lineage_status: 'active', lineage_budget: normalizeLineageBudget(manifest.lineage_budget), task_id: taskId, workspace, workspace_claims: workspaceClaims, ...(globalWriteReason === null ? {} : { global_write_justification: globalWriteReason }), goal, requirements, scope: manifest.scope ?? [], non_goals: manifest.non_goals ?? [], nodes, participants: [], reviews: [], repair_records: [], max_review_charter: null, events, workflow_revision: 0, closed_revision: null, closed_at: null, created_at: created, updated_at: created, workspace_lease: null };
   return state;
 }
 
@@ -1747,7 +1777,7 @@ function staleNodes(state, now = Date.now()) {
 
 function compactState(state) {
   const workspaceLease = publicWorkspaceLease(state);
-  return { task_id: state.task_id, application_id: state.application_id, release_id: state.release_id, task_kind: state.task_kind, release_main: state.release_main, ...(workspaceLease ? { state_path: workspaceLease.state_path, database_path: workspaceLease.database_path, task_key: workspaceLease.task_key } : {}), workspace: state.workspace, workspace_claims: state.workspace_claims, workspace_lease: workspaceLease, coordinator_task_path: state.coordinator_task_path, coordinator_thread_id: state.coordinator_thread_id, execution_routing_policy_version: state.execution_routing_policy_version, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), assurance_assessment: state.assurance_assessment, review_protocol_version: state.review_protocol_version, review_entry_stage: state.review_entry_stage, review_context: state.review_context, goal: state.goal, nodes: Object.values(state.nodes), ready_nodes: readyNodes(state), stale_nodes: staleNodes(state), participants: state.participants, reviews: externallyVisibleReviews(state), repair_records: state.repair_records, max_review_charter: state.max_review_charter, events: state.events, workflow_revision: state.workflow_revision, updated_at: state.updated_at };
+  return { task_id: state.task_id, application_id: state.application_id, release_id: state.release_id, task_kind: state.task_kind, release_main: state.release_main, lineage_status: state.lineage_status, lineage_budget: state.lineage_budget, ...(workspaceLease ? { state_path: workspaceLease.state_path, database_path: workspaceLease.database_path, task_key: workspaceLease.task_key } : {}), workspace: state.workspace, workspace_claims: state.workspace_claims, workspace_lease: workspaceLease, coordinator_task_path: state.coordinator_task_path, coordinator_thread_id: state.coordinator_thread_id, execution_routing_policy_version: state.execution_routing_policy_version, assurance_level: state.assurance_level, effective_assurance_level: effectiveAssuranceLevel(state), assurance_assessment: state.assurance_assessment, review_protocol_version: state.review_protocol_version, review_entry_stage: state.review_entry_stage, review_context: state.review_context, goal: state.goal, nodes: Object.values(state.nodes), ready_nodes: readyNodes(state), stale_nodes: staleNodes(state), participants: state.participants, reviews: externallyVisibleReviews(state), repair_records: state.repair_records, max_review_charter: state.max_review_charter, events: state.events, workflow_revision: state.workflow_revision, updated_at: state.updated_at };
 }
 
 function doctorCheck(id, status, detail) { return { id, status, detail }; }
@@ -1855,7 +1885,8 @@ async function doctorTask(parameters) {
 
 async function validateWorkspaceLeaseEntry(entry, leasePath) {
   const fields = new Set(['task_id', 'task_key', 'state_path', 'state_dir', 'state_parent_authority', 'acquired_at', 'phase', 'workspace_claims']);
-  if (!hasExactFields(entry, fields) || !validTimestamp(entry.acquired_at) || !['initializing', 'active'].includes(entry.phase)) throw new ControllerError(`Unsupported workspace lease entry: ${leasePath}`);
+  const fieldsWithLineage = new Set([...fields, 'lineage_key']);
+  if ((!hasExactFields(entry, fields) && !hasExactFields(entry, fieldsWithLineage)) || !validTimestamp(entry.acquired_at) || !['initializing', 'active'].includes(entry.phase)) throw new ControllerError(`Unsupported workspace lease entry: ${leasePath}`);
   requiredIdentifier(entry.task_id, 'workspace lease task_id');
   if (typeof entry.state_path !== 'string' || typeof entry.state_dir !== 'string') throw new ControllerError(`Invalid workspace lease entry path: ${leasePath}`);
   const statePath = await canonicalStatePath(entry.state_path, 'workspace lease state_path');
@@ -1864,13 +1895,21 @@ async function validateWorkspaceLeaseEntry(entry, leasePath) {
   entry.state_path = statePath;
   entry.state_dir = stateDir;
   if (entry.task_key !== taskKey(statePath)) throw new ControllerError(`Invalid workspace lease task key: ${leasePath}`);
+  if (hasOwn(entry, 'lineage_key') && (typeof entry.lineage_key !== 'string' || !/^[0-9a-f]{64}$/u.test(entry.lineage_key))) throw new ControllerError(`Invalid workspace lease lineage key: ${leasePath}`);
   if (!validStateParentAuthority(entry.state_parent_authority, statePath)) throw new ControllerError(`Invalid workspace lease state parent authority: ${leasePath}`);
   entry.workspace_claims = normalizeStoredWorkspaceClaims(entry.workspace_claims);
 }
 
 function normalizeWorkspaceLeaseLocks(lease, leasePath) {
-  if (!hasExactFields(lease, new Set(['version', 'workspace', 'active_tasks', 'active_locks', 'updated_at'])) || !Array.isArray(lease.active_locks) || lease.active_locks.length > MAX_WORKSPACE_ACTIVE_WRITE_LOCKS) {
+  const baseFields = new Set(['version', 'workspace', 'active_tasks', 'active_locks', 'updated_at']);
+  const ledgerFields = new Set([...baseFields, 'lineage_ledger']);
+  if ((!hasExactFields(lease, baseFields) && !hasExactFields(lease, ledgerFields)) || !Array.isArray(lease.active_locks) || lease.active_locks.length > MAX_WORKSPACE_ACTIVE_WRITE_LOCKS) {
     throw new ControllerError(`Unsupported workspace lease: ${leasePath}`);
+  }
+  if (!hasOwn(lease, 'lineage_ledger')) lease.lineage_ledger = {};
+  if (!lease.lineage_ledger || typeof lease.lineage_ledger !== 'object' || Array.isArray(lease.lineage_ledger)) throw new ControllerError(`Unsupported lineage ledger: ${leasePath}`);
+  for (const [key, entry] of Object.entries(lease.lineage_ledger)) {
+    if (!/^[0-9a-f]{64}$/u.test(key) || !entry || typeof entry !== 'object' || Array.isArray(entry) || !Number.isSafeInteger(entry.task_count) || entry.task_count < 0 || !Number.isSafeInteger(entry.attempt_count) || entry.attempt_count < 0 || typeof entry.terminated !== 'boolean' || typeof entry.scope_decision_required !== 'boolean') throw new ControllerError(`Unsupported lineage ledger entry: ${leasePath}`);
   }
 }
 
@@ -1971,7 +2010,7 @@ async function ensureWorkspaceControl(workspace, { allowCreate = false, stateDir
   if (!allowCreate) throw new ControllerError(`Workspace control database does not exist: ${databasePath}`);
   await assertWorkspaceControlCreationIsSafe(workspace, stateDirectory);
   if (await workspaceControlExists(workspace)) return databasePath;
-  const lease = { version: WORKSPACE_LEASE_VERSION, workspace, active_tasks: [], active_locks: [], updated_at: utcNow() };
+  const lease = { version: WORKSPACE_LEASE_VERSION, workspace, active_tasks: [], active_locks: [], lineage_ledger: {}, updated_at: utcNow() };
   try {
     await createWorkspaceControl(workspace, lease);
   } catch (error) {
@@ -2137,6 +2176,78 @@ function workspaceLeaseEntryMatches(entry, state, filePath, { activeOnly = true 
     && sameJson(entry.workspace_claims, stateWorkspaceClaims(state))
     && sameJson(entry.state_parent_authority, state.workspace_lease?.state_parent_authority)
     && (!activeOnly || entry.phase === 'active');
+}
+
+function lineageKeyForState(state) {
+  const identity = [state.workspace, state.coordinator_task_path, state.coordinator_thread_id].join('\u0000');
+  return createHash('sha256').update(identity, 'utf8').digest('hex');
+}
+
+function lineageBlockedReason(state) {
+  if (state.lineage_status === 'terminated') return 'lineage is terminated';
+  const charter = state.max_review_charter;
+  if (charter?.scope_decision_required === true || charter?.status === 'scope_decision_required') return 'lineage requires a scope decision';
+  for (const node of Object.values(state.nodes ?? {})) {
+    if (node?.review_gate?.scope_decision_required === true) return 'lineage requires a scope decision';
+  }
+  return null;
+}
+
+function lineageAttemptCount(state) {
+  const attempts = Object.values(state.nodes ?? {}).reduce((total, node) => {
+    const own = Number.isSafeInteger(node?.attempt_budget_used) ? node.attempt_budget_used : 0;
+    const unavailable = Number.isSafeInteger(node?.unavailable_attempts) ? node.unavailable_attempts : 0;
+    const lanes = node?.review_gate?.cohort?.lanes && typeof node.review_gate.cohort.lanes === 'object'
+      ? Object.values(node.review_gate.cohort.lanes).reduce((sum, lane) => sum + (Number.isSafeInteger(lane?.attempt_budget_used) ? lane.attempt_budget_used : 0) + (Number.isSafeInteger(lane?.unavailable_attempts) ? lane.unavailable_attempts : 0), 0)
+      : 0;
+    return total + own + unavailable + lanes;
+  }, 0);
+  // A task reservation consumes one lineage attempt even before its first
+  // node is claimed; otherwise max_attempts=1 would admit an unbounded number
+  // of freshly initialized tasks whose nodes remain pending.
+  return Math.max(1, attempts);
+}
+
+function lineageAdmission(state, candidates, lease, filePath) {
+  const key = lineageKeyForState(state);
+  const ledger = lease.lineage_ledger?.[key] ?? { task_count: 0, attempt_count: 0, terminated: false, scope_decision_required: false };
+  if (ledger.terminated) throw new ControllerError(`Cannot initialize task in lineage ${key}: lineage is terminated (ledger)`);
+  if (ledger.scope_decision_required) throw new ControllerError(`Cannot initialize task in lineage ${key}: lineage requires a scope decision (ledger)`);
+  const matching = [];
+  for (const entry of candidates) {
+    try {
+      const candidate = normalizeState(entry.state);
+      if (lineageKeyForState(candidate) === key) matching.push({ candidate, task_id: entry.task_id });
+    } catch (error) {
+      // Unsupported legacy/corrupt rows are not lineage evidence. They remain
+      // visible to workspace-overview/doctor, while current v3 rows are the
+      // only inputs to admission accounting.
+      const raw = entry.state;
+      if (raw?.workspace === state.workspace && raw?.coordinator_task_path === state.coordinator_task_path && raw?.coordinator_thread_id === state.coordinator_thread_id) {
+        throw new ControllerError(`Cannot establish lineage admission while reading ${entry.task_id}: ${error.message}`);
+      }
+      continue;
+    }
+  }
+  const reserved = lease.active_tasks.filter(entry => {
+    if (entry.task_key === taskKey(filePath)) return false;
+    if (typeof entry.lineage_key === 'string') return entry.lineage_key === key;
+    if (entry.phase === 'initializing') throw new ControllerError(`Cannot establish lineage admission while an initializing task has no lineage metadata: ${entry.task_id}`);
+    return false;
+  });
+  const seen = new Set(matching.map(item => item.task_id));
+  const taskCount = Math.max(ledger.task_count, matching.length + reserved.filter(entry => !seen.has(entry.task_id)).length);
+  for (const item of matching) {
+    const reason = lineageBlockedReason(item.candidate);
+    if (reason) throw new ControllerError(`Cannot initialize task in lineage ${key}: ${reason} (${item.task_id})`);
+  }
+  const budgets = [...matching.map(item => item.candidate.lineage_budget), state.lineage_budget];
+  const budget = budgets[0] ?? null;
+  if (budgets.some(candidate => !sameJson(candidate, budget))) throw new ControllerError(`Cannot initialize task in lineage ${key}: lineage_budget conflicts with an existing task`);
+  if (budget?.max_tasks !== undefined && taskCount >= budget.max_tasks) throw new ControllerError(`Cannot initialize task in lineage ${key}: max_tasks budget exhausted (${taskCount}/${budget.max_tasks})`);
+  const attempts = Math.max(ledger.attempt_count, matching.reduce((total, item) => total + lineageAttemptCount(item.candidate), 0) + reserved.filter(entry => !seen.has(entry.task_id)).length);
+  if (budget?.max_attempts !== undefined && attempts >= budget.max_attempts) throw new ControllerError(`Cannot initialize task in lineage ${key}: max_attempts budget exhausted (${attempts}/${budget.max_attempts})`);
+  return { key, task_count: taskCount + 1, attempt_count: attempts + 1 };
 }
 
 function workspaceLeaseMatches(lease, state, filePath) {
@@ -2450,7 +2561,8 @@ async function initTask(parameters) {
   if (await stateExists(filePath)) throw new ControllerError(`Task already exists: ${state.task_id}`);
   await ensureGlobalNamespaceIdentity(path.dirname(filePath), parentAuthority);
   state.workspace_lease = { registry_path: leasePath, state_path: filePath, task_key: taskKey(filePath), state_parent_authority: parentAuthority, status: 'active', acquired_at: utcNow(), workspace_claims: state.workspace_claims };
-  const entry = { task_id: state.task_id, task_key: taskKey(filePath), state_path: filePath, state_dir: path.dirname(filePath), state_parent_authority: parentAuthority, acquired_at: state.workspace_lease.acquired_at, phase: 'initializing', workspace_claims: state.workspace_claims };
+  const lineageKey = lineageKeyForState(state);
+  const entry = { task_id: state.task_id, task_key: taskKey(filePath), state_path: filePath, state_dir: path.dirname(filePath), state_parent_authority: parentAuthority, acquired_at: state.workspace_lease.acquired_at, phase: 'initializing', workspace_claims: state.workspace_claims, lineage_key: lineageKey };
 
   await withWorkspaceLeaseLock(state.workspace, async (lockedLeasePath, authorityContext) => {
     if (lockedLeasePath !== leasePath) throw new ControllerError('Workspace lease authority path changed during initialization');
@@ -2459,6 +2571,9 @@ async function initTask(parameters) {
     const existingStatePath = lease.active_tasks.find(entry => entry.task_key === taskKey(filePath));
     if (existingStatePath) throw new ControllerError(`Workspace state path already has an active lease entry: ${filePath}; reconcile this exact workspace/task/state_dir entry before initializing again`);
     await assertReleaseMainAdmission(state, lease);
+    const candidates = await listGlobalTaskStatesForWorkspace(state.workspace);
+    const lineage = lineageAdmission(state, candidates, lease, filePath);
+    lease.lineage_ledger[lineage.key] = { task_count: lineage.task_count, attempt_count: lineage.attempt_count, terminated: false, scope_decision_required: false };
     lease.active_tasks.push(entry);
     lease.updated_at = utcNow();
   }, { allowAuthorityCreation: true, stateDirectory: path.dirname(filePath) });
@@ -4168,14 +4283,27 @@ async function closeCheck(parameters) {
   await verifyRegularDirectorySnapshot(parentAuthority, 'Controller state parent');
   const leasePath = initialState.workspace_lease.registry_path;
   if (initialState.workspace_lease.status === 'released') {
-    const removal = await removeReleasedWorkspaceLeaseEntry(initialState, filePath);
     const fingerprint = workspaceFingerprintFromPreflight(initialState, fingerprintPreflight, 'Close check');
     const reasons = await closeReasons(initialState, { workspaceFingerprint: fingerprint });
+    if (!reasons.length && initialState.lineage_status !== 'terminated') {
+      initialState.closed_revision = initialState.workflow_revision;
+      initialState.closed_at = initialState.closed_at ?? utcNow();
+      initialState.lineage_status = 'terminated';
+      addEvent(initialState, 'lineage_terminated', { close_allowed: true });
+      await writeState(filePath, initialState);
+    }
+    const closedState = normalizeState(await loadState(filePath));
+    await withWorkspaceLeaseLock(closedState.workspace, async (_leasePath, authorityContext) => {
+      const key = lineageKeyForState(closedState);
+      const prior = authorityContext.lease.lineage_ledger[key] ?? { task_count: 1, attempt_count: 1, terminated: false, scope_decision_required: false };
+      authorityContext.lease.lineage_ledger[key] = { ...prior, terminated: closedState.lineage_status === 'terminated' };
+    }, { allowAuthorityCreation: false });
+    const removal = await removeReleasedWorkspaceLeaseEntry(closedState, filePath);
     return [{
       ...storage,
-      task_id: initialState.task_id,
-      assurance_level: initialState.assurance_level,
-      effective_assurance_level: effectiveAssuranceLevel(initialState),
+      task_id: closedState.task_id,
+      assurance_level: closedState.assurance_level,
+      effective_assurance_level: effectiveAssuranceLevel(closedState),
       close_allowed: !reasons.length,
       reasons,
       workspace_lease: publicReleasedWorkspaceLease(filePath, { alreadyReleased: true, selfHealed: removal.removed }),
@@ -4199,11 +4327,17 @@ async function closeCheck(parameters) {
     state.workspace_lease.released_at = utcNow();
     state.closed_revision = state.workflow_revision;
     state.closed_at = utcNow();
+    state.lineage_status = 'terminated';
     addEvent(state, 'workspace_lease_released', { close_allowed: true });
   });
   if (!result.close_allowed) return [result, 2];
   const releasedState = normalizeState(await loadState(filePath));
   if (releasedState.workspace_lease?.registry_path !== leasePath || releasedState.workspace_lease.status !== 'released') throw new ControllerError('Task workspace lease changed before close release');
+  await withWorkspaceLeaseLock(releasedState.workspace, async (_leasePath, authorityContext) => {
+    const key = lineageKeyForState(releasedState);
+    const prior = authorityContext.lease.lineage_ledger[key] ?? { task_count: 1, attempt_count: 1, terminated: false, scope_decision_required: false };
+    authorityContext.lease.lineage_ledger[key] = { ...prior, terminated: true };
+  }, { allowAuthorityCreation: false });
   await removeReleasedWorkspaceLeaseEntry(releasedState, filePath);
   result.workspace_lease = publicReleasedWorkspaceLease(filePath);
   return [result, 0];

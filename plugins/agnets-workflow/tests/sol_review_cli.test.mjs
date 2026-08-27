@@ -123,7 +123,8 @@ test('uses the resolved current-account CODEX_HOME and preserves the Codex exit 
     assert.match(invocation.args.at(-1), /review prompt$/);
     assert.equal(invocation.options.env.CODEX_HOME, item.codexHome);
     assert.equal(invocation.options.shell, false);
-    assert.equal(resolveCodexHome({ USERPROFILE: 'C:\\Users\\Administrator' }, 'win32'), path.join('C:\\Users\\Administrator', '.codex'));
+    assert.equal(resolveCodexHome({ USERPROFILE: 'C:\\Users\\Administrator' }, 'win32'), path.win32.join('C:\\Users\\Administrator', '.codex'));
+    assert.equal(resolveCodexHome({ CODEX_HOME: 'D:\\CodexHome' }, 'win32'), path.win32.resolve('D:\\CodexHome'));
   } finally { await rm(item.root, { recursive: true, force: true }); }
 });
 

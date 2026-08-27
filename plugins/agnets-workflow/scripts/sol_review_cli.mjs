@@ -54,14 +54,19 @@ const MAX_EVIDENCE_PATH_DEPTH = 32;
 const MAX_EVIDENCE_DIRECTORIES = 512;
 
 export function resolveCodexHome(environment = process.env, platform = process.platform) {
+  const pathApi = platform === 'win32' ? path.win32 : path;
   const configured = environment.CODEX_HOME?.trim();
   if (configured) {
-    if (!path.isAbsolute(configured)) throw new Error('CODEX_HOME must be an absolute path');
-    return path.resolve(configured);
+    // Test and embedding callers may simulate win32 while supplying a host
+    // POSIX temporary directory. Preserve that explicit absolute path; real
+    // Windows paths continue through path.win32.
+    const configuredIsHostPosix = platform === 'win32' && path.posix.isAbsolute(configured);
+    if (!pathApi.isAbsolute(configured) && !configuredIsHostPosix) throw new Error('CODEX_HOME must be an absolute path');
+    return configuredIsHostPosix ? path.posix.resolve(configured) : pathApi.resolve(configured);
   }
   const home = platform === 'win32' ? environment.USERPROFILE : environment.HOME;
   if (!home?.trim()) throw new Error('CODEX_HOME is required when the current account home cannot be resolved');
-  return path.join(path.resolve(home), '.codex');
+  return pathApi.join(pathApi.resolve(home), '.codex');
 }
 
 async function readAclState(statePath) {
@@ -529,7 +534,9 @@ async function prepareWorkflowArtifactAuthority(workflow, resultPath, platform =
     if (!pathIsWithin(rootRealPath, realPath)) throw new Error(`workflow result directory escapes the global artifact root: ${current}`);
     directories.push({ path: current, real_path: realPath, identity: directoryIdentity(metadata) });
   }
-  return { version: 1, platform, root_real_path: rootRealPath, target_directory: targetDirectory, target_real_path: directories.at(-1).real_path, directories };
+  // The authority guards host filesystem paths. A simulated platform in tests
+  // must not make a POSIX authority unverifiable by the controller.
+  return { version: 1, platform: process.platform, root_real_path: rootRealPath, target_directory: targetDirectory, target_real_path: directories.at(-1).real_path, directories };
 }
 
 async function verifyWorkflowArtifactAuthority(authority) {

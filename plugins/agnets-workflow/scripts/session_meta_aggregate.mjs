@@ -1,5 +1,6 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 const DATE_PATTERN = /^(\d{4})-(\d{2})-(\d{2})$/;
 const JSONL_PATTERN = /\.jsonl$/iu;
@@ -149,7 +150,7 @@ function parseArgs(argv) {
 
 export const HELP = 'Read active <codex-home>/sessions/YYYY/MM/DD and <codex-home>/archived_sessions. Active files are selected by date directories; archive files are selected by a YYYY-MM-DD filename date or first session timestamp date. Only the first JSONL record is parsed and it must be type=session_meta.';
 
-if (process.argv[1] && new URL(import.meta.url).pathname.toLowerCase() === new URL(`file:///${process.argv[1].replaceAll('\\', '/')}`).pathname.toLowerCase()) {
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
   try {
     const args = parseArgs(process.argv.slice(2));
     if (args.help) { process.stdout.write(`${HELP}\n`); }

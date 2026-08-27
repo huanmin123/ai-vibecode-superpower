@@ -262,6 +262,9 @@ configure_project() {
   if [ -f "$agents" ] && agents_heading_candidate "$agents" 'AI 工具'; then
     die 'AGENTS.md 包含旧版 AI 工具注入标题；请人工迁移为当前 CodeGraph 与 RTK 受管标题'
   fi
+  if [ -f "$agents" ] && [ "$(LC_ALL=C od -An -t x1 -N 3 "$agents" | tr -d ' \n')" = 'efbbbf' ]; then
+    die 'AGENTS.md 包含 UTF-8 BOM；请人工迁移为当前 CodeGraph 与 RTK 受管标题'
+  fi
   if [ -f "$agents" ] && agents_heading_candidate "$agents" 'CodeGraph 与 RTK'; then
     managed_section=$(managed_agents_section "$agents" "$agents_heading") || die 'AGENTS.md 的 CodeGraph 与 RTK 受管标题冲突或重复'
     case "$managed_section" in
