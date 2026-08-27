@@ -533,6 +533,9 @@ test('MCP exposes workspace overview and wait defaults to event summary with exp
     assert.ok(overview.workspace.endsWith(`${path.sep}workspace`));
     assert.equal(overview.task_count, 1);
     assert.equal(overview.current_executors[0].node_id, 'total-review');
+    assert.deepEqual(overview.unstarted_active_tasks, []);
+    assert.deepEqual(overview.active_write_locks, []);
+    assert.deepEqual(overview.stale_lock_owners, []);
   } finally {
     await closeMcp(server.child);
     await rm(temp, { recursive: true, force: true });
@@ -587,6 +590,7 @@ test('MCP workflow_wait reports derived write-lock changes without fabricating s
     await mkdir(workspace, { recursive: true });
     const initialized = await server.request({ method: 'tools/call', params: { name: 'workflow_init', arguments: { manifest: v3McpWriteManifest(workspace) } } });
     assert.equal(initialized.result.isError, undefined);
+    const initializedResult = resultObject(initialized);
     const started = resultObject(await server.request({ method: 'tools/call', params: { name: 'workflow_start', arguments: { task_id: 'mcp-write-task', node_id: 'work', agent_task_path: '/root/mcp-write-task-work', agent_thread_id: '01a0193d-6e8f-78a2-815a-19afa3358260', agent_role: 'avsp_terra_high', native_agent_started: true, state_dir: stateDir } } }));
     const beforeLock = resultObject(await server.request({ method: 'tools/call', params: { name: 'workflow_status', arguments: { task_id: 'mcp-write-task', state_dir: stateDir } } }));
     const acquired = resultObject(await server.request({ method: 'tools/call', params: { name: 'workflow_acquire_write_lock', arguments: { task_id: 'mcp-write-task', node_id: 'work', claim_id: started.claim_id, write_prefixes: ['src'], purpose: 'verify wait lock observation', state_dir: stateDir } } }));
@@ -596,6 +600,18 @@ test('MCP workflow_wait reports derived write-lock changes without fabricating s
     assert.deepEqual(changed.events, []);
     assert.deepEqual(changed.changed_nodes, []);
     assert.equal(changed.observed_changes.active_write_locks.length, 1);
+    const { readGlobalTaskState, writeGlobalTaskState } = await import('../scripts/global_workflow_store.mjs');
+    const logicalPath = path.join(initializedResult.task_key.namespace, 'mcp-write-task.sqlite');
+    const state = await readGlobalTaskState(logicalPath);
+    state.nodes.work.heartbeat_at = new Date(Date.now() - 1801 * 1000).toISOString();
+    state.updated_at = state.nodes.work.heartbeat_at;
+    await writeGlobalTaskState(logicalPath, state);
+    const overview = resultObject(await server.request({ method: 'tools/call', params: { name: 'workflow_workspace_overview', arguments: { workspace } } }));
+    assert.equal(overview.active_write_locks.length, 1);
+    assert.equal(overview.stale_lock_owners.length, 1);
+    assert.equal(overview.stale_lock_owners[0].claim_id, started.claim_id);
+    assert.equal(overview.stale_lock_owners[0].stale_reason, 'heartbeat_expired');
+    assert.deepEqual(overview.stale_lock_owners[0].locks, overview.active_write_locks);
     const lockId = acquired.acquired[0].lock_id;
     const beforeRelease = resultObject(await server.request({ method: 'tools/call', params: { name: 'workflow_status', arguments: { task_id: 'mcp-write-task', state_dir: stateDir } } }));
     await server.request({ method: 'tools/call', params: { name: 'workflow_release_write_lock', arguments: { task_id: 'mcp-write-task', node_id: 'work', claim_id: started.claim_id, lock_ids: [lockId], state_dir: stateDir } } });

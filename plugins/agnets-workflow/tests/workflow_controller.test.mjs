@@ -1475,6 +1475,190 @@ test('workflow init binds application/release metadata, gates release mains, and
   }
 });
 
+test('workspace overview diagnoses only overdue unstarted tasks and stale write-lock owners', async () => {
+  const { dispatch } = await import('../scripts/workflow_controller.mjs');
+  const { readGlobalTaskState, writeGlobalTaskState } = await import('../scripts/global_workflow_store.mjs');
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-overview-diagnostics-'));
+  const workspace = path.join(temp, 'workspace');
+  const stateDir = stateDirFor(workspace);
+  try {
+    await mkdir(workspace, { recursive: true });
+    const taskId = 'overview-diagnostics';
+    const manifestPath = path.join(temp, 'manifest.json');
+    await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace, { task_id: taskId })));
+    const [initialized] = await dispatch('init', { manifest: manifestPath });
+
+    let [overview] = await dispatch('workspace-overview', { workspace });
+    assert.deepEqual(overview.unstarted_active_tasks, [], 'a freshly initialized task remains within the dispatch grace period');
+    assert.deepEqual(overview.active_write_locks, []);
+    assert.deepEqual(overview.stale_lock_owners, []);
+
+    const logicalPath = path.join(initialized.task_key.namespace, `${taskId}.sqlite`);
+    const pendingState = await readGlobalTaskState(logicalPath);
+    const overdue = new Date(Date.now() - 601 * 1000).toISOString();
+    pendingState.created_at = overdue;
+    pendingState.updated_at = overdue;
+    await writeGlobalTaskState(logicalPath, pendingState);
+
+    [overview] = await dispatch('workspace-overview', { workspace });
+    assert.equal(overview.unstarted_active_tasks.length, 1);
+    assert.deepEqual(overview.unstarted_active_tasks[0], {
+      task_id: taskId,
+      ready_node_ids: ['work'],
+      ready_at: overdue,
+      created_at: overdue,
+      age_sec: overview.unstarted_active_tasks[0].age_sec,
+      dispatch_grace_sec: 600,
+      reason: 'ready_nodes_not_dispatched',
+    });
+    assert.ok(overview.unstarted_active_tasks[0].age_sec >= 601);
+
+    pendingState.events.push({ at: new Date().toISOString(), type: 'future_ready_transition', node_id: 'work' });
+    await writeGlobalTaskState(logicalPath, pendingState);
+    [overview] = await dispatch('workspace-overview', { workspace });
+    assert.deepEqual(overview.unstarted_active_tasks, [], 'unknown event history fails closed instead of reusing created_at');
+    pendingState.events.pop();
+    pendingState.events.push({ type: 'node_completed', node_id: 'work' });
+    await writeGlobalTaskState(logicalPath, pendingState);
+    [overview] = await dispatch('workspace-overview', { workspace });
+    assert.deepEqual(overview.unstarted_active_tasks, [], 'malformed event history fails closed instead of reusing created_at');
+    pendingState.events.pop();
+
+    pendingState.participants.push({
+      agent_task_path: '/root/prior-work', agent_thread_id: null, agent_role: 'avsp_terra_high',
+      node_id: 'work', claim_id: 'prior-claim', attempt: 0, reviewer_slot: null,
+      fallback_reason: null, fallback_error: null,
+    });
+    await writeGlobalTaskState(logicalPath, pendingState);
+    [overview] = await dispatch('workspace-overview', { workspace });
+    assert.equal(overview.unstarted_active_tasks.length, 1, 'historical participants do not prove that a node is currently running');
+
+    const [started] = await dispatch('start', {
+      task_id: taskId,
+      node_id: 'work',
+      agent_task_path: '/root/work',
+      agent_role: 'avsp_terra_high',
+      native_agent_started: true,
+      state_dir: stateDir,
+    });
+    await dispatch('acquire-write-lock', {
+      task_id: taskId,
+      node_id: 'work',
+      claim_id: started.claim_id,
+      write_prefixes: ['.'],
+      purpose: 'exercise workspace overview lock diagnostics',
+      state_dir: stateDir,
+    });
+
+    [overview] = await dispatch('workspace-overview', { workspace });
+    assert.deepEqual(overview.unstarted_active_tasks, [], 'a running task is never diagnosed as unstarted');
+    assert.equal(overview.active_write_locks.length, 1);
+    assert.deepEqual(overview.stale_lock_owners, []);
+
+    const runningState = await readGlobalTaskState(logicalPath);
+    runningState.nodes.work.heartbeat_at = new Date(Date.now() - 1801 * 1000).toISOString();
+    runningState.updated_at = runningState.nodes.work.heartbeat_at;
+    await writeGlobalTaskState(logicalPath, runningState);
+
+    [overview] = await dispatch('workspace-overview', { workspace });
+    assert.equal(overview.stale_tasks[0].reason, 'heartbeat_expired');
+    assert.deepEqual(overview.stale_lock_owners, [{
+      task_id: taskId,
+      node_id: 'work',
+      claim_id: started.claim_id,
+      stale_reason: 'heartbeat_expired',
+      lock_count: 1,
+      locks: overview.active_write_locks,
+    }]);
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test('workspace overview treats only running cohort lanes as active executors', async () => {
+  const { dispatch } = await import('../scripts/workflow_controller.mjs');
+  const { readGlobalTaskState, writeGlobalTaskState } = await import('../scripts/global_workflow_store.mjs');
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-overview-cohort-'));
+  const workspace = path.join(temp, 'workspace');
+  const stateDir = stateDirFor(workspace);
+  const manifestPath = path.join(temp, 'manifest.json');
+  const resultPath = path.join(temp, 'work-result.json');
+  try {
+    await mkdir(workspace, { recursive: true });
+    await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace, { task_id: 'overview-cohort', review_entry_stage: 'terra_cohort' })));
+    const [initialized] = await dispatch('init', { manifest: manifestPath });
+    const [work] = await dispatch('start', { task_id: 'overview-cohort', node_id: 'work', agent_task_path: '/root/work', agent_role: 'avsp_terra_high', native_agent_started: true, state_dir: stateDir });
+    await writeFile(resultPath, JSON.stringify({ changed: true }));
+    await dispatch('complete', { task_id: 'overview-cohort', node_id: 'work', claim_id: work.claim_id, status: 'succeeded', result: resultPath, completion_attestation: 'native_agent_finished', state_dir: stateDir });
+
+    const logicalPath = path.join(initialized.task_key.namespace, 'overview-cohort.sqlite');
+    const state = await readGlobalTaskState(logicalPath);
+    state.nodes.review.status = 'running';
+    state.created_at = new Date(Date.now() - 601 * 1000).toISOString();
+    state.updated_at = state.created_at;
+    for (const event of state.events) {
+      if (event.type === 'node_completed' && event.node_id === 'work') event.at = state.created_at;
+    }
+    await writeGlobalTaskState(logicalPath, state);
+
+    let [overview] = await dispatch('workspace-overview', { workspace });
+    assert.deepEqual(overview.current_executors, []);
+    assert.equal(overview.unstarted_active_tasks[0].task_id, 'overview-cohort');
+    assert.deepEqual(overview.unstarted_active_tasks[0].ready_node_ids, ['review']);
+    assert.equal(overview.unstarted_active_tasks[0].ready_at, state.created_at);
+
+    await dispatch('start', { task_id: 'overview-cohort', node_id: 'review', reviewer_slot: 'coverage', agent_task_path: '/root/cohort-coverage', agent_role: 'avsp_terra_xhigh', native_agent_started: true, state_dir: stateDir });
+    [overview] = await dispatch('workspace-overview', { workspace });
+    assert.equal(overview.current_executors.length, 1);
+    assert.equal(overview.current_executors[0].reviewer_slot, 'coverage');
+    assert.deepEqual(overview.unstarted_active_tasks, []);
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test('workspace overview waits for downstream nodes to be ready before dispatch grace', async () => {
+  const { dispatch } = await import('../scripts/workflow_controller.mjs');
+  const { readGlobalTaskState, writeGlobalTaskState } = await import('../scripts/global_workflow_store.mjs');
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-overview-ready-age-'));
+  const workspace = path.join(temp, 'workspace');
+  const stateDir = stateDirFor(workspace);
+  const manifestPath = path.join(temp, 'manifest.json');
+  const resultPath = path.join(temp, 'work-result.json');
+  try {
+    await mkdir(workspace, { recursive: true });
+    await writeFile(manifestPath, JSON.stringify(v3Manifest(workspace, { task_id: 'overview-ready-age' })));
+    const [initialized] = await dispatch('init', { manifest: manifestPath });
+    const [work] = await dispatch('start', { task_id: 'overview-ready-age', node_id: 'work', agent_task_path: '/root/work', agent_role: 'avsp_terra_high', native_agent_started: true, state_dir: stateDir });
+    await writeFile(resultPath, JSON.stringify({ changed: true }));
+    await dispatch('complete', { task_id: 'overview-ready-age', node_id: 'work', claim_id: work.claim_id, status: 'succeeded', result: resultPath, completion_attestation: 'native_agent_finished', state_dir: stateDir });
+
+    const logicalPath = path.join(initialized.task_key.namespace, 'overview-ready-age.sqlite');
+    const state = await readGlobalTaskState(logicalPath);
+    state.created_at = new Date(Date.now() - 3600 * 1000).toISOString();
+    state.updated_at = state.created_at;
+    await writeGlobalTaskState(logicalPath, state);
+
+    let [overview] = await dispatch('workspace-overview', { workspace });
+    assert.deepEqual(overview.unstarted_active_tasks, [], 'a downstream node newly made ready gets a fresh grace period');
+
+    const readyAt = new Date(Date.now() - 601 * 1000).toISOString();
+    const agedState = await readGlobalTaskState(logicalPath);
+    for (const event of agedState.events) {
+      if (event.type === 'node_completed' && event.node_id === 'work') event.at = readyAt;
+    }
+    await writeGlobalTaskState(logicalPath, agedState);
+    [overview] = await dispatch('workspace-overview', { workspace });
+    assert.equal(overview.unstarted_active_tasks.length, 1);
+    assert.equal(overview.unstarted_active_tasks[0].task_id, 'overview-ready-age');
+    assert.deepEqual(overview.unstarted_active_tasks[0].ready_node_ids, ['review']);
+    assert.equal(overview.unstarted_active_tasks[0].ready_at, readyAt);
+    assert.ok(overview.unstarted_active_tasks[0].age_sec >= 601);
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
 test('workspace overview isolates unsupported legacy task state while retaining current v3 tasks', async () => {
   const { ControllerError, dispatch } = await import('../scripts/workflow_controller.mjs');
   const { readGlobalTaskState, writeGlobalTaskState } = await import('../scripts/global_workflow_store.mjs');

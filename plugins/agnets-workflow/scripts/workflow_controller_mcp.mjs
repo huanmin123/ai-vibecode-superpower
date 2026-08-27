@@ -50,7 +50,7 @@ export const TOOLS = [
   ['workflow_stale', '列出未在启动期限内产生首个心跳或之后失去心跳的运行节点，并返回当前工作区的实际写锁；不会自动接管或过期释放。', ['task_id', 'state_dir'], { task_id: { type: 'string' }, state_dir: { type: 'string' } }],
   ['workflow_status', '默认返回适合轮询的任务摘要及当前工作区实际写锁；仅在排障或审计需要完整参与者、结果和审核记录时设 detail=full。', ['task_id', 'state_dir'], { task_id: { type: 'string' }, state_dir: { type: 'string' }, detail: { enum: ['summary', 'full'], description: '默认 summary；full 返回控制器完整状态视图。' } }],
   ['workflow_wait', '按 workflow_status 或上次 workflow_wait 返回的 cursor 被动等待可操作变化；默认只返回事件摘要、变化节点和无事件时的 observed_changes 派生观察，只有 detail=full 才返回完整当前状态。每次必须传 workflow_init/status 返回的同一非空 task_id 与 state_dir。忽略普通 heartbeat，默认 300 秒、最大 600 秒。', ['task_id', 'state_dir', 'after_cursor'], { task_id: { type: 'string', minLength: 1, description: '复用 workflow_init/status 返回的 task_id，不能为空。' }, state_dir: { type: 'string' }, after_cursor: { type: 'string', description: '最近 workflow_status 或 workflow_wait 返回的 cursor。' }, timeout_sec: { type: 'integer', minimum: 1, maximum: 600, description: '等待上限，默认 300 秒。' }, detail: { enum: ['summary', 'full'], description: '默认 summary 事件摘要；full 返回完整当前状态。' } }],
-  ['workflow_workspace_overview', '只读返回一个工作区的紧凑总览：当前执行者、失联任务、失败任务和租约截止时间；不会返回完整 DAG、结果或审核正文。', ['workspace'], { workspace: { type: 'string', minLength: 1 } }],
+  ['workflow_workspace_overview', '只读返回一个工作区的紧凑总览：当前执行者、失联任务、失败任务、未启动任务、实际写锁、失联锁持有者和租约截止时间；不会返回完整 DAG、结果或审核正文。', ['workspace'], { workspace: { type: 'string', minLength: 1 } }],
   ['workflow_doctor', '只读诊断指定任务的用户级全局 SQLite 状态、工作区租约、过期节点与受控重派前提；诊断结果以 database_path 和 task_key 定位任务，不会修改或删除状态。', ['task_id', 'state_dir'], { task_id: { type: 'string' }, state_dir: { type: 'string' } }],
 ].map(([name, description, required, properties]) => ({ name, description, inputSchema: { type: 'object', required, properties } }));
 
@@ -368,6 +368,9 @@ export function compactMcpResult(toolName, result, argumentsValue = {}) {
     stale_tasks: result.stale_tasks ?? [],
     failed_tasks: result.failed_tasks ?? [],
     lease_deadlines: result.lease_deadlines ?? [],
+    unstarted_active_tasks: result.unstarted_active_tasks ?? [],
+    active_write_locks: result.active_write_locks ?? [],
+    stale_lock_owners: result.stale_lock_owners ?? [],
     tasks: result.tasks ?? [],
     unsupported_tasks: result.unsupported_tasks ?? [],
   };

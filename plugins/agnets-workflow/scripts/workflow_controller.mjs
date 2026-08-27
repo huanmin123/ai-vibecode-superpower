@@ -149,6 +149,8 @@ const pathIsWithin = (root, candidate) => {
 };
 const DEFAULT_LEASE_SEC = 1800;
 const DEFAULT_ACTIVATION_TIMEOUT_SEC = 600;
+// Keep the no-dispatch diagnostic aligned with the existing activation window.
+const DISPATCH_GRACE_SEC = DEFAULT_ACTIVATION_TIMEOUT_SEC;
 const WORKSPACE_LEASE_VERSION = 3;
 const WORKSPACE_CLAIM_MODES = new Set(['read', 'write']);
 const MAX_WORKSPACE_CLAIMS = 128;
@@ -2094,6 +2096,15 @@ async function activeWorkspaceWriteLocks(state) {
   return lease.active_locks.map(compactWorkspaceWriteLock);
 }
 
+async function activeWorkspaceWriteLocksForWorkspace(workspace) {
+  if (!await workspaceControlExists(workspace)) return [];
+  const leasePath = workspaceLeasePath(workspace);
+  const lease = await loadWorkspaceLease(leasePath, workspace);
+  // Keep claim_id available for internal stale-owner correlation. The public
+  // overview still uses the established compact lock shape below.
+  return lease.active_locks;
+}
+
 async function compactStateWithActiveWriteLocks(state) {
   return { ...compactState(state), active_write_locks: await activeWorkspaceWriteLocks(state) };
 }
@@ -2105,6 +2116,119 @@ function workspaceLeaseDeadline(node) {
   return node?.activation_deadline_at ?? null;
 }
 
+const READY_RESET_EVENTS = new Set([
+  'node_retried',
+  'pending_owner_rebound',
+  'review_gate_invalidated',
+  'assurance_level_raised',
+  'review_protocol_unavailable_retried',
+  'review_protocol_abandoned_retried',
+  'review_protocol_stage_escalated',
+  'terra_cohort_escalated',
+  'terra_cohort_lane_retried',
+  'max_closure_review_ready',
+  'stale_node_requeued',
+  'root_rescue',
+  'delegable_execution_escalated_to_protected',
+]);
+
+const KNOWN_WORKFLOW_EVENT_TYPES = new Set([
+  'task_initialized',
+  'review_direct_dependencies_completed',
+  'workspace_lease_released',
+  'assurance_level_raised',
+  'pending_owner_rebound',
+  'review_gate_invalidated',
+  'node_claimed',
+  'node_started',
+  'terra_cohort_lane_completed',
+  'terra_cohort_blind_round_completed',
+  'terra_cohort_passed',
+  'terra_cohort_failed',
+  'max_initial_review_charter_frozen',
+  'max_review_closure_attempt_rolled_back',
+  'max_review_closure_passed',
+  'max_review_terminal_failure',
+  'node_completed',
+  'stale_node_requeued',
+  'root_rescue',
+  'delegable_execution_escalated_to_protected',
+  'node_abandoned',
+  'terra_cohort_lane_retried',
+  'review_protocol_unavailable_retried',
+  'review_protocol_abandoned_retried',
+  'max_closure_review_ready',
+  'terra_cohort_escalated',
+  'max_initial_repair_required',
+  'review_protocol_stage_escalated',
+  'total_review_escalated',
+  'max_review_repair_required',
+  'terra_review_escalated',
+  'node_retried',
+  'terra_cohort_repair_recorded',
+  'terra_single_repair_recorded',
+  'sol_review_repair_recorded',
+  'max_review_repair_recorded',
+  'max_review_closure_recorded_pending_completion',
+  'total_review_recorded',
+  'quality_review_recorded',
+  'lineage_terminated',
+]);
+
+function latestEventAt(events, predicate) {
+  return events.reduce((latest, event) => {
+    if (!predicate(event)) return latest;
+    const at = Date.parse(event.at);
+    return Number.isFinite(at) && (latest === null || at > latest) ? at : latest;
+  }, null);
+}
+
+function readyAt(state, node) {
+  const fallback = Date.parse(state.created_at);
+  let ready = Number.isFinite(fallback) ? fallback : null;
+  const events = Array.isArray(state.events) ? state.events : [];
+  if (!events.length || events.some(event => !event || typeof event !== 'object' || Array.isArray(event)
+    || !KNOWN_WORKFLOW_EVENT_TYPES.has(event.type) || !validTimestamp(event.at))) return null;
+  if (node.depends_on.length) {
+    const dependencyTimes = node.depends_on.map(dependencyId => latestEventAt(events, event => event.node_id === dependencyId
+      && event.type === 'node_completed'
+      && ['succeeded', 'skipped'].includes(event.status)));
+    if (dependencyTimes.some(at => at === null)) return null;
+    ready = Math.max(...dependencyTimes);
+  }
+
+  if (isCohortReviewNode(state, node)) {
+    const phaseStarted = latestEventAt(events, event => event.node_id === node.id
+      && event.type === 'terra_cohort_blind_round_completed');
+    if (phaseStarted !== null) ready = Math.max(ready ?? phaseStarted, phaseStarted);
+  }
+  const reset = latestEventAt(events, event => event.node_id === node.id && READY_RESET_EVENTS.has(event.type));
+  if (reset !== null) ready = Math.max(ready ?? reset, reset);
+  return ready;
+}
+
+function unstartedActiveTask(state, { now = Date.now(), running = false } = {}) {
+  if (state.workspace_lease?.status !== 'active' || running) return null;
+  const ready = readyNodes(state);
+  if (!ready.length) return null;
+  const readyTimes = ready.map(node => readyAt(state, node));
+  if (readyTimes.some(at => at === null)) return null;
+  const overdue = ready
+    .map((node, index) => ({ node, at: readyTimes[index] }))
+    .filter(item => now - item.at > DISPATCH_GRACE_SEC * 1000);
+  if (!overdue.length) return null;
+  const readyStartedAt = Math.min(...overdue.map(item => item.at));
+  return {
+    task_id: state.task_id,
+    ready_node_ids: overdue.map(item => item.node.id),
+    ready_at: new Date(readyStartedAt).toISOString(),
+    created_at: state.created_at,
+    age_sec: Math.max(0, Math.floor((now - readyStartedAt) / 1000)),
+    dispatch_grace_sec: DISPATCH_GRACE_SEC,
+    reason: 'ready_nodes_not_dispatched',
+  };
+}
+
 function workspaceOverviewTask(state) {
   const executors = [];
   const failedNodes = [];
@@ -2114,7 +2238,9 @@ function workspaceOverviewTask(state) {
     const cohort = isCohortReviewNode(state, node);
     const allLanes = cohort ? cohortLanes(node) : [];
     const lanes = allLanes.filter(lane => lane.status === RUNNING);
-    const observations = lanes.length ? lanes.map(lane => ({ ...lane, node_id: node.id })) : node.status === RUNNING ? [{ ...node, node_id: node.id }] : [];
+    const observations = cohort
+      ? lanes.map(lane => ({ ...lane, node_id: node.id }))
+      : node.status === RUNNING ? [{ ...node, node_id: node.id }] : [];
     for (const observation of observations) executors.push({
       task_id: state.task_id, node_id: observation.node_id, reviewer_slot: observation.slot ?? null,
       agent_task_path: observation.agent_task_path ?? null, agent_thread_id: observation.agent_thread_id ?? null,
@@ -2132,12 +2258,17 @@ function workspaceOverviewTask(state) {
       failedNodes.push({ task_id: state.task_id, node_id: node.id, status: node.status, claim_id: node.claim_id ?? null, attempt: node.attempt ?? null });
     }
   }
+  const running = Object.values(state.nodes ?? {}).some(node => isCohortReviewNode(state, node)
+    ? cohortLanes(node).some(lane => lane.status === RUNNING)
+    : node.status === RUNNING);
+  const unstarted = unstartedActiveTask(state, { running });
   return {
     task_id: state.task_id, application_id: state.application_id, release_id: state.release_id, task_kind: state.task_kind,
     lease_status: state.workspace_lease?.status ?? null, current_executors: executors,
     stale_tasks: stale.map(node => ({ task_id: state.task_id, node_id: node.id, reviewer_slot: node.reviewer_slot ?? null, reason: node.reason, claim_id: node.claim_id ?? null, lease_deadline_at: node.activation_deadline_at ?? null })),
     failed_tasks: failedNodes,
     lease_deadlines: executors.filter(item => item.lease_deadline_at).map(item => ({ task_id: item.task_id, node_id: item.node_id, reviewer_slot: item.reviewer_slot, lease_deadline_at: item.lease_deadline_at })),
+    unstarted_active_tasks: unstarted ? [unstarted] : [],
   };
 }
 
@@ -2161,6 +2292,27 @@ async function workspaceOverview(parameters) {
       });
     }
   }
+  const activeWriteLockRecords = await activeWorkspaceWriteLocksForWorkspace(workspace);
+  const activeWriteLocks = activeWriteLockRecords.map(compactWorkspaceWriteLock);
+  const staleByClaim = new Map(tasks.flatMap(task => task.stale_tasks).filter(item => item.claim_id).map(item => [`${item.task_id}\u0000${item.node_id}\u0000${item.claim_id}`, item]));
+  const staleLockOwnerMap = new Map();
+  for (const lock of activeWriteLockRecords) {
+    const key = `${lock.task_id}\u0000${lock.node_id}\u0000${lock.claim_id}`;
+    const stale = staleByClaim.get(key);
+    if (!stale) continue;
+    const owner = staleLockOwnerMap.get(key) ?? {
+      task_id: lock.task_id,
+      node_id: lock.node_id,
+      claim_id: lock.claim_id,
+      stale_reason: stale.reason,
+      lock_count: 0,
+      locks: [],
+    };
+    owner.lock_count += 1;
+    owner.locks.push(compactWorkspaceWriteLock(lock));
+    staleLockOwnerMap.set(key, owner);
+  }
+  const staleLockOwners = [...staleLockOwnerMap.values()];
   return {
     workspace,
     task_count: tasks.length,
@@ -2168,6 +2320,9 @@ async function workspaceOverview(parameters) {
     stale_tasks: tasks.flatMap(task => task.stale_tasks),
     failed_tasks: tasks.flatMap(task => task.failed_tasks),
     lease_deadlines: tasks.flatMap(task => task.lease_deadlines),
+    unstarted_active_tasks: tasks.flatMap(task => task.unstarted_active_tasks),
+    active_write_locks: activeWriteLocks,
+    stale_lock_owners: staleLockOwners,
     tasks: tasks.map(task => ({ task_id: task.task_id, application_id: task.application_id, release_id: task.release_id, task_kind: task.task_kind, lease_status: task.lease_status })),
     unsupported_tasks: unsupportedTasks,
   };
