@@ -1,0 +1,25 @@
+{
+  "name": "causal-debugger",
+  "version": "0.1.0+codex.20260828",
+  "description": "为 Codex 预编译全局代码关系、运行时证据和有界因果假设，减少反复搜索。",
+  "author": {
+    "name": "ai-vibecode-superpower"
+  },
+  "license": "MIT",
+  "keywords": ["debugging", "causal-analysis", "codegraph", "logs"],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "因果调试器",
+    "shortDescription": "一次编译全局证据，再让 AI 定位根因。",
+    "longDescription": "使用 CodeGraph、运行时日志和有界因果分析生成可追溯的问题证据包。只读分析，不自动修改代码。",
+    "developerName": "ai-vibecode-superpower",
+    "category": "Developer Tools",
+    "capabilities": ["Interactive"],
+    "defaultPrompt": [
+      "分析这个问题并给出全局因果链",
+      "把日志和代码关系整理成证据包",
+      "查找最可能的根因并列出验证步骤"
+    ]
+  }
+}

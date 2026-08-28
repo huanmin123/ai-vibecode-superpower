@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "suiteId": "f4-schema-deadline-holdout-spike-v1-20260828",
+  "mode": "spike",
+  "seed": "f4-schema-deadline-v1",
+  "repetitions": 1,
+  "executionProfile": {
+    "model": "gpt-5.6-terra",
+    "reasoningEffort": "high",
+    "promptVersion": "debug-v5-enum-guard",
+    "tokenBudget": 250000,
+    "timeoutMs": 180000,
+    "maxToolCalls": 8
+  },
+  "arms": [
+    { "id": "baseline", "evidenceMode": "none" },
+    { "id": "assisted", "evidenceMode": "packet" }
+  ],
+  "cases": [
+    {
+      "id": "case-026",
+      "repositoryId": "sub2api-lite",
+      "split": "holdout",
+      "category": "configuration",
+      "caseKind": "bug",
+      "workspace": {
+        "path": "C:\\Users\\Administrator\\AppData\\Local\\Temp\\causal-debugger-real-project-experiment-20260828\\holdout-sub2api-f4-schema-deadline",
+        "snapshot": "git:3a542d13d480f351dec4011e394def896e174e58"
+      },
+      "problem": {
+        "text": "F4 operation-log PostgreSQL schema 首次初始化时，短请求 deadline 可能先于 schema bootstrap 完成，导致冷启动偶发失败。请定位根因文件和关键因果关系。"
+      },
+      "evidencePackets": {
+        "assisted": {
+          "path": "C:\\Users\\Administrator\\AppData\\Local\\Temp\\causal-debugger-real-project-experiment-20260828\\holdout-sub2api-f4-schema-deadline\\evidence-packet.json",
+          "sha256": "4b9d7e846db7600aad0752c557db9aa1d0dfef1bb058064abe491b09da9b7df4"
+        }
+      },
+      "truth": {
+        "rootCauseFiles": ["backend-go/projects/gateway/internal/operationlog/store.go"],
+        "criticalRelations": [
+          {
+            "source": "symbol:backend-go/projects/gateway/internal/operationlog/store.go:EnsureSchema",
+            "target": "capability:f4-schema-bootstrap-deadline-long-enough",
+            "kind": "timeout",
+            "observation": "absent"
+          }
+        ]
+      }
+    }
+  ]
+}

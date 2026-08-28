@@ -72,7 +72,7 @@ test('policy v3 establishes the persisted application and release metadata contr
   const pluginManifest = JSON.parse(await readFile(path.join(root, '.codex-plugin', 'plugin.json'), 'utf8'));
   const mcpSource = await readFile(path.join(root, 'scripts', 'workflow_controller_mcp.mjs'), 'utf8');
   assert.equal(packageJson.version, '0.2.2');
-  assert.equal(pluginManifest.version, '0.2.2+codex.20260824000100');
+  assert.equal(pluginManifest.version, '0.2.2+codex.20260827000100');
   assert.match(mcpSource, /serverInfo: \{ name: 'agnets-workflow', version: '0\.2\.2' \}/);
   const { dispatch } = await import('../scripts/workflow_controller.mjs');
   const temp = await mkdtemp(path.join(os.tmpdir(), 'agnets-workflow-policy-v3-'));
@@ -1687,7 +1687,7 @@ test('workspace overview isolates unsupported legacy task state while retaining 
     assert.deepEqual(overview.tasks, [{ task_id: 'current-v3', application_id: legacyState.application_id ?? v3Manifest(workspace).application_id, release_id: 'current-release', task_kind: 'workflow', lease_status: 'active' }]);
     assert.deepEqual(overview.unsupported_tasks, [{
       task_id: 'legacy-malformed',
-      namespace: legacy.task_key.namespace,
+      namespace: process.platform === 'win32' ? legacy.task_key.namespace.toLowerCase() : legacy.task_key.namespace,
       error_code: 'UNSUPPORTED_WORKFLOW_STATE',
       field_errors: [{ path: 'application_id', code: 'unsupported_state', expected: 'present', actual: 'missing', message: 'Task state is missing required current field: application_id' }],
       recovery: { action: 'start_new_workflow' },

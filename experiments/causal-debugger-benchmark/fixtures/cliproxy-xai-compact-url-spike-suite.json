@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "suiteId": "cliproxy-xai-compact-url-holdout-spike-v1-20260828",
+  "mode": "spike",
+  "seed": "cliproxy-xai-compact-url-v1",
+  "repetitions": 1,
+  "executionProfile": {
+    "model": "gpt-5.6-terra",
+    "reasoningEffort": "high",
+    "promptVersion": "debug-v5-enum-guard",
+    "tokenBudget": 250000,
+    "timeoutMs": 180000,
+    "maxToolCalls": 8
+  },
+  "arms": [
+    { "id": "baseline", "evidenceMode": "none" },
+    { "id": "assisted", "evidenceMode": "packet" }
+  ],
+  "cases": [
+    {
+      "id": "case-028",
+      "repositoryId": "cliproxyapi",
+      "split": "holdout",
+      "category": "cross_service",
+      "caseKind": "bug",
+      "workspace": {
+        "path": "C:\\Users\\Administrator\\AppData\\Local\\Temp\\causal-debugger-real-project-experiment-20260828\\holdout-cliproxy-xai-compact-url",
+        "snapshot": "git:4231ad6e2a93040aa50b4aa918cc67adebc86a4c"
+      },
+      "problem": {
+        "text": "XAI compact 请求在 OAuth/CLI proxy 场景下偶发 404，并可能让整个认证池进入 cooldown；请定位最可能的根因文件和跨边界关系。"
+      },
+      "evidencePackets": {
+        "assisted": {
+          "path": "C:\\Users\\Administrator\\AppData\\Local\\Temp\\causal-debugger-real-project-experiment-20260828\\holdout-cliproxy-xai-compact-url\\evidence-packet.json",
+          "sha256": "a4a3fa3622e1273178e072ce33e484a342ff19f5be6e4d79ce12ae6a48d33a91"
+        }
+      },
+      "truth": {
+        "rootCauseFiles": ["internal/runtime/executor/xai_executor.go"],
+        "criticalRelations": [
+          {
+            "source": "symbol:internal/runtime/executor/xai_executor.go:executeCompactRequest",
+            "target": "capability:xai-compact-request-uses-dedicated-base-url",
+            "kind": "configuration",
+            "observation": "absent"
+          }
+        ]
+      }
+    }
+  ]
+}

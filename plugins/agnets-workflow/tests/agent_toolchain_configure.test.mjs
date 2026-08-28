@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
 const execFile = promisify(execFileCallback);
-const skillDirectory = path.dirname(fileURLToPath(new URL('../skills/agent-toolchain/SKILL.md', import.meta.url)));
+const skillDirectory = path.dirname(fileURLToPath(new URL('../../../skills/agent-toolchain/SKILL.md', import.meta.url)));
 const powershellDriver = path.join(skillDirectory, 'scripts', 'agent-toolchain.ps1');
 const shellDriver = path.join(skillDirectory, 'scripts', 'agent-toolchain.sh');
 const managedHeading = '## CodeGraph 与 RTK';

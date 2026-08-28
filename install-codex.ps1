@@ -727,6 +727,7 @@ function Get-ManagedPluginFileHashes {
     $hashes = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($file in Get-ChildItem -LiteralPath $absoluteRoot -Recurse -File -Force) {
         $relative = $file.FullName.Substring($absoluteRoot.Length).TrimStart([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar).Replace('\', '/')
+        if ($relative -eq 'node_modules' -or $relative.StartsWith('node_modules/')) { continue }
         if ([string]::IsNullOrWhiteSpace($relative) -or $hashes.ContainsKey($relative)) {
             throw "Invalid managed plugin file layout: $absoluteRoot"
         }
@@ -764,12 +765,48 @@ function Expand-ManagedPluginMcpHome {
         [System.IO.File]::WriteAllText($descriptorPath, $expanded, [System.Text.UTF8Encoding]::new($false))
     }
     $descriptor = Get-Content -LiteralPath $descriptorPath -Raw | ConvertFrom-Json -ErrorAction Stop
-    $configuredHome = $descriptor.mcpServers.'workflow-controller'.env.CODEX_HOME
-    if ($configuredHome -isnot [string] -or -not (Test-SamePath -Left $configuredHome -Right $CodexHome)) {
-        throw "Installed workflow-controller MCP does not contain the resolved Codex home: $descriptorPath"
+    $workflowServer = $descriptor.mcpServers.'workflow-controller'
+    if ($null -ne $workflowServer) {
+        $configuredHome = $workflowServer.env.CODEX_HOME
+        if ($configuredHome -isnot [string] -or -not (Test-SamePath -Left $configuredHome -Right $CodexHome)) {
+            throw "Installed workflow-controller MCP does not contain the resolved Codex home: $descriptorPath"
+        }
+        $envVarsProperty = $workflowServer.PSObject.Properties['env_vars']
+        if ($null -ne $envVarsProperty -and $null -ne $envVarsProperty.Value) {
+            throw "Installed workflow-controller MCP must not inherit Codex home variables: $descriptorPath"
+        }
     }
-    if ($null -ne $descriptor.mcpServers.'workflow-controller'.env_vars) {
-        throw "Installed workflow-controller MCP must not inherit Codex home variables: $descriptorPath"
+}
+
+function Install-ManagedPluginDependencies {
+    param(
+        [Parameter(Mandatory)][string]$CachePath,
+        [Parameter(Mandatory)][string]$PluginName
+    )
+
+    $lockPath = Join-Path $CachePath 'package-lock.json'
+    if (-not (Test-Path -LiteralPath $lockPath -PathType Leaf)) { return }
+    $npmCommand = Get-Command npm.cmd -All -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $npmCommand -or [string]::IsNullOrWhiteSpace($npmCommand.Source)) {
+        throw "npm.cmd is required to install dependencies for managed plugin: $PluginName"
+    }
+    $npmOutput = (& $npmCommand.Source --prefix $CachePath ci --omit=dev --ignore-scripts --no-audit --no-fund 2>&1 | Out-String)
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not install dependencies for managed plugin: $PluginName. npm output: $npmOutput"
+    }
+}
+
+function Repair-ManagedPluginCacheMcpHomes {
+    param(
+        [Parameter(Mandatory)][string]$CodexHome,
+        [Parameter(Mandatory)][string]$MarketplaceName,
+        [Parameter(Mandatory)][string]$PluginName
+    )
+    $cacheRoot = Join-Path (Join-Path (Join-Path $CodexHome 'plugins\cache') $MarketplaceName) $PluginName
+    if (-not (Test-Path -LiteralPath $cacheRoot -PathType Container)) { return }
+    Assert-NoReparsePointsInTree -Path $cacheRoot
+    foreach ($descriptor in Get-ChildItem -LiteralPath $cacheRoot -Filter '.mcp.json' -File -Recurse -Force) {
+        Expand-ManagedPluginMcpHome -CachePath $descriptor.Directory.FullName -CodexHome $CodexHome
     }
 }
 
@@ -832,12 +869,14 @@ function Install-ManagedPlugin {
     $previousCodexHome = $env:CODEX_HOME
     try {
         $env:CODEX_HOME = $CodexHome
+        Repair-ManagedPluginCacheMcpHomes -CodexHome $CodexHome -MarketplaceName $MarketplaceName -PluginName $PluginName
         & $codexCli plugin marketplace add $MarketplaceRoot
         if ($LASTEXITCODE -ne 0) { throw "Could not register plugin marketplace: $MarketplaceRoot" }
         $marketplaceOutput = (& $codexCli plugin marketplace list 2>&1 | Out-String)
         if ($LASTEXITCODE -ne 0 -or $marketplaceOutput -notmatch ('(?m)^\s*' + [System.Text.RegularExpressions.Regex]::Escape($MarketplaceName) + '\s+')) {
             throw "Codex did not retain marketplace registration after add: $MarketplaceName. Output: $marketplaceOutput"
         }
+        Repair-ManagedPluginCacheMcpHomes -CodexHome $CodexHome -MarketplaceName $MarketplaceName -PluginName $PluginName
         $cacheMatches = Test-ManagedPluginCacheMatchesSource -PluginSource $plugin.Source -CachePath $cachePath -CodexHome $CodexHome
         $pluginActive = Test-ManagedPluginIsActive -CodexCli $codexCli -PluginName $PluginName -MarketplaceName $MarketplaceName -PluginVersion $plugin.Version
         if (-not ($cacheMatches -and $pluginActive)) {
@@ -858,6 +897,7 @@ function Install-ManagedPlugin {
                 Write-Warning "Codex reported an error while cleaning an older plugin cache entry, but the requested plugin cache and active configuration were verified. Original output: $pluginAddOutput"
             }
         }
+        Install-ManagedPluginDependencies -CachePath $cachePath -PluginName $PluginName
         # Codex plugin add may rewrite config.toml from an in-memory snapshot.
         # Register once more after it so the final durable config keeps both the
         # enabled plugin and its marketplace.
@@ -935,18 +975,20 @@ $managedAgentRoleContracts = @(
     [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_terra_medium_readonly.toml'; RoleName = 'avsp_terra_medium_readonly'; Model = 'gpt-5.6-terra'; ReasoningEffort = 'medium'; SandboxMode = 'read-only' }
 )
 $managedPluginName = 'agnets-workflow'
+$causalDebuggerPluginName = 'causal-debugger'
 $managedMarketplaceName = 'ai-vibecode-superpower-local'
 $sourcePlugin = Join-Path $scriptRoot "plugins\$managedPluginName"
+$causalDebuggerPluginSource = Join-Path $scriptRoot "plugins\$causalDebuggerPluginName"
 $sourceMarketplace = Join-Path $scriptRoot '.agents\plugins\marketplace.json'
 $sourcePluginSkills = Join-Path $sourcePlugin 'skills'
 $sourceStandaloneSkills = Join-Path $scriptRoot 'skills'
 $managedPluginSkillNames = @(
-    'agent-toolchain'
     'orchestrate-model-workflow'
     'workflow-controller'
 )
 $legacyPluginSkillNamesToRemove = @('adaptive-efficiency')
 $managedStandaloneSkillNames = @(
+    'agent-toolchain'
     'gpt-image-2-cli'
     'project-doc-planner'
 )
@@ -959,6 +1001,7 @@ if (-not (Test-Path -LiteralPath $sourceAgentRoles -PathType Container)) { throw
 if (-not (Test-Path -LiteralPath $sourceAgentRoleManifest -PathType Leaf)) { throw "Missing source file: $sourceAgentRoleManifest" }
 if (-not (Test-Path -LiteralPath $sourceMarketplace -PathType Leaf)) { throw "Missing source file: $sourceMarketplace" }
 if (-not (Test-Path -LiteralPath $sourcePlugin -PathType Container)) { throw "Missing source directory: $sourcePlugin" }
+if (-not (Test-Path -LiteralPath $causalDebuggerPluginSource -PathType Container)) { throw "Missing source directory: $causalDebuggerPluginSource" }
 Assert-ManagedAgentRoleProfiles -RoleDirectory $sourceAgentRoles -Contracts $managedAgentRoleContracts -ManifestPath $sourceAgentRoleManifest
 if (-not (Test-Path -LiteralPath $sourcePluginSkills -PathType Container)) { throw "Missing source directory: $sourcePluginSkills" }
 if (-not (Test-Path -LiteralPath $sourceStandaloneSkills -PathType Container)) { throw "Missing source directory: $sourceStandaloneSkills" }
@@ -973,11 +1016,10 @@ foreach ($skillName in $managedStandaloneSkillNames) {
     }
 }
 
-if ([string]::IsNullOrWhiteSpace($env:CODEX_HOME)) {
-    $codexHome = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)) '.codex'
-} else {
-    $codexHome = $env:CODEX_HOME
-}
+$userProfile = $env:USERPROFILE
+if ([string]::IsNullOrWhiteSpace($userProfile)) { $userProfile = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile) }
+if ([string]::IsNullOrWhiteSpace($userProfile)) { throw 'Could not determine the current user profile directory' }
+$codexHome = Join-Path $userProfile '.codex'
 $codexHome = Get-AbsolutePath -Path $codexHome
 
 if ([System.IO.Path]::GetPathRoot($codexHome).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar) -eq $codexHome.TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)) {
@@ -1109,6 +1151,11 @@ try {
     # Plugin commands update config.toml. Run them only after its staged version
     # is installed, while the transaction can still restore the previous config.
     Install-ManagedPlugin -CodexHome $codexHome -MarketplaceRoot $scriptRoot -PluginName $managedPluginName -MarketplaceName $managedMarketplaceName -PluginSource $sourcePlugin
+    Install-ManagedPlugin -CodexHome $codexHome -MarketplaceRoot $scriptRoot -PluginName $causalDebuggerPluginName -MarketplaceName $managedMarketplaceName -PluginSource $causalDebuggerPluginSource
+    $managedPlugin = Get-ManagedPluginIdentity -PluginSource $sourcePlugin -PluginName $managedPluginName
+    if (-not (Test-ManagedPluginIsActive -CodexCli (Get-CodexCliPath) -PluginName $managedPluginName -MarketplaceName $managedMarketplaceName -PluginVersion $managedPlugin.Version)) {
+        throw "Codex did not retain the managed workflow plugin after installing $causalDebuggerPluginName"
+    }
 
     foreach ($target in $transactionTargets.Where({ $_.Operation -eq 'Remove' })) {
         if ($target.WasPresent) {
@@ -1126,6 +1173,7 @@ try {
 
     Write-Host "Codex configuration installed in: $codexHome"
     Write-Host "Managed plugin installed: $managedPluginName@$managedMarketplaceName"
+    Write-Host "Causal debugger installed: $causalDebuggerPluginName@$managedMarketplaceName"
     Write-Host 'Managed standalone skills installed; obsolete global copies of plugin skills removed.'
     if ($null -ne $backupDirectory) {
         Write-Host "Backup directory: $backupDirectory"

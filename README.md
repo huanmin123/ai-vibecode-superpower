@@ -11,7 +11,7 @@
 | **速度** | 可拆分的取证与准备工作并行推进；依赖满足后立刻进入下一节点。 | 减少等待串行链路，让复杂任务更快收敛。 |
 | **智力** | 先用证据缩小问题，再把高强度判断留给真正复杂、冲突或高风险的决策。 | 不是“多想一点”，而是让推理聚焦在最值得推理的地方。 |
 | **成本** | 范围明确的扫描、整理和可验证执行使用更经济的路径；高成本复审按风险升级。 | 降低重复探索与不必要的高强度推理消耗。 |
-| **可靠性** | 协作闭环中的复杂任务留下状态、checkpoint、验证和审核证据；直接任务保留实际改动与验证证据。 | 中断可恢复，结论可核对，未验证的风险不会被包装成完成。 |
+| **可靠性** | 协作闭环中的复杂任务留下状态、checkpoint、验证和审核证据；直接任务保留实际结果和验证证据，有改动时附 diff。 | 中断可恢复，结论可核对，未验证的风险不会被包装成完成。 |
 
 以上收益取决于任务规模、可拆分程度、代码库质量和验证条件。一次性小改动通常直接完成，不会强行引入额外协作成本。
 
@@ -21,7 +21,7 @@
 flowchart LR
     USER(["目标 · 范围 · 验收标准"]) --> INTAKE["任务准入<br/>先判断：直接完成，还是进入协作闭环？"]
 
-    INTAKE -->|"单文件、边界清晰且低风险"| DIRECT["最小充分实现<br/>直接修改"]
+    INTAKE -->|"简单问答、只读查询或单文件且边界清晰低风险"| DIRECT["最小充分实现<br/>直接完成"]
     DIRECT --> LOCAL_VERIFY["贴近改动验证<br/>并按影响扩大"]
     LOCAL_VERIFY --> DIRECT_DELIVERY(["直接交付"])
     INTAKE -->|"复杂、跨域或高风险"| EXPLORE
@@ -66,7 +66,7 @@ flowchart LR
     class PROMOTE,DELIVERY,DIRECT_DELIVERY result;
 ```
 
-复杂任务用 `Explore → Plan → Work → Critique → Promote` 表达主线：`Explore` 是取证，`Plan` 是定案与契约，`Work` 包含实施和集成验证，`Critique` 是独立末端质量门，`Promote` 仅表示在质量门与关闭检查通过后允许可信交付，不授权额外发布或部署。单文件、边界清晰且低风险的直接任务不进入该闭环，只需直接完成并运行贴近改动、再按影响扩大的验证。
+复杂任务用 `Explore → Plan → Work → Critique → Promote` 表达主线：`Explore` 是取证，`Plan` 是定案与契约，`Work` 包含实施和集成验证，`Critique` 是独立末端质量门，`Promote` 仅表示在质量门与关闭检查通过后允许可信交付，不授权额外发布或部署。简单问答、只读查询或单文件且边界清晰低风险的直接任务不进入该闭环；有改动时运行贴近改动、再按影响扩大的验证后交付。
 
 这不是“多开几个 agent”。它是一套明确分工的工程闭环：低成本工作尽量并行和复用，高强度判断只在证据不足、风险上升或需要独立复查时介入；每次交付都要经过与任务风险相称的验证。
 
@@ -87,6 +87,7 @@ flowchart LR
 
 - 已安装并可运行的 Codex CLI。
 - Node.js `>=22.5.0`（工作流控制器使用原生 `node:sqlite`）。
+- 可运行的 `npm`（安装 `causal-debugger` 的 CodeGraph 运行时依赖）。
 - macOS/Linux 还需要 `rg`（ripgrep）。
 - 安装前完全退出 Codex Desktop；否则运行中的应用可能把配置覆盖回去。
 
@@ -124,6 +125,9 @@ sandbox_mode = "danger-full-access"
 [plugins."agnets-workflow@ai-vibecode-superpower-local"]
 enabled = true
 
+[plugins."causal-debugger@ai-vibecode-superpower-local"]
+enabled = true
+
 [agents]
 max_threads = 1000
 max_depth = 5
@@ -138,7 +142,8 @@ goals = true
 
 | 能力 | 何时使用 | 你会得到 |
 | --- | --- | --- |
-| [`agent-toolchain`](plugins/agnets-workflow/skills/agent-toolchain/SKILL.md) | 首次接入、修复、维护或审查 CodeGraph/RTK | 对目标项目进行受控接入与维护。 |
+| [`agent-toolchain`](skills/agent-toolchain/SKILL.md) | 首次接入、修复、维护或审查 CodeGraph/RTK | 对目标项目进行受控接入与维护。 |
+| [`causal-debugger`](plugins/causal-debugger/skills/causal-debugger/SKILL.md) | Bug、异常、超时、崩溃或行为回归的只读分析 | 汇总 CodeGraph 与日志证据，输出有界根因候选。 |
 | [`workflow-controller`](plugins/agnets-workflow/skills/workflow-controller/SKILL.md) | 需要持久化状态、恢复交接或严格收口 | 任务状态、checkpoint、写入协调与关闭检查。 |
 | [`project-doc-planner`](skills/project-doc-planner/SKILL.md) | 新项目或大型改造的文档规划 | 可维护的项目级文档结构。 |
 | [`gpt-image-2-cli`](skills/gpt-image-2-cli/SKILL.md) | 需要生成或编辑图片素材 | 通过命令行调用图像生成能力。 |

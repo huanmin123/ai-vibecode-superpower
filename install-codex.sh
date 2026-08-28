@@ -10,14 +10,16 @@ source_docs=$script_dir/codex-global-config/docs
 source_agent_roles=$script_dir/codex-global-config/agents/ai-vibecode-superpower
 source_agent_role_manifest=$script_dir/codex-global-config/agents/ai-vibecode-superpower.sha256
 managed_plugin_name=agnets-workflow
+causal_debugger_plugin_name=causal-debugger
 managed_marketplace_name=ai-vibecode-superpower-local
 source_plugin=$script_dir/plugins/$managed_plugin_name
+causal_debugger_plugin_source=$script_dir/plugins/$causal_debugger_plugin_name
 source_marketplace=$script_dir/.agents/plugins/marketplace.json
 source_plugin_skills=$source_plugin/skills
 source_standalone_skills=$script_dir/skills
-managed_plugin_skill_names='agent-toolchain orchestrate-model-workflow workflow-controller'
+managed_plugin_skill_names='orchestrate-model-workflow workflow-controller'
 legacy_plugin_skill_names_to_remove='adaptive-efficiency'
-managed_standalone_skill_names='gpt-image-2-cli project-doc-planner'
+managed_standalone_skill_names='agent-toolchain gpt-image-2-cli project-doc-planner'
 managed_agent_role_files='ai-vibecode-superpower-avsp_luna_high.toml ai-vibecode-superpower-avsp_luna_xhigh.toml ai-vibecode-superpower-avsp_luna_high_executor.toml ai-vibecode-superpower-avsp_luna_xhigh_executor.toml ai-vibecode-superpower-avsp_sol_high.toml ai-vibecode-superpower-avsp_sol_max.toml ai-vibecode-superpower-avsp_sol_xhigh.toml ai-vibecode-superpower-avsp_terra_high.toml ai-vibecode-superpower-avsp_terra_xhigh.toml ai-vibecode-superpower-avsp_terra_xhigh_readonly.toml ai-vibecode-superpower-avsp_terra_low_readonly.toml ai-vibecode-superpower-avsp_terra_medium_readonly.toml'
 
 for source_path in "$source_agents" "$source_config" "$source_model_provider_settings" "$source_agent_role_manifest" "$source_marketplace"; do
@@ -32,6 +34,10 @@ for source_path in "$source_docs" "$source_agent_roles" "$source_plugin" "$sourc
         exit 1
     fi
 done
+if [ ! -d "$causal_debugger_plugin_source" ]; then
+    printf '%s\n' "Missing source directory: $causal_debugger_plugin_source" >&2
+    exit 1
+fi
 for agent_role_file in $managed_agent_role_files; do
     source_role=$source_agent_roles/$agent_role_file
     if [ ! -f "$source_role" ]; then
@@ -66,12 +72,8 @@ command -v rg >/dev/null 2>&1 || {
     exit 1
 }
 
-if [ -n "${CODEX_HOME:-}" ]; then
-    codex_home=$CODEX_HOME
-else
-    : "${HOME:?HOME must be set when CODEX_HOME is empty}"
-    codex_home=$HOME/.codex
-fi
+: "${HOME:?HOME must be set}"
+codex_home=$HOME/.codex
 
 mkdir -p "$codex_home"
 codex_home=$(CDPATH= cd -- "$codex_home" && pwd -P) || exit 1
@@ -135,6 +137,36 @@ if (server?.env?.CODEX_HOME !== codexHome.replaceAll('\\', '/') || server?.env_v
 NODE
 }
 
+repair_managed_plugin_cache_mcp_homes() {
+    cache_root=$codex_home/plugins/cache/$managed_marketplace_name/$managed_plugin_name
+    [ -d "$cache_root" ] || return 0
+    node --input-type=module - "$cache_root" "$codex_home" <<'NODE'
+import { lstat, readdir, readFile, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+const [root, codexHome] = process.argv.slice(2);
+const resolvedHome = codexHome.replaceAll('\\', '/');
+async function visit(directory) {
+  const stat = await lstat(directory);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`unsafe plugin cache root: ${directory}`);
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    const target = join(directory, entry.name);
+    const child = await lstat(target);
+    if (child.isSymbolicLink()) throw new Error(`unsafe plugin cache link: ${target}`);
+    if (child.isDirectory()) await visit(target);
+    else if (child.isFile() && entry.name === '.mcp.json') {
+      const content = await readFile(target, 'utf8');
+      const expanded = content.replaceAll('<CODEX_HOME>', resolvedHome);
+      if (expanded !== content) await writeFile(target, expanded, 'utf8');
+      const descriptor = JSON.parse(expanded);
+      const server = descriptor?.mcpServers?.['workflow-controller'];
+      if (server?.env?.CODEX_HOME !== resolvedHome || server?.env_vars !== undefined) throw new Error(`invalid managed plugin MCP descriptor: ${target}`);
+    }
+  }
+}
+await visit(root);
+NODE
+}
+
 plugin_cache_matches_source() {
     candidate_cache=$1
     [ -d "$candidate_cache" ] || return 1
@@ -156,6 +188,7 @@ async function collect(root) {
       const stat = await lstat(absolute);
       if (stat.isSymbolicLink()) throw new Error(`unsafe plugin link: ${absolute}`);
       if (stat.isDirectory()) {
+        if (entry.name === 'node_modules') continue;
         await visit(absolute);
       } else if (stat.isFile()) {
         const name = relative(root, absolute).split(sep).join('/');
@@ -175,6 +208,21 @@ async function collect(root) {
 const [source, cache] = await Promise.all([collect(sourceRoot), collect(cacheRoot)]);
 process.exitCode = JSON.stringify(source) === JSON.stringify(cache) ? 0 : 1;
 NODE
+}
+
+install_plugin_dependencies() {
+    plugin_name=$1
+    plugin_version=$2
+    plugin_cache=$codex_home/plugins/cache/$managed_marketplace_name/$plugin_name/$plugin_version
+    [ -f "$plugin_cache/package-lock.json" ] || return 0
+    command -v npm >/dev/null 2>&1 || {
+        printf '%s\n' "npm is required to install dependencies for managed plugin: $plugin_name" >&2
+        return 1
+    }
+    npm --prefix "$plugin_cache" ci --omit=dev --ignore-scripts --no-audit --no-fund || {
+        printf '%s\n' "Could not install dependencies for managed plugin: $plugin_name" >&2
+        return 1
+    }
 }
 
 managed_plugin_is_active() {
@@ -217,6 +265,7 @@ install_managed_plugin() {
         return 1
     }
     plugin_cache=$codex_home/plugins/cache/$managed_marketplace_name/$managed_plugin_name/$plugin_version
+    repair_managed_plugin_cache_mcp_homes
     CODEX_HOME="$codex_home" codex plugin marketplace add "$script_dir"
     if ! plugin_cache_matches_source "$plugin_cache" || ! managed_plugin_is_active "$plugin_version"; then
         # An enabled entry that the CLI cannot list is not a usable install.
@@ -239,6 +288,7 @@ install_managed_plugin() {
     # plugin add can rewrite config.toml from an in-memory snapshot; register
     # the marketplace again so the installed plugin remains discoverable.
     CODEX_HOME="$codex_home" codex plugin marketplace add "$script_dir"
+    repair_managed_plugin_cache_mcp_homes
     marketplace_output=$(CODEX_HOME="$codex_home" codex plugin marketplace list 2>&1) || {
         printf '%s\n' 'Could not verify managed plugin marketplace registration.' >&2
         return 1
@@ -256,6 +306,37 @@ install_managed_plugin() {
     if [ "$final_cache_matches" -ne 1 ]; then
         printf '%s\n' "Warning: managed plugin cache differs from the source after semantic MCP validation; retaining the verified active plugin: $managed_plugin_name@$managed_marketplace_name" >&2
     fi
+    install_plugin_dependencies "$managed_plugin_name" "$plugin_version" || return 1
+}
+
+install_additional_plugin() {
+    plugin_name=$1
+    plugin_source=$2
+    plugin_version=$(node --input-type=module - "$plugin_source/.codex-plugin/plugin.json" "$plugin_name" <<'NODE'
+import { readFile } from 'node:fs/promises';
+const [manifestPath, expectedName] = process.argv.slice(2);
+const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
+if (manifest.name !== expectedName || typeof manifest.version !== 'string' || !/^[0-9A-Za-z][0-9A-Za-z.+_-]*$/.test(manifest.version)) process.exitCode = 1;
+else process.stdout.write(manifest.version);
+NODE
+    ) || {
+        printf '%s\n' "Invalid managed plugin manifest: $plugin_source/.codex-plugin/plugin.json" >&2
+        exit 1
+    }
+    CODEX_HOME="$codex_home" codex plugin marketplace add "$script_dir" >/dev/null
+    CODEX_HOME="$codex_home" codex plugin add "$plugin_name@$managed_marketplace_name" >/dev/null || {
+        printf '%s\n' "Could not install managed plugin: $plugin_name@$managed_marketplace_name" >&2
+        exit 1
+    }
+    plugin_output=$(CODEX_HOME="$codex_home" codex plugin list 2>&1) || {
+        printf '%s\n' "Could not verify installed plugin: $plugin_name@$managed_marketplace_name" >&2
+        exit 1
+    }
+    printf '%s\n' "$plugin_output" | rg -q "^[[:space:]]*$plugin_name@$managed_marketplace_name[[:space:]]+installed,[[:space:]]+enabled[[:space:]]+$plugin_version[[:space:]]+" || {
+        printf '%s\n' "Codex did not retain the exact managed plugin version: $plugin_name@$managed_marketplace_name ($plugin_version)" >&2
+        exit 1
+    }
+    install_plugin_dependencies "$plugin_name" "$plugin_version" || exit 1
 }
 
 remove_retired_workflow_plugin() {
@@ -1259,6 +1340,15 @@ remove_retired_workflow_plugin
 # Plugin commands update config.toml. Run them only after its staged version
 # is installed, while the transaction can still restore the previous config.
 install_managed_plugin
+managed_workflow_version=$plugin_version
+install_additional_plugin "$causal_debugger_plugin_name" "$causal_debugger_plugin_source"
+plugin_version=$managed_workflow_version
+if ! managed_plugin_is_active "$plugin_version"; then
+    printf '%s\n' "Codex did not retain the managed workflow plugin after installing $causal_debugger_plugin_name" >&2
+    exit 1
+fi
+# Keep the marketplace discoverable after the second plugin add as well.
+CODEX_HOME="$codex_home" codex plugin marketplace add "$script_dir" >/dev/null
 
 while IFS="$tab" read -r target_name target_path candidate_path target_kind target_operation; do
     [ "$target_operation" = remove ] || continue
@@ -1278,6 +1368,7 @@ assert_managed_agent_role_directory "$codex_home/agents/ai-vibecode-superpower"
 completed=1
 printf '%s\n' "Codex configuration installed in: $codex_home"
 printf '%s\n' "Managed plugin installed: $managed_plugin_name@$managed_marketplace_name"
+printf '%s\n' "Causal debugger installed: $causal_debugger_plugin_name@$managed_marketplace_name"
 printf '%s\n' 'Managed standalone skills installed; obsolete global copies of plugin skills removed.'
 if [ -n "$backup_dir" ]; then
     printf '%s\n' "Backup directory: $backup_dir"

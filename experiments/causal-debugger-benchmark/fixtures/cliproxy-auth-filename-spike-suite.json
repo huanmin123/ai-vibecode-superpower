@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "suiteId": "cliproxy-auth-filename-holdout-spike-v1-20260828",
+  "mode": "spike",
+  "seed": "cliproxy-auth-filename-v1",
+  "repetitions": 1,
+  "executionProfile": {
+    "model": "gpt-5.6-terra",
+    "reasoningEffort": "high",
+    "promptVersion": "debug-v5-enum-guard",
+    "tokenBudget": 250000,
+    "timeoutMs": 180000,
+    "maxToolCalls": 8
+  },
+  "arms": [
+    { "id": "baseline", "evidenceMode": "none" },
+    { "id": "assisted", "evidenceMode": "packet" }
+  ],
+  "cases": [
+    {
+      "id": "case-027",
+      "repositoryId": "cliproxyapi",
+      "split": "holdout",
+      "category": "configuration",
+      "caseKind": "bug",
+      "workspace": {
+        "path": "C:\\Users\\Administrator\\AppData\\Local\\Temp\\causal-debugger-real-project-experiment-20260828\\holdout-cliproxy-auth-filename",
+        "snapshot": "git:58ef846ff0cc0c17ed301d9e47a84de0cdaf8c81"
+      },
+      "problem": {
+        "text": "同一邮箱的多个 Codex OAuth 账户在非 team 订阅下可能复用 credential 文件名，造成一个账户覆盖另一个账户。请定位根因文件和关键因果关系。"
+      },
+      "evidencePackets": {
+        "assisted": {
+          "path": "C:\\Users\\Administrator\\AppData\\Local\\Temp\\causal-debugger-real-project-experiment-20260828\\holdout-cliproxy-auth-filename\\evidence-packet.json",
+          "sha256": "91d74b7dd90f960fbb435fba23ca0921139f487cf73daacc9cc4e3a1ab484f50"
+        }
+      },
+      "truth": {
+        "rootCauseFiles": ["internal/auth/codex/filename.go"],
+        "criticalRelations": [
+          {
+            "source": "symbol:internal/auth/codex/filename.go:CredentialFileName",
+            "target": "identity:credential-filename-includes-account-hash",
+            "kind": "identity",
+            "observation": "absent"
+          }
+        ]
+      }
+    }
+  ]
+}
