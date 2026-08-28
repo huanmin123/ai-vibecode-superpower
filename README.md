@@ -11,7 +11,7 @@
 | **速度** | 可拆分的取证与准备工作并行推进；依赖满足后立刻进入下一节点。 | 减少等待串行链路，让复杂任务更快收敛。 |
 | **智力** | 先用证据缩小问题，再把高强度判断留给真正复杂、冲突或高风险的决策。 | 不是“多想一点”，而是让推理聚焦在最值得推理的地方。 |
 | **成本** | 范围明确的扫描、整理和可验证执行使用更经济的路径；高成本复审按风险升级。 | 降低重复探索与不必要的高强度推理消耗。 |
-| **可靠性** | 每项工作留下状态、checkpoint、验证和审核证据；交付前由独立质量门把关。 | 中断可恢复，结论可核对，未验证的风险不会被包装成完成。 |
+| **可靠性** | 协作闭环中的复杂任务留下状态、checkpoint、验证和审核证据；直接任务保留实际改动与验证证据。 | 中断可恢复，结论可核对，未验证的风险不会被包装成完成。 |
 
 以上收益取决于任务规模、可拆分程度、代码库质量和验证条件。一次性小改动通常直接完成，不会强行引入额外协作成本。
 
@@ -21,16 +21,18 @@
 flowchart LR
     USER(["目标 · 范围 · 验收标准"]) --> INTAKE["任务准入<br/>先判断：直接完成，还是进入协作闭环？"]
 
-    INTAKE -->|"小而明确"| DIRECT["最小充分实现<br/>直接修改 + 就近验证"]
-    INTAKE -->|"复杂、跨域或高风险"| DISCOVER
+    INTAKE -->|"单文件、边界清晰且低风险"| DIRECT["最小充分实现<br/>直接修改"]
+    DIRECT --> LOCAL_VERIFY["贴近改动验证<br/>并按影响扩大"]
+    LOCAL_VERIFY --> DIRECT_DELIVERY(["直接交付"])
+    INTAKE -->|"复杂、跨域或高风险"| EXPLORE
 
-    subgraph INTEL["智能编排层 · 把推理花在刀刃上"]
+    subgraph INTEL["复杂任务主线 · 把推理花在刀刃上"]
         direction TB
-        DISCOVER["并行取证<br/>拆开独立证据域，减少重复探索"]
-        DESIGN["证据驱动定案<br/>明确契约、边界、风险与验证"]
-        EXECUTE["受控执行<br/>范围明确的工作按依赖并行推进"]
-        VERIFY["集成验证<br/>检查结果、影响范围与残余风险"]
-        DISCOVER --> DESIGN --> EXECUTE --> VERIFY
+        EXPLORE["Explore · 并行取证<br/>拆开独立证据域，减少重复探索"]
+        PLAN["Plan · 证据驱动定案<br/>明确契约、边界、风险与验证"]
+        WORK["Work · 受控执行<br/>范围明确的工作按依赖并行推进"]
+        VERIFY["Work 内集成验证<br/>检查结果、影响范围与残余风险"]
+        EXPLORE --> PLAN --> WORK --> VERIFY
     end
 
     subgraph CONTROL["持久化控制平面 · 可恢复、可审计、不丢上下文"]
@@ -42,27 +44,29 @@ flowchart LR
         DAG --> STATE --> LOCK --> EVIDENCE
     end
 
-    DISCOVER -.->|"拆分与就绪"| DAG
-    EXECUTE -.->|"实际写入时"| LOCK
+    EXPLORE -.->|"拆分与就绪"| DAG
+    WORK -.->|"实际写入时"| LOCK
     VERIFY -.->|"验证完成后"| EVIDENCE
 
-    DIRECT --> GATE
-    VERIFY --> GATE{"独立末端质量门<br/>验收、范围、验证与风险是否闭环？"}
-    GATE -->|"通过"| DELIVERY(["可信交付<br/>速度 × 智力 × 成本效率"])
-    GATE -->|"发现问题"| REPAIR["精确修复<br/>重新验证，并按需要提高审查强度"]
-    REPAIR --> EXECUTE
+    VERIFY --> CRITIQUE{"Critique · 独立末端质量门<br/>验收、范围、验证与风险是否闭环？"}
+    CRITIQUE -->|"质量门与关闭检查通过"| PROMOTE["Promote · 可信交付<br/>速度 × 智力 × 成本效率"]
+    PROMOTE --> DELIVERY(["可信交付完成"])
+    CRITIQUE -->|"发现问题"| REPAIR["精确修复<br/>重新验证，并按需要提高审查强度"]
+    REPAIR --> WORK
 
     classDef start fill:#0b1220,stroke:#38bdf8,color:#f8fafc,stroke-width:2px;
     classDef smart fill:#102a43,stroke:#22d3ee,color:#ecfeff,stroke-width:2px;
     classDef control fill:#1e1b4b,stroke:#a78bfa,color:#f5f3ff,stroke-width:2px;
     classDef gate fill:#3f1d2e,stroke:#fb7185,color:#fff1f2,stroke-width:2px;
     classDef result fill:#14532d,stroke:#4ade80,color:#f0fdf4,stroke-width:3px;
-    class USER,INTAKE,DIRECT start;
-    class DISCOVER,DESIGN,EXECUTE,VERIFY smart;
+    class USER,INTAKE,DIRECT,LOCAL_VERIFY start;
+    class EXPLORE,PLAN,WORK,VERIFY smart;
     class DAG,STATE,LOCK,EVIDENCE control;
-    class GATE,REPAIR gate;
-    class DELIVERY result;
+    class CRITIQUE,REPAIR gate;
+    class PROMOTE,DELIVERY,DIRECT_DELIVERY result;
 ```
+
+复杂任务用 `Explore → Plan → Work → Critique → Promote` 表达主线：`Explore` 是取证，`Plan` 是定案与契约，`Work` 包含实施和集成验证，`Critique` 是独立末端质量门，`Promote` 仅表示在质量门与关闭检查通过后允许可信交付，不授权额外发布或部署。单文件、边界清晰且低风险的直接任务不进入该闭环，只需直接完成并运行贴近改动、再按影响扩大的验证。
 
 这不是“多开几个 agent”。它是一套明确分工的工程闭环：低成本工作尽量并行和复用，高强度判断只在证据不足、风险上升或需要独立复查时介入；每次交付都要经过与任务风险相称的验证。
 

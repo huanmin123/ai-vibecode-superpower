@@ -2,6 +2,8 @@
 
 路由、角色与恢复规则以 [SKILL.md](../SKILL.md) 为准。本文件只约定父子 agent 如何传递任务，不创建运行时对象或状态文件。
 
+本模板只用于已准入的复杂任务。任务表使用 `Explore / Plan / Work / Critique` 标记可派发工作；这些名称是对外进度语言，不替代控制器节点或审核协议。`Promote` 不填入任务表，只由 main/root 在质量门通过且关闭检查允许后表达可信交付。单文件、边界清晰且低风险的直接任务不创建本模板、控制器或独立审核。
+
 ## 计划
 
 ```markdown
@@ -16,7 +18,7 @@
 
 | task_name | 阶段 | agent_type | 输入/依赖 | 验收 | 状态 |
 | --- | --- | --- | --- | --- | --- |
-| <Codex task name> | 取证 / 定案 / 实施 / 预审 / 总验收 | <role> | <必要输入> | <条件> | pending |
+| <Codex task name> | Explore / Plan / Work / Critique | <role> | <必要输入> | <条件> | pending |
 ```
 
 ## 委派消息
