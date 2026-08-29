@@ -126,6 +126,19 @@ function evidenceConfidence({ runtimeSupport, temporalSupport, interventionLift,
   return 'low';
 }
 
+function propagatedMetric(rootPaths, evidenceByNode, field) {
+  let best = 0;
+  for (const path of rootPaths) {
+    for (const [distance, nodeId] of path.path.entries()) {
+      const evidence = evidenceByNode.get(nodeId) ?? [];
+      if (evidence.length === 0) continue;
+      const average = evidence.reduce((sum, item) => sum + item[field], 0) / evidence.length;
+      best = Math.max(best, average * (0.75 ** distance));
+    }
+  }
+  return best;
+}
+
 function buildReverseBeam(seeds, incoming, nodeMap, maxDepth, beamWidth) {
   const paths = [];
   let truncated = false;
@@ -165,10 +178,18 @@ function buildReverseBeam(seeds, incoming, nodeMap, maxDepth, beamWidth) {
 function scoreHypothesis(root, rootPaths, seedCount, evidenceByNode, gapsByNode, nodeMap, priorByNode, weights, edges) {
   const coveredSeeds = new Set(rootPaths.map((path) => path.seedId));
   const evidence = evidenceByNode.get(root) ?? [];
-  const temporalSupport = evidence.reduce((sum, item) => sum + item.temporal, 0) / Math.max(1, evidence.length);
-  const runtimeSupport = evidence.reduce((sum, item) => sum + item.support, 0) / Math.max(1, evidence.length);
-  const interventionLift = evidence.reduce((sum, item) => sum + item.interventionLift, 0) / Math.max(1, evidence.length);
-  const contradiction = evidence.reduce((sum, item) => sum + item.contradiction, 0) / Math.max(1, evidence.length);
+  const directTemporalSupport = evidence.reduce((sum, item) => sum + item.temporal, 0) / Math.max(1, evidence.length);
+  const directRuntimeSupport = evidence.reduce((sum, item) => sum + item.support, 0) / Math.max(1, evidence.length);
+  const directInterventionLift = evidence.reduce((sum, item) => sum + item.interventionLift, 0) / Math.max(1, evidence.length);
+  const directContradiction = evidence.reduce((sum, item) => sum + item.contradiction, 0) / Math.max(1, evidence.length);
+  const propagatedTemporalSupport = propagatedMetric(rootPaths, evidenceByNode, 'temporal');
+  const propagatedRuntimeSupport = propagatedMetric(rootPaths, evidenceByNode, 'support');
+  const propagatedInterventionLift = propagatedMetric(rootPaths, evidenceByNode, 'interventionLift');
+  const propagatedContradiction = propagatedMetric(rootPaths, evidenceByNode, 'contradiction');
+  const temporalSupport = Math.max(directTemporalSupport, propagatedTemporalSupport);
+  const runtimeSupport = Math.max(directRuntimeSupport, propagatedRuntimeSupport);
+  const interventionLift = Math.max(directInterventionLift, propagatedInterventionLift);
+  const contradiction = Math.max(directContradiction, propagatedContradiction);
   const structuralSupport = rootPaths.reduce((sum, path) => sum + path.score, 0) / Math.max(1, rootPaths.length);
   const symptomCoverage = coveredSeeds.size / Math.max(1, seedCount);
   const prior = clamp(priorByNode.get(root) ?? 0);
@@ -205,10 +226,18 @@ function scoreHypothesis(root, rootPaths, seedCount, evidenceByNode, gapsByNode,
     prior,
     symptomCoverage,
     temporalSupport,
+    directTemporalSupport,
+    propagatedTemporalSupport,
     structuralSupport,
     runtimeSupport,
+    directRuntimeSupport,
+    propagatedRuntimeSupport,
     interventionLift,
+    directInterventionLift,
+    propagatedInterventionLift,
     contradiction,
+    directContradiction,
+    propagatedContradiction,
     unresolvedGap,
     testPenalty,
     supportingEvidence,

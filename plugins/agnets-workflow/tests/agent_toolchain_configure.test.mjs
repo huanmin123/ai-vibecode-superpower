@@ -233,6 +233,36 @@ test('POSIX configure declares the same complete CodeGraph/RTK block', async () 
   assert.ok(source.includes("die 'AGENTS.md 包含旧版 AI 工具注入标题；请人工迁移为当前 CodeGraph 与 RTK 受管标题'"));
 });
 
+test('upgrade action is pinned to supported versions and includes required post-upgrade checks', async () => {
+  const [powershellSource, shellSource, skill, installReference] = await Promise.all([
+    readFile(powershellDriver, 'utf8'),
+    readFile(shellDriver, 'utf8'),
+    readFile(path.join(skillDirectory, 'SKILL.md'), 'utf8'),
+    readFile(path.join(skillDirectory, 'references', 'install.md'), 'utf8'),
+  ]);
+
+  assert.match(powershellSource, /agent-toolchain\.ps1 upgrade --project PATH --dry-run\|--apply/);
+  assert.match(powershellSource, /function Invoke-Upgrade/);
+  assert.match(powershellSource, /\$codeGraphNeedsUpgrade = -not \(Test-Ready 'codegraph'\)/);
+  assert.match(powershellSource, /Invoke-RebuildCodeGraphIndex/);
+  assert.match(powershellSource, /'upgrade' \{ .* Invoke-Upgrade \}/);
+
+  assert.match(shellSource, /agent-toolchain\.sh upgrade --project PATH --dry-run\|--apply/);
+  assert.match(shellSource, /upgrade\(\)/);
+  assert.match(shellSource, /is_ready codegraph \|\| codegraph_needs_upgrade=1/);
+  assert.match(shellSource, /rebuild_codegraph_index/);
+  assert.match(shellSource, /upgrade\) upgrade ;;/);
+
+  assert.match(skill, /只把旧受管安装升级到驱动内置 manifest 的当前受支持版本，不查询 GitHub\/npm 最新版/);
+  assert.match(installReference, /不查询 GitHub\/npm 的最新版本，也不接受目标版本参数/);
+  assert.match(installReference, /CodeGraph 发生版本变化时，`--apply` 会全量重建 `.codegraph\/`，随后运行完整 `doctor`/);
+});
+
+test('PowerShell help accepts the documented --help invocation', { skip: process.platform !== 'win32' ? 'Windows PowerShell driver test runs only on Windows.' : !powershell && 'No PowerShell 7 found; set AGENT_TOOLCHAIN_TEST_PWSH to a PowerShell executable.' }, async () => {
+  const { stdout } = await run(powershell, ['-NoLogo', '-NoProfile', '-File', powershellDriver, '--help']);
+  assert.match(stdout, /agent-toolchain\.ps1 upgrade --project PATH --dry-run\|--apply/);
+});
+
 test('POSIX configure writes one complete CodeGraph/RTK block and rejects modified blocks', { skip: process.platform === 'win32' && !windowsBash && 'No Bash found on PATH; set AGENT_TOOLCHAIN_TEST_BASH to a Bash executable.' }, async () => {
   await verifyDriver('posix', invokePosixDriver);
 });

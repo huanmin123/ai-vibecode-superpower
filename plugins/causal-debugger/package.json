@@ -7,10 +7,10 @@
     "node": ">=22.5.0"
   },
   "dependencies": {
-    "@colbymchenry/codegraph": "1.5.0"
+    "@colbymchenry/codegraph": "1.6.0"
   },
   "scripts": {
-    "check": "node --check scripts/causal_debugger_mcp.mjs && node --check lib/causal-engine.mjs && node --check lib/runtime-evidence.mjs && node --check lib/codegraph-adapter.mjs",
+    "check": "node --check scripts/causal_debugger_mcp.mjs && node --check lib/causal-engine.mjs && node --check lib/runtime-evidence.mjs && node --check lib/codegraph-adapter.mjs && node --check lib/evidence-selection.mjs && node --check lib/incident-parser.mjs && node --check lib/clarification-policy.mjs",
     "test": "node --test tests/*.test.mjs"
   }
 }

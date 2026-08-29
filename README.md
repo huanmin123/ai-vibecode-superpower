@@ -142,7 +142,7 @@ goals = true
 
 | 能力 | 何时使用 | 你会得到 |
 | --- | --- | --- |
-| [`agent-toolchain`](skills/agent-toolchain/SKILL.md) | 首次接入、修复、维护或审查 CodeGraph/RTK | 对目标项目进行受控接入与维护。 |
+| [`agent-toolchain`](skills/agent-toolchain/SKILL.md) | 首次接入、升级、修复、维护或审查 CodeGraph/RTK | 对目标项目进行受控接入与维护。 |
 | [`causal-debugger`](plugins/causal-debugger/skills/causal-debugger/SKILL.md) | Bug、异常、超时、崩溃或行为回归的只读分析 | 汇总 CodeGraph 与日志证据，输出有界根因候选。 |
 | [`workflow-controller`](plugins/agnets-workflow/skills/workflow-controller/SKILL.md) | 需要持久化状态、恢复交接或严格收口 | 任务状态、checkpoint、写入协调与关闭检查。 |
 | [`project-doc-planner`](skills/project-doc-planner/SKILL.md) | 新项目或大型改造的文档规划 | 可维护的项目级文档结构。 |

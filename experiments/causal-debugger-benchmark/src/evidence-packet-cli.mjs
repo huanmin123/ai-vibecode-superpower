@@ -61,7 +61,7 @@ async function main() {
   const source = await readFile(sourcePath, 'utf8');
   const packet = createEvidencePacket({
     elapsedMs: Number(requireOption(options, 'elapsed-ms')),
-    generator: 'codegraph-cli-1.5.0',
+    generator: 'codegraph-cli-1.6.0',
     query: requireOption(options, 'query'),
     content: source,
     claims: rawClaims,

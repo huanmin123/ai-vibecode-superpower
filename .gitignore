@@ -4,3 +4,5 @@
 .idea
 external-projects
 examples
+/.codegraph/
+node_modules/

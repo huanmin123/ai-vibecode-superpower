@@ -17,6 +17,7 @@ const plugin = 'agnets-workflow';
 const pluginVersion = '0.2.2+codex.20260827000100';
 const causalDebuggerPlugin = 'causal-debugger';
 const causalDebuggerPluginVersion = '0.1.0+codex.20260828';
+const previousCausalDebuggerPluginVersion = '0.0.0';
 const previousPluginVersion = '0.2.2+codex.20260824000100';
 const retiredPlugin = 'workflow-controller@ai-vibecode-superpower-local';
 
@@ -156,6 +157,9 @@ test('PowerShell installer preserves marketplace and plugin state after plugin a
     await writeFile(path.join(codexHome, 'skills', 'agent-toolchain', 'STALE.txt'), 'stale standalone copy\n', 'utf8');
     await mkdir(path.join(codexHome, 'plugins', 'cache', marketplace, plugin, previousPluginVersion, 'skills', 'agent-toolchain'), { recursive: true });
     await writeFile(path.join(codexHome, 'plugins', 'cache', marketplace, plugin, previousPluginVersion, 'skills', 'agent-toolchain', 'STALE.txt'), 'stale plugin cache copy\n', 'utf8');
+    const staleCausalCachePath = path.join(codexHome, 'plugins', 'cache', marketplace, causalDebuggerPlugin, previousCausalDebuggerPluginVersion);
+    await mkdir(staleCausalCachePath, { recursive: true });
+    await writeFile(path.join(staleCausalCachePath, '.mcp.json'), await readFile(path.join(repository, 'plugins', causalDebuggerPlugin, '.mcp.json'), 'utf8'), 'utf8');
     await writeFile(path.join(codexHome, 'config.toml'), `[plugins."${retiredPlugin}"]\nenabled = true\n`, 'utf8');
     await writeFakeCodex(binDirectory);
 
@@ -229,6 +233,7 @@ test('PowerShell installer preserves marketplace and plugin state after plugin a
     const causalCachePath = path.join(codexHome, 'plugins', 'cache', marketplace, causalDebuggerPlugin, causalDebuggerPluginVersion);
     const causalDescriptor = JSON.parse(await readFile(path.join(causalCachePath, '.mcp.json'), 'utf8'));
     assert.ok(causalDescriptor.mcpServers['causal-debugger']);
+    assert.equal(Object.hasOwn(causalDescriptor.mcpServers, 'workflow-controller'), false);
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
   }

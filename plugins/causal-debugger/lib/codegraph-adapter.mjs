@@ -2,6 +2,7 @@ import { pathToFileURL } from 'node:url';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { buildGlobalCausalAnalysis } from './causal-engine.mjs';
+import { selectEvidencePacket } from './evidence-selection.mjs';
 
 const require = createRequire(import.meta.url);
 const DEFAULT_SDK_PATH = null;
@@ -128,6 +129,12 @@ function mapRuntimeEvents(graph, projectRoot, events) {
     if (!matched && event.sourceLocations.length === 0) unknown.push({ eventId: event.id, reason: 'missing_source_location' });
   }
   return { mapped, unknown };
+}
+
+function normalizeSourceLocations(locations) {
+  return Array.isArray(locations)
+    ? locations.filter((location) => location && typeof location.filePath === 'string' && Number.isInteger(location.line) && location.line > 0)
+    : [];
 }
 
 function runtimeCorrelationKey(event) {
@@ -275,7 +282,14 @@ export async function readCodeGraphEvidence(options) {
     const health = inspectGraphHealth(graph);
     if (!health.healthy) throw new Error(`CodeGraph index is not healthy: ${health.reasons.join(', ')}`);
     const runtimeInput = normalizeRuntimeEvents(options?.runtimeEvidence);
-    const runtimeMapping = mapRuntimeEvents(graph, projectRoot, runtimeInput.events);
+    const locationEvents = normalizeSourceLocations(options?.sourceLocations).map((location, index) => ({
+      id: `incident-location:${location.filePath}:${location.line}:${location.column ?? ''}:${index}`,
+      type: 'incident_anchor',
+      level: 'info',
+      message: `user-provided source location ${location.filePath}:${location.line}`,
+      sourceLocations: [location],
+    }));
+    const runtimeMapping = mapRuntimeEvents(graph, projectRoot, [...locationEvents, ...runtimeInput.events]);
     const explicitSeedIds = Array.isArray(options?.seedIds) ? options.seedIds.filter((id) => typeof id === 'string' && id) : [];
     const seedQueries = Array.isArray(options?.seedQueries) ? options.seedQueries.filter((query) => typeof query === 'string' && query.trim()) : [];
     const queryLimit = Number.isInteger(options?.queryLimit) && options.queryLimit > 0 ? Math.min(options.queryLimit, 50) : 8;
@@ -363,11 +377,16 @@ export async function buildAnalysisFromCodeGraph(options) {
     runtimeEvidence: evidence.runtime.mapped.map((item) => ({ nodeId: item.nodeId, support: item.support, contradiction: item.contradiction, temporal: item.temporal, interventionLift: item.interventionLift, refs: item.refs })),
     graphScope: evidence.graphScope,
     truncated: evidence.bounds.truncated,
-    unknowns: evidence.runtime.unknown,
+    unknowns: [...evidence.runtime.unknown, ...(Array.isArray(options?.unknowns) ? options.unknowns : [])],
     relationGaps: evidence.relationGaps,
     recommendedProbes: evidence.recommendedProbes,
   }, options?.engineOptions ?? {});
-  return { evidence, analysis };
+  const packet = selectEvidencePacket({ evidence, analysis }, {
+    nodeLimit: options?.packetNodeLimit,
+    edgeLimit: options?.packetEdgeLimit,
+    includeOmittedIds: options?.includeOmittedIds === true,
+  });
+  return { evidence, analysis, packet };
 }
 
 export { DEFAULT_SDK_PATH, buildRuntimeSequenceEdges, expandSeedQueries };

@@ -1,5 +1,7 @@
 # CodeGraph 验收测试报告
 
+> 版本说明：第 2、3 节的 fixture 数值是 `1.5.0` 的历史黑盒基线，保留用于回归对比。本次统一升级到 `1.6.0` 后，已通过公开 SDK 的只读 smoke：当前仓库索引 `getIndexState() = complete`、`isIndexStale() = false`、`getIndexBuildInfo().version = 1.6.0`、`extractionVersion = 25`；完整 fixture 回归仍需单独补跑后才能更新下方历史数值。
+
 ## 1. 结论
 
 当前受管的 `@colbymchenry/codegraph@1.5.0` **可以作为 Causal Debugger 的静态结构图 Provider，但不能单独满足因果诊断引擎的全部要求**。

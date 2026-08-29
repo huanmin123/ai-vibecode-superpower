@@ -765,7 +765,8 @@ function Expand-ManagedPluginMcpHome {
         [System.IO.File]::WriteAllText($descriptorPath, $expanded, [System.Text.UTF8Encoding]::new($false))
     }
     $descriptor = Get-Content -LiteralPath $descriptorPath -Raw | ConvertFrom-Json -ErrorAction Stop
-    $workflowServer = $descriptor.mcpServers.'workflow-controller'
+    $workflowServerProperty = $descriptor.mcpServers.PSObject.Properties['workflow-controller']
+    $workflowServer = if ($null -eq $workflowServerProperty) { $null } else { $workflowServerProperty.Value }
     if ($null -ne $workflowServer) {
         $configuredHome = $workflowServer.env.CODEX_HOME
         if ($configuredHome -isnot [string] -or -not (Test-SamePath -Left $configuredHome -Right $CodexHome)) {

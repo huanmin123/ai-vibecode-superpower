@@ -119,7 +119,7 @@ runner 使用 `codex exec --ephemeral --ignore-rules --sandbox read-only --json`
 
 `src/causal-engine.mjs` 提供一个不依赖 CodeGraph 私有数据库的实验原型：接收已物化的节点、边、症状 seed 和运行时证据，使用固定深度/beam 宽度的多源反向搜索生成问题子图，保留多个根因假设，并输出可解释排序特征与反事实支持。它只消费 CodeGraph 适配器输出，不负责解析语言或修改索引；当前仍是 benchmark 原型，不是完整 MCP 插件。
 
-`src/runtime-evidence.mjs` 提供日志/console 的有界流式读取、源文件 SHA-256、脱敏、RTK `0.44.1` 压缩和基础字段抽取。RTK 仅负责去重/折叠输出，压缩失败会返回 `status=failed`，不会伪装成完整运行时证据；跨服务和无 Trace ID 的日志仍必须由因果引擎标记为 `unknown`。
+`src/runtime-evidence.mjs` 提供日志/console 的有界流式读取、源文件 SHA-256、脱敏、RTK `0.46.0` 压缩和基础字段抽取。RTK 仅负责去重/折叠输出，压缩失败会返回 `status=failed`，不会伪装成完整运行时证据；跨服务和无 Trace ID 的日志仍必须由因果引擎标记为 `unknown`。
 
 运行时事件中的 `file:line[:column]` 会由 `codegraph-adapter.mjs` 通过 `getNodesInFile` 映射到 CodeGraph 覆盖该行的最窄节点；映射失败保留 `unknown`，不绑定相邻代码。可直接运行：
 

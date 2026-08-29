@@ -13,6 +13,7 @@ Usage:
   agent-toolchain.sh configure --project PATH
   agent-toolchain.sh doctor --project PATH [--quick]
   agent-toolchain.sh bootstrap --project PATH --dry-run|--apply
+  agent-toolchain.sh upgrade --project PATH --dry-run|--apply
   agent-toolchain.sh init-codegraph --project PATH
   agent-toolchain.sh maintain --project PATH [--sync]
   agent-toolchain.sh rollback rtk VERSION
@@ -299,17 +300,17 @@ DO_NOT_TRACK = "1"'
 }
 
 load_trusted_manifest() {
-  CODEGRAPH_VERSION=1.5.0
+  CODEGRAPH_VERSION=1.6.0
   CODEGRAPH_NPM_PACKAGE='@colbymchenry/codegraph'
-  RTK_VERSION=0.44.1
+  RTK_VERSION=0.46.0
   RTK_DARWIN_ARM64_ASSET=rtk-aarch64-apple-darwin.tar.gz
-  RTK_DARWIN_ARM64_SHA256=a6a8bb086034a5d4f90ff93f965a631ad4937b5974494dd8a51859e3b04908a8
+  RTK_DARWIN_ARM64_SHA256=484e5dd2b4bfdbbb910727a0ba1e2d63b2e23efa922cfcc7300fd131bca3e10a
   RTK_DARWIN_X64_ASSET=rtk-x86_64-apple-darwin.tar.gz
-  RTK_DARWIN_X64_SHA256=52475adf4659e95b3560eac117e13bc6ab3320de8b8ce75ba4e7d5f3604613cf
+  RTK_DARWIN_X64_SHA256=67eb651fa9cfc4a4ea65876242eb71b8837abdac40521d0dd363214ec1a068dd
   RTK_LINUX_ARM64_ASSET=rtk-aarch64-unknown-linux-gnu.tar.gz
-  RTK_LINUX_ARM64_SHA256=ce97a94dbda556125fdbb22c94f538f93ae7dbc2b3de6f497bd60f206959c11c
+  RTK_LINUX_ARM64_SHA256=e8c2e1787f46017ea7c5a711b2bc6a7f7cf61c7ad69385b4c1e4daff1135dcd1
   RTK_LINUX_X64_ASSET=rtk-x86_64-unknown-linux-musl.tar.gz
-  RTK_LINUX_X64_SHA256=986f29704469b3d1051e2474105c6c75ab8b73651068dcd61612c1fb3938ad95
+  RTK_LINUX_X64_SHA256=79aa5b89c69566feceb66c8a27cfbe52237fc7ee3e683115f43745a3262d21
   select_platform_assets
 }
 
@@ -1046,6 +1047,49 @@ init_codegraph() {
   (cd "$PROJECT" && run_codegraph "$(managed_binary codegraph)" status)
 }
 
+rebuild_codegraph_index() {
+  is_ready codegraph || die "CodeGraph 尚未安装"
+  assert_codegraph_index_safe
+  if [ -d "$PROJECT/.codegraph" ] && find "$PROJECT/.codegraph" -mindepth 1 ! -name .gitignore -print -quit | rg -q .; then
+    note "CodeGraph 版本已变化；执行全量索引重建"
+    (cd "$PROJECT" && run_codegraph "$(managed_binary codegraph)" index) || die "CodeGraph index 失败"
+  else
+    note ".codegraph 不存在或为空；初始化当前版本索引"
+    (cd "$PROJECT" && run_codegraph "$(managed_binary codegraph)" init) || die "CodeGraph init 失败"
+  fi
+  (cd "$PROJECT" && run_codegraph "$(managed_binary codegraph)" status) || die "CodeGraph status 失败"
+}
+
+upgrade() {
+  [ "$APPLY" -ne "$DRY_RUN" ] || die "upgrade 必须且只能指定 --dry-run 或 --apply"
+  codegraph_needs_upgrade=0
+  rtk_needs_upgrade=0
+  is_ready codegraph || codegraph_needs_upgrade=1
+  is_ready rtk || rtk_needs_upgrade=1
+  if [ "$codegraph_needs_upgrade" -eq 0 ] && [ "$rtk_needs_upgrade" -eq 0 ]; then
+    note "CodeGraph 与 RTK 已是当前受支持版本；不下载或重建索引"
+    [ "$DRY_RUN" -eq 1 ] && note "dry-run: 将运行完整 doctor"
+    doctor
+    return
+  fi
+  bootstrap
+  if [ "$DRY_RUN" -eq 1 ]; then
+    if [ "$codegraph_needs_upgrade" -eq 1 ]; then
+      note "dry-run: CodeGraph 升级后将执行 codegraph index 全量重建"
+    else
+      note "dry-run: CodeGraph 已是当前受支持版本；将保留现有索引"
+    fi
+    note "dry-run: 将运行完整 doctor"
+    return
+  fi
+  if [ "$codegraph_needs_upgrade" -eq 1 ]; then
+    rebuild_codegraph_index
+  else
+    note "CodeGraph 已是当前受支持版本；保留现有索引"
+  fi
+  doctor
+}
+
 maintain() {
   is_ready codegraph || die "CodeGraph 尚未安装"
   assert_codegraph_index_safe
@@ -1066,7 +1110,7 @@ rollback() {
 main() {
   parse_args "$@"
   case "$ACTION" in
-    doctor|bootstrap|init-codegraph|maintain)
+    doctor|bootstrap|upgrade|init-codegraph|maintain)
       detect_platform
       check_project
       load_trusted_manifest
@@ -1087,6 +1131,7 @@ main() {
     configure) configure_project ;;
     doctor) doctor ;;
     bootstrap) bootstrap ;;
+    upgrade) upgrade ;;
     init-codegraph) init_codegraph ;;
     maintain) maintain ;;
     rollback) rollback ;;

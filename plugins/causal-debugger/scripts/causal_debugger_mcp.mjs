@@ -12,8 +12,11 @@ async function loadModules() {
   if (!modulesPromise) {
     modulesPromise = Promise.all([
       import(pathToFileURL(path.join(sourceDirectory, 'codegraph-adapter.mjs')).href),
+      import(pathToFileURL(path.join(sourceDirectory, 'clarification-policy.mjs')).href),
+      import(pathToFileURL(path.join(sourceDirectory, 'incident-parser.mjs')).href),
       import(pathToFileURL(path.join(sourceDirectory, 'runtime-evidence.mjs')).href),
-    ]).then(([adapter, runtime]) => ({ adapter, runtime }));
+      import(pathToFileURL(path.join(sourceDirectory, 'evidence-selection.mjs')).href),
+    ]).then(([adapter, clarification, incident, runtime, selection]) => ({ adapter, clarification, incident, runtime, selection }));
   }
   return modulesPromise;
 }
@@ -32,6 +35,7 @@ const TOOLS = [
         projectRoot: { type: 'string' },
         queries: { type: 'array', items: { type: 'string' } },
         query: { type: 'string' },
+        description: { type: 'string' },
         seedIds: { type: 'array', items: { type: 'string' } },
         runtimeEvidence: { type: ['array', 'object'] },
         logFile: { type: 'string' },
@@ -41,10 +45,67 @@ const TOOLS = [
         beamWidth: { type: 'integer', minimum: 1, maximum: 256 },
         queryLimit: { type: 'integer', minimum: 1, maximum: 50 },
         seedLimit: { type: 'integer', minimum: 1, maximum: 64 },
+        packetNodeLimit: { type: 'integer', minimum: 1, maximum: 2000 },
+        packetEdgeLimit: { type: 'integer', minimum: 1, maximum: 4000 },
+        includeLedger: { type: 'boolean' },
+      },
+    },
+  },
+  {
+    name: 'causal_expand',
+    description: '按上一次分析的 analysisId、节点、关系或症状 seed 定向展开证据。',
+    inputSchema: {
+      type: 'object',
+      required: ['analysisId'],
+      properties: {
+        analysisId: { type: 'string' },
+        nodeIds: { type: 'array', items: { type: 'string' } },
+        relationIds: { type: 'array', items: { type: 'string' } },
+        seedIds: { type: 'array', items: { type: 'string' } },
+        nodeLimit: { type: 'integer', minimum: 1, maximum: 500 },
+        edgeLimit: { type: 'integer', minimum: 1, maximum: 1000 },
       },
     },
   },
 ];
+
+const analysisCache = new Map();
+const MAX_ANALYSIS_CACHE = 8;
+
+function rememberAnalysis(analysisId, value) {
+  analysisCache.delete(analysisId);
+  analysisCache.set(analysisId, value);
+  while (analysisCache.size > MAX_ANALYSIS_CACHE) analysisCache.delete(analysisCache.keys().next().value);
+}
+
+function summarizeEvidence(evidence, analysis, includeLedger) {
+  if (includeLedger === true) return evidence;
+  return {
+    source: evidence.source,
+    projectRoot: evidence.projectRoot,
+    index: evidence.index,
+    seeds: evidence.seeds,
+    seedMatches: evidence.seedMatches,
+    bounds: evidence.bounds,
+    relationGaps: evidence.relationGaps,
+    runtime: {
+      input: evidence.runtime?.input ?? null,
+      mappedCount: evidence.runtime?.mapped?.length ?? 0,
+      unknownCount: evidence.runtime?.unknown?.length ?? 0,
+      correlationCount: evidence.runtime?.correlations?.length ?? 0,
+    },
+    ledger: {
+      analysisId: analysis.analysisId,
+      nodeCount: analysis.graph?.nodes?.length ?? 0,
+      edgeCount: analysis.graph?.edges?.length ?? 0,
+      scope: 'analysis_graph',
+      complete: analysis.coverage?.truncated !== true,
+      available: true,
+      durability: 'process_cache',
+      retrieval: 'causal_expand',
+    },
+  };
+}
 
 function success(id, value) {
   return { jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(value) }], structuredContent: value } };
@@ -64,7 +125,7 @@ async function handle(request) {
   const name = request.params?.name;
   const args = request.params?.arguments ?? {};
   try {
-    const { adapter, runtime } = await loadModules();
+    const { adapter, clarification, incident, runtime, selection } = await loadModules();
     if (name === 'causal_status') {
       return success(id, await adapter.readCodeGraphStatus(args.projectRoot));
     }
@@ -79,19 +140,75 @@ async function handle(request) {
         }
         runtimeEvidence = await runtime.compressLogWithRtk({ filePath: logFile, rtkExecutable: args.rtkExecutable });
       }
-      const queries = [...(Array.isArray(args.queries) ? args.queries : []), ...(typeof args.query === 'string' && args.query ? [args.query] : [])];
+      const descriptions = typeof args.description === 'string' && args.description.trim() ? incident.parseIncidentDescription(args.description) : null;
+      const parsedQueries = descriptions?.anchors?.length ? descriptions.anchors : (descriptions?.queries ?? []);
+      const explicitQueries = [...(Array.isArray(args.queries) ? args.queries : []), ...(typeof args.query === 'string' && args.query ? [args.query] : [])];
+      const preflight = clarification.assessIncidentInput({
+        incident: descriptions,
+        explicitQueries,
+        seedIds: Array.isArray(args.seedIds) ? args.seedIds : [],
+        runtimeEvidence,
+        logFile: args.logFile,
+      });
+      if (!preflight.shouldAnalyze) {
+        return success(id, { status: 'needs_clarification', incident: descriptions, triage: preflight, evidence: null, analysis: null });
+      }
+      const queries = [...explicitQueries, ...parsedQueries];
       const result = await adapter.buildAnalysisFromCodeGraph({
         projectRoot,
         seedQueries: queries,
         seedIds: Array.isArray(args.seedIds) ? args.seedIds : [],
+        sourceLocations: descriptions?.sourceLocations ?? [],
+        unknowns: descriptions?.unknowns ?? [],
         runtimeEvidence,
         queryLimit: Number.isInteger(args.queryLimit) ? args.queryLimit : 8,
         seedLimit: Number.isInteger(args.seedLimit) ? args.seedLimit : 24,
         maxDepth: Number.isInteger(args.maxDepth) ? args.maxDepth : 3,
         limit: Number.isInteger(args.limit) ? args.limit : 250,
+        packetNodeLimit: Number.isInteger(args.packetNodeLimit) ? args.packetNodeLimit : 64,
+        packetEdgeLimit: Number.isInteger(args.packetEdgeLimit) ? args.packetEdgeLimit : 128,
         engineOptions: { maxDepth: Number.isInteger(args.maxDepth) ? args.maxDepth : 3, beamWidth: Number.isInteger(args.beamWidth) ? args.beamWidth : 24 },
       });
-      return success(id, result);
+      const triage = clarification.assessAnalysisResult({ incident: descriptions, evidence: result.evidence, analysis: result.analysis, preflight });
+      if (triage.question && result.analysis && !result.analysis.recommendedProbes.includes(triage.question)) {
+        result.analysis.recommendedProbes = [triage.question, ...result.analysis.recommendedProbes].slice(0, 2);
+      }
+      rememberAnalysis(result.analysis.analysisId, result);
+      const packetIncomplete = result.packet.coverage_manifest.incomplete === true;
+      const status = packetIncomplete
+        ? 'partial'
+        : triage.action === 'analyze' ? 'ready' : triage.action === 'analyze_and_clarify' ? 'partial' : 'needs_clarification';
+      const focusedAnalysis = {
+        ...result.analysis,
+        graph: result.packet.graph,
+        coverage: {
+          ...result.analysis.coverage,
+          packet: result.packet.coverage_manifest,
+        },
+      };
+      return success(id, {
+        status,
+        incident: descriptions,
+        triage,
+        analysis: focusedAnalysis,
+        packet: result.packet,
+        evidence: summarizeEvidence(result.evidence, result.analysis, args.includeLedger === true),
+      });
+    }
+    if (name === 'causal_expand') {
+      const entry = analysisCache.get(args.analysisId);
+      if (!entry) throw new Error(`analysis cache not found for ${args.analysisId}; rerun causal_analyze`);
+      const expansion = selection.expandEvidencePacket({ analysis: entry.analysis }, {
+        nodeIds: args.nodeIds,
+        relationIds: args.relationIds,
+        seedIds: args.seedIds,
+        nodeLimit: Number.isInteger(args.nodeLimit) ? args.nodeLimit : 64,
+        edgeLimit: Number.isInteger(args.edgeLimit) ? args.edgeLimit : 128,
+      });
+      return success(id, {
+        status: expansion.coverage_manifest.incomplete ? 'partial' : 'ready',
+        expansion,
+      });
     }
     return failure(id, `Unknown tool: ${name}`);
   } catch (error) { return failure(id, error); }

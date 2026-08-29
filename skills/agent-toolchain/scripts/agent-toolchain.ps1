@@ -18,6 +18,7 @@ Usage:
   agent-toolchain.ps1 configure --project PATH
   agent-toolchain.ps1 doctor --project PATH [--quick]
   agent-toolchain.ps1 bootstrap --project PATH --dry-run|--apply
+  agent-toolchain.ps1 upgrade --project PATH --dry-run|--apply
   agent-toolchain.ps1 init-codegraph --project PATH
   agent-toolchain.ps1 maintain --project PATH [--sync]
   agent-toolchain.ps1 rollback rtk VERSION
@@ -50,13 +51,17 @@ function Get-PlatformName {
   $architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
   switch ($architecture) {
     'x64' { return 'win32-x64' }
-    'arm64' { Fail 'Windows arm64 不受支持：RTK 0.44.1 没有官方 Windows arm64 发布资产，不能安装半套工具链' }
+    'arm64' { Fail 'Windows arm64 不受支持：RTK 0.46.0 没有官方 Windows arm64 发布资产，不能安装半套工具链' }
     default { Fail "不支持的 Windows 架构：$architecture" }
   }
 }
 
 function Parse-Arguments {
   $script:Action = if ($Action) { $Action } else { '' }
+  if ($script:Action -eq '' -and $DriverArgs.Count -eq 1 -and $DriverArgs[0] -in @('help', '-h', '--help')) {
+    $script:Action = $DriverArgs[0]
+    $DriverArgs = @()
+  }
   $index = 0
   while ($index -lt $DriverArgs.Count) {
     $argument = $DriverArgs[$index]
@@ -244,8 +249,8 @@ DO_NOT_TRACK = "1"
 
 function Load-TrustedManifest {
   $script:Manifest = [ordered]@{
-    CODEGRAPH_VERSION = '1.5.0'; CODEGRAPH_NPM_PACKAGE = '@colbymchenry/codegraph'; RTK_VERSION = '0.44.1'
-    RTK_WIN32_X64_ASSET = 'rtk-x86_64-pc-windows-msvc.zip'; RTK_WIN32_X64_SHA256 = 'e9f2e26c377279c34604d81021347f8a0f16eb539ab54dd17567ab5805b2957d'
+    CODEGRAPH_VERSION = '1.6.0'; CODEGRAPH_NPM_PACKAGE = '@colbymchenry/codegraph'; RTK_VERSION = '0.46.0'
+    RTK_WIN32_X64_ASSET = 'rtk-x86_64-pc-windows-msvc.zip'; RTK_WIN32_X64_SHA256 = '9bc5acd54d35a916e4a561435963e0acf2f1a0115cf43dcfe2b719f361c8a970'
   }
 }
 
@@ -445,15 +450,17 @@ function Ensure-PublicRtkBinary([string]$Version) {
   }
   $target = Get-Binary 'rtk' (Get-VersionDirectory 'rtk' $Version)
   $temporary = Join-Path $ToolchainBin ".rtk-$([Guid]::NewGuid().ToString('N')).tmp"
+  $backup = Join-Path $ToolchainBin ".rtk-$([Guid]::NewGuid().ToString('N')).bak"
   try {
     New-Item -ItemType HardLink -Path $temporary -Target $target | Out-Null
     if (Test-Path -LiteralPath $publicPath -PathType Leaf) {
-      [System.IO.File]::Replace($temporary, $publicPath, $null)
+      [System.IO.File]::Replace($temporary, $publicPath, $backup)
     } else {
       [System.IO.File]::Move($temporary, $publicPath)
     }
   } finally {
     if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
+    if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Force }
   }
   if (-not (Test-PublicRtkBinary $Version)) { Fail 'RTK 原生公共入口验证失败' }
   Remove-LegacyRtkLauncher
@@ -668,16 +675,14 @@ function Install-Tool([ValidateSet('codegraph', 'rtk')][string]$Tool) {
   if (Test-Ready $Tool) { Note "$Tool $version 已就绪"; return }
   $destination = Get-VersionDirectory $Tool $version
   if (Test-Path -LiteralPath $destination) {
-    if ((Get-CurrentVersion $Tool) -eq $version) {
-      Verify-VersionDirectory $Tool $version
-      if ($script:DryRun) {
-        Note "dry-run: 修复 $ToolchainBin\\rtk.exe 公共入口"
-        return
-      }
-      Set-CurrentVersion $Tool $version
-      if (Test-Ready $Tool) { Note "$Tool $version 已修复"; return }
+    Verify-VersionDirectory $Tool $version
+    if ($script:DryRun) {
+      Note "dry-run: 发布已校验的 $Tool $version 到 $ToolchainBin\\rtk.exe"
+      return
     }
-    Fail "$destination 已存在但不健康，拒绝覆盖"
+    Set-CurrentVersion $Tool $version
+    if (Test-Ready $Tool) { Note "$Tool $version 已发布"; return }
+    Fail "$destination 已存在但发布后验证失败"
   }
   if ($script:DryRun) {
     Note "dry-run: 下载 $(Get-ToolValue $Tool 'url')"
@@ -826,6 +831,51 @@ function Invoke-InitCodeGraph {
   Invoke-WithCodeGraphEnvironment { Push-Location -LiteralPath $script:Project; try { $binary = Get-Binary 'codegraph' (Get-VersionDirectory 'codegraph' (Get-ToolValue 'codegraph' 'version')); & $binary init; if ($LASTEXITCODE -ne 0) { Fail 'CodeGraph init 失败' }; & $binary status; if ($LASTEXITCODE -ne 0) { Fail 'CodeGraph status 失败' } } finally { Pop-Location } }
 }
 
+function Invoke-RebuildCodeGraphIndex {
+  if (-not (Test-Ready 'codegraph')) { Fail 'CodeGraph 尚未安装' }
+  $indexDirectory = Join-Path $script:Project '.codegraph'
+  Assert-CodeGraphIndexSafe
+  Invoke-WithCodeGraphEnvironment {
+    Push-Location -LiteralPath $script:Project
+    try {
+      $binary = Get-Binary 'codegraph' (Get-VersionDirectory 'codegraph' (Get-ToolValue 'codegraph' 'version'))
+      if ((Test-Path -LiteralPath $indexDirectory -PathType Container) -and (Get-ChildItem -LiteralPath $indexDirectory -Force | Where-Object { $_.Name -ne '.gitignore' } | Select-Object -First 1)) {
+        Note 'CodeGraph 版本已变化；执行全量索引重建'
+        & $binary index
+        if ($LASTEXITCODE -ne 0) { Fail 'CodeGraph index 失败' }
+      } else {
+        Note '.codegraph 不存在或为空；初始化当前版本索引'
+        & $binary init
+        if ($LASTEXITCODE -ne 0) { Fail 'CodeGraph init 失败' }
+      }
+      & $binary status
+      if ($LASTEXITCODE -ne 0) { Fail 'CodeGraph status 失败' }
+    } finally { Pop-Location }
+  }
+}
+
+function Invoke-Upgrade {
+  if ($script:Apply -eq $script:DryRun) { Fail 'upgrade 必须且只能指定 --dry-run 或 --apply' }
+  $codeGraphNeedsUpgrade = -not (Test-Ready 'codegraph')
+  $rtkNeedsUpgrade = -not (Test-Ready 'rtk')
+  if (-not $codeGraphNeedsUpgrade -and -not $rtkNeedsUpgrade) {
+    Note 'CodeGraph 与 RTK 已是当前受支持版本；不下载或重建索引'
+    if ($script:DryRun) { Note 'dry-run: 将运行完整 doctor' }
+    Invoke-Doctor
+    return
+  }
+  Invoke-Bootstrap
+  if ($script:DryRun) {
+    if ($codeGraphNeedsUpgrade) { Note 'dry-run: CodeGraph 升级后将执行 codegraph index 全量重建' }
+    else { Note 'dry-run: CodeGraph 已是当前受支持版本；将保留现有索引' }
+    Note 'dry-run: 将运行完整 doctor'
+    return
+  }
+  if ($codeGraphNeedsUpgrade) { Invoke-RebuildCodeGraphIndex }
+  else { Note 'CodeGraph 已是当前受支持版本；保留现有索引' }
+  Invoke-Doctor
+}
+
 function Invoke-Maintain {
   if (-not (Test-Ready 'codegraph')) { Fail 'CodeGraph 尚未安装' }
   Assert-CodeGraphIndexSafe
@@ -846,6 +896,7 @@ switch ($script:Action) {
   'configure' { Check-Project; Configure-Project }
   'doctor' { $script:PlatformName = Get-PlatformName; Check-Project; Load-TrustedManifest; Invoke-Doctor }
   'bootstrap' { $script:PlatformName = Get-PlatformName; Check-Project; Load-TrustedManifest; Invoke-Bootstrap }
+  'upgrade' { $script:PlatformName = Get-PlatformName; Check-Project; Load-TrustedManifest; Invoke-Upgrade }
   'init-codegraph' { $script:PlatformName = Get-PlatformName; Check-Project; Load-TrustedManifest; Invoke-InitCodeGraph }
   'maintain' { $script:PlatformName = Get-PlatformName; Check-Project; Load-TrustedManifest; Invoke-Maintain }
   'rollback' { $script:PlatformName = Get-PlatformName; Load-TrustedManifest; Invoke-Rollback }

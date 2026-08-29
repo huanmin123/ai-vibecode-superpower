@@ -1,4 +1,4 @@
 interface:
   display_name: "项目工具链接入与维护"
-  short_description: "Configure, repair, or maintain this project's CodeGraph and RTK toolchain"
-  default_prompt: "Use $agent-toolchain to configure, repair, or maintain this project's CodeGraph and RTK toolchain."
+  short_description: "Configure, upgrade, repair, or maintain this project's CodeGraph and RTK toolchain"
+  default_prompt: "Use $agent-toolchain to configure, upgrade to supported versions, repair, or maintain this project's CodeGraph and RTK toolchain."
