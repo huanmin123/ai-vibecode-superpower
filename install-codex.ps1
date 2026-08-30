@@ -976,10 +976,8 @@ $managedAgentRoleContracts = @(
     [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_terra_medium_readonly.toml'; RoleName = 'avsp_terra_medium_readonly'; Model = 'gpt-5.6-terra'; ReasoningEffort = 'medium'; SandboxMode = 'read-only' }
 )
 $managedPluginName = 'agnets-workflow'
-$causalDebuggerPluginName = 'causal-debugger'
 $managedMarketplaceName = 'ai-vibecode-superpower-local'
 $sourcePlugin = Join-Path $scriptRoot "plugins\$managedPluginName"
-$causalDebuggerPluginSource = Join-Path $scriptRoot "plugins\$causalDebuggerPluginName"
 $sourceMarketplace = Join-Path $scriptRoot '.agents\plugins\marketplace.json'
 $sourcePluginSkills = Join-Path $sourcePlugin 'skills'
 $sourceStandaloneSkills = Join-Path $scriptRoot 'skills'
@@ -1002,7 +1000,6 @@ if (-not (Test-Path -LiteralPath $sourceAgentRoles -PathType Container)) { throw
 if (-not (Test-Path -LiteralPath $sourceAgentRoleManifest -PathType Leaf)) { throw "Missing source file: $sourceAgentRoleManifest" }
 if (-not (Test-Path -LiteralPath $sourceMarketplace -PathType Leaf)) { throw "Missing source file: $sourceMarketplace" }
 if (-not (Test-Path -LiteralPath $sourcePlugin -PathType Container)) { throw "Missing source directory: $sourcePlugin" }
-if (-not (Test-Path -LiteralPath $causalDebuggerPluginSource -PathType Container)) { throw "Missing source directory: $causalDebuggerPluginSource" }
 Assert-ManagedAgentRoleProfiles -RoleDirectory $sourceAgentRoles -Contracts $managedAgentRoleContracts -ManifestPath $sourceAgentRoleManifest
 if (-not (Test-Path -LiteralPath $sourcePluginSkills -PathType Container)) { throw "Missing source directory: $sourcePluginSkills" }
 if (-not (Test-Path -LiteralPath $sourceStandaloneSkills -PathType Container)) { throw "Missing source directory: $sourceStandaloneSkills" }
@@ -1145,17 +1142,14 @@ try {
     }
 
     # Do not leave the retired controller installed beside the v3-only plugin.
-    # Remove it before plugin registration so the old CLI write cannot overwrite
-    # the new marketplace/plugin state.
     Remove-RetiredWorkflowPlugin -CodexHome $codexHome
 
     # Plugin commands update config.toml. Run them only after its staged version
     # is installed, while the transaction can still restore the previous config.
     Install-ManagedPlugin -CodexHome $codexHome -MarketplaceRoot $scriptRoot -PluginName $managedPluginName -MarketplaceName $managedMarketplaceName -PluginSource $sourcePlugin
-    Install-ManagedPlugin -CodexHome $codexHome -MarketplaceRoot $scriptRoot -PluginName $causalDebuggerPluginName -MarketplaceName $managedMarketplaceName -PluginSource $causalDebuggerPluginSource
     $managedPlugin = Get-ManagedPluginIdentity -PluginSource $sourcePlugin -PluginName $managedPluginName
     if (-not (Test-ManagedPluginIsActive -CodexCli (Get-CodexCliPath) -PluginName $managedPluginName -MarketplaceName $managedMarketplaceName -PluginVersion $managedPlugin.Version)) {
-        throw "Codex did not retain the managed workflow plugin after installing $causalDebuggerPluginName"
+        throw "Codex did not retain the managed workflow plugin after installation"
     }
 
     foreach ($target in $transactionTargets.Where({ $_.Operation -eq 'Remove' })) {
@@ -1174,7 +1168,6 @@ try {
 
     Write-Host "Codex configuration installed in: $codexHome"
     Write-Host "Managed plugin installed: $managedPluginName@$managedMarketplaceName"
-    Write-Host "Causal debugger installed: $causalDebuggerPluginName@$managedMarketplaceName"
     Write-Host 'Managed standalone skills installed; obsolete global copies of plugin skills removed.'
     if ($null -ne $backupDirectory) {
         Write-Host "Backup directory: $backupDirectory"

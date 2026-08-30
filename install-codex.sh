@@ -10,10 +10,8 @@ source_docs=$script_dir/codex-global-config/docs
 source_agent_roles=$script_dir/codex-global-config/agents/ai-vibecode-superpower
 source_agent_role_manifest=$script_dir/codex-global-config/agents/ai-vibecode-superpower.sha256
 managed_plugin_name=agnets-workflow
-causal_debugger_plugin_name=causal-debugger
 managed_marketplace_name=ai-vibecode-superpower-local
 source_plugin=$script_dir/plugins/$managed_plugin_name
-causal_debugger_plugin_source=$script_dir/plugins/$causal_debugger_plugin_name
 source_marketplace=$script_dir/.agents/plugins/marketplace.json
 source_plugin_skills=$source_plugin/skills
 source_standalone_skills=$script_dir/skills
@@ -34,10 +32,6 @@ for source_path in "$source_docs" "$source_agent_roles" "$source_plugin" "$sourc
         exit 1
     fi
 done
-if [ ! -d "$causal_debugger_plugin_source" ]; then
-    printf '%s\n' "Missing source directory: $causal_debugger_plugin_source" >&2
-    exit 1
-fi
 for agent_role_file in $managed_agent_role_files; do
     source_role=$source_agent_roles/$agent_role_file
     if [ ! -f "$source_role" ]; then
@@ -307,36 +301,6 @@ install_managed_plugin() {
         printf '%s\n' "Warning: managed plugin cache differs from the source after semantic MCP validation; retaining the verified active plugin: $managed_plugin_name@$managed_marketplace_name" >&2
     fi
     install_plugin_dependencies "$managed_plugin_name" "$plugin_version" || return 1
-}
-
-install_additional_plugin() {
-    plugin_name=$1
-    plugin_source=$2
-    plugin_version=$(node --input-type=module - "$plugin_source/.codex-plugin/plugin.json" "$plugin_name" <<'NODE'
-import { readFile } from 'node:fs/promises';
-const [manifestPath, expectedName] = process.argv.slice(2);
-const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
-if (manifest.name !== expectedName || typeof manifest.version !== 'string' || !/^[0-9A-Za-z][0-9A-Za-z.+_-]*$/.test(manifest.version)) process.exitCode = 1;
-else process.stdout.write(manifest.version);
-NODE
-    ) || {
-        printf '%s\n' "Invalid managed plugin manifest: $plugin_source/.codex-plugin/plugin.json" >&2
-        exit 1
-    }
-    CODEX_HOME="$codex_home" codex plugin marketplace add "$script_dir" >/dev/null
-    CODEX_HOME="$codex_home" codex plugin add "$plugin_name@$managed_marketplace_name" >/dev/null || {
-        printf '%s\n' "Could not install managed plugin: $plugin_name@$managed_marketplace_name" >&2
-        exit 1
-    }
-    plugin_output=$(CODEX_HOME="$codex_home" codex plugin list 2>&1) || {
-        printf '%s\n' "Could not verify installed plugin: $plugin_name@$managed_marketplace_name" >&2
-        exit 1
-    }
-    printf '%s\n' "$plugin_output" | rg -q "^[[:space:]]*$plugin_name@$managed_marketplace_name[[:space:]]+installed,[[:space:]]+enabled[[:space:]]+$plugin_version[[:space:]]+" || {
-        printf '%s\n' "Codex did not retain the exact managed plugin version: $plugin_name@$managed_marketplace_name ($plugin_version)" >&2
-        exit 1
-    }
-    install_plugin_dependencies "$plugin_name" "$plugin_version" || exit 1
 }
 
 remove_retired_workflow_plugin() {
@@ -1333,22 +1297,15 @@ while IFS="$tab" read -r target_name target_path candidate_path target_kind targ
 done < "$manifest"
 
 # Do not leave the retired controller installed beside the v3-only plugin.
-# Remove it before plugin registration so the old CLI write cannot overwrite
-# the new marketplace/plugin state.
 remove_retired_workflow_plugin
 
 # Plugin commands update config.toml. Run them only after its staged version
 # is installed, while the transaction can still restore the previous config.
 install_managed_plugin
-managed_workflow_version=$plugin_version
-install_additional_plugin "$causal_debugger_plugin_name" "$causal_debugger_plugin_source"
-plugin_version=$managed_workflow_version
 if ! managed_plugin_is_active "$plugin_version"; then
-    printf '%s\n' "Codex did not retain the managed workflow plugin after installing $causal_debugger_plugin_name" >&2
+    printf '%s\n' 'Codex did not retain the managed workflow plugin after installation' >&2
     exit 1
 fi
-# Keep the marketplace discoverable after the second plugin add as well.
-CODEX_HOME="$codex_home" codex plugin marketplace add "$script_dir" >/dev/null
 
 while IFS="$tab" read -r target_name target_path candidate_path target_kind target_operation; do
     [ "$target_operation" = remove ] || continue
@@ -1368,7 +1325,6 @@ assert_managed_agent_role_directory "$codex_home/agents/ai-vibecode-superpower"
 completed=1
 printf '%s\n' "Codex configuration installed in: $codex_home"
 printf '%s\n' "Managed plugin installed: $managed_plugin_name@$managed_marketplace_name"
-printf '%s\n' "Causal debugger installed: $causal_debugger_plugin_name@$managed_marketplace_name"
 printf '%s\n' 'Managed standalone skills installed; obsolete global copies of plugin skills removed.'
 if [ -n "$backup_dir" ]; then
     printf '%s\n' "Backup directory: $backup_dir"

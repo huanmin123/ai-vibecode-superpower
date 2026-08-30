@@ -15,9 +15,6 @@ const shellInstaller = path.join(repository, 'install-codex.sh');
 const marketplace = 'ai-vibecode-superpower-local';
 const plugin = 'agnets-workflow';
 const pluginVersion = '0.2.2+codex.20260827000100';
-const causalDebuggerPlugin = 'causal-debugger';
-const causalDebuggerPluginVersion = '0.1.0+codex.20260828';
-const previousCausalDebuggerPluginVersion = '0.0.0';
 const previousPluginVersion = '0.2.2+codex.20260824000100';
 const retiredPlugin = 'workflow-controller@ai-vibecode-superpower-local';
 
@@ -105,7 +102,6 @@ if (args[1] === 'add') {
   const configEntries = [
     '[plugins."agnets-workflow@ai-vibecode-superpower-local"]\nenabled = true',
   ];
-  if (pluginName === 'causal-debugger') configEntries.push('[plugins."causal-debugger@ai-vibecode-superpower-local"]\nenabled = true');
   await writeFile(configPath, configEntries.join('\n') + '\n', 'utf8');
   state.marketplaceRegistered = false;
   state.pluginEnabled = true;
@@ -117,7 +113,6 @@ if (args[1] === 'list') {
   await save();
   if (state.pluginEnabled) {
     process.stdout.write('agnets-workflow@ai-vibecode-superpower-local installed, enabled ' + state.version + ' managed\n');
-    if (state.pluginVersions['causal-debugger']) process.stdout.write('causal-debugger@ai-vibecode-superpower-local installed, enabled ' + state.pluginVersions['causal-debugger'] + ' managed\n');
   }
   process.exit(0);
 }
@@ -157,9 +152,6 @@ test('PowerShell installer preserves marketplace and plugin state after plugin a
     await writeFile(path.join(codexHome, 'skills', 'agent-toolchain', 'STALE.txt'), 'stale standalone copy\n', 'utf8');
     await mkdir(path.join(codexHome, 'plugins', 'cache', marketplace, plugin, previousPluginVersion, 'skills', 'agent-toolchain'), { recursive: true });
     await writeFile(path.join(codexHome, 'plugins', 'cache', marketplace, plugin, previousPluginVersion, 'skills', 'agent-toolchain', 'STALE.txt'), 'stale plugin cache copy\n', 'utf8');
-    const staleCausalCachePath = path.join(codexHome, 'plugins', 'cache', marketplace, causalDebuggerPlugin, previousCausalDebuggerPluginVersion);
-    await mkdir(staleCausalCachePath, { recursive: true });
-    await writeFile(path.join(staleCausalCachePath, '.mcp.json'), await readFile(path.join(repository, 'plugins', causalDebuggerPlugin, '.mcp.json'), 'utf8'), 'utf8');
     await writeFile(path.join(codexHome, 'config.toml'), `[plugins."${retiredPlugin}"]\nenabled = true\n`, 'utf8');
     await writeFakeCodex(binDirectory);
 
@@ -195,14 +187,12 @@ test('PowerShell installer preserves marketplace and plugin state after plugin a
     const removeIndex = commands.indexOf(`plugin remove ${retiredPlugin}`);
     const firstMarketplaceAdd = commands.indexOf(`plugin marketplace add ${repository}`);
     const pluginAdd = commands.indexOf(`plugin add ${plugin}@${marketplace}`);
-    const causalPluginAdd = commands.indexOf(`plugin add ${causalDebuggerPlugin}@${marketplace}`);
     const secondMarketplaceAdd = commands.lastIndexOf(`plugin marketplace add ${repository}`);
     const marketplaceList = commands.indexOf('plugin marketplace list', secondMarketplaceAdd);
     assert.ok(removeIndex >= 0, 'retired plugin must be removed when its entry exists');
     assert.ok(removeIndex < firstMarketplaceAdd, 'retired plugin removal must precede managed plugin registration');
     assert.ok(firstMarketplaceAdd >= 0 && firstMarketplaceAdd < pluginAdd);
-    assert.ok(pluginAdd < causalPluginAdd, 'causal debugger must be installed after the managed workflow plugin');
-    assert.ok(causalPluginAdd < secondMarketplaceAdd);
+    assert.ok(pluginAdd < secondMarketplaceAdd);
     assert.ok(secondMarketplaceAdd < marketplaceList);
 
     const config = await readFile(path.join(codexHome, 'config.toml'), 'utf8');
@@ -211,8 +201,6 @@ test('PowerShell installer preserves marketplace and plugin state after plugin a
     assert.equal(state.pluginEnabled, true);
     assert.equal(state.marketplaceRegistered, true);
     assert.equal(state.version, pluginVersion);
-    assert.equal(state.pluginVersions[causalDebuggerPlugin], causalDebuggerPluginVersion);
-    assert.match(config, /\[plugins\."causal-debugger@ai-vibecode-superpower-local"\]/);
 
     const standaloneSkill = await readFile(path.join(codexHome, 'skills', 'agent-toolchain', 'SKILL.md'), 'utf8');
     assert.match(standaloneSkill, /^---\r?\nname: agent-toolchain\r?\n/);
@@ -230,10 +218,6 @@ test('PowerShell installer preserves marketplace and plugin state after plugin a
     assert.equal(Object.hasOwn(descriptor.mcpServers['workflow-controller'], 'env_vars'), false);
     assert.doesNotMatch(descriptorText, /<CODEX_HOME>/);
 
-    const causalCachePath = path.join(codexHome, 'plugins', 'cache', marketplace, causalDebuggerPlugin, causalDebuggerPluginVersion);
-    const causalDescriptor = JSON.parse(await readFile(path.join(causalCachePath, '.mcp.json'), 'utf8'));
-    assert.ok(causalDescriptor.mcpServers['causal-debugger']);
-    assert.equal(Object.hasOwn(causalDescriptor.mcpServers, 'workflow-controller'), false);
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
   }

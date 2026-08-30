@@ -1,103 +1,58 @@
 ---
 name: orchestrate-model-workflow
-description: "在复杂开发、实现、修复、架构设计、Bug 或漏洞诊断、复审和验收中，使用 Codex 命名 agent role 按证据、决策风险和执行风险分工。"
+description: "在复杂开发、实现、修复、架构设计、Bug 或漏洞诊断、复审和验收中，按证据、决策风险和执行风险选择 Luna、Terra 与 Sol。"
 ---
 
 # 多模型工作流编排
 
-控制器会为没有 `workflow` 字段的直接总审制品写入与当前 task/node/claim/state_dir 匹配的 pending envelope；已有绑定缺失、`null`、假值或其他不匹配 completion 均不得完成或关闭。控制器只可回写自身生成的最终 completion；制品写入失败时节点保持运行中，原 claim 可重试。受控外部证据目录以流式遍历校验，普通文件最多 512（含 manifest），目录最多 512（不含根目录）。
+本 skill 是独立的行为指导。它帮助 Codex 判断任务复杂度、选择合适的 role、分配证据和实施工作，并在交付前完成独立复审。它不要求额外的持久化系统、专用协议或固定输出格式；Codex 可依据当前任务和可用能力自主调度。
 
-本文件是路由、所有权、交接和验收的唯一运行规则。role profile 定义本地提示和模型偏好；[execution-plan.md](references/execution-plan.md) 只提供复杂任务的消息模板。
+## 先判断任务规模
 
-## Codex 运行边界
+简单问答、只读查询、边界清楚的单文件低风险整理，可由 main/root 直接完成。直接完成后运行最贴近改动的验证，再按影响扩大验证范围。
 
-Codex 原生提供命名 role、父子 agent、消息、等待/中断和实例状态。`execution_contract`、`execution_risk`、`execution_owner`、`integration_owner` 与 `quality_guard` 只是任务消息中的协调字段，不是原生对象、锁或 ACL；父 agent 必须核验实际 role、消息、状态、diff、产物和验证输出。
+跨文件改动、未知根因、需要互补取证、复杂权衡、受保护写入、独立复审或用户明确要求编排时，使用下面的五阶段。阶段是工作主线，不是额外的状态机；必要时可在阶段内并行处理互不冲突的工作。
 
-role 会先应用，但 child 随后继承父 turn 的 approval policy 和 permission profile。因此 profile 中的 `sandbox_mode = "read-only"` 是行为边界和配置意图，不是可由 profile 单独证明的硬隔离。父 agent 在委派前核验实际有效权限；model/effort 以成功加载的 role 为准，role 或模型不可用时保留原始错误。
+## 五阶段主线
 
-本文出现的 Codex `V1`/`V2` 只指原生运行时和会话机制，绝不表示 workflow routing schema 的兼容范围；持久化 workflow 一律只接受 `routing_schema_version=3`。当前 Codex V2 运行时在 session persistence/state DB 启用且写入成功时，会保留可用于恢复的 thread metadata、父子边和 rollout；重启后可由原生 `send_message`/`followup_task` 按已知 thread UUID 懒加载已关闭的 V2 子代理。控制器不能直接调用内部 `resume_agent`；正在运行的 turn、活动 wait 和未确认的 pending wakeup 不保证恢复。元数据或 rollout 不可读时，才使用控制器 checkpoint、任务状态和工作区证据创建新代理，不得声称恢复了旧会话。
+1. **Explore**：先检查相关代码、配置、文档、调用关系、测试和运行证据。把事实、判断、假设和未知项分开；只做能缩小问题边界的互补取证。
+2. **Plan**：基于证据明确目标、范围、非目标、授权、验收、停止条件、执行风险、恢复方式和验证方法。仍有会实质改变结果的选择时，暂停并向协调者请求决定。
+3. **Work**：严格按已定计划实施。执行者只修改获授权的范围，记录实际改动和原始错误；不得借实现便利扩大范围、隐藏失败或引入未经证明必要的依赖。
+4. **Critique**：冻结当前证据和产物，由未参与实施的独立复审 role 检查目标、验收、范围、diff、验证、回归风险和未验证项。复审失败时指出阻塞证据并返回修复，不把失败改写为通过。
+5. **Promote**：只有验收满足、独立复审通过且没有必需工作剩余时交付。交付不等于未经授权的发布、部署或其他外部状态变更。
 
-## Role 与拓扑
+## Role 选择
 
-这是消息和提示策略，不是 Codex 运行时 ACL：main/root 可按独立目标并行创建 `1..N` 个 Luna、Terra 或 Sol 分支。只读分支必须有互补证据域或不同决策问题，并标为 `execution_risk=read_only`；状态变更仅可由 main/root 或 `avsp_terra_high` 直接委派新的 Luna executor。不要因为潜在写入范围相交而预先串行：真正修改共享文件、数据或外部状态前，执行者才申请最小实际路径锁；锁未覆盖的工作可以并行。新建节点只有完整契约、`execution_risk=delegable`、唯一 `execution_owner` 且影响和恢复受控时，才可直派 `avsp_luna_high_executor` 或 `avsp_luna_xhigh_executor`；executor 是叶节点，Terra 不得作为这类节点的初始执行者。其他状态变更由 Terra 保护执行和集成。Luna 已停止后若新证据使契约不再受控，main/root 先形成新的完整契约，再用 `workflow_escalate_execution` 将节点显式改为 `protected` 并转交 Terra；不得保留 `delegable` 标签接管。这里没有角色数量的静态上限；V2 并发主要受 `agents.max_threads` 映射的会话线程上限和资源约束，`agents.max_depth` 只约束 V1，V2 不读取它。所有 Luna 只读 role、Luna executor、Sol、Terra readonly fallback 与 `avsp_terra_xhigh` 都不得派生子 agent；Sol 也不得派写入节点。写入任务的关闭由声明的质量门决定；进入 Sol 的任务必须由 main/root 新建、此前未参与该任务的独立 Sol 实例审核。仅所选 Sol role 或模型实际不可用时使用 `avsp_terra_xhigh_readonly` 兜底。缺少当前质量门要求的可核验记录等同 `unavailable`，不得关闭；Codex 没有可由本工作流配置的原生关闭 hook，父 agent 仍须实际执行这一 guard。
+角色差异通过现有 role 名称表达；不要在本 skill 中重写 role prompt。
 
-| 用途 | `agent_type` | 选择条件 |
+| 用途 | role | 选择原则 |
 | --- | --- | --- |
-| 常规取证、预审 | `avsp_luna_high` | 默认首选；跨文件、未知根因或需要扫描的有界只读证据域 |
-| 深入取证、复杂预审 | `avsp_luna_xhigh` | 需要更深局部证据理解 |
-| 已定契约执行 | `avsp_luna_high_executor` / `avsp_luna_xhigh_executor` | main/root 或 `avsp_terra_high` 直接委派的 `delegable` 状态变更任务；executor 为叶节点 |
-| Luna 只读替代 | `avsp_terra_low_readonly` / `avsp_terra_medium_readonly` | 对应 Luna role 真正不可用时一对一替代 |
-| 高难定案、复杂复审、Sol 质量门 | `avsp_sol_high` | 证据充分，但多约束权衡、跨域影响或推理复杂度高；也是 Sol 质量门默认 role |
-| 升级调查、受约束重设计、升级总验收 | `avsp_sol_xhigh` | 证据冲突、根因未证实、无可靠 oracle，或需重新思考 |
-| 最高强度复审与最终升级验收 | `avsp_sol_max` | `avsp_sol_xhigh` 有效失败修复后使用；先作一次独立 max 全局审核，失败后冻结 charter、受保护修复一次，再由新 max 实例 closure；closure 有效失败必须停止并交由用户决策 |
-| Sol 只读替代、总验收兜底 | `avsp_terra_xhigh_readonly` | 所选 Sol role 或模型真正不可用时替代同一只读阶段，必须披露独立性下降 |
-| 契约、保护执行与集成 | `avsp_terra_high` | 处理 `protected` 状态变更、审核 executor 结果并负责集成；可直接委派 executor |
-| 有界定案、常规复审 | `avsp_terra_xhigh` | 证据充分、范围有界且推理路径常规的新建独立只读实例 |
+| 常规取证、预审 | `avsp_luna_high` | 默认的有界只读证据任务 |
+| 深入取证、复杂预审 | `avsp_luna_xhigh` | 需要更深局部理解或证据关联时使用 |
+| 已定契约的可委派实施 | `avsp_luna_high_executor` | 影响、恢复、共享范围和验证均受控时使用 |
+| 更深的已定契约实施 | `avsp_luna_xhigh_executor` | 仍可委派，但完整契约需要更深局部推理时使用 |
+| 受保护执行、契约审核和集成 | `avsp_terra_high` | 处理不可安全委派的写入，或审核并集成 executor 结果 |
+| 有界定案、常规复审 | `avsp_terra_xhigh` | 证据充分、范围有界且判断路径常规时使用 |
+| 高难定案、复杂复审 | `avsp_sol_high` | 多约束权衡、跨域影响或较高推理风险 |
+| 升级调查、重设计或升级验收 | `avsp_sol_xhigh` | 证据冲突、根因未证实或可靠验证依据不足 |
+| 最高强度复审和最终升级验收 | `avsp_sol_max` | 前级复审有效失败并完成授权修复后使用 |
+| Sol 只读替代 | `avsp_terra_xhigh_readonly` | 仅所选 Sol role 或模型确实不可用时使用，并披露独立性下降 |
+| Luna 只读替代 | `avsp_terra_low_readonly` / `avsp_terra_medium_readonly` | 仅对应 Luna role 确实不可用时一对一替代，并保留原始错误 |
 
-## 委派、路由与执行
+默认由 Luna 取证，main/root 保留目标、设计、授权和最终判断。Terra 与 Sol 不因任务名称或“复杂”一词自动触发；按实际证据、影响、可恢复性和验证可靠性选择。Codex 可自主决定是否并行取证或实施，但共享文件、数据和外部状态存在实际冲突时必须串行并明确所有权。
 
-### 工作流准入
+## 授权与执行边界
 
-先判断是否需要多代理持久化工作流。简单问答、只读查询、边界清晰且可由 main/root 独立完成的单文件低风险整理，不创建控制器 DAG，也不派独立审核代理；main/root 直接完成，并在结束前执行与风险相称的验证。只有任务需要跨文件或复杂取证、多节点协作、持久恢复、受保护写入、独立末端质量门或用户明确要求该工作流时，才进入下述完整生命周期。准入只决定是否启用持久化编排，不得用来跳过本来就需要的验证或高风险独立审核。
+委派任何状态变更前，任务包必须清楚说明授权、完整 `execution_contract`、`execution_risk=delegable`（仅适用于确实可安全委派的变更）、唯一 `execution_owner`、`integration_owner`、`quality_guard`、`routing_reason`、验收和停止条件。缺少其中任一项，或仍存在未决的行为、兼容性、范围或恢复选择，停止委派并返回证据。
 
-### 对外阶段语言
+只有 main/root 或 `avsp_terra_high` 可直接委派已定契约的实施任务；实施 role 不得再派生 agent。`protected` 操作不由 Luna executor 承担，应交由 `avsp_terra_high` 按授权处理。任何代理都不得私自部署、发送外部消息、改变安装状态、切换分支或扩大工作目录。
 
-复杂任务的计划、进度和交付使用 `Explore → Plan → Work → Critique → Promote` 说明主线，但这些名称不是控制器节点、额外角色或新的关闭路径：
+只读与写入按实际副作用判断，无法证明没有状态变化时按写入处理。共享写入必须有唯一执行者和明确集成者；发现所有权冲突、范围漂移、契约缺口或共享写入未受控，立即停止，不用猜测补全。
 
-- `Explore`：按互补证据域取证，缩小未知项。
-- `Plan`：由 main/root 基于证据明确目标、范围、非目标、执行契约、风险与验证。
-- `Work`：按既定契约实施、集成并完成所有会写入工作区的验证。
-- `Critique`：冻结证据后进入唯一任务级末端质量门；其独立性、升级和失败语义仍完全遵循本文件。
-- `Promote`：只有质量门通过且关闭检查允许时才交付；它不表示未经授权的发布、部署或其他外部状态变更。
+## 证据、失败与验收
 
-单文件、边界清晰且低风险的直接任务不进入这五阶段闭环：直接实施，运行贴近改动、再按影响扩大的验证并交付。不得因使用阶段语言而为这类任务创建控制器、独立审核或额外 agent。
+验证从最贴近改动的检查开始，再按风险扩大到格式、类型、测试、构建或运行验证。验证结果必须可复核，不能以“看起来正确”代替证据。保留已尝试操作、原始错误、受影响范围、缺失条件和未解决问题。
 
-### 完整任务生命周期
+未知不得静默降级。只有确认 role 或模型确实不可用时，才使用表中的只读替代，并同时保留原始 provider 错误；超时、证据不足、普通失败或结果不佳不是不可用证明。任何 fallback 都必须由协调者明确决定，不得变成后续任务的默认路由。
 
-一次用户输入建立一份完整任务清单。main/root 先明确目标、范围、非目标、验收和授权；随后完成必要的取证、设计与执行契约，派发全部就绪的取证、实现、集成和验证节点，并在每次状态变更后核验结果与工作区。节点的 `quality_guard` 只定义该节点必须留下的测试或证据，不创建审核代理，也不得把审核插入每个小步骤。
-
-全部非审核节点完成后，main/root 汇总验证、清理已知派生产物并冻结当前快照与工作区指纹；这时才启动清单中唯一的末端质量门。门通过才可关闭、释放租约和交付；门失败后的修复回到任务内部，修复完成后重新进入同一个末端门。审核节点必须直接依赖全部非审核节点，任何节点不得依赖审核节点，禁止为单点、小任务或节点交接单独追加审核。执行期间若新证据证明原门级不足，只能在末端门被认领前调用 `workflow_raise_assurance` 将 v3 的 `terra` 单调提高为 `sol`，并把同一个未认领门重绑定为 `sol_high`。该入口不允许通用追加节点或降级。
-
-### 默认分流
-
-跨文件、未知根因或需扫描的任务，若能拆出独立只读证据域，默认先派 `avsp_luna_high`；单文件且改法明确时可跳过并记录理由。主控保留设计、授权、集成和最终判断。
-
-持久化复杂任务使用 `routing_schema_version=3` 和 `execution_routing_policy_version=3`；后者明确绑定 `application_id`、`release_id`、`task_kind` 与 `release_main` 的持久状态契约，旧策略状态不得读取、迁移或接管。任务必须声明顶层 `coordinator_task_path` 与 `coordinator_thread_id`（UUID 字符串）、`assurance_level`、结构化 `assurance_assessment`、`review_context`（精确含非空 `environment`、`scenarios`、`boundaries`）和 `review_entry_stage`。审核包必须携带这两个绑定字段，审核 JSON 必须原样回显并只发送给绑定协调者；这是插件侧声明与校验，不等于宿主认证。`review_entry_stage` 只能是 `terra_single`、`terra_cohort`、`sol_high` 或 `sol_xhigh`：常规任务从 `terra_single` 开始；已有中等复杂度、跨域或需挑战单审固化风险时从 `terra_cohort` 开始；高度复杂、证据冲突或低可信 oracle 时可直接从 `sol_high` 或 `sol_xhigh` 开始。不得直接进入 `sol_max`，它只能来自前级有效失败后的受控链。全部 assurance 维度为 `controlled` 时不应初始化持久化复杂任务；任一为 `partial` 且没有 `unknown` 时门级必须是 `terra`，任一为 `unknown` 时必须是 `sol`。一个任务仍只有一个末端审核节点，cohort 是该节点内部的并行 lane，不是第二个质量门。Sol 仅在所选 Sol 实际不可用时使用 Terra fallback。共享写入、外部副作用或不可恢复变更仍为 `protected`，由 Terra 处理。
-
-### 通用委派约束
-
-命名 `agent_type` 的 `spawn_agent` 必须显式传 `fork_turns="none"`，并使用自包含消息。仅确需有限最近上下文时才传正整数；不得省略。`fork_turns="all"` 仅用于继承父 role 的 full-history fork，且不得同时传自定义 `agent_type`。
-
-状态变更包括任何持久工作区文件、配置、依赖或锁文件、生成产物、版本控制状态、数据库或其他数据，以及外部服务、API、部署或消息状态的改变。只有能够证明未改变上述任一状态的任务才是只读；无法证明时必须按状态变更处理。v3 写入任务按影响范围、可恢复性、不确定性、可验证性和耦合性选择一次任务末端质量门，并把状态、证据、理由和选择理由写入 `assurance_assessment`。执行中风险上升时更新同一结构并调用受控升级入口；证据不足只能保持或提升门级，不能降级。
-
-对外部仓库的状态变更，在创建工作流节点、下载完整源码、安装依赖或委派执行者之前，main/root 必须做一次只读预检：固定目标分支的提交、读取根 `AGENTS.md` 以及仓库明确指向的贡献/维护限制，并核对目标需求是否被允许。若规则要求用户确认、仅接受特定类别修复，或禁止该类改动，保留原始约束并停止该仓库的执行；不得把它当作普通失败重试，也不得以本地实验为由绕过。预检未发现限制后，才可建立该仓库的执行合同；网络不可达时可改用可核验的固定提交源码归档，但仍必须完成同一预检。
-
-### 路由规则
-
-1. **只需事实**：按独立且互补的证据域委派 Luna，并在清单中设 `execution_risk=read_only`；不得重复取同一事实或为使用 Luna 改写风险。证据不足但可补充时继续取证，否则停止并报告。
-2. **需要判断**：证据充分时，`avsp_terra_xhigh` 与 `avsp_sol_high` 同属定案层，按难度分流而非先后升级；高影响或风险域名称本身不触发 Sol。v3 审核者先针对原始目标、requirements、环境、场景、边界、当前产物和验证独立形成全局判断，再核对全部 review/repair 历史；历史是待复核证据，不能限制审核范围。审核 JSON 必须记录 `independent_assessment`、`history_reconciliation`，并原样回填 `workflow_audit_context.review_history_digest`。`fail` 必须包含至少一个结构化 blocking finding。`terra_single` 有效 `fail` 后必须先记录精确 repair，再进入 `terra_cohort`；cohort 使用两个新的 `avsp_terra_xhigh` 并行 blind lane，随后各以一轮 cross-questioning 精确挑战另一份报告。两份最终立场均 pass 才通过；任一 blocker 或不收敛即汇总 findings，repair 后升级 `sol_high`。Sol 使用单调链：`sol_high` 有效 fail -> repair -> 新 `sol_xhigh`；`sol_xhigh` 有效 fail -> repair -> 新 `sol_max_initial`；首次 max 仍 fail 时冻结该次 blockers，执行一次 protected repair，再由新 `sol_max_closure` 复核。closure 任一有效 fail（含新全局 blocker）立即 `scope_decision_required`/`blocked`，自动流程终止，必须由用户选择替代任务或明确扩大范围；不得自动重开、同级循环或伪装为 pass。`unavailable`、超时、证据不足或无效输出不计入有效失败，也不升级；只在确认旧实例停止后由新实例在当前阶段使用独立的有限不可用预算重试。
-3. **需要状态变更**：先写完整 `execution_contract` 和五项路由字段；仍有行为、风险或兼容性选择时不得委派 executor。main/root 不必为每个已定步骤额外创建 Terra 实例；只要契约完整即可直派 Luna 并负责集成。Terra 直派只处理 `protected` 写入，并负责审核和集成。
-4. **执行风险**：可证明没有任何工作区、数据或外部状态变更的取证为 `read_only`，交给只读 role；只有影响面受控、失败可回滚或恢复、外部副作用受限、共享状态与顺序风险已解决且有可靠验证的写入才是 `delegable`；其余写入为 `protected`，由 Terra 直接执行。新建且契约完整的 `delegable` 节点必须交给 Luna executor：默认 Luna/high，只有完整契约仍需更深局部理解时用 xhigh executor，并在 `routing_reason` 记录理由；“实现复杂”不是 Terra 直写理由。Terra 只可直接执行 `protected` 节点，或在 Luna executor 已停止、新证据表明影响/回滚/副作用/共享顺序/验证之一不再受控时，由 main/root 用 `workflow_escalate_execution` 记录原 claim、原因、新路由理由、新的质量检查和更新后的 `assurance_assessment` 后转交；若评估出现 `unknown`，先用 `workflow_raise_assurance` 升级到 Sol。旧工作流状态一律不读取、不迁移、不接管；需重新开始新工作流。使用控制器时，将写入/审阅范围写成不可变 `workspace_claims`；它是可申请锁的审计上界而非 ACL 或预占锁。执行者只在即将进行一组实际工作区写入时，对最小文件或目录前缀调用 `workflow_acquire_write_lock`，完成该组写入立即调用 `workflow_release_write_lock`；实际锁冲突才串行，禁止以“可能涉及”范围或根目录锁预先阻塞他人。根目录锁仅允许真实全工作区副作用并须记录具体 purpose。范围扩大仍必须确认旧执行者停止并释放 entry 后，以新 `task_id` 和 claims 超集创建替代任务。缺少任一审计字段、旧清单或实际共享写入风险未被路径锁覆盖时一律按 `protected`，不得静默当作可委派。`execution_owner` 是每个状态变更的唯一执行者。
-5. **质量门与关闭**：每个任务只有一个末端质量门，不能按节点拆分；v3 `terra_cohort` 的两条并行 lane 与交叉质询属于同一个门。执行期间升级后的门仍是同一个任务级末端门。Sol 必须核验原始目标、验收条件、环境、场景、边界、范围与非目标、执行契约、实际 diff/产物、验证结果、需求覆盖、范围漂移、回归风险和未验证项，并确认实际 diff/产物均属于任务的 `write` claims；无法证明时不得 pass。所有门级都要求当前快照和 scoped 指纹匹配；范围外 peer 变化不使已有 `pass` 失效，但范围内与 read claim 变化会使其失效。max closure 还要求已冻结的 charter 为 `closure_passed`；`scope_decision_required`、缺 charter 或未完成受保护 repair 一律拒绝关闭。closure 有效 fail 后必须保留 blocked 状态并请求用户决策，不得调用自动 retry 或 record-repair。关闭检查发现普通 gate 已失效时，main/root 必须调用 `workflow_invalidate_gate` 或以新的独立 reviewer 路径重开同一个审核节点；不得复用旧 `pass`，也不得新建第二个审核节点。进入 Sol 后仅所选 Sol role 或模型被实际证明不可用时，才使用此前未参与该任务的 `avsp_terra_xhigh_readonly` 兜底并披露独立性下降；超时、证据不足或普通失败不得降级。
-
-## 消息、失败与恢复
-
-父 agent 发送自包含任务包：role、目标、范围与非目标、授权、必要事实、验收、验证、返回格式和停止条件；状态变更再附契约、风险与 owner。审核任务包还必须含 `coordinator_task_path`、`task_id`、`state_dir`、`node_id` 与 active `claim_id`。审核代理把完整审核 JSON 仅用协作层 `send_message` 发往该协调者，最终可见答复只给自然语言 verdict、blocker 数量、关键证据与“审核载荷已发送”；不得输出裸 JSON、JSON 代码块或逐字段载荷。`coordinator_thread_id` 只用于控制器绑定校验，不是消息投递目标；不得把 Codex app 的 `send_message_to_thread` 指向协调者当前线程，否则会把内部任务载荷注入用户可见会话。其他子 agent 返回实际改动、证据、验证、未完成工作和原始错误，父 agent 只在实际核验后集成或关闭。
-
-`send_message` 只投递；`followup_task` 的成功只表示已提交触发请求，不证明 turn 已启动或完成；`wait_agent` 只等待 mailbox activity、steering 或 timeout，不代表目标终态；`interrupt_agent` 的成功、no-op 或 previous status 都不证明已终止，`Interrupted` 不是 final。控制器节点启动时，由已经开始回合的子实例调用 `workflow_start(..., native_agent_started=true)`；Root 必须保存该响应返回的 `task_id`、`state_dir`、`node_id` 和 `claim_id`，后续调用原样复用，缺失时先 `workflow_status`，禁止猜测。正常完成路径中，只有在 Root 实际确认该实例进入原生 `AgentStatus::Completed`（宿主可能将最终答复显示为 `FINAL_ANSWER`）后，才可以 `workflow_complete(..., completion_attestation=native_agent_finished)`。**审核节点还有强制顺序：审核代理通过 `send_message` 私信完整审核 JSON；Root 接收后先成功 `workflow_record_review`（同一 active claim），再 `workflow_complete`，且不得把该 JSON 转发到用户可见回复。**仅限已持有 active claim 且已记录 `unavailable` 审核的工作流绑定总审，外部审核实例启动失败或确认退出时才可使用 `native_agent_start_failed` 或 `native_agent_exit_confirmed`；它们不是跳过审核、也不是普通审核节点的完成方式。已由 `workflow_rescue` 显式转交的 `main/root` 节点则在自身验证后使用 `root_rescue_self_completion`。这些字段形成可审计的声明，但当前宿主未公开调用者身份验证，不能把它们说成强认证。恢复或替换前必须检查 `list_agents`、实际状态/历史/输出及旧实例是否已停止写入。
-
-工具调用契约：`functions.wait` 只能使用当前活动 `functions.exec` 返回的 `cell_id`；异步 agent 使用 `collaboration.wait_agent`，持久化 workflow 使用 `workflow_wait` 并原样复用 `workflow_status`/上一次 wait 返回的 `cursor`。`collaboration.send_message` 的 `target` 与 `message` 必须非空；`request_user_input` 仅限 main/root。`functions.exec` 内嵌工具参数必须按目标工具 schema 传 object，失败时保留原始错误和已尝试操作，不得静默重试、吞错或报告成功。
-
-等待原生代理时优先一次调用带充分 timeout 的 `wait_agent`，收到 mailbox activity 后再核验对应实例；持久化工作流先从 `workflow_status` 取得 `cursor`，随后使用 `workflow-controller` MCP 的 `workflow_wait` 被动等待可操作变化。`workflow_wait` 默认是事件摘要，只有显式 `detail=full` 才读取完整状态；只读排障可调用 `workflow_workspace_overview` 查看当前执行者、ready 节点自最近一次进入 ready 超过调度宽限期仍未启动的 active 任务、失联/失败任务、实际写锁、stale claim 持锁者和租约截止时间。总览无法从事件证明 ready 时间时不报警，只诊断，不得据此自动释放锁或接管实例。普通 heartbeat 不应唤醒协调者；不得用固定短间隔循环调用 `list_agents`、`workflow_status` 或其他状态工具。能力没有事件或 wait 接口时，才按预计完成时间和最近进展逐步退避，并在明确的 timeout、租约、stale 或恢复边界前主动核验。
-
-`workflow_wait` 默认只返回 cursor 变化对应的事件摘要（`events`、`changed_nodes`、无事件时的 `observed_changes`、原因和建议等待时间）；`observed_changes` 仅表示当前派生观察（例如 stale 节点和 workspace 写锁），不是重复事件或完成证明。需要完整当前任务状态时显式传 `detail=full`。返回必须被当作可观察状态而不是“代理已完成”的证明：`reason` 说明本次返回（如 `state_changed`、`native_thread_unverified` 或 `timeout`），`wait_reason`/`waiting_reason` 说明当前阻塞在 `activation_pending`、`running`、`stale`、`ready`、`terminal` 或待处理状态。`workflow_start` 激活但没有 `agent_thread_id` 时，控制器不得把空值当作原生回合不存在，应立即报告 `native_thread_unverified` 和 `reconciliation_required=true`，由协调者先核对原生实例；在确认旧实例停止前不得重绑定、重排队或关闭，这不是成功或可关闭状态。`workflow_claim` 尚未激活时仍按 `activation_deadline_at` 等待，超时必须返回 `stale`/`never_activated` 证据。审核 `unavailable` 始终保留为不可用并要求受控重试；关闭门必须明确报告不可用/需重试，不能伪装为通过。
-
-Luna readonly 真正不可用时才一对一改用对应 Terra low/medium readonly 并保留原错；控制器认领该 fallback 时必须提供 `fallback_reason`，并将原因写入认领事件。每个新节点及每次 retry/rebind 都必须重新按节点保存的 `agent_type` 首先调度其配置的 Luna primary；一次 claim 的 Terra fallback 只能记录该 claim 的 `agent_role`/`fallback_reason`，不得改写 `node.agent_type`、写入全局可用性记忆，或成为后续节点/attempt 的默认 route。后续调度必须再次调用 primary；timeout、证据不足或普通失败不属于不可用。所选 Sol role 或模型真正不可用时才改用 Terra xhigh readonly 并披露独立性下降；总审 fallback 的认领和审查记录都必须提供 `fallback_reason`。executor 失败时，`integration_owner` 核验状态、diff、产物和输出，确认旧 executor 已停止或不再写入后，优先以新完整契约替换一次；只有新证据使契约不再受控时，main/root 才可用 `workflow_escalate_execution` 把原 Luna claim 改为 `protected` 并交由 Terra 接管。该调用必须记录新的 `routing_reason`、`quality_guard` 和同级或更高的 `assurance_assessment`；若它要求 Sol，先调用 `workflow_raise_assurance`。不得把接管结果归为 Luna 结果。如果 Root 必须直接救援写入，必须通过控制器的 `workflow_rescue` 记录原 claim、原因、替代路径和 `main/root` 角色，再以新 claim 完成，不能把救援结果归为 Luna 结果。Terra high 不可用时，main/root 可在契约仍完整、`delegable` 且自身承担 `integration_owner` 时直派 executor；其他情况停止报告。所有 fallback 都是父 agent 的显式动作，不是 Codex 自动行为。
-
-Fallback 的原始 provider 错误优先以结构化 `fallback_error={code,provider,model,upstream_status,request_id,message,...}` 传递；`fallback_reason` 仅是操作摘要，不能注入或改写 provider error。Luna fallback 的原始 `model` 必须为 `gpt-5.6-luna`；Sol fallback 也必须保留原始 model、request_id 和 message。`workflow_rebind_pending` 或 retry 的 `reason` 不是原始 provider error 载荷，旧事件不迁移、不改写。会话统计只接受首条 `type=session_meta` 的元数据聚合，不接受文本命中替代。
-
-若 session persistence/state DB 未启用、写入失败或重启后没有可读的必要状态，只做一次当前状态、diff 和输出盘点，保留原始错误与缺失条件，停止当前恢复或替换并交回父级或用户。对于持久化控制器节点，若计划实例在认领前就未启动，确认其已停止后，以替代实例的真实路径调用 `workflow_rebind_pending`，无需制造一次失败 attempt；若已有活动 claim，先确认原生状态中的旧执行者已停止，V2 thread metadata/rollout 可读时可用原生 `send_message`/`followup_task` 懒加载原子代理并继续原 claim，否则再创建并核对新的原生实例，以其真实路径作为 `replacement_agent_task_path` 调用 `workflow_requeue_stale`。控制器会记录旧 attempt 并将现代节点的 `execution_owner` 显式重绑定给替代实例。替代路径必须不同于旧执行者，审核替代者还必须从未参与该任务。活动 turn、wait 或未确认 pending wakeup 不保证恢复；不得声称自动恢复、已排队或自动重试，也不得重复只读验证。
-
-审核前，main/root 完成所有会写入被审工作区的验证，清理已知测试产物并调用 `audit-context` 冻结证据；审核实例不得修改该工作区。使用 Sol CLI、受控外部证据或硬超时时，必须读取 [Sol 总审运行细则](references/sol-review.md)；普通原生 Sol 审核不加载该参考。
-
-记录 guards 为 `pass`、`fail` 或 `unavailable`；后者不等于通过。只有验收满足且没有必需工作剩余时关闭，并交付实际改动、验证证据、未覆盖行为、残余风险和未解决问题。
+完成时返回实际改动、diff 或产物位置、验证命令及结果、原始错误、未验证项和未解决问题，由 `integration_owner` 审核并集成。若独立复审发现阻塞问题，先完成授权修复，再重新复审；若无法在原范围内满足验收，停止并请求用户决策。

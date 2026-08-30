@@ -87,7 +87,6 @@ flowchart LR
 
 - 已安装并可运行的 Codex CLI。
 - Node.js `>=22.5.0`（工作流控制器使用原生 `node:sqlite`）。
-- 可运行的 `npm`（安装 `causal-debugger` 的 CodeGraph 运行时依赖）。
 - macOS/Linux 还需要 `rg`（ripgrep）。
 - 安装前完全退出 Codex Desktop；否则运行中的应用可能把配置覆盖回去。
 
@@ -125,9 +124,6 @@ sandbox_mode = "danger-full-access"
 [plugins."agnets-workflow@ai-vibecode-superpower-local"]
 enabled = true
 
-[plugins."causal-debugger@ai-vibecode-superpower-local"]
-enabled = true
-
 [agents]
 max_threads = 1000
 max_depth = 5
@@ -143,7 +139,6 @@ goals = true
 | 能力 | 何时使用 | 你会得到 |
 | --- | --- | --- |
 | [`agent-toolchain`](skills/agent-toolchain/SKILL.md) | 首次接入、升级、修复、维护或审查 CodeGraph/RTK | 对目标项目进行受控接入与维护。 |
-| [`causal-debugger`](plugins/causal-debugger/skills/causal-debugger/SKILL.md) | Bug、异常、超时、崩溃或行为回归的只读分析 | 汇总 CodeGraph 与日志证据，输出有界根因候选。 |
 | [`workflow-controller`](plugins/agnets-workflow/skills/workflow-controller/SKILL.md) | 需要持久化状态、恢复交接或严格收口 | 任务状态、checkpoint、写入协调与关闭检查。 |
 | [`project-doc-planner`](skills/project-doc-planner/SKILL.md) | 新项目或大型改造的文档规划 | 可维护的项目级文档结构。 |
 | [`gpt-image-2-cli`](skills/gpt-image-2-cli/SKILL.md) | 需要生成或编辑图片素材 | 通过命令行调用图像生成能力。 |
