@@ -1,769 +1,248 @@
 #!/bin/sh
-
 set -eu
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P) || exit 1
-source_agents=$script_dir/codex-global-config/AGENTS.md
-source_config=$script_dir/codex-global-config/config.toml
-source_model_provider_settings=$script_dir/codex-global-config/model-provider-settings.toml
-source_docs=$script_dir/codex-global-config/docs
-source_agent_roles=$script_dir/codex-global-config/agents/ai-vibecode-superpower
-source_agent_role_manifest=$script_dir/codex-global-config/agents/ai-vibecode-superpower.sha256
-managed_plugin_name=agnets-workflow
-managed_marketplace_name=ai-vibecode-superpower-local
-source_plugin=$script_dir/plugins/$managed_plugin_name
-source_marketplace=$script_dir/.agents/plugins/marketplace.json
-source_plugin_skills=$source_plugin/skills
-source_standalone_skills=$script_dir/skills
-managed_plugin_skill_names='orchestrate-model-workflow workflow-controller'
-legacy_plugin_skill_names_to_remove='adaptive-efficiency'
-managed_standalone_skill_names='agent-toolchain gpt-image-2-cli project-doc-planner'
-managed_agent_role_files='ai-vibecode-superpower-avsp_luna_high.toml ai-vibecode-superpower-avsp_luna_xhigh.toml ai-vibecode-superpower-avsp_luna_high_executor.toml ai-vibecode-superpower-avsp_luna_xhigh_executor.toml ai-vibecode-superpower-avsp_sol_high.toml ai-vibecode-superpower-avsp_sol_max.toml ai-vibecode-superpower-avsp_sol_xhigh.toml ai-vibecode-superpower-avsp_terra_high.toml ai-vibecode-superpower-avsp_terra_xhigh.toml ai-vibecode-superpower-avsp_terra_xhigh_readonly.toml ai-vibecode-superpower-avsp_terra_low_readonly.toml ai-vibecode-superpower-avsp_terra_medium_readonly.toml'
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 
-for source_path in "$source_agents" "$source_config" "$source_model_provider_settings" "$source_agent_role_manifest" "$source_marketplace"; do
-    if [ ! -f "$source_path" ]; then
-        printf '%s\n' "Missing source file: $source_path" >&2
-        exit 1
-    fi
-done
-for source_path in "$source_docs" "$source_agent_roles" "$source_plugin" "$source_plugin_skills" "$source_standalone_skills"; do
-    if [ ! -d "$source_path" ]; then
-        printf '%s\n' "Missing source directory: $source_path" >&2
-        exit 1
-    fi
-done
-for agent_role_file in $managed_agent_role_files; do
-    source_role=$source_agent_roles/$agent_role_file
-    if [ ! -f "$source_role" ]; then
-        printf '%s\n' "Missing managed agent role: $source_role" >&2
-        exit 1
-    fi
-done
-
-for skill_name in $managed_plugin_skill_names; do
-    if [ ! -d "$source_plugin_skills/$skill_name" ]; then
-        printf '%s\n' "Missing managed plugin skill: $skill_name" >&2
-        exit 1
-    fi
-done
-for skill_name in $managed_standalone_skill_names; do
-    if [ ! -d "$source_standalone_skills/$skill_name" ]; then
-        printf '%s\n' "Missing managed standalone skill: $skill_name" >&2
-        exit 1
-    fi
-done
-
-case $(uname -s) in
-    Darwin|Linux) ;;
-    *)
-        printf '%s\n' "Unsupported operating system: $(uname -s)" >&2
-        exit 1
-        ;;
-esac
-
-command -v rg >/dev/null 2>&1 || {
-    printf '%s\n' 'ripgrep (rg) is required to safely scan user agent roles.' >&2
+die() {
+    printf '%s\n' "$1" >&2
     exit 1
 }
-
-: "${HOME:?HOME must be set}"
-codex_home=$HOME/.codex
-
-mkdir -p "$codex_home"
-codex_home=$(CDPATH= cd -- "$codex_home" && pwd -P) || exit 1
-if [ "$codex_home" = / ]; then
-    printf '%s\n' 'Refusing to install into a filesystem root.' >&2
-    exit 1
-fi
-if command -v pgrep >/dev/null 2>&1 && pgrep -f '(^|[[:space:]])app-server([[:space:]]|$)' >/dev/null 2>&1; then
-    printf '%s\n' 'Codex Desktop is still running. Exit every Codex Desktop window and wait for its app-server processes to stop before installing; otherwise the live app can overwrite plugin registration and keep the previous MCP cache loaded.' >&2
-    exit 1
-fi
-
-if [ "$codex_home/AGENTS.md" -ef "$source_agents" ] || \
-   [ "$codex_home/config.toml" -ef "$source_config" ] || \
-   [ "$codex_home/docs" -ef "$source_docs" ] || \
-   [ "$codex_home/agents/ai-vibecode-superpower" -ef "$source_agent_roles" ]; then
-    printf '%s\n' 'Destination target overlaps its source.' >&2
-    exit 1
-fi
-for skill_name in $managed_standalone_skill_names; do
-    if [ "$codex_home/skills/$skill_name" -ef "$source_standalone_skills/$skill_name" ]; then
-        printf '%s\n' "Destination target overlaps its source: $codex_home/skills/$skill_name" >&2
-        exit 1
-    fi
-done
-stage_dir=
-backup_dir=
-manifest=
-completed=0
-lock_file=$codex_home/.install.lock
-agents_parent_created=0
-tab=$(printf '\t')
-carriage_return=$(printf '\r')
-
-managed_plugin_version() {
-    node --input-type=module - "$source_plugin/.codex-plugin/plugin.json" "$managed_plugin_name" <<'NODE'
-import { readFile } from 'node:fs/promises';
-
-const [manifestPath, expectedName] = process.argv.slice(2);
-const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
-if (manifest.name !== expectedName || typeof manifest.version !== 'string' || !/^[0-9A-Za-z][0-9A-Za-z.+_-]*$/.test(manifest.version)) {
-  process.exitCode = 1;
-} else {
-  process.stdout.write(manifest.version);
-}
-NODE
-}
-
-expand_plugin_mcp_home() {
-    candidate_cache=$1
-    node --input-type=module - "$candidate_cache/.mcp.json" "$codex_home" <<'NODE'
-import { readFile, writeFile } from 'node:fs/promises';
-import path from 'node:path';
-const [descriptorPath, codexHome] = process.argv.slice(2);
-const content = await readFile(descriptorPath, 'utf8');
-const expanded = content.replaceAll('<CODEX_HOME>', codexHome.replaceAll('\\', '/'));
-if (expanded !== content) await writeFile(descriptorPath, expanded, 'utf8');
-const descriptor = JSON.parse(expanded);
-const server = descriptor?.mcpServers?.['workflow-controller'];
-if (server?.env?.CODEX_HOME !== codexHome.replaceAll('\\', '/') || server?.env_vars !== undefined) process.exitCode = 1;
-NODE
-}
-
-repair_managed_plugin_cache_mcp_homes() {
-    cache_root=$codex_home/plugins/cache/$managed_marketplace_name/$managed_plugin_name
-    [ -d "$cache_root" ] || return 0
-    node --input-type=module - "$cache_root" "$codex_home" <<'NODE'
-import { lstat, readdir, readFile, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
-const [root, codexHome] = process.argv.slice(2);
-const resolvedHome = codexHome.replaceAll('\\', '/');
-async function visit(directory) {
-  const stat = await lstat(directory);
-  if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`unsafe plugin cache root: ${directory}`);
-  for (const entry of await readdir(directory, { withFileTypes: true })) {
-    const target = join(directory, entry.name);
-    const child = await lstat(target);
-    if (child.isSymbolicLink()) throw new Error(`unsafe plugin cache link: ${target}`);
-    if (child.isDirectory()) await visit(target);
-    else if (child.isFile() && entry.name === '.mcp.json') {
-      const content = await readFile(target, 'utf8');
-      const expanded = content.replaceAll('<CODEX_HOME>', resolvedHome);
-      if (expanded !== content) await writeFile(target, expanded, 'utf8');
-      const descriptor = JSON.parse(expanded);
-      const server = descriptor?.mcpServers?.['workflow-controller'];
-      if (server?.env?.CODEX_HOME !== resolvedHome || server?.env_vars !== undefined) throw new Error(`invalid managed plugin MCP descriptor: ${target}`);
-    }
-  }
-}
-await visit(root);
-NODE
-}
-
-plugin_cache_matches_source() {
-    candidate_cache=$1
-    [ -d "$candidate_cache" ] || return 1
-    expand_plugin_mcp_home "$candidate_cache" || return 1
-    node --input-type=module - "$source_plugin" "$candidate_cache" "$codex_home" <<'NODE'
-import { lstat, readdir, readFile } from 'node:fs/promises';
-import { join, relative, sep } from 'node:path';
-import { createHash } from 'node:crypto';
-
-const [sourceRoot, cacheRoot, codexHome] = process.argv.slice(2);
-
-async function collect(root) {
-  const rootStat = await lstat(root);
-  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) throw new Error(`unsafe plugin root: ${root}`);
-  const records = [];
-  async function visit(directory) {
-    for (const entry of await readdir(directory, { withFileTypes: true })) {
-      const absolute = join(directory, entry.name);
-      const stat = await lstat(absolute);
-      if (stat.isSymbolicLink()) throw new Error(`unsafe plugin link: ${absolute}`);
-      if (stat.isDirectory()) {
-        if (entry.name === 'node_modules') continue;
-        await visit(absolute);
-      } else if (stat.isFile()) {
-        const name = relative(root, absolute).split(sep).join('/');
-        let content = await readFile(absolute);
-        if (root === sourceRoot && name === '.mcp.json') content = Buffer.from(content.toString('utf8').replaceAll('<CODEX_HOME>', codexHome.replaceAll('\\', '/')));
-        const digest = createHash('sha256').update(content).digest('hex');
-        records.push([name, digest]);
-      } else {
-        throw new Error(`unsupported plugin entry: ${absolute}`);
-      }
-    }
-  }
-  await visit(root);
-  return records.sort(([left], [right]) => left.localeCompare(right));
-}
-
-const [source, cache] = await Promise.all([collect(sourceRoot), collect(cacheRoot)]);
-process.exitCode = JSON.stringify(source) === JSON.stringify(cache) ? 0 : 1;
-NODE
-}
-
-install_plugin_dependencies() {
-    plugin_name=$1
-    plugin_version=$2
-    plugin_cache=$codex_home/plugins/cache/$managed_marketplace_name/$plugin_name/$plugin_version
-    [ -f "$plugin_cache/package-lock.json" ] || return 0
-    command -v npm >/dev/null 2>&1 || {
-        printf '%s\n' "npm is required to install dependencies for managed plugin: $plugin_name" >&2
-        return 1
-    }
-    npm --prefix "$plugin_cache" ci --omit=dev --ignore-scripts --no-audit --no-fund || {
-        printf '%s\n' "Could not install dependencies for managed plugin: $plugin_name" >&2
-        return 1
-    }
-}
-
-managed_plugin_is_active() {
-    expected_version=$1
-    plugin_output=$(CODEX_HOME="$codex_home" codex plugin list 2>&1) || return 1
-    printf '%s\n' "$plugin_output" | rg -q "^[[:space:]]*$managed_plugin_name@$managed_marketplace_name[[:space:]]+installed,[[:space:]]+enabled[[:space:]]+$expected_version[[:space:]]"
-}
-
-install_managed_plugin() {
-    command -v codex >/dev/null 2>&1 || {
-        printf '%s\n' 'Codex CLI is required to install the managed plugin, but codex was not found.' >&2
-        return 1
-    }
-    command -v node >/dev/null 2>&1 || {
-        printf '%s\n' 'Node.js is required for the agnets-workflow workflow-controller MCP server, but the node command was not found.' >&2
-        return 1
-    }
-    node_version=$(node -p 'process.versions.node') || {
-        printf '%s\n' 'Cannot determine the Node.js version required by the native SQLite workflow controller.' >&2
-        return 1
-    }
-    old_ifs=$IFS
-    IFS=.
-    set -- $node_version
-    IFS=$old_ifs
-    node_major=${1:-0}
-    node_minor=${2:-0}
-    case "$node_major:$node_minor" in
-        *[!0-9:]*|'')
-            printf '%s\n' "Cannot parse Node.js version: $node_version" >&2
-            return 1
-            ;;
-    esac
-    if [ "$node_major" -lt 22 ] || { [ "$node_major" -eq 22 ] && [ "$node_minor" -lt 5 ]; }; then
-        printf '%s\n' "Node.js 22.5.0 or newer is required for the native SQLite workflow controller; found $node_version" >&2
-        return 1
-    fi
-    plugin_version=$(managed_plugin_version) || {
-        printf '%s\n' "Invalid managed plugin manifest: $source_plugin/.codex-plugin/plugin.json" >&2
-        return 1
-    }
-    plugin_cache=$codex_home/plugins/cache/$managed_marketplace_name/$managed_plugin_name/$plugin_version
-    repair_managed_plugin_cache_mcp_homes
-    CODEX_HOME="$codex_home" codex plugin marketplace add "$script_dir"
-    if ! plugin_cache_matches_source "$plugin_cache" || ! managed_plugin_is_active "$plugin_version"; then
-        # An enabled entry that the CLI cannot list is not a usable install.
-        # Remove that stale identity before re-adding so Codex cannot retain an
-        # old config/cache snapshot and silently no-op the requested fix.
-        if ! plugin_remove_output=$(CODEX_HOME="$codex_home" codex plugin remove "$managed_plugin_name@$managed_marketplace_name" 2>&1); then
-            printf '%s\n' 'Warning: Codex could not remove a stale managed plugin before reinstall; continuing with plugin add.' >&2
-            printf '%s\n' "$plugin_remove_output" >&2
-        fi
-        if ! plugin_add_output=$(CODEX_HOME="$codex_home" codex plugin add "$managed_plugin_name@$managed_marketplace_name" 2>&1); then
-            if ! plugin_cache_matches_source "$plugin_cache" || ! managed_plugin_is_active "$plugin_version"; then
-                printf '%s\n' "Could not install managed plugin: $managed_plugin_name@$managed_marketplace_name" >&2
-                printf '%s\n' "$plugin_add_output" >&2
-                return 1
-            fi
-            printf '%s\n' 'Codex reported an error while cleaning an older plugin cache entry, but the requested plugin cache and active configuration were verified.' >&2
-            printf '%s\n' "$plugin_add_output" >&2
-        fi
-    fi
-    # plugin add can rewrite config.toml from an in-memory snapshot; register
-    # the marketplace again so the installed plugin remains discoverable.
-    CODEX_HOME="$codex_home" codex plugin marketplace add "$script_dir"
-    repair_managed_plugin_cache_mcp_homes
-    marketplace_output=$(CODEX_HOME="$codex_home" codex plugin marketplace list 2>&1) || {
-        printf '%s\n' 'Could not verify managed plugin marketplace registration.' >&2
-        return 1
-    }
-    printf '%s\n' "$marketplace_output" | rg -q "^[[:space:]]*$managed_marketplace_name[[:space:]]" || {
-        printf '%s\n' "Codex did not retain marketplace registration after plugin install: $managed_marketplace_name" >&2
-        return 1
-    }
-    final_cache_matches=1
-    plugin_cache_matches_source "$plugin_cache" || final_cache_matches=0
-    if ! managed_plugin_is_active "$plugin_version"; then
-        printf '%s\n' "Codex did not retain the exact managed plugin version: $managed_plugin_name@$managed_marketplace_name ($plugin_version)" >&2
-        return 1
-    fi
-    if [ "$final_cache_matches" -ne 1 ]; then
-        printf '%s\n' "Warning: managed plugin cache differs from the source after semantic MCP validation; retaining the verified active plugin: $managed_plugin_name@$managed_marketplace_name" >&2
-    fi
-    install_plugin_dependencies "$managed_plugin_name" "$plugin_version" || return 1
-}
-
-remove_retired_workflow_plugin() {
-    retired_plugin_id=workflow-controller@ai-vibecode-superpower-local
-    config_path=$codex_home/config.toml
-    [ -f "$config_path" ] || return 0
-    if ! rg -F -q -- "[plugins.\"$retired_plugin_id\"]" "$config_path" && \
-       ! rg -F -q -- "[plugins.'$retired_plugin_id']" "$config_path"; then
-        return 0
-    fi
-    command -v codex >/dev/null 2>&1 || {
-        printf '%s\n' 'Codex CLI is required to remove the retired workflow plugin, but codex was not found.' >&2
-        return 1
-    }
-    attempt=1
-    while :; do
-        if CODEX_HOME="$codex_home" codex plugin remove "$retired_plugin_id"; then
-            return 0
-        else
-            exit_code=$?
-        fi
-        if [ "$attempt" -ge 8 ]; then
-            printf '%s\n' "Could not remove retired workflow plugin after 8 attempts: $retired_plugin_id (exit code $exit_code)" >&2
-            return "$exit_code"
-        fi
-        attempt=$((attempt + 1))
-        sleep 1
-    done
-}
-
-prune_old_install_backups() {
-    backup_root=$codex_home/backups
-    [ -d "$backup_root" ] || return 0
-    assert_directory_container "$backup_root"
-    backup_list=$stage_dir/managed-backups.txt
-    : > "$backup_list"
-    for candidate in "$backup_root"/backup-*; do
-        path_exists "$candidate" || continue
-        backup_name=${candidate##*/}
-        printf '%s\n' "$backup_name" | rg -q '^backup-[0-9]{8}-[0-9]{6}-[0-9]+\.[[:alnum:]]{6}$' || continue
-        if [ -L "$candidate" ] || [ ! -d "$candidate" ]; then
-            continue
-        fi
-        if [ -n "$(find "$candidate" -type l -print -quit)" ]; then
-            continue
-        fi
-        printf '%s\n' "$candidate" >> "$backup_list"
-    done
-    sort -r "$backup_list" | awk 'NR > 5' | while IFS= read -r candidate; do
-        [ -n "$candidate" ] || continue
-        rm -rf "$candidate"
-    done
-}
-
 path_exists() {
     [ -e "$1" ] || [ -L "$1" ]
 }
 
+assert_path_chain() {
+    chain_path=$1
+    while [ "$chain_path" != "/" ] && [ "$chain_path" != "." ]; do
+        if [ -L "$chain_path" ]; then
+            printf '%s\n' "Refusing symlink path: $chain_path" >&2
+            return 1
+        fi
+        next_path=$(dirname -- "$chain_path")
+        [ "$next_path" = "$chain_path" ] && break
+        chain_path=$next_path
+    done
+}
+
 assert_no_symlink_tree() {
-    target_path=$1
-
-    if [ -L "$target_path" ]; then
-        printf '%s\n' "Refusing to copy through a symbolic link: $target_path" >&2
-        exit 1
+    tree_path=$1
+    path_exists "$tree_path" || return 0
+    if [ -L "$tree_path" ]; then
+        printf '%s\n' "Refusing symlink path: $tree_path" >&2
+        return 1
     fi
-    if [ ! -d "$target_path" ]; then
-        return 0
-    fi
-    for child_path in "$target_path"/* "$target_path"/.[!.]* "$target_path"/..?*; do
-        path_exists "$child_path" || continue
-        assert_no_symlink_tree "$child_path"
-    done
-}
-
-is_managed_agent_role_file() {
-    case $1 in
-        ai-vibecode-superpower-avsp_luna_high.toml|\
-        ai-vibecode-superpower-avsp_luna_xhigh.toml|\
-        ai-vibecode-superpower-avsp_luna_high_executor.toml|\
-        ai-vibecode-superpower-avsp_luna_xhigh_executor.toml|\
-        ai-vibecode-superpower-avsp_sol_high.toml|\
-        ai-vibecode-superpower-avsp_sol_max.toml|\
-        ai-vibecode-superpower-avsp_sol_xhigh.toml|\
-        ai-vibecode-superpower-avsp_terra_high.toml|\
-        ai-vibecode-superpower-avsp_terra_xhigh.toml|\
-        ai-vibecode-superpower-avsp_terra_xhigh_readonly.toml|\
-        ai-vibecode-superpower-avsp_terra_low_readonly.toml|\
-        ai-vibecode-superpower-avsp_terra_medium_readonly.toml)
-            return 0
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
-normalized_lf_sha256() {
-    case $(uname -s) in
-        Darwin)
-            sed "s/${carriage_return}\$//" "$1" | shasum -a 256 | awk '{ print $1 }'
-            ;;
-        Linux)
-            sed "s/${carriage_return}\$//" "$1" | sha256sum | awk '{ print $1 }'
-            ;;
-    esac
-}
-
-parse_managed_agent_role_manifest_line() {
-    manifest_line=$1
-    case $manifest_line in
-        *"  "*) ;;
-        *) return 1 ;;
-    esac
-    manifest_hash=${manifest_line%"  "*}
-    manifest_role_file=${manifest_line#"$manifest_hash"  }
-    [ "$manifest_hash  $manifest_role_file" = "$manifest_line" ] || return 1
-    [ -n "$manifest_role_file" ] || return 1
-    case $manifest_hash in
-        *[!0-9a-f]*|'') return 1 ;;
-    esac
-    [ "${#manifest_hash}" -eq 64 ] || return 1
-    case $manifest_role_file in
-        *[[:space:]]*) return 1 ;;
-    esac
-    return 0
-}
-
-managed_agent_role_manifest_hash() {
-    requested_role_file=$1
-    while IFS= read -r manifest_line || [ -n "$manifest_line" ]; do
-        if ! parse_managed_agent_role_manifest_line "$manifest_line"; then
-            printf '%s\n' "Invalid managed agent role manifest: $source_agent_role_manifest" >&2
-            return 1
-        fi
-        if [ "$manifest_role_file" = "$requested_role_file" ]; then
-            printf '%s\n' "$manifest_hash"
-            return 0
-        fi
-    done < "$source_agent_role_manifest"
-    printf '%s\n' "Missing managed agent role hash: $requested_role_file" >&2
-    return 1
-}
-
-assert_managed_agent_role_manifest() {
-    manifest_path=$1
-    manifest_count=0
-    manifest_role_files=
-
-    while IFS= read -r manifest_line || [ -n "$manifest_line" ]; do
-        if ! parse_managed_agent_role_manifest_line "$manifest_line"; then
-            printf '%s\n' "Invalid managed agent role manifest: $manifest_path" >&2
-            exit 1
-        fi
-        if ! is_managed_agent_role_file "$manifest_role_file"; then
-            printf '%s\n' "Unexpected managed agent role manifest entry: $manifest_role_file" >&2
-            exit 1
-        fi
-        case " $manifest_role_files " in
-            *" $manifest_role_file "*)
-                printf '%s\n' "Repeated managed agent role hash: $manifest_role_file" >&2
-                exit 1
-                ;;
-        esac
-        manifest_role_files="$manifest_role_files $manifest_role_file"
-        manifest_count=$((manifest_count + 1))
-    done < "$manifest_path"
-
-    expected_role_count=0
-    for role_file in $managed_agent_role_files; do
-        expected_role_count=$((expected_role_count + 1))
-        case " $manifest_role_files " in
-            *" $role_file "*) ;;
-            *)
-                printf '%s\n' "Missing managed agent role hash: $role_file" >&2
-                exit 1
-                ;;
-        esac
-    done
-    if [ "$manifest_count" -ne "$expected_role_count" ]; then
-        printf '%s\n' "Unexpected managed agent role manifest entry count: $manifest_path" >&2
-        exit 1
-    fi
-}
-
-assert_managed_agent_role_contract() {
-    role_path=$1
-    role_file=$(basename "$role_path")
-
-    case $role_file in
-        ai-vibecode-superpower-avsp_luna_high.toml)
-            expected_name=avsp_luna_high
-            expected_model=gpt-5.6-luna
-            expected_effort=high
-            expected_sandbox=read-only
-            ;;
-        ai-vibecode-superpower-avsp_luna_xhigh.toml)
-            expected_name=avsp_luna_xhigh
-            expected_model=gpt-5.6-luna
-            expected_effort=xhigh
-            expected_sandbox=read-only
-            ;;
-        ai-vibecode-superpower-avsp_luna_high_executor.toml)
-            expected_name=avsp_luna_high_executor
-            expected_model=gpt-5.6-luna
-            expected_effort=high
-            expected_sandbox=danger-full-access
-            ;;
-        ai-vibecode-superpower-avsp_luna_xhigh_executor.toml)
-            expected_name=avsp_luna_xhigh_executor
-            expected_model=gpt-5.6-luna
-            expected_effort=xhigh
-            expected_sandbox=danger-full-access
-            ;;
-        ai-vibecode-superpower-avsp_sol_high.toml)
-            expected_name=avsp_sol_high
-            expected_model=gpt-5.6-sol
-            expected_effort=high
-            expected_sandbox=read-only
-            ;;
-        ai-vibecode-superpower-avsp_sol_max.toml)
-            expected_name=avsp_sol_max
-            expected_model=gpt-5.6-sol
-            expected_effort=max
-            expected_sandbox=read-only
-            ;;
-        ai-vibecode-superpower-avsp_sol_xhigh.toml)
-            expected_name=avsp_sol_xhigh
-            expected_model=gpt-5.6-sol
-            expected_effort=xhigh
-            expected_sandbox=read-only
-            ;;
-        ai-vibecode-superpower-avsp_terra_high.toml)
-            expected_name=avsp_terra_high
-            expected_model=gpt-5.6-terra
-            expected_effort=high
-            expected_sandbox=danger-full-access
-            ;;
-        ai-vibecode-superpower-avsp_terra_xhigh.toml)
-            expected_name=avsp_terra_xhigh
-            expected_model=gpt-5.6-terra
-            expected_effort=xhigh
-            expected_sandbox=read-only
-            ;;
-        ai-vibecode-superpower-avsp_terra_xhigh_readonly.toml)
-            expected_name=avsp_terra_xhigh_readonly
-            expected_model=gpt-5.6-terra
-            expected_effort=xhigh
-            expected_sandbox=read-only
-            ;;
-        ai-vibecode-superpower-avsp_terra_low_readonly.toml)
-            expected_name=avsp_terra_low_readonly
-            expected_model=gpt-5.6-terra
-            expected_effort=low
-            expected_sandbox=read-only
-            ;;
-        ai-vibecode-superpower-avsp_terra_medium_readonly.toml)
-            expected_name=avsp_terra_medium_readonly
-            expected_model=gpt-5.6-terra
-            expected_effort=medium
-            expected_sandbox=read-only
-            ;;
-        *)
-            printf '%s\n' "Unexpected managed agent role: $role_path" >&2
-            exit 1
-            ;;
-    esac
-
-    expected_hash=$(managed_agent_role_manifest_hash "$role_file")
-    actual_hash=$(normalized_lf_sha256 "$role_path")
-    if [ "$actual_hash" != "$expected_hash" ]; then
-        printf '%s\n' "Managed agent role content does not match its contract: $role_path" >&2
-        exit 1
-    fi
-
-    if ! awk \
-        -v expected_name="$expected_name" \
-        -v expected_model="$expected_model" \
-        -v expected_effort="$expected_effort" \
-        -v expected_sandbox="$expected_sandbox" '
-        function trim(value) {
-            sub(/^[[:space:]]*/, "", value)
-            sub(/[[:space:]]*$/, "", value)
-            return value
-        }
-        function validate_scalar(key, expected) {
-            seen[key]++
-            if (seen[key] != 1 || line != key " = \"" expected "\"") {
-                invalid = 1
-            }
-        }
-        BEGIN {
-            in_developer_instructions = 0
-            developer_instructions_count = 0
-            description_count = 0
-        }
-        {
-            line = trim($0)
-
-            if (in_developer_instructions) {
-                if (line == "\"\"\"") {
-                    in_developer_instructions = 0
-                }
-                next
-            }
-            if (line == "" || line ~ /^#/) {
-                next
-            }
-            if (line ~ /^developer_instructions[[:space:]]*=[[:space:]]*"""[[:space:]]*$/) {
-                developer_instructions_count++
-                if (developer_instructions_count != 1) {
-                    invalid = 1
-                }
-                in_developer_instructions = 1
-                next
-            }
-            if (line ~ /^description[[:space:]]*=/) {
-                description_count++
-                if (description_count != 1 || line !~ /^description[[:space:]]*=[[:space:]]*"[^"]*"[[:space:]]*$/) {
-                    invalid = 1
-                }
-                next
-            }
-            if (line ~ /^name[[:space:]]*=/) {
-                validate_scalar("name", expected_name)
-                next
-            }
-            if (line ~ /^model[[:space:]]*=/) {
-                validate_scalar("model", expected_model)
-                next
-            }
-            if (line ~ /^model_reasoning_effort[[:space:]]*=/) {
-                validate_scalar("model_reasoning_effort", expected_effort)
-                next
-            }
-            if (line ~ /^sandbox_mode[[:space:]]*=/) {
-                validate_scalar("sandbox_mode", expected_sandbox)
-                next
-            }
-            invalid = 1
-        }
-        END {
-            if (in_developer_instructions || developer_instructions_count != 1 || description_count != 1 ||
-                seen["name"] != 1 || seen["model"] != 1 ||
-                seen["model_reasoning_effort"] != 1 || seen["sandbox_mode"] != 1) {
-                invalid = 1
-            }
-            exit invalid ? 1 : 0
-        }
-    ' "$role_path"; then
-        printf '%s\n' "Invalid managed agent role contract: $role_path" >&2
-        exit 1
-    fi
-}
-
-assert_managed_agent_role_directory() {
-    role_directory=$1
-    expected_role_count=0
-    actual_role_count=0
-
-    assert_no_symlink_tree "$role_directory"
-    for role_path in "$role_directory"/* "$role_directory"/.[!.]* "$role_directory"/..?*; do
-        path_exists "$role_path" || continue
-        if [ ! -f "$role_path" ]; then
-            printf '%s\n' "Expected a regular managed agent role file: $role_path" >&2
-            exit 1
-        fi
-        role_file=$(basename "$role_path")
-        if ! is_managed_agent_role_file "$role_file"; then
-            printf '%s\n' "Unexpected managed agent role file: $role_path" >&2
-            exit 1
-        fi
-        actual_role_count=$((actual_role_count + 1))
-    done
-    for role_file in $managed_agent_role_files; do
-        expected_role_count=$((expected_role_count + 1))
-        role_path=$role_directory/$role_file
-        if [ ! -f "$role_path" ]; then
-            printf '%s\n' "Missing managed agent role: $role_path" >&2
-            exit 1
-        fi
-        assert_managed_agent_role_contract "$role_path"
-    done
-    if [ "$actual_role_count" -ne "$expected_role_count" ]; then
-        printf '%s\n' "Unexpected managed agent role file count in: $role_directory" >&2
-        exit 1
+    if [ -d "$tree_path" ]; then
+        for child_path in "$tree_path"/* "$tree_path"/.[!.]* "$tree_path"/..?*; do
+            path_exists "$child_path" || continue
+            assert_no_symlink_tree "$child_path" || return 1
+        done
     fi
 }
 
 assert_target() {
     target_path=$1
     target_kind=$2
-
+    assert_path_chain "$target_path" || return 1
     path_exists "$target_path" || return 0
     if [ -L "$target_path" ]; then
         printf '%s\n' "Refusing to replace a symbolic link: $target_path" >&2
-        exit 1
+        return 1
     fi
-    case $target_kind in
-        file)
-            if [ ! -f "$target_path" ]; then
-                printf '%s\n' "Expected a regular file target: $target_path" >&2
-                exit 1
-            fi
-            ;;
-        directory)
-            if [ ! -d "$target_path" ]; then
-                printf '%s\n' "Expected a directory target: $target_path" >&2
-                exit 1
-            fi
-            assert_no_symlink_tree "$target_path"
-            ;;
-        *)
-            printf '%s\n' "Unknown target type: $target_kind" >&2
-            exit 1
-            ;;
+    case "$target_kind" in
+        file) [ -f "$target_path" ] || { printf '%s\n' "Expected a regular file target: $target_path" >&2; return 1; } ;;
+        directory) [ -d "$target_path" ] || { printf '%s\n' "Expected a directory target: $target_path" >&2; return 1; }; assert_no_symlink_tree "$target_path" || return 1 ;;
+        *) printf '%s\n' "Unknown target kind: $target_kind" >&2; return 1 ;;
     esac
 }
 
 assert_directory_container() {
-    target_path=$1
-
-    path_exists "$target_path" || return 0
-    if [ -L "$target_path" ] || [ ! -d "$target_path" ]; then
-        printf '%s\n' "Expected a non-symbolic-link directory: $target_path" >&2
-        exit 1
+    container_path=$1
+    assert_path_chain "$container_path" || return 1
+    path_exists "$container_path" || return 0
+    if [ -L "$container_path" ] || [ ! -d "$container_path" ]; then
+        printf '%s\n' "Expected a non-symbolic-link directory: $container_path" >&2
+        return 1
     fi
 }
 
-assert_no_reserved_agent_role_name_conflict() {
-    agents_directory=$1
+: "$HOME"
+raw_home=$HOME/.codex
+if printenv CODEX_HOME >/dev/null 2>&1; then raw_home=$(printenv CODEX_HOME); fi
+case "$raw_home" in
+    /*) ;;
+    *) raw_home=$(CDPATH= cd -- . && printf '%s/%s' "$PWD" "$raw_home") ;;
+esac
+case "$raw_home" in /|.) die "Refusing unsafe Codex home: $raw_home" ;; esac
+assert_path_chain "$raw_home" || die "Unsafe Codex home path: $raw_home"
+mkdir -p "$(dirname -- "$raw_home")"
+assert_path_chain "$raw_home" || die "Unsafe Codex home path: $raw_home"
+codex_home=$(CDPATH= cd -- "$(dirname -- "$raw_home")" && printf '%s/%s' "$(pwd -P)" "$(basename -- "$raw_home")")
+case "$codex_home" in /|.) die "Refusing unsafe Codex home: $codex_home" ;; esac
+mkdir -p "$codex_home"
+assert_path_chain "$codex_home" || die "Unsafe Codex home path: $codex_home"
 
-    [ -d "$agents_directory" ] || return 0
-    assert_no_symlink_tree "$agents_directory"
-    conflict_found=0
-    for scan_root in "$agents_directory"/* "$agents_directory"/.[!.]* "$agents_directory"/..?*; do
-        path_exists "$scan_root" || continue
-        [ "$(basename "$scan_root")" = ai-vibecode-superpower ] && continue
-        if conflicting_roles=$(rg -il --hidden --no-ignore --glob '*.toml' '^[[:space:]]*(?:name|["\x27]name["\x27])[[:space:]]*=[[:space:]]*["\x27]{1,3}(?:avsp_|\\u0061vsp_|\\U00000061vsp_)' "$scan_root"); then
-            if [ "$conflict_found" -eq 0 ]; then
-                printf '%s\n' "User agent role uses the reserved avsp_ namespace:" >&2
-            fi
-            printf '%s\n' "$conflicting_roles" >&2
-            conflict_found=1
-        else
-            search_status=$?
-            if [ "$search_status" -ne 1 ]; then
-                printf '%s\n' "Could not safely scan user agent roles in: $scan_root" >&2
-                exit "$search_status"
-            fi
-        fi
+source_roles=$script_dir/codex-global-config/agents/ai-vibecode-superpower
+source_manifest=$script_dir/codex-global-config/agents/ai-vibecode-superpower.sha256
+source_docs=$script_dir/codex-global-config/docs
+source_agents=$script_dir/codex-global-config/AGENTS.md
+source_config=$script_dir/codex-global-config/config.toml
+source_model_provider_settings=$script_dir/codex-global-config/model-provider-settings.toml
+source_skills=$script_dir/skills
+skill_names='agent-toolchain gpt-image-2-cli project-doc-planner orchestrate-model-workflow'
+for source_path in "$source_roles" "$source_manifest" "$source_docs" "$source_agents" "$source_config" "$source_model_provider_settings"; do
+    [ -e "$source_path" ] || die "Missing source: $source_path"
+done
+for name in $skill_names; do [ -d "$source_skills/$name" ] || die "Missing skill: $name"; done
+assert_path_chain "$script_dir" || die "Unsafe installer source path: $script_dir"
+for source_path in "$source_roles" "$source_manifest" "$source_docs" "$source_agents" "$source_config" "$source_model_provider_settings" "$source_skills"; do
+    assert_no_symlink_tree "$source_path" || die "Source tree contains a symlink or unsafe entry: $source_path"
+done
+
+normalized_lf_sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        awk '{ sub(/\r$/, ""); print }' "$1" | sha256sum | awk '{print $1}'
+    else
+        awk '{ sub(/\r$/, ""); print }' "$1" | shasum -a 256 | awk '{print $1}'
+    fi
+}
+
+manifest_hash() {
+    requested_role=$1
+    manifest_path=${2:-$source_manifest}
+    awk -v requested="$requested_role" '$0 ~ /^[0-9a-f]{64}  [^[:space:]]+$/ && $2 == requested { print $1; found = 1 } END { if (!found) exit 1 }' "$manifest_path"
+}
+
+assert_roles() {
+    roles_dir=${1:-$source_roles}
+    manifest_path=${2:-$source_manifest}
+    manifest_count=$(wc -l < "$manifest_path")
+    [ "$manifest_count" -eq 12 ] || die 'Expected 12 managed role hashes'
+    for role_path in "$roles_dir"/*.toml; do
+        [ -f "$role_path" ] || die "Missing managed role: $role_path"
+        role_name=$(basename "$role_path")
+        expected_hash=$(manifest_hash "$role_name" "$manifest_path") || die "Missing role hash: $role_name"
+        actual_hash=$(normalized_lf_sha256 "$role_path")
+        [ "$expected_hash" = "$actual_hash" ] || die "Role hash mismatch: $role_name"
+        field_matches=$(rg -o '^(name|model|model_reasoning_effort|sandbox_mode|description|developer_instructions)[[:space:]]*=' "$role_path" | awk '{ sub(/[[:space:]]*=.*/, ""); print }') || die "Role fields missing: $role_name"
+        printf '%s\n' "$field_matches" | awk 'BEGIN { wanted["name"]=1; wanted["model"]=1; wanted["model_reasoning_effort"]=1; wanted["sandbox_mode"]=1; wanted["description"]=1; wanted["developer_instructions"]=1 } { count[$0]++ } END { for (key in wanted) if (count[key] != 1) exit 1 }' || die "Role fields missing or repeated: $role_name"
     done
-    if [ "$conflict_found" -ne 0 ]; then
-        exit 1
+}
+
+assert_safe_toml_merge_input() {
+    config_path=$1
+    if ! awk '
+        function trim(value) { sub(/^[[:space:]]*/, "", value); sub(/[[:space:]]*$/, "", value); return value }
+        function fail(message) { printf "%s:%d: unsupported TOML syntax for safe merge: %s\n", FILENAME, FNR, message > "/dev/stderr"; invalid = 1 }
+        function closed(value, position, character, basic, literal, array_depth, inline_depth) {
+            basic = 0; literal = 0; array_depth = 0; inline_depth = 0
+            for (position = 1; position <= length(value); position++) {
+                character = substr(value, position, 1)
+                if (basic) { if (character == "\\") position++; else if (character == "\"") basic = 0; continue }
+                if (literal) { if (character == "\047") literal = 0; continue }
+                if (character == "\"") basic = 1
+                else if (character == "\047") literal = 1
+                else if (character == "[") array_depth++
+                else if (character == "]") array_depth--
+                else if (character == "{") inline_depth++
+                else if (character == "}") inline_depth--
+                if (array_depth < 0 || inline_depth < 0) return 0
+            }
+            return !basic && !literal && array_depth == 0 && inline_depth == 0
+        }
+        BEGIN { section = "root" }
+        {
+            line = trim($0)
+            if (line == "" || line ~ /^#/) next
+            if (line ~ /"""/ || line ~ /\047\047\047/) { fail("multiline strings are not supported"); next }
+            if (line ~ /^\[\[/) { if (line !~ /^\[\[[^]]+\]\][[:space:]]*(#.*)?$/) fail("ambiguous array table header"); section = "other"; next }
+            if (line ~ /^\[/) { if (line !~ /^\[[^]]+\][[:space:]]*(#.*)?$/) { fail("ambiguous table header"); next }; header = line; sub(/^\[/, "", header); sub(/\][[:space:]]*(#.*)?$/, "", header); section = header; next }
+            if (index(line, "=") == 0) { fail("unrecognized line"); next }
+            key = trim(substr(line, 1, index(line, "=") - 1)); value = substr(line, index(line, "=") + 1)
+            if (!closed(value)) { fail("cross-line or unclosed value"); next }
+            if (key !~ /^[A-Za-z][A-Za-z0-9_-]*$/) { fail("unsupported key syntax"); next }
+            managed = (section == "root" && (key == "model" || key == "model_reasoning_effort" || key == "sandbox_mode" || key == "approval_policy" || key == "approvals_reviewer")) || (section == "agents" && (key == "max_threads" || key == "max_depth")) || (section == "features" && key == "goals")
+            if (managed && seen[section "/" key]++) fail("repeated managed key")
+        }
+        END { exit invalid ? 1 : 0 }
+    ' "$config_path"; then
+        die "Refusing unsafe TOML merge input: $config_path"
     fi
 }
 
-mark_state() {
-    state_name=$1
-    target_name=$2
-    marker=$stage_dir/state/$state_name/$target_name
-    mkdir -p "$(dirname "$marker")"
-    : > "$marker"
+merge_managed_config() {
+    config_input=$1
+    config_output=$2
+    awk '
+        BEGIN {
+            current = "root"
+            source_section = "root"
+            provider_order[1] = "request_max_retries"; provider_order[2] = "stream_max_retries"
+            provider_order[3] = "stream_idle_timeout_ms"; provider_order[4] = "websocket_connect_timeout_ms"
+        }
+        function managed(section, key) {
+            return (section == "root" && (key == "model" || key == "model_reasoning_effort" || key == "sandbox_mode" || key == "approval_policy" || key == "approvals_reviewer")) || (section == "agents" && (key == "max_threads" || key == "max_depth")) || (section == "features" && key == "goals")
+        }
+        function flush_managed(section, key, position, count) {
+            if (section == "root") { order[1]="model"; order[2]="model_reasoning_effort"; order[3]="sandbox_mode"; order[4]="approval_policy"; order[5]="approvals_reviewer"; count=5 }
+            else if (section == "agents") { order[1]="max_threads"; order[2]="max_depth"; count=2 }
+            else if (section == "features") { order[1]="goals"; count=1 }
+            else return
+            for (position=1; position<=count; position++) { key=order[position]; if (!seen[section SUBSEP key]) { print key " = " value[section SUBSEP key]; seen[section SUBSEP key]=1 } }
+        }
+        function is_provider_section(section) { return section ~ /^model_providers\.("[^"]+"|\047[^\047]+\047|[A-Za-z0-9_-]+)$/ }
+        function flush_provider(key, position) {
+            if (!in_provider) return
+            for (position=1; position<=4; position++) { key=provider_order[position]; if (!provider_seen[key]) { print key " = " provider_value[key]; provider_seen[key]=1 } }
+        }
+        FILENAME == ARGV[1] {
+            if ($0 ~ /^[[:space:]]*\[\[/) { source_section="other"; next }
+            if ($0 ~ /^[[:space:]]*\[[^]]+\]/) { header=$0; sub(/^[[:space:]]*\[/,"",header); sub(/\][[:space:]]*(#.*)?$/,"",header); source_section=(header=="agents" || header=="features") ? header : "other"; next }
+            if (index($0,"=")>0) { key=substr($0,1,index($0,"=")-1); gsub(/^[[:space:]]+|[[:space:]]+$/,"",key); if (managed(source_section,key)) { value[source_section SUBSEP key]=substr($0,index($0,"=")+1); gsub(/^[[:space:]]+|[[:space:]]+$/,"",value[source_section SUBSEP key]) } }
+            next
+        }
+        FILENAME == ARGV[2] {
+            if ($0 ~ /^[[:space:]]*[A-Za-z][A-Za-z0-9_-]*[[:space:]]*=/) { key=$0; sub(/^[[:space:]]*/,"",key); sub(/[[:space:]]*=.*/,"",key); provider_value[key]=substr($0,index($0,"=")+1); gsub(/^[[:space:]]+|[[:space:]]+$/,"",provider_value[key]) }
+            next
+        }
+        {
+            if ($0 ~ /^[[:space:]]*\[\[/) { flush_managed(current); flush_provider(); current="other"; in_provider=0; for (provider_key in provider_seen) delete provider_seen[provider_key]; print; next }
+            if ($0 ~ /^[[:space:]]*\[[^]]+\]/) {
+                flush_managed(current); flush_provider()
+                header=$0; sub(/^[[:space:]]*\[/,"",header); sub(/\][[:space:]]*(#.*)?$/,"",header); gsub(/^[[:space:]]+|[[:space:]]+$/,"",header)
+                current=(header=="agents" || header=="features") ? header : "other"; in_provider=is_provider_section(header); if (in_provider) provider_found=1; for (provider_key in provider_seen) delete provider_seen[provider_key]; if (current=="agents" || current=="features") present[current]=1; print; next
+            }
+            if (in_provider && $0 ~ /^[[:space:]]*[A-Za-z][A-Za-z0-9_-]*[[:space:]]*=/) { key=$0; sub(/^[[:space:]]*/,"",key); sub(/[[:space:]]*=.*/,"",key); if (key in provider_value && !provider_seen[key]) { print key " = " provider_value[key]; provider_seen[key]=1; next } }
+            if (index($0,"=")>0) { key=substr($0,1,index($0,"=")-1); gsub(/^[[:space:]]+|[[:space:]]+$/,"",key); if (managed(current,key) && !seen[current SUBSEP key]) { print key " = " value[current SUBSEP key]; seen[current SUBSEP key]=1; next } }
+            print
+        }
+        END {
+            required["root" SUBSEP "model"]=1; required["root" SUBSEP "model_reasoning_effort"]=1; required["root" SUBSEP "sandbox_mode"]=1; required["root" SUBSEP "approval_policy"]=1; required["root" SUBSEP "approvals_reviewer"]=1; required["agents" SUBSEP "max_threads"]=1; required["agents" SUBSEP "max_depth"]=1; required["features" SUBSEP "goals"]=1
+            for (setting in required) if (!(setting in value)) { print "Missing managed config setting: " setting > "/dev/stderr"; exit 1 }
+            for (position=1; position<=4; position++) if (!(provider_order[position] in provider_value)) { print "Missing managed model provider setting: " provider_order[position] > "/dev/stderr"; exit 1 }
+            if (!provider_found) print "No [model_providers.<provider-id>] table found in " ARGV[3] "; skipped managed model provider settings." > "/dev/stderr"
+            flush_managed(current); flush_provider()
+            if (!present["agents"]) { print ""; print "[agents]"; flush_managed("agents") }
+            if (!present["features"]) { print ""; print "[features]"; flush_managed("features") }
+        }
+    ' "$source_config" "$source_model_provider_settings" "$config_input" > "$config_output" || die "Could not merge Codex TOML configuration."
 }
+
+for target_spec in \
+    "$codex_home/AGENTS.md file" \
+    "$codex_home/config.toml file" \
+    "$codex_home/docs directory" \
+    "$codex_home/agents/ai-vibecode-superpower directory"; do
+    target_path=${target_spec% *}
+    target_kind=${target_spec##* }
+    assert_target "$target_path" "$target_kind" || die "Unsafe install target: $target_path"
+done
+for skill_name in $skill_names; do
+    assert_target "$codex_home/skills/$skill_name" directory || die "Unsafe install target: $codex_home/skills/$skill_name"
+done
+for container_path in "$codex_home/agents" "$codex_home/skills" "$codex_home/backups"; do
+    assert_directory_container "$container_path" || die "Unsafe managed container: $container_path"
+done
+assert_roles
 
 has_state() {
     state_name=$1
@@ -771,380 +250,48 @@ has_state() {
     [ -f "$stage_dir/state/$state_name/$target_name" ]
 }
 
-assert_managed_agent_role_manifest "$source_agent_role_manifest"
-assert_managed_agent_role_directory "$source_agent_roles"
-
-expand_codex_home_placeholders() {
-    stage_root=$1
-    codex_home_value=$2
-    node -e '
-const fs = require("node:fs");
-const path = require("node:path");
-const root = process.argv[1];
-const codexHome = process.argv[2];
-const extensions = new Set([".md", ".toml", ".txt"]);
-function visit(directory) {
-  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-    const target = path.join(directory, entry.name);
-    if (entry.isDirectory()) visit(target);
-    else if (extensions.has(path.extname(entry.name).toLowerCase())) {
-      const content = fs.readFileSync(target, "utf8");
-      const expanded = content.replaceAll("<CODEX_HOME>", codexHome).replaceAll("$CODEX_HOME", codexHome);
-      if (expanded !== content) fs.writeFileSync(target, expanded, "utf8");
-    }
-  }
-}
-visit(root);
-' "$stage_root" "$codex_home_value"
+mark_state() {
+    state_name=$1
+    target_name=$2
+    marker=$stage_dir/state/$state_name/$target_name
+    mkdir -p -- "$(dirname -- "$marker")"
+    : > "$marker"
 }
 
-assert_safe_toml_merge_input() {
-    config_path=$1
-
-    if ! awk '
-        function trim(value) {
-            sub(/^[[:space:]]*/, "", value)
-            sub(/[[:space:]]*$/, "", value)
-            return value
-        }
-        function fail(message) {
-            printf "%s:%d: unsupported TOML syntax for safe merge: %s\\n", FILENAME, FNR, message > "/dev/stderr"
-            invalid = 1
-        }
-        function assert_single_line_value(value,    position, character, next_character, in_basic_string, in_literal_string, array_depth, table_depth) {
-            in_basic_string = 0
-            in_literal_string = 0
-            array_depth = 0
-            table_depth = 0
-            for (position = 1; position <= length(value); position++) {
-                character = substr(value, position, 1)
-                if (in_basic_string) {
-                    if (character == "\\") {
-                        position++
-                    } else if (character == "\"") {
-                        in_basic_string = 0
-                    }
-                    continue
-                }
-                if (in_literal_string) {
-                    if (character == "\047") {
-                        in_literal_string = 0
-                    }
-                    continue
-                }
-                if (character == "#") {
-                    break
-                }
-                if (character == "\"") {
-                    in_basic_string = 1
-                } else if (character == "\047") {
-                    in_literal_string = 1
-                } else if (character == "[") {
-                    array_depth++
-                } else if (character == "]") {
-                    array_depth--
-                } else if (character == "{") {
-                    table_depth++
-                } else if (character == "}") {
-                    table_depth--
-                }
-                if (array_depth < 0 || table_depth < 0) {
-                    return 0
-                }
-            }
-            return !in_basic_string && !in_literal_string && array_depth == 0 && table_depth == 0
-        }
-        BEGIN {
-            section = "root"
-        }
-        {
-            line = trim($0)
-            if (line ~ /"""/ || line ~ /\047\047\047/) {
-                fail("multiline strings are not supported")
-                next
-            }
-            if (line == "" || line ~ /^#/) {
-                next
-            }
-            if (line ~ /^\[/) {
-                array_table = line ~ /^\[\[/
-                if (array_table) {
-                    if (line !~ /^\[\[[^]]+\]\][[:space:]]*(#.*)?$/) {
-                        fail("ambiguous array table header")
-                        next
-                    }
-                    header = line
-                    sub(/^\[\[/, "", header)
-                    sub(/\][[:space:]]*\][[:space:]]*(#.*)?$/, "", header)
-                } else if (line !~ /^\[[^]]+\][[:space:]]*(#.*)?$/) {
-                    fail("ambiguous table header")
-                    next
-                } else {
-                    header = line
-                    sub(/^[[:space:]]*\[/, "", header)
-                    sub(/\][[:space:]]*(#.*)?$/, "", header)
-                }
-                header = trim(header)
-                if (index(header, "\\") > 0 && header !~ /^[A-Za-z0-9_-]+[.]/) {
-                    fail("escaped table key is not supported")
-                    next
-                }
-                if (array_table && (header == "agents" || header == "features")) {
-                    fail("managed table cannot be an array table")
-                    next
-                }
-                if (header ~ /^["\047]?(agents|features|model|model_reasoning_effort|sandbox_mode|approval_policy|approvals_reviewer)["\047]?[[:space:]]*([.]|$)/ && header != "agents" && header != "features") {
-                    fail("managed namespace table is ambiguous")
-                    next
-                }
-                section = header
-                if (!array_table) {
-                    table_seen[section]++
-                }
-                if (!array_table && (section == "agents" || section == "features") && table_seen[section] != 1) {
-                    fail("managed table is repeated")
-                }
-                next
-            }
-            if (index(line, "=") == 0) {
-                fail("unrecognized non-comment line")
-                next
-            }
-            key = substr(line, 1, index(line, "=") - 1)
-            key = trim(key)
-            value = substr(line, index(line, "=") + 1)
-            if (!assert_single_line_value(value)) {
-                fail("cross-line or unclosed value")
-                next
-            }
-            if (key !~ /^[A-Za-z][A-Za-z0-9_-]*$/) {
-                if (section == "root" && (index(key, "\\") > 0 || key ~ /^["\047]?(model|model_reasoning_effort|sandbox_mode|approval_policy|approvals_reviewer|agents|features)["\047]?[[:space:]]*($|[.])/)) {
-                    fail("quoted or dotted managed key")
-                } else if ((section == "agents" || section == "features") && key ~ /^("|\047)?(max_threads|max_depth|goals)/) {
-                    fail("quoted or dotted managed key")
-                }
-                next
-            }
-            if (section == "root" && (key == "agents" || key == "features")) {
-                fail("managed table cannot be a root key")
-                next
-            }
-            if (section == "root" && (key == "model" || key == "model_reasoning_effort" || key == "sandbox_mode" || key == "approval_policy" || key == "approvals_reviewer")) {
-                managed_seen[section SUBSEP key]++
-                if (managed_seen[section SUBSEP key] != 1) {
-                    fail("managed key is repeated")
-                }
-            }
-            if (section == "agents" && (key == "max_threads" || key == "max_depth")) {
-                managed_seen[section SUBSEP key]++
-                if (managed_seen[section SUBSEP key] != 1) {
-                    fail("managed key is repeated")
-                }
-            }
-            if (section == "features" && key == "goals") {
-                managed_seen[section SUBSEP key]++
-                if (managed_seen[section SUBSEP key] != 1) {
-                    fail("managed key is repeated")
-                }
-            }
-        }
-        END {
-            exit invalid ? 1 : 0
-        }
-    ' "$config_path"; then
-        printf '%s\n' "Refusing to merge $config_path; no files were changed." >&2
-        exit 1
-    fi
-}
-
-merge_managed_config() {
-    config_input=$1
-    config_output=$2
-
-    awk '
-        BEGIN {
-            section = "root"
-            current = "root"
-            provider_order[1] = "request_max_retries"
-            provider_order[2] = "stream_max_retries"
-            provider_order[3] = "stream_idle_timeout_ms"
-            provider_order[4] = "websocket_connect_timeout_ms"
-            provider_count = 4
-        }
-        function managed_key(section, key) {
-            return (section == "root" && (key == "model" || key == "model_reasoning_effort" || key == "sandbox_mode" || key == "approval_policy" || key == "approvals_reviewer")) ||
-                   (section == "agents" && (key == "max_threads" || key == "max_depth")) ||
-                   (section == "features" && key == "goals")
-        }
-        function flush_missing(section,    key, position, count) {
-            count = 0
-            if (section == "root") {
-                order[1] = "model"; order[2] = "model_reasoning_effort"; order[3] = "sandbox_mode"; order[4] = "approval_policy"; order[5] = "approvals_reviewer"; count = 5
-            } else if (section == "agents") {
-                order[1] = "max_threads"; order[2] = "max_depth"; count = 2
-            } else if (section == "features") {
-                order[1] = "goals"; count = 1
-            }
-            for (position = 1; position <= count; position++) {
-                key = order[position]
-                if (!seen[section SUBSEP key]) {
-                    print key " = " value[section SUBSEP key]
-                    seen[section SUBSEP key] = 1
-                }
-            }
-        }
-        FILENAME == ARGV[1] {
-            if ($0 ~ /^[[:space:]]*\[\[[^]]+\]\][[:space:]]*(#.*)?$/) {
-                section = "other"
-                next
-            }
-            if ($0 ~ /^[[:space:]]*\[[^]]+\][[:space:]]*(#.*)?$/) {
-                header = $0
-                sub(/^[[:space:]]*\[/, "", header)
-                sub(/\][[:space:]]*(#.*)?$/, "", header)
-                gsub(/^[[:space:]]+|[[:space:]]+$/, "", header)
-                section = (header == "agents" || header == "features") ? header : "other"
-                next
-            }
-            if (index($0, "=") > 0) {
-                key = substr($0, 1, index($0, "=") - 1)
-                gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
-                if (managed_key(section, key)) {
-                    value[section SUBSEP key] = substr($0, index($0, "=") + 1)
-                    gsub(/^[[:space:]]+|[[:space:]]+$/, "", value[section SUBSEP key])
-                }
-            }
-            next
-        }
-        FILENAME == ARGV[2] {
-            if ($0 ~ /^[[:space:]]*([A-Za-z][A-Za-z0-9_-]*)[[:space:]]*=/) {
-                key = $0; sub(/^[[:space:]]*/, "", key); sub(/[[:space:]]*=.*/, "", key)
-                provider_value[key] = substr($0, index($0, "=") + 1)
-                gsub(/^[[:space:]]+|[[:space:]]+$/, "", provider_value[key])
-            }
-            next
-        }
-        function is_provider_section(section) { return section ~ /^model_providers\.("[^"]+"|\047[^\047]+\047|[A-Za-z0-9_-]+)$/ }
-        function flush_provider_missing(    key) {
-            if (!provider_section) return
-            for (position = 1; position <= provider_count; position++) {
-                key = provider_order[position]
-                if (!provider_seen[key]) {
-                    print key " = " provider_value[key]
-                    provider_seen[key] = 1
-                }
-            }
-        }
-        {
-            if ($0 ~ /^[[:space:]]*\[\[[^]]+\]\][[:space:]]*(#.*)?$/) {
-                flush_missing(current)
-                flush_provider_missing()
-                current = "other"
-                provider_section = 0
-                for (position = 1; position <= provider_count; position++) provider_seen[provider_order[position]] = 0
-                print
-                next
-            }
-            if ($0 ~ /^[[:space:]]*\[[^]]+\][[:space:]]*(#.*)?$/) {
-                flush_missing(current)
-                flush_provider_missing()
-                header = $0
-                sub(/^[[:space:]]*\[/, "", header)
-                sub(/\][[:space:]]*(#.*)?$/, "", header)
-                gsub(/^[[:space:]]+|[[:space:]]+$/, "", header)
-                current = (header == "agents" || header == "features") ? header : "other"
-                provider_section = is_provider_section(header)
-                if (provider_section) provider_found = 1
-                for (position = 1; position <= provider_count; position++) provider_seen[provider_order[position]] = 0
-                present[current] = 1
-                print
-                next
-            }
-            if (provider_section && $0 ~ /^[[:space:]]*[A-Za-z][A-Za-z0-9_-]*[[:space:]]*=/) {
-                key = $0; sub(/^[[:space:]]*/, "", key); sub(/[[:space:]]*=.*/, "", key)
-                if (key in provider_value && !provider_seen[key]) {
-                    print key " = " provider_value[key]
-                    provider_seen[key] = 1
-                    next
-                }
-            }
-            if (index($0, "=") > 0) {
-                key = substr($0, 1, index($0, "=") - 1)
-                gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
-                if (managed_key(current, key) && !seen[current SUBSEP key]) {
-                    print key " = " value[current SUBSEP key]
-                    seen[current SUBSEP key] = 1
-                    next
-                }
-            }
-            print
-        }
-        END {
-            required["root" SUBSEP "model"] = 1
-            required["root" SUBSEP "model_reasoning_effort"] = 1
-            required["root" SUBSEP "sandbox_mode"] = 1
-            required["root" SUBSEP "approval_policy"] = 1
-            required["root" SUBSEP "approvals_reviewer"] = 1
-            required["agents" SUBSEP "max_threads"] = 1
-            required["agents" SUBSEP "max_depth"] = 1
-            required["features" SUBSEP "goals"] = 1
-            for (setting in required) {
-                if (!(setting in value)) {
-                    print "Missing managed config setting: " setting > "/dev/stderr"
-                    exit 1
-                }
-            }
-            for (position = 1; position <= provider_count; position++) {
-                key = provider_order[position]
-                if (!(key in provider_value)) {
-                    print "Missing managed model provider setting: " key > "/dev/stderr"
-                    exit 1
-                }
-            }
-            if (!provider_found) {
-                print "No [model_providers.<provider-id>] table found in " ARGV[3] "; skipped managed model provider settings." > "/dev/stderr"
-            }
-            flush_missing(current)
-            flush_provider_missing()
-            if (!present["agents"]) {
-                print ""
-                print "[agents]"
-                flush_missing("agents")
-            }
-            if (!present["features"]) {
-                print ""
-                print "[features]"
-                flush_missing("features")
-            }
-        }
-    ' "$source_config" "$source_model_provider_settings" "$config_input" > "$config_output"
-}
-
+assert_directory_container "$codex_home" || die 'Unsafe Codex home container.'
+stage_dir=$(mktemp -d "$codex_home/.install-stage.XXXXXX") || die 'Could not create staging directory.'
+assert_directory_container "$stage_dir" || die 'Unsafe staging directory.'
+backup_dir=
+manifest=
+completed=0
 rollback() {
     rollback_failed=0
     [ -n "$manifest" ] && [ -f "$manifest" ] || return 0
-
-    while IFS="$tab" read -r target_name target_path candidate_path target_kind target_operation; do
-        if has_state install-started "$target_name" && path_exists "$target_path"; then
-            rm -rf "$target_path" || rollback_failed=1
-        fi
-    done < "$manifest"
-
-    while IFS="$tab" read -r target_name target_path candidate_path target_kind target_operation; do
-        backup_path=$backup_dir/$target_name
-        if has_state backed-up "$target_name" && path_exists "$backup_path"; then
-            mkdir -p "$(dirname "$target_path")" || rollback_failed=1
-            if ! path_exists "$target_path"; then
-                mv "$backup_path" "$target_path" || rollback_failed=1
+    while IFS="$(printf '\t')" read -r target_name target_path candidate_path target_kind target_operation; do
+        if [ -f "$stage_dir/state/install-started/$target_name" ] && path_exists "$target_path"; then
+            if [ -L "$target_path" ] || ! rm -rf -- "$target_path"; then
+                printf '%s\n' "Rollback failed removing $target_path" >&2
+                rollback_failed=1
             fi
         fi
     done < "$manifest"
-
-    if [ "$agents_parent_created" -eq 1 ] && [ -d "$codex_home/agents" ]; then
-        rmdir "$codex_home/agents" 2>/dev/null || true
-    fi
+    while IFS="$(printf '\t')" read -r target_name target_path candidate_path target_kind target_operation; do
+        backup_path=$backup_dir/$target_name
+        if [ -f "$stage_dir/state/backed-up/$target_name" ] && path_exists "$backup_path"; then
+            if ! assert_path_chain "$target_path"; then
+                printf '%s\n' "Rollback refused unsafe destination: $target_path" >&2
+                rollback_failed=1
+            elif path_exists "$target_path"; then
+                printf '%s\n' "Rollback could not restore because destination exists: $target_path" >&2
+                rollback_failed=1
+            elif ! mkdir -p -- "$(dirname -- "$target_path")" || ! mv -- "$backup_path" "$target_path"; then
+                printf '%s\n' "Rollback failed restoring $target_path" >&2
+                rollback_failed=1
+            fi
+        fi
+    done < "$manifest"
     if [ "$rollback_failed" -ne 0 ]; then
-        printf '%s\n' "Rollback was incomplete; retained backup directory: $backup_dir" >&2
+        printf '%s\n' "Rollback was incomplete; backup retained at $backup_dir" >&2
     fi
 }
 
@@ -1154,184 +301,69 @@ cleanup() {
         set +e
         rollback
     fi
-    if [ -n "$stage_dir" ] && [ -d "$stage_dir" ]; then
-        rm -rf "$stage_dir"
-    fi
+    if [ -n "$stage_dir" ] && [ -d "$stage_dir" ]; then rm -rf -- "$stage_dir"; fi
     exit "$status"
 }
+trap cleanup EXIT HUP INT TERM
 
-trap cleanup 0
-trap 'exit 1' 1 2 3 15
-
-# Keep the kernel advisory lock on this process's descriptor for the whole
-# transaction. The ordinary lock file is intentionally retained between runs.
-if [ -L "$lock_file" ] || { path_exists "$lock_file" && [ ! -f "$lock_file" ]; }; then
-    printf '%s\n' "Expected a regular lock file target: $lock_file" >&2
-    exit 1
-fi
-exec 9>> "$lock_file" || exit 1
-case $(uname -s) in
-    Darwin)
-        command -v lockf >/dev/null 2>&1 || {
-            printf '%s\n' 'lockf is required to serialize the macOS installer.' >&2
-            exit 1
-        }
-        lockf -k -t 0 9 || {
-            printf '%s\n' "Another Codex installer is already running for: $codex_home" >&2
-            exit 1
-        }
-        ;;
-    Linux)
-        command -v flock >/dev/null 2>&1 || {
-            printf '%s\n' 'flock is required to serialize the Linux installer.' >&2
-            exit 1
-        }
-        flock -n 9 || {
-            printf '%s\n' "Another Codex installer is already running for: $codex_home" >&2
-            exit 1
-        }
-        ;;
-esac
-
-stage_dir=$(mktemp -d "$codex_home/.install-stage.XXXXXX")
-mkdir -p "$stage_dir/state/backed-up" "$stage_dir/state/install-started"
+mkdir -p -- "$stage_dir/state/backed-up" "$stage_dir/state/install-started" "$stage_dir/agents" "$stage_dir/skills"
 cp "$source_agents" "$stage_dir/AGENTS.md"
 cp -R "$source_docs" "$stage_dir/docs"
-mkdir -p "$stage_dir/agents"
-cp -R "$source_agent_roles" "$stage_dir/agents/"
-mkdir -p "$stage_dir/skills"
-for skill_name in $managed_standalone_skill_names; do
-    cp -R "$source_standalone_skills/$skill_name" "$stage_dir/skills/"
-done
-
-assert_target "$codex_home/config.toml" file
-config_input=$codex_home/config.toml
-if ! path_exists "$config_input"; then
-    config_input=$stage_dir/empty-config.toml
-    : > "$config_input"
-fi
+cp -R "$source_roles" "$stage_dir/agents/"
+for skill_name in $skill_names; do cp -R "$source_skills/$skill_name" "$stage_dir/skills/"; done
+config_input=$source_config
+if path_exists "$codex_home/config.toml"; then cp "$codex_home/config.toml" "$stage_dir/existing-config.toml"; config_input=$stage_dir/existing-config.toml; fi
+: > "$stage_dir/merged-config.toml"
 assert_safe_toml_merge_input "$source_config"
 assert_safe_toml_merge_input "$source_model_provider_settings"
 assert_safe_toml_merge_input "$config_input"
 merge_managed_config "$config_input" "$stage_dir/merged-config.toml"
-assert_safe_toml_merge_input "$stage_dir/merged-config.toml"
-
-for name in AGENTS.md merged-config.toml docs agents/ai-vibecode-superpower; do
-    if ! path_exists "$stage_dir/$name"; then
-        printf '%s\n' "Staging failed for: $name" >&2
-        exit 1
-    fi
-done
-for agent_role_file in $managed_agent_role_files; do
-    if [ ! -f "$stage_dir/agents/ai-vibecode-superpower/$agent_role_file" ]; then
-        printf '%s\n' "Staging failed for managed agent role: $agent_role_file" >&2
-        exit 1
-    fi
-done
-for skill_name in $managed_standalone_skill_names; do
-    if [ ! -d "$stage_dir/skills/$skill_name" ]; then
-        printf '%s\n' "Staging failed for standalone skill: $skill_name" >&2
-        exit 1
-    fi
-done
-expand_codex_home_placeholders "$stage_dir" "$codex_home"
-assert_managed_agent_role_directory "$stage_dir/agents/ai-vibecode-superpower"
+mv "$stage_dir/merged-config.toml" "$stage_dir/config.toml"
+assert_safe_toml_merge_input "$stage_dir/config.toml"
+escaped_home=$(printf '%s' "$codex_home" | sed 's/[\\&|]/\\&/g')
+file_list=$stage_dir/files.list
+find "$stage_dir" -type f \( -name '*.md' -o -name '*.toml' -o -name '*.txt' \) -print > "$file_list" || die 'Could not enumerate staged text files.'
+while IFS= read -r text_file || [ -n "$text_file" ]; do
+    [ "$text_file" = "$file_list" ] && continue
+    temporary_file=$text_file.tmp
+    sed "s|<CODEX_HOME>|$escaped_home|g; s|\$CODEX_HOME|$escaped_home|g" "$text_file" > "$temporary_file" || die "Could not expand placeholders in: $text_file"
+    mv "$temporary_file" "$text_file"
+done < "$file_list"
+rm -f "$file_list"
 
 manifest=$stage_dir/targets.tsv
-printf '%s\t%s\t%s\t%s\t%s\n' AGENTS.md "$codex_home/AGENTS.md" "$stage_dir/AGENTS.md" file replace > "$manifest"
-printf '%s\t%s\t%s\t%s\t%s\n' config.toml "$codex_home/config.toml" "$stage_dir/merged-config.toml" file replace >> "$manifest"
-printf '%s\t%s\t%s\t%s\t%s\n' docs "$codex_home/docs" "$stage_dir/docs" directory replace >> "$manifest"
-printf '%s\t%s\t%s\t%s\t%s\n' agents/ai-vibecode-superpower "$codex_home/agents/ai-vibecode-superpower" "$stage_dir/agents/ai-vibecode-superpower" directory replace >> "$manifest"
-for skill_name in $managed_standalone_skill_names; do
-    printf '%s\t%s\t%s\t%s\t%s\n' "skills/$skill_name" "$codex_home/skills/$skill_name" "$stage_dir/skills/$skill_name" directory replace >> "$manifest"
-done
-for skill_name in $managed_plugin_skill_names; do
-    printf '%s\t%s\t%s\t%s\t%s\n' "skills/$skill_name" "$codex_home/skills/$skill_name" - directory remove >> "$manifest"
-done
-for skill_name in $legacy_plugin_skill_names_to_remove; do
-    printf '%s\t%s\t%s\t%s\t%s\n' "skills/$skill_name" "$codex_home/skills/$skill_name" - directory remove >> "$manifest"
-done
-
-# All source candidates exist now. Validate every destination and backup path before replacing or removing any target.
-assert_target "$codex_home/AGENTS.md" file
-assert_target "$codex_home/config.toml" file
-assert_target "$codex_home/docs" directory
-assert_directory_container "$codex_home/agents"
-assert_no_reserved_agent_role_name_conflict "$codex_home/agents"
-assert_directory_container "$codex_home/skills"
-if path_exists "$codex_home/backups"; then
-    assert_directory_container "$codex_home/backups"
-fi
-while IFS="$tab" read -r target_name target_path candidate_path target_kind target_operation; do
-    assert_target "$target_path" "$target_kind"
-done < "$manifest"
-
+printf 'AGENTS.md\t%s\t%s\tfile\treplace\n' "$codex_home/AGENTS.md" "$stage_dir/AGENTS.md" > "$manifest"
+printf 'config.toml\t%s\t%s\tfile\treplace\n' "$codex_home/config.toml" "$stage_dir/config.toml" >> "$manifest"
+printf 'docs\t%s\t%s\tdirectory\treplace\n' "$codex_home/docs" "$stage_dir/docs" >> "$manifest"
+printf 'agents/ai-vibecode-superpower\t%s\t%s\tdirectory\treplace\n' "$codex_home/agents/ai-vibecode-superpower" "$stage_dir/agents/ai-vibecode-superpower" >> "$manifest"
+for skill_name in $skill_names; do printf 'skills/%s\t%s\t%s\tdirectory\treplace\n' "$skill_name" "$codex_home/skills/$skill_name" "$stage_dir/skills/$skill_name" >> "$manifest"; done
 has_existing_target=0
-while IFS="$tab" read -r target_name target_path candidate_path target_kind target_operation; do
-    if path_exists "$target_path"; then
-        has_existing_target=1
-        break
-    fi
+while IFS="$(printf '\t')" read -r target_name target_path candidate_path target_kind target_operation; do
+    if path_exists "$target_path"; then has_existing_target=1; break; fi
 done < "$manifest"
-if [ ! -d "$codex_home/agents" ]; then
-    mkdir "$codex_home/agents"
-    agents_parent_created=1
-fi
 if [ "$has_existing_target" -eq 1 ]; then
-    mkdir -p "$codex_home/backups"
-    backup_dir=$(mktemp -d "$codex_home/backups/backup-$(date +%Y%m%d-%H%M%S)-$$.XXXXXX")
+    mkdir -p -- "$codex_home/backups"
+    assert_directory_container "$codex_home/backups" || die 'Unsafe backup container.'
+    backup_dir=$(mktemp -d "$codex_home/backups/backup-$(date +%Y%m%d-%H%M%S).XXXXXX") || die 'Could not create backup directory.'
 fi
-
-while IFS="$tab" read -r target_name target_path candidate_path target_kind target_operation; do
-    [ "$target_operation" = replace ] || continue
-    if path_exists "$target_path"; then
-        backup_path=$backup_dir/$target_name
-        mkdir -p "$(dirname "$backup_path")"
-        mv "$target_path" "$backup_path"
-        mark_state backed-up "$target_name"
-    fi
-    mark_state install-started "$target_name"
+while IFS="$(printf '\t')" read -r target_name target_path candidate_path target_kind target_operation; do
+    assert_target "$target_path" "$target_kind" || die "Unsafe install target: $target_path"
     if [ "$target_operation" = replace ]; then
-        mv "$candidate_path" "$target_path"
+        path_exists "$candidate_path" || die "Missing staged candidate: $candidate_path"
+        if path_exists "$target_path"; then
+            [ -n "$backup_dir" ] || die "Existing target has no backup directory: $target_path"
+            backup_path=$backup_dir/$target_name
+            mkdir -p -- "$(dirname -- "$backup_path")"
+            mv -- "$target_path" "$backup_path"
+            mark_state backed-up "$target_name"
+        fi
+        mark_state install-started "$target_name"
+        assert_path_chain "$target_path" || die "Unsafe install destination: $target_path"
+        mkdir -p -- "$(dirname -- "$target_path")"
+        mv -- "$candidate_path" "$target_path"
     fi
 done < "$manifest"
-
-# Do not leave the retired controller installed beside the v3-only plugin.
-remove_retired_workflow_plugin
-
-# Plugin commands update config.toml. Run them only after its staged version
-# is installed, while the transaction can still restore the previous config.
-install_managed_plugin
-if ! managed_plugin_is_active "$plugin_version"; then
-    printf '%s\n' 'Codex did not retain the managed workflow plugin after installation' >&2
-    exit 1
-fi
-
-while IFS="$tab" read -r target_name target_path candidate_path target_kind target_operation; do
-    [ "$target_operation" = remove ] || continue
-    if path_exists "$target_path"; then
-        backup_path=$backup_dir/$target_name
-        mkdir -p "$(dirname "$backup_path")"
-        mv "$target_path" "$backup_path"
-        mark_state backed-up "$target_name"
-    fi
-    mark_state install-started "$target_name"
-done < "$manifest"
-
-# Re-validate the installed role directory, not only the staging copy.
-# Codex Desktop/CLI loads role profiles at process start and does not hot-reload them.
-assert_managed_agent_role_directory "$codex_home/agents/ai-vibecode-superpower"
-
+assert_roles "$codex_home/agents/ai-vibecode-superpower" "$source_manifest"
 completed=1
-printf '%s\n' "Codex configuration installed in: $codex_home"
-printf '%s\n' "Managed plugin installed: $managed_plugin_name@$managed_marketplace_name"
-printf '%s\n' 'Managed standalone skills installed; obsolete global copies of plugin skills removed.'
-if [ -n "$backup_dir" ]; then
-    printf '%s\n' "Backup directory: $backup_dir"
-else
-    printf '%s\n' 'Backup directory: none (no managed targets existed)'
-fi
-if ! prune_old_install_backups; then
-    printf '%s\n' 'Installed successfully, but old backup retention could not complete.' >&2
-fi
-printf '%s\n' 'Restart Codex Desktop/CLI before starting a new workflow so newly installed agent roles are loaded.' >&2
+printf '%s\n' "Codex configuration installed in: $codex_home" 'Standalone skills and managed agent roles installed.'
+if [ -n "$backup_dir" ]; then printf '%s\n' "Backup directory: $backup_dir"; fi

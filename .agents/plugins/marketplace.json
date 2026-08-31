@@ -3,18 +3,5 @@
   "interface": {
     "displayName": "AI Vibecode Superpower 本地插件"
   },
-  "plugins": [
-    {
-      "name": "agnets-workflow",
-      "source": {
-        "source": "local",
-        "path": "./plugins/agnets-workflow"
-      },
-      "policy": {
-        "installation": "AVAILABLE",
-        "authentication": "ON_INSTALL"
-      },
-      "category": "Productivity"
-    }
-  ]
+  "plugins": []
 }

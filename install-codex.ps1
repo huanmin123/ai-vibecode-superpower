@@ -4,1196 +4,278 @@ param()
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-function Test-ExistingPath {
-    param([Parameter(Mandatory)][string]$Path)
-
-    return (Test-Path -LiteralPath $Path -PathType Any)
-}
-
-function Get-AbsolutePath {
-    param([Parameter(Mandatory)][string]$Path)
-
-    return [System.IO.Path]::GetFullPath($Path)
-}
-
-function Test-SamePath {
-    param(
-        [Parameter(Mandatory)][string]$Left,
-        [Parameter(Mandatory)][string]$Right
-    )
-
-    return [string]::Equals(
-        (Get-AbsolutePath -Path $Left).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar),
-        (Get-AbsolutePath -Path $Right).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar),
-        [System.StringComparison]::OrdinalIgnoreCase
-    )
-}
-
-function Assert-NoReparsePoints {
-    param([Parameter(Mandatory)][string]$Path)
-
-    $current = Get-AbsolutePath -Path $Path
-    while (-not (Test-Path -LiteralPath $current -PathType Any)) {
-        $parent = Split-Path -Parent $current
-        if ([string]::IsNullOrEmpty($parent) -or $parent -eq $current) { break }
-        $current = $parent
+function Get-NormalizedHash([string]$Path) {
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    $out = [Collections.Generic.List[byte]]::new()
+    for ($i = 0; $i -lt $bytes.Length; $i++) {
+        if ($bytes[$i] -eq 13 -and $i + 1 -lt $bytes.Length -and $bytes[$i + 1] -eq 10) { $out.Add(10); $i++ } else { $out.Add($bytes[$i]) }
     }
-
-    while (Test-Path -LiteralPath $current -PathType Any) {
-        $item = Get-Item -LiteralPath $current -Force
-        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-            throw "Refusing to install through a symbolic link or junction: $current"
-        }
-
-        $parent = Split-Path -Parent $current
-        if ([string]::IsNullOrEmpty($parent) -or $parent -eq $current) { break }
-        $current = $parent
-    }
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return (($sha.ComputeHash($out.ToArray()) | ForEach-Object { $_.ToString('x2') }) -join '') } finally { $sha.Dispose() }
 }
 
-function Assert-NoReparsePointsInTree {
-    param([Parameter(Mandatory)][string]$Path)
-
-    if (-not (Test-Path -LiteralPath $Path -PathType Any)) { return }
+function Assert-NoReparse([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return }
     $item = Get-Item -LiteralPath $Path -Force
-    if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw "Refusing to copy through a symbolic link or junction: $Path"
-    }
-    if (-not $item.PSIsContainer) { return }
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Refusing reparse point: $Path" }
+    if ($item.PSIsContainer) { Get-ChildItem -LiteralPath $Path -Force | ForEach-Object { Assert-NoReparse $_.FullName } }
+}
 
-    foreach ($child in Get-ChildItem -LiteralPath $Path -Force) {
-        Assert-NoReparsePointsInTree -Path $child.FullName
+function Assert-NoReparseChain([string]$Path) {
+    $currentPath = [IO.Path]::GetFullPath($Path)
+    while ($currentPath -and -not (Test-Path -LiteralPath $currentPath)) {
+        $parentPath = Split-Path -Parent $currentPath
+        if ([string]::IsNullOrEmpty($parentPath) -or $parentPath -eq $currentPath) { break }
+        $currentPath = $parentPath
+    }
+    while ($currentPath -and (Test-Path -LiteralPath $currentPath)) {
+        $current = Get-Item -LiteralPath $currentPath -Force -ErrorAction Stop
+        if (($current.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Refusing reparse point: $($current.FullName)" }
+        $parentPath = Split-Path -Parent $currentPath
+        if ([string]::IsNullOrEmpty($parentPath) -or $parentPath -eq $currentPath) { break }
+        $currentPath = $parentPath
     }
 }
 
-function Get-NormalizedLfSha256 {
-    param([Parameter(Mandatory)][string]$Path)
-
-    $sourceBytes = [System.IO.File]::ReadAllBytes($Path)
-    $normalizedBytes = [System.Collections.Generic.List[byte]]::new()
-    for ($index = 0; $index -lt $sourceBytes.Length; $index++) {
-        if ($sourceBytes[$index] -eq 0x0D -and ($index + 1 -eq $sourceBytes.Length -or $sourceBytes[$index + 1] -eq 0x0A)) {
-            if ($index + 1 -lt $sourceBytes.Length) {
-                $normalizedBytes.Add(0x0A)
-                $index++
-            }
-            continue
-        }
-        $normalizedBytes.Add($sourceBytes[$index])
-    }
-    $sha256 = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        return (($sha256.ComputeHash($normalizedBytes.ToArray()) | ForEach-Object { $_.ToString('x2') }) -join '')
-    } finally {
-        $sha256.Dispose()
-    }
+function Assert-InstallContainer([string]$Path) {
+    Assert-NoReparseChain $Path
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $item = Get-Item -LiteralPath $Path -Force
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or -not $item.PSIsContainer) { throw "Expected a non-reparse directory: $Path" }
 }
 
-function Assert-ManagedAgentRoleProfiles {
-    param(
-        [Parameter(Mandatory)][string]$RoleDirectory,
-        [Parameter(Mandatory)][System.Collections.IEnumerable]$Contracts,
-        [Parameter(Mandatory)][string]$ManifestPath
-    )
+function Assert-InstallTarget([string]$Path, [ValidateSet('File', 'Directory')][string]$Kind) {
+    Assert-NoReparseChain $Path
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $item = Get-Item -LiteralPath $Path -Force
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Refusing to replace reparse point: $Path" }
+    if ($Kind -eq 'File' -and $item.PSIsContainer) { throw "Expected a regular file target: $Path" }
+    if ($Kind -eq 'Directory' -and -not $item.PSIsContainer) { throw "Expected a directory target: $Path" }
+    if ($Kind -eq 'Directory') { Assert-NoReparse $Path }
+}
 
-    Assert-NoReparsePointsInTree -Path $RoleDirectory
-    $contractList = @($Contracts)
-    $expectedHashes = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::Ordinal)
-    foreach ($line in [System.IO.File]::ReadLines($ManifestPath)) {
-        if ($line -notmatch '^([0-9a-f]{64}) {2}([^\s]+)$') {
-            throw "Invalid managed agent role manifest: $ManifestPath"
-        }
-        if ($expectedHashes.ContainsKey($Matches[2])) {
-            throw "Repeated managed agent role hash: $($Matches[2])"
-        }
-        $expectedHashes[$Matches[2]] = $Matches[1]
+function Assert-RoleProfiles([string]$Directory, [string]$Manifest) {
+    $hashes = @{}
+    foreach ($line in Get-Content -LiteralPath $Manifest) {
+        if ($line -notmatch '^([0-9a-f]{64}) {2}([^\s]+)$') { throw "Invalid role manifest: $Manifest" }
+        $hashes[$Matches[2]] = $Matches[1]
     }
-    $expectedFileNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
-    foreach ($contract in $contractList) {
-        [void]$expectedFileNames.Add($contract.FileName)
-        if (-not $expectedHashes.ContainsKey($contract.FileName)) {
-            throw "Missing managed agent role hash: $($contract.FileName)"
-        }
-    }
-    if ($expectedHashes.Count -ne $contractList.Count) { throw "Unexpected managed agent role manifest entry count: $ManifestPath" }
-
-    $entries = @(Get-ChildItem -LiteralPath $RoleDirectory -Force)
-    if ($entries.Count -ne $contractList.Count) {
-        throw "Expected exactly $($contractList.Count) managed agent role files in: $RoleDirectory"
-    }
-    foreach ($entry in $entries) {
-        if ($entry.PSIsContainer -or -not $expectedFileNames.Contains($entry.Name)) {
-            throw "Unexpected managed agent role file: $($entry.FullName)"
-        }
-    }
-
-    foreach ($contract in $contractList) {
-        $rolePath = Join-Path $RoleDirectory $contract.FileName
-        if (-not (Test-Path -LiteralPath $rolePath -PathType Leaf)) {
-            throw "Missing managed agent role: $rolePath"
-        }
-        $actualHash = Get-NormalizedLfSha256 -Path $rolePath
-        if ($actualHash -ne $expectedHashes[$contract.FileName]) {
-            throw "Managed agent role content does not match its contract: $rolePath"
-        }
-
-        $expectedValues = @{
-            'name' = $contract.RoleName
-            'model' = $contract.Model
-            'model_reasoning_effort' = $contract.ReasoningEffort
-            'sandbox_mode' = $contract.SandboxMode
-        }
-        $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
-        $descriptionCount = 0
-        $developerInstructionsCount = 0
-        $inDeveloperInstructions = $false
-
-        foreach ($line in [System.IO.File]::ReadLines($rolePath)) {
-            $trimmed = $line.Trim()
-            if ($inDeveloperInstructions) {
-                if ($trimmed -match '"""') {
-                    if ($trimmed -ne '"""') {
-                        throw "Invalid managed agent role contract: $rolePath"
-                    }
-                    $inDeveloperInstructions = $false
-                }
-                continue
-            }
-            if ([string]::IsNullOrWhiteSpace($trimmed) -or $trimmed.StartsWith('#')) {
-                continue
-            }
-            if ($trimmed -match '^developer_instructions\s*=\s*"""\s*$') {
-                $developerInstructionsCount++
-                if ($developerInstructionsCount -ne 1) {
-                    throw "Invalid managed agent role contract: $rolePath"
-                }
-                $inDeveloperInstructions = $true
-                continue
-            }
-            if ($trimmed -match '^description\s*=') {
-                $descriptionCount++
-                if ($descriptionCount -ne 1 -or $trimmed -notmatch '^description\s*=\s*"[^"]*"\s*$') {
-                    throw "Invalid managed agent role contract: $rolePath"
-                }
-                continue
-            }
-            if ($trimmed -match '^(name|model|model_reasoning_effort|sandbox_mode)\s*=') {
-                $key = $Matches[1]
-                if (-not $seen.Add($key) -or $trimmed -ne ('{0} = "{1}"' -f $key, $expectedValues[$key])) {
-                    throw "Invalid managed agent role contract: $rolePath"
-                }
-                continue
-            }
-            throw "Invalid managed agent role contract: $rolePath"
-        }
-
-        if ($inDeveloperInstructions -or $descriptionCount -ne 1 -or $developerInstructionsCount -ne 1) {
-            throw "Invalid managed agent role contract: $rolePath"
-        }
-        foreach ($key in $expectedValues.Keys) {
-            if (-not $seen.Contains($key)) {
-                throw "Invalid managed agent role contract: $rolePath"
-            }
+    if ($hashes.Count -ne 12) { throw 'Expected 12 managed role hashes' }
+    $files = @(Get-ChildItem -LiteralPath $Directory -Filter '*.toml' -File)
+    if ($files.Count -ne 12) { throw 'Expected 12 managed role files' }
+    foreach ($file in $files) {
+        if (-not $hashes.ContainsKey($file.Name) -or (Get-NormalizedHash $file.FullName) -ne $hashes[$file.Name]) { throw "Role hash mismatch: $($file.Name)" }
+        $text = Get-Content -LiteralPath $file.FullName -Raw
+        foreach ($key in 'name', 'model', 'model_reasoning_effort', 'sandbox_mode', 'description', 'developer_instructions') {
+            if ($text -notmatch "(?m)^$key\s*=") { throw "Role field missing: $($file.Name)/$key" }
         }
     }
 }
 
-function Assert-NoReservedAgentRoleNameConflict {
-    param(
-        [Parameter(Mandatory)][string]$AgentsDirectory,
-        [Parameter(Mandatory)][string]$ManagedRoleDirectory
-    )
-
-    if (-not (Test-Path -LiteralPath $AgentsDirectory -PathType Container)) { return }
-    Assert-NoReparsePointsInTree -Path $AgentsDirectory
-    $managedPrefix = (Get-AbsolutePath -Path $ManagedRoleDirectory).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
-    foreach ($role in Get-ChildItem -LiteralPath $AgentsDirectory -Recurse -File -Filter '*.toml' -Force) {
-        if ($role.FullName.StartsWith($managedPrefix, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
-        foreach ($line in [System.IO.File]::ReadLines($role.FullName)) {
-            if ($line -match '^\s*(?:name|["'']name["''])\s*=\s*(?:["'']{1,3})(?:avsp_|\\u0061vsp_|\\U00000061vsp_)') {
-                throw "User agent role uses the reserved avsp_ namespace: $($role.FullName)"
-            }
-        }
-    }
-}
-
-function Get-InstallMutex {
-    param([Parameter(Mandatory)][string]$CodexHome)
-
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes($CodexHome.ToUpperInvariant())
-    $sha256 = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        $hash = $sha256.ComputeHash($bytes)
-    } finally {
-        $sha256.Dispose()
-    }
-    $name = 'Local\CodexInstaller-' + (($hash | ForEach-Object { $_.ToString('x2') }) -join '')
-    $mutex = [System.Threading.Mutex]::new($false, $name)
-    try {
-        if (-not $mutex.WaitOne(0)) {
-            $mutex.Dispose()
-            throw "Another Codex installer is already running for: $CodexHome"
-        }
-    } catch [System.Threading.AbandonedMutexException] {
-        # An interrupted installer left no active owner; this process now owns the mutex.
-    }
-    return $mutex
-}
-
-function New-UniqueDirectory {
-    param(
-        [Parameter(Mandatory)][string]$Parent,
-        [Parameter(Mandatory)][string]$Prefix
-    )
-
-    do {
-        $candidate = Join-Path $Parent ('{0}{1}-{2}' -f $Prefix, (Get-Date -Format 'yyyyMMdd-HHmmss'), [System.Guid]::NewGuid().ToString('N'))
-    } while (Test-Path -LiteralPath $candidate)
-
-    New-Item -ItemType Directory -Path $candidate | Out-Null
-    return $candidate
-}
-
-function Expand-CodexHomePlaceholders {
-    param(
-        [Parameter(Mandatory)][string]$Root,
-        [Parameter(Mandatory)][string]$CodexHome
-    )
-
-    $textExtensions = @('.md', '.toml', '.txt')
-    foreach ($file in Get-ChildItem -LiteralPath $Root -File -Recurse -Force) {
-        if ($textExtensions -notcontains $file.Extension.ToLowerInvariant()) { continue }
-        $content = [System.IO.File]::ReadAllText($file.FullName)
-        $expanded = $content.Replace('<CODEX_HOME>', $CodexHome).Replace('$CODEX_HOME', $CodexHome)
-        if ($expanded -ne $content) {
-            [System.IO.File]::WriteAllText($file.FullName, $expanded, [System.Text.UTF8Encoding]::new($false))
-        }
-    }
-}
-
-function Remove-OldInstallBackups {
-    param(
-        [Parameter(Mandatory)][string]$BackupRoot,
-        [ValidateRange(1, 100)][int]$Keep = 5
-    )
-
-    if (-not (Test-Path -LiteralPath $BackupRoot -PathType Container)) { return }
-    Assert-InstallContainer -Path $BackupRoot
-    $managedBackups = @(
-        Get-ChildItem -LiteralPath $BackupRoot -Force -Directory |
-            Where-Object {
-                $_.Name -cmatch '^backup-[0-9]{8}-[0-9]{6}-[0-9a-f]{32}$' -and
-                ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0
-            } |
-            Sort-Object -Property Name -Descending
-    )
-    foreach ($backup in $managedBackups | Select-Object -Skip $Keep) {
-        Assert-NoReparsePointsInTree -Path $backup.FullName
-        Remove-Item -LiteralPath $backup.FullName -Recurse -Force
-    }
-}
-
-function Get-ManagedTomlSettings {
-    param([Parameter(Mandatory)][string]$Path)
-
-    $settings = [ordered]@{
-        '' = [ordered]@{
-            'model' = $null
-            'model_reasoning_effort' = $null
-            'sandbox_mode' = $null
-            'approval_policy' = $null
-            'approvals_reviewer' = $null
-        }
-        'agents' = [ordered]@{
-            'max_threads' = $null
-            'max_depth' = $null
-        }
-        'features' = [ordered]@{
-            'goals' = $null
-        }
-    }
-    $section = ''
-    foreach ($line in Get-Content -LiteralPath $Path) {
-        if ($line -cmatch '^\s*\[\[[^\]]+\]\]\s*(?:#.*)?$') {
-            $section = '__other__'
-            continue
-        }
-        if ($line -cmatch '^\s*\[([^\]]+)\]\s*(?:#.*)?$') {
-            $section = $Matches[1].Trim()
-            continue
-        }
-        if (($settings.Keys -ccontains $section) -and $line -cmatch '^\s*([A-Za-z][A-Za-z0-9_-]*)\s*=\s*(.+)$') {
-            $key = $Matches[1]
-            if ($settings[$section].Keys -ccontains $key) {
-                $settings[$section][$key] = $Matches[2].Trim()
-            }
-        }
-    }
-
-    foreach ($settingSection in $settings.Keys) {
-        foreach ($key in $settings[$settingSection].Keys) {
-            if ([string]::IsNullOrWhiteSpace($settings[$settingSection][$key])) {
-                throw "Missing managed config setting: $settingSection/$key"
-            }
-        }
-    }
-    return $settings
-}
-
-function Merge-ManagedTomlSettings {
-    param(
-        [Parameter(Mandatory)][System.Collections.IDictionary]$Settings,
-        [Parameter(Mandatory)][string]$ExistingPath,
-        [Parameter(Mandatory)][string]$OutputPath
-    )
-
-    $output = [System.Collections.Generic.List[string]]::new()
-    $seenSections = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
-    $seenKeys = @{}
-    foreach ($settingSection in $Settings.Keys) {
-        $seenKeys[$settingSection] = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
-    }
-
-    function Add-MissingSettings {
-        param([Parameter(Mandatory)][AllowEmptyString()][string]$Section)
-
-        if (-not ($Settings.Keys -ccontains $Section)) { return }
-        foreach ($key in $Settings[$Section].Keys) {
-            if (-not $seenKeys[$Section].Contains($key)) {
-                $output.Add("$key = $($Settings[$Section][$key])")
-                [void]$seenKeys[$Section].Add($key)
-            }
-        }
-    }
-
-    $section = ''
-    if (Test-Path -LiteralPath $ExistingPath -PathType Leaf) {
-        foreach ($line in Get-Content -LiteralPath $ExistingPath) {
-            if ($line -cmatch '^\s*\[\[[^\]]+\]\]\s*(?:#.*)?$') {
-                Add-MissingSettings -Section $section
-                $section = '__other__'
-                $output.Add($line)
-                continue
-            }
-            if ($line -cmatch '^\s*\[([^\]]+)\]\s*(?:#.*)?$') {
-                Add-MissingSettings -Section $section
-                $section = $Matches[1].Trim()
-                if ($Settings.Keys -ccontains $section) { [void]$seenSections.Add($section) }
-                $output.Add($line)
-                continue
-            }
-            if (($Settings.Keys -ccontains $section) -and $line -cmatch '^\s*([A-Za-z][A-Za-z0-9_-]*)\s*=') {
-                $key = $Matches[1]
-                if (($Settings[$section].Keys -ccontains $key) -and -not $seenKeys[$section].Contains($key)) {
-                    $output.Add("$key = $($Settings[$section][$key])")
-                    [void]$seenKeys[$section].Add($key)
-                    continue
-                }
-            }
-            $output.Add($line)
-        }
-    }
-    Add-MissingSettings -Section $section
-
-    foreach ($settingSection in @('agents', 'features')) {
-        if (-not $seenSections.Contains($settingSection)) {
-            if ($output.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($output[$output.Count - 1])) { $output.Add('') }
-            $output.Add("[$settingSection]")
-            Add-MissingSettings -Section $settingSection
-        }
-    }
-    Set-Content -LiteralPath $OutputPath -Value $output
-}
-
-function Assert-SafeTomlMergeInput {
-    param([Parameter(Mandatory)][string]$Path)
-
-    $section = ''
-    $tableSeen = @{}
-    $managedSeen = @{}
-    $lineNumber = 0
-    foreach ($line in [System.IO.File]::ReadLines($Path)) {
-        $lineNumber++
+function Assert-SafeTomlMergeInput([string]$Path) {
+    $section = 'root'; $seen = @{}
+    foreach ($line in [IO.File]::ReadLines($Path)) {
         $trimmed = $line.Trim()
-        if ($trimmed.Contains('"""') -or $trimmed.Contains("'''")) {
-            throw "Unsupported TOML syntax for safe merge at $Path`:$lineNumber (multiline strings)"
-        }
         if ([string]::IsNullOrWhiteSpace($trimmed) -or $trimmed.StartsWith('#')) { continue }
-        if ($trimmed.StartsWith('[', [System.StringComparison]::Ordinal)) {
-            $arrayTable = $trimmed.StartsWith('[[', [System.StringComparison]::Ordinal)
-            $headerPattern = if ($arrayTable) { '^\[\[([^\]]+)\]\]\s*(?:#.*)?$' } else { '^\[([^\]]+)\]\s*(?:#.*)?$' }
-            if ($trimmed -notmatch $headerPattern) {
-                throw "Unsupported TOML syntax for safe merge at $Path`:$lineNumber (ambiguous table header)"
-            }
-            $section = $Matches[1].Trim()
-            if ($section.Contains('\') -and $section -cnotmatch '^[A-Za-z0-9_-]+\.') {
-                throw "Unsupported TOML syntax for safe merge at $Path`:$lineNumber (escaped table key)"
-            }
-            if ($arrayTable -and $section -cin @('agents', 'features')) {
-                throw "Unsupported TOML syntax for safe merge at $Path`:$lineNumber (managed table cannot be an array table)"
-            }
-            if ($section -cmatch '^["'']?(agents|features|model|model_reasoning_effort|sandbox_mode|approval_policy|approvals_reviewer)["'']?\s*(?:[.]|$)' -and $section -cnotin @('agents', 'features')) {
-                throw "Unsupported TOML syntax for safe merge at $Path`:$lineNumber (managed namespace table)"
-            }
-            if (-not $arrayTable -and $section -cin @('agents', 'features')) {
-                $tableSeen[$section] = 1 + ($tableSeen[$section] ?? 0)
-                if ($tableSeen[$section] -ne 1) { throw "Unsupported TOML syntax for safe merge at $Path`:$lineNumber (repeated managed table)" }
-            }
-            continue
-        }
-        $separator = $trimmed.IndexOf('=')
-        if ($separator -lt 1) { throw "Unsupported TOML syntax for safe merge at $Path`:$lineNumber (unrecognized line)" }
-        $key = $trimmed.Substring(0, $separator).Trim()
-        $value = $trimmed.Substring($separator + 1)
-        $inBasicString = $false
-        $inLiteralString = $false
-        $arrayDepth = 0
-        $tableDepth = 0
-        for ($index = 0; $index -lt $value.Length; $index++) {
-            $character = $value[$index]
-            if ($inBasicString) {
-                if ($character -eq '\') { $index++; continue }
-                if ($character -eq '"') { $inBasicString = $false }
-                continue
-            }
-            if ($inLiteralString) {
-                if ($character -eq "'") { $inLiteralString = $false }
-                continue
-            }
-            if ($character -eq '#') { break }
-            if ($character -eq '"') { $inBasicString = $true; continue }
-            if ($character -eq "'") { $inLiteralString = $true; continue }
-            if ($character -eq '[') { $arrayDepth++; continue }
-            if ($character -eq ']') { $arrayDepth--; continue }
-            if ($character -eq '{') { $tableDepth++; continue }
-            if ($character -eq '}') { $tableDepth--; continue }
-        }
-        if ($inBasicString -or $inLiteralString -or $arrayDepth -ne 0 -or $tableDepth -ne 0) {
-            throw "Unsupported TOML syntax for safe merge at $Path`:$lineNumber (cross-line or unclosed value)"
-        }
-        if ($key -cnotmatch '^[A-Za-z][A-Za-z0-9_-]*$') {
-            if (($section -ceq '' -and ($key.Contains('\') -or $key -cmatch '^["'']?(model|model_reasoning_effort|sandbox_mode|approval_policy|approvals_reviewer|agents|features)["'']?\s*(?:$|[.])')) -or
-                ($section -cin @('agents', 'features') -and $key -cmatch '^["'']?(max_threads|max_depth|goals)["'']?\s*(?:$|[.])')) {
-                throw "Unsupported TOML syntax for safe merge at $Path`:$lineNumber (quoted or dotted managed key)"
-            }
-            continue
-        }
-        if ($section -ceq '' -and $key -cin @('agents', 'features')) {
-            throw "Unsupported TOML syntax for safe merge at $Path`:$lineNumber (managed table cannot be a root key)"
-        }
-        $managed = ($section -ceq '' -and $key -cin @('model', 'model_reasoning_effort', 'sandbox_mode', 'approval_policy', 'approvals_reviewer')) -or
-                   ($section -ceq 'agents' -and $key -cin @('max_threads', 'max_depth')) -or
-                   ($section -ceq 'features' -and $key -ceq 'goals')
+        if ($trimmed.Contains('"""') -or $trimmed.Contains("'''")) { throw "Unsupported multiline TOML in $Path" }
+        if ($trimmed -match '^\[\[([^\]]+)\]\]') { $section = '__array__'; continue }
+        if ($trimmed -match '^\[([^\]]+)\]') { $section = $Matches[1].Trim(); continue }
+        if ($trimmed -notmatch '=') { throw "Unsupported TOML line in ${Path}: $line" }
+        $key = $trimmed.Substring(0, $trimmed.IndexOf('=')).Trim()
+        if ($key -notmatch '^[A-Za-z][A-Za-z0-9_-]*$') { continue }
+        $managed = ($section -eq 'root' -and $key -in @('model','model_reasoning_effort','sandbox_mode','approval_policy','approvals_reviewer')) -or
+            ($section -eq 'agents' -and $key -in @('max_threads','max_depth')) -or
+            ($section -eq 'features' -and $key -eq 'goals')
         if ($managed) {
-            $managedKey = "$section/$key"
-            $managedSeen[$managedKey] = 1 + ($managedSeen[$managedKey] ?? 0)
-            if ($managedSeen[$managedKey] -ne 1) { throw "Unsupported TOML syntax for safe merge at $Path`:$lineNumber (repeated managed key)" }
+            $identity = "$section/$key"
+            if ($seen.ContainsKey($identity)) { throw "Repeated managed TOML key in ${Path}: $identity" }
+            $seen[$identity] = $true
         }
     }
 }
 
-function Assert-InstallTarget {
-    param(
-        [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][ValidateSet('File', 'Directory')][string]$Kind
-    )
-
-    Assert-NoReparsePoints -Path $Path
-    if (-not (Test-ExistingPath -Path $Path)) { return }
-
-    $item = Get-Item -LiteralPath $Path -Force
-    if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw "Refusing to replace a symbolic link or junction: $Path"
+function Get-ManagedConfigValues([string]$Path) {
+    $values = [ordered]@{
+        root = [ordered]@{ model = $null; model_reasoning_effort = $null; sandbox_mode = $null; approval_policy = $null; approvals_reviewer = $null }
+        agents = [ordered]@{ max_threads = $null; max_depth = $null }
+        features = [ordered]@{ goals = $null }
     }
-    if ($Kind -eq 'File' -and $item.PSIsContainer) {
-        throw "Expected a regular file target: $Path"
-    }
-    if ($Kind -eq 'Directory') {
-        if (-not $item.PSIsContainer) { throw "Expected a directory target: $Path" }
-        Assert-NoReparsePointsInTree -Path $Path
-    }
-}
-
-function Assert-InstallContainer {
-    param([Parameter(Mandatory)][string]$Path)
-
-    Assert-NoReparsePoints -Path $Path
-    if (-not (Test-ExistingPath -Path $Path)) { return }
-    $item = Get-Item -LiteralPath $Path -Force
-    if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or -not $item.PSIsContainer) {
-        throw "Expected a non-symbolic-link directory: $Path"
-    }
-}
-
-function Invoke-InstallRollback {
-    param(
-        [Parameter(Mandatory)][System.Collections.IEnumerable]$Targets,
-        [AllowNull()][string]$BackupDirectory,
-        [Parameter(Mandatory)][string]$AgentsTarget,
-        [Parameter(Mandatory)][bool]$AgentsParentCreated,
-        [Parameter(Mandatory)][string]$SkillsTarget,
-        [Parameter(Mandatory)][bool]$SkillsParentCreated
-    )
-
-    $errors = [System.Collections.Generic.List[string]]::new()
-    foreach ($target in $Targets) {
-        if ($target.InstallStarted -and (Test-ExistingPath -Path $target.Target)) {
-            try {
-                Remove-Item -LiteralPath $target.Target -Recurse -Force
-            } catch {
-                $errors.Add("Could not remove installed target $($target.Target): $($_.Exception.Message)")
-            }
-        }
-    }
-    if (-not [string]::IsNullOrWhiteSpace($BackupDirectory)) {
-        foreach ($target in $Targets) {
-            $backupTarget = Join-Path $BackupDirectory $target.Name
-            if ($target.BackedUp -and (Test-ExistingPath -Path $backupTarget)) {
-                try {
-                    if (-not (Test-ExistingPath -Path $target.Target)) {
-                        New-Item -ItemType Directory -Path (Split-Path -Parent $target.Target) -Force | Out-Null
-                        Move-Item -LiteralPath $backupTarget -Destination $target.Target
-                    }
-                } catch {
-                    $errors.Add("Could not restore target $($target.Target): $($_.Exception.Message)")
-                }
-            }
-        }
-    }
-    if ($AgentsParentCreated -and (Test-Path -LiteralPath $AgentsTarget -PathType Container)) {
-        try {
-            if (@(Get-ChildItem -LiteralPath $AgentsTarget -Force).Count -eq 0) {
-                Remove-Item -LiteralPath $AgentsTarget -Force
-            }
-        } catch {
-            $errors.Add("Could not remove newly created agents directory ${AgentsTarget}: $($_.Exception.Message)")
-        }
-    }
-    if ($SkillsParentCreated -and (Test-Path -LiteralPath $SkillsTarget -PathType Container)) {
-        try {
-            if (@(Get-ChildItem -LiteralPath $SkillsTarget -Force).Count -eq 0) {
-                Remove-Item -LiteralPath $SkillsTarget -Force
-            }
-        } catch {
-            $errors.Add("Could not remove newly created skills directory ${SkillsTarget}: $($_.Exception.Message)")
-        }
-    }
-    return $errors
-}
-
-function Get-ManagedModelProviderSettings {
-    param([Parameter(Mandatory)][string]$Path)
-
-    $settings = [ordered]@{
-        'request_max_retries' = $null
-        'stream_max_retries' = $null
-        'stream_idle_timeout_ms' = $null
-        'websocket_connect_timeout_ms' = $null
-    }
+    $section = 'root'
     foreach ($line in Get-Content -LiteralPath $Path) {
-        if ($line -cmatch '^\s*([A-Za-z][A-Za-z0-9_-]*)\s*=\s*(.+)$' -and $settings.Keys -ccontains $Matches[1]) {
-            $settings[$Matches[1]] = $Matches[2].Trim()
-        }
-    }
-    foreach ($key in $settings.Keys) {
-        if ([string]::IsNullOrWhiteSpace($settings[$key])) { throw "Missing managed model provider setting: $key" }
-    }
-    return $settings
-}
-
-function Merge-ManagedModelProviderSettings {
-    param(
-        [Parameter(Mandatory)][System.Collections.IDictionary]$Settings,
-        [Parameter(Mandatory)][string]$ExistingPath,
-        [Parameter(Mandatory)][string]$OutputPath
-    )
-
-    $output = [System.Collections.Generic.List[string]]::new()
-    $section = ''
-    $providerSection = $false
-    $providerFound = $false
-    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
-
-    function Add-MissingProviderSettings {
-        if (-not $providerSection) { return }
-        foreach ($key in $Settings.Keys) {
-            if (-not $seen.Contains($key)) {
-                $output.Add("$key = $($Settings[$key])")
-                [void]$seen.Add($key)
-            }
-        }
-    }
-
-    foreach ($line in Get-Content -LiteralPath $ExistingPath) {
-        if ($line -cmatch '^\s*\[\[[^\]]+\]\]\s*(?:#.*)?$') {
-            Add-MissingProviderSettings
-            $section = '__other__'; $providerSection = $false; $seen.Clear(); $output.Add($line); continue
-        }
-        if ($line -cmatch '^\s*\[([^\]]+)\]\s*(?:#.*)?$') {
-            Add-MissingProviderSettings
-            $section = $Matches[1].Trim()
-            $providerSection = $section -cmatch '^model_providers\.(?:[A-Za-z0-9_-]+|"[^"]+"|''[^'']+'')$'
-            if ($providerSection) { $providerFound = $true }
-            $seen.Clear(); $output.Add($line); continue
-        }
-        if ($providerSection -and $line -cmatch '^\s*([A-Za-z][A-Za-z0-9_-]*)\s*=') {
+        if ($line -match '^\s*\[\[([^\]]+)\]\]') { $section = '__array__'; continue }
+        if ($line -match '^\s*\[([^\]]+)\]') { $section = $Matches[1].Trim(); continue }
+        if ($values.Contains($section) -and $line -match '^\s*([A-Za-z][A-Za-z0-9_-]*)\s*=\s*(.+)$') {
             $key = $Matches[1]
-            if ($Settings.Keys -ccontains $key -and -not $seen.Contains($key)) {
-                $output.Add("$key = $($Settings[$key])")
-                [void]$seen.Add($key)
-                continue
-            }
-        }
-        $output.Add($line)
-    }
-    Add-MissingProviderSettings
-    if (-not $providerFound) {
-        Write-Warning "No [model_providers.<provider-id>] table found in $ExistingPath; skipped managed model provider settings."
-    }
-    Set-Content -LiteralPath $OutputPath -Value $output
-}
-
-function Get-CodexCliPath {
-    foreach ($commandName in @('codex.cmd', 'codex.exe')) {
-        $command = Get-Command $commandName -All -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($null -ne $command -and -not [string]::IsNullOrWhiteSpace($command.Source)) {
-            return $command.Source
+            if ($values[$section].Contains($key)) { $values[$section][$key] = $Matches[2].Trim() }
         }
     }
-    throw 'Codex CLI is required to install the managed plugin, but codex.cmd/codex.exe was not found.'
+    foreach ($sectionName in $values.Keys) { foreach ($key in $values[$sectionName].Keys) { if ([string]::IsNullOrWhiteSpace($values[$sectionName][$key])) { throw "Missing managed config setting: $sectionName/$key" } } }
+    return $values
 }
 
-function Assert-WorkflowControllerNode {
-    $nodeCommand = Get-Command node -All -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -eq $nodeCommand -or [string]::IsNullOrWhiteSpace($nodeCommand.Source)) {
-        throw 'Node.js is required for the agnets-workflow workflow-controller MCP server, but the node command was not found.'
+function Get-ProviderSettings([string]$Path) {
+    $values = [ordered]@{ request_max_retries = $null; stream_max_retries = $null; stream_idle_timeout_ms = $null; websocket_connect_timeout_ms = $null }
+    foreach ($line in Get-Content -LiteralPath $Path) {
+        if ($line -match '^\s*([A-Za-z][A-Za-z0-9_-]*)\s*=\s*(.+)$' -and $values.Contains($Matches[1])) { $values[$Matches[1]] = $Matches[2].Trim() }
     }
-    $nodePath = $nodeCommand.Source
-    $nodeVersionText = (& $nodePath -p 'process.versions.node').Trim()
-    if ($LASTEXITCODE -ne 0) { throw "Cannot determine Node.js version from: $nodePath" }
-    try { $nodeVersion = [System.Version]::Parse($nodeVersionText) }
-    catch { throw "Cannot parse Node.js version '$nodeVersionText' from: $nodePath" }
-    if ($nodeVersion -lt [System.Version]'22.5.0') {
-        throw "Node.js 22.5.0 or newer is required for the native SQLite workflow controller; found $nodeVersionText at $nodePath"
-    }
+    foreach ($key in $values.Keys) { if ([string]::IsNullOrWhiteSpace($values[$key])) { throw "Missing provider setting: $key" } }
+    return $values
 }
 
-function Assert-CodexDesktopStopped {
-    $running = @(Get-CimInstance Win32_Process -Filter "Name = 'codex.exe'" -ErrorAction Stop | Where-Object {
-        $_.CommandLine -match '(?i)(?:^|\s)app-server(?:\s|$)'
-    })
-    if ($running.Count -eq 0) { return }
-    $processSummary = ($running | ForEach-Object { "PID $($_.ProcessId)" }) -join ', '
-    throw "Codex Desktop is still running ($processSummary). Exit every Codex Desktop window and wait for its app-server processes to stop before installing; otherwise the live app can overwrite plugin registration and keep the previous MCP cache loaded."
-}
-
-function Get-ManagedPluginIdentity {
-    param(
-        [Parameter(Mandatory)][string]$PluginSource,
-        [Parameter(Mandatory)][string]$PluginName
-    )
-
-    Assert-NoReparsePointsInTree -Path $PluginSource
-    $manifestPath = Join-Path $PluginSource '.codex-plugin\plugin.json'
-    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
-        throw "Missing managed plugin manifest: $manifestPath"
-    }
-    try {
-        $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json -ErrorAction Stop
-    } catch {
-        throw "Invalid managed plugin manifest: $manifestPath ($($_.Exception.Message))"
-    }
-    if ($manifest.name -ne $PluginName) {
-        throw "Managed plugin manifest name does not match expected plugin: $manifestPath"
-    }
-    if ($manifest.version -isnot [string] -or [string]::IsNullOrWhiteSpace($manifest.version) -or $manifest.version -notmatch '^[0-9A-Za-z][0-9A-Za-z.+_-]*$') {
-        throw "Managed plugin manifest has an unsafe or empty version: $manifestPath"
-    }
-    return [pscustomobject]@{
-        Version = $manifest.version
-        Source = (Get-AbsolutePath -Path $PluginSource)
-    }
-}
-
-function Get-ManagedPluginFileHashes {
-    param(
-        [Parameter(Mandatory)][string]$Root,
-        [string]$CodexHome,
-        [switch]$ExpandMcpHome
-    )
-
-    Assert-NoReparsePointsInTree -Path $Root
-    $absoluteRoot = (Get-AbsolutePath -Path $Root).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
-    $hashes = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($file in Get-ChildItem -LiteralPath $absoluteRoot -Recurse -File -Force) {
-        $relative = $file.FullName.Substring($absoluteRoot.Length).TrimStart([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar).Replace('\', '/')
-        if ($relative -eq 'node_modules' -or $relative.StartsWith('node_modules/')) { continue }
-        if ([string]::IsNullOrWhiteSpace($relative) -or $hashes.ContainsKey($relative)) {
-            throw "Invalid managed plugin file layout: $absoluteRoot"
+function Merge-Config([string]$Template, [string]$Existing, [string]$Provider, [string]$Output) {
+    Assert-SafeTomlMergeInput $Template
+    Assert-SafeTomlMergeInput $Provider
+    if (Test-Path -LiteralPath $Existing -PathType Leaf) { Assert-SafeTomlMergeInput $Existing }
+    $managed = Get-ManagedConfigValues $Template
+    $providerValues = Get-ProviderSettings $Provider
+    $lines = [Collections.Generic.List[string]]::new()
+    if (Test-Path -LiteralPath $Existing -PathType Leaf) { Get-Content -LiteralPath $Existing | ForEach-Object { $lines.Add($_) } } else { Get-Content -LiteralPath $Template | ForEach-Object { $lines.Add($_) } }
+    $outputLines = [Collections.Generic.List[string]]::new()
+    $seen = @{ root = @{}; agents = @{}; features = @{} }
+    $seenSections = @{}
+    $section = 'root'; $providerSection = $false; $providerSeen = @{}; $providerFound = $false
+    $flush = {
+        param([string]$name)
+        if ($name -eq 'root' -or $name -eq 'agents' -or $name -eq 'features') {
+            foreach ($key in $managed[$name].Keys) { if (-not $seen[$name].ContainsKey($key)) { $outputLines.Add("$key = $($managed[$name][$key])"); $seen[$name][$key] = $true } }
         }
-        if ($ExpandMcpHome -and $relative -eq '.mcp.json') {
-            if ([string]::IsNullOrWhiteSpace($CodexHome)) { throw 'CodexHome is required when expanding the plugin MCP descriptor' }
-            $content = [System.IO.File]::ReadAllText($file.FullName)
-            $expanded = $content.Replace('<CODEX_HOME>', $CodexHome.Replace('\', '/'))
-            $sha256 = [System.Security.Cryptography.SHA256]::Create()
-            try {
-                $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($expanded)
-                $hashes[$relative] = (($sha256.ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') }) -join '')
-            } finally {
-                $sha256.Dispose()
-            }
-        } else {
-            $hashes[$relative] = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($providerSection) {
+            foreach ($key in $providerValues.Keys) { if (-not $providerSeen.ContainsKey($key)) { $outputLines.Add("$key = $($providerValues[$key])"); $providerSeen[$key] = $true } }
         }
     }
-    return $hashes
+    foreach ($line in $lines) {
+        if ($line -match '^\s*\[\[([^\]]+)\]\]') { & $flush $section; $section = '__array__'; $providerSection = $false; $providerSeen = @{}; $outputLines.Add($line); continue }
+        if ($line -match '^\s*\[([^\]]+)\]') {
+            & $flush $section
+            $header = $Matches[1].Trim()
+            $section = if ($header -in @('agents','features')) { $header } else { '__other__' }
+            if ($section -in @('agents','features')) { $seenSections[$section] = $true }
+            $providerSection = $header -match '^model_providers\.(?:[A-Za-z0-9_-]+|"[^"]+"|''[^'']+'')$'
+            if ($providerSection) { $providerFound = $true }
+            $providerSeen = @{}
+            $outputLines.Add($line); continue
+        }
+        if ($providerSection -and $line -match '^\s*([A-Za-z][A-Za-z0-9_-]*)\s*=') {
+            $key = $Matches[1]
+            if ($providerValues.Contains($key)) { $outputLines.Add("$key = $($providerValues[$key])"); $providerSeen[$key] = $true; continue }
+        }
+        if (($section -eq 'root' -or $section -eq 'agents' -or $section -eq 'features') -and $line -match '^\s*([A-Za-z][A-Za-z0-9_-]*)\s*=') {
+            $key = $Matches[1]
+            if ($managed[$section].Contains($key)) { $outputLines.Add("$key = $($managed[$section][$key])"); $seen[$section][$key] = $true; continue }
+        }
+        $outputLines.Add($line)
+    }
+    & $flush $section
+    foreach ($table in 'agents','features') {
+        if (-not $seenSections.ContainsKey($table)) { if ($outputLines.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($outputLines[$outputLines.Count - 1])) { $outputLines.Add('') }; $outputLines.Add("[$table]"); foreach ($key in $managed[$table].Keys) { $outputLines.Add("$key = $($managed[$table][$key])") } }
+    }
+    if (-not $providerFound) { Write-Warning "No [model_providers.<provider-id>] table found in $Existing; skipped provider settings." }
+    Set-Content -LiteralPath $Output -Value $outputLines -Encoding utf8
 }
 
-function Expand-ManagedPluginMcpHome {
-    param(
-        [Parameter(Mandatory)][string]$CachePath,
-        [Parameter(Mandatory)][string]$CodexHome
-    )
-
-    if (-not (Test-Path -LiteralPath $CachePath -PathType Container)) { return }
-    Assert-NoReparsePointsInTree -Path $CachePath
-    $descriptorPath = Join-Path $CachePath '.mcp.json'
-    if (-not (Test-Path -LiteralPath $descriptorPath -PathType Leaf)) { throw "Missing installed MCP descriptor: $descriptorPath" }
-    $content = [System.IO.File]::ReadAllText($descriptorPath)
-    $expanded = $content.Replace('<CODEX_HOME>', $CodexHome.Replace('\', '/'))
-    if ($expanded -ne $content) {
-        [System.IO.File]::WriteAllText($descriptorPath, $expanded, [System.Text.UTF8Encoding]::new($false))
-    }
-    $descriptor = Get-Content -LiteralPath $descriptorPath -Raw | ConvertFrom-Json -ErrorAction Stop
-    $workflowServerProperty = $descriptor.mcpServers.PSObject.Properties['workflow-controller']
-    $workflowServer = if ($null -eq $workflowServerProperty) { $null } else { $workflowServerProperty.Value }
-    if ($null -ne $workflowServer) {
-        $configuredHome = $workflowServer.env.CODEX_HOME
-        if ($configuredHome -isnot [string] -or -not (Test-SamePath -Left $configuredHome -Right $CodexHome)) {
-            throw "Installed workflow-controller MCP does not contain the resolved Codex home: $descriptorPath"
-        }
-        $envVarsProperty = $workflowServer.PSObject.Properties['env_vars']
-        if ($null -ne $envVarsProperty -and $null -ne $envVarsProperty.Value) {
-            throw "Installed workflow-controller MCP must not inherit Codex home variables: $descriptorPath"
-        }
+function Expand-Placeholders([string]$Directory, [string]$CodexRoot) {
+    foreach ($file in Get-ChildItem -LiteralPath $Directory -Recurse -File) {
+        if ($file.Extension.ToLowerInvariant() -notin @('.md','.toml','.txt')) { continue }
+        $text = [IO.File]::ReadAllText($file.FullName)
+        $expanded = $text.Replace('<CODEX_HOME>', $CodexRoot).Replace('$CODEX_HOME', $CodexRoot)
+        if ($expanded -ne $text) { [IO.File]::WriteAllText($file.FullName, $expanded, [Text.UTF8Encoding]::new($false)) }
     }
 }
 
-function Install-ManagedPluginDependencies {
-    param(
-        [Parameter(Mandatory)][string]$CachePath,
-        [Parameter(Mandatory)][string]$PluginName
-    )
+$root = Split-Path -Parent $PSCommandPath
+$profilePath = if ($env:USERPROFILE) { $env:USERPROFILE } else { [Environment]::GetFolderPath('UserProfile') }
+$homePath = if ($env:CODEX_HOME) { [IO.Path]::GetFullPath($env:CODEX_HOME) } else { [IO.Path]::GetFullPath((Join-Path $profilePath '.codex')) }
+if ([string]::IsNullOrWhiteSpace($homePath) -or [IO.Path]::GetPathRoot($homePath).TrimEnd('\') -eq $homePath.TrimEnd('\')) { throw "Refusing unsafe Codex home: $homePath" }
+$sourceRoles = Join-Path $root 'codex-global-config\agents\ai-vibecode-superpower'
+$sourceManifest = Join-Path $root 'codex-global-config\agents\ai-vibecode-superpower.sha256'
+$sourceDocs = Join-Path $root 'codex-global-config\docs'
+$sourceAgents = Join-Path $root 'codex-global-config\AGENTS.md'
+$sourceConfig = Join-Path $root 'codex-global-config\config.toml'
+$sourceProvider = Join-Path $root 'codex-global-config\model-provider-settings.toml'
+$sourceSkills = Join-Path $root 'skills'
+$skillNames = @('agent-toolchain','gpt-image-2-cli','project-doc-planner','orchestrate-model-workflow')
+foreach ($path in @($sourceRoles,$sourceManifest,$sourceDocs,$sourceAgents,$sourceConfig,$sourceProvider,$sourceSkills)) { if (-not (Test-Path -LiteralPath $path)) { throw "Missing source: $path" } }
+foreach ($name in $skillNames) { if (-not (Test-Path -LiteralPath (Join-Path $sourceSkills $name) -PathType Container)) { throw "Missing skill: $name" } }
+Assert-RoleProfiles $sourceRoles $sourceManifest
+Assert-NoReparseChain $root
+Assert-NoReparse $root
+Assert-NoReparseChain $homePath
 
-    $lockPath = Join-Path $CachePath 'package-lock.json'
-    if (-not (Test-Path -LiteralPath $lockPath -PathType Leaf)) { return }
-    $npmCommand = Get-Command npm.cmd -All -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -eq $npmCommand -or [string]::IsNullOrWhiteSpace($npmCommand.Source)) {
-        throw "npm.cmd is required to install dependencies for managed plugin: $PluginName"
-    }
-    $npmOutput = (& $npmCommand.Source --prefix $CachePath ci --omit=dev --ignore-scripts --no-audit --no-fund 2>&1 | Out-String)
-    if ($LASTEXITCODE -ne 0) {
-        throw "Could not install dependencies for managed plugin: $PluginName. npm output: $npmOutput"
-    }
-}
+$existingConfig = Join-Path $homePath 'config.toml'
 
-function Repair-ManagedPluginCacheMcpHomes {
-    param(
-        [Parameter(Mandatory)][string]$CodexHome,
-        [Parameter(Mandatory)][string]$MarketplaceName,
-        [Parameter(Mandatory)][string]$PluginName
-    )
-    $cacheRoot = Join-Path (Join-Path (Join-Path $CodexHome 'plugins\cache') $MarketplaceName) $PluginName
-    if (-not (Test-Path -LiteralPath $cacheRoot -PathType Container)) { return }
-    Assert-NoReparsePointsInTree -Path $cacheRoot
-    foreach ($descriptor in Get-ChildItem -LiteralPath $cacheRoot -Filter '.mcp.json' -File -Recurse -Force) {
-        Expand-ManagedPluginMcpHome -CachePath $descriptor.Directory.FullName -CodexHome $CodexHome
-    }
-}
-
-function Test-ManagedPluginCacheMatchesSource {
-    param(
-        [Parameter(Mandatory)][string]$PluginSource,
-        [Parameter(Mandatory)][string]$CachePath,
-        [Parameter(Mandatory)][string]$CodexHome
-    )
-
-    if (-not (Test-Path -LiteralPath $CachePath -PathType Container)) { return $false }
-    try { Expand-ManagedPluginMcpHome -CachePath $CachePath -CodexHome $CodexHome }
-    catch { return $false }
-    # The descriptor is verified structurally by Expand-ManagedPluginMcpHome.
-    # Exclude it from byte-for-byte cache hashing: its expected CODEX_HOME
-    # expansion can differ in equivalent Windows path spelling (for example,
-    # long versus 8.3 form) while the semantic validation above remains true.
-    $sourceHashes = Get-ManagedPluginFileHashes -Root $PluginSource
-    $cacheHashes = Get-ManagedPluginFileHashes -Root $CachePath
-    [void]$sourceHashes.Remove('.mcp.json')
-    [void]$cacheHashes.Remove('.mcp.json')
-    if ($sourceHashes.Count -ne $cacheHashes.Count) { return $false }
-    foreach ($relative in $sourceHashes.Keys) {
-        if (-not $cacheHashes.ContainsKey($relative) -or $cacheHashes[$relative] -ne $sourceHashes[$relative]) {
-            return $false
-        }
-    }
-    return $true
-}
-
-function Test-ManagedPluginIsActive {
-    param(
-        [Parameter(Mandatory)][string]$CodexCli,
-        [Parameter(Mandatory)][string]$PluginName,
-        [Parameter(Mandatory)][string]$MarketplaceName,
-        [Parameter(Mandatory)][string]$PluginVersion
-    )
-
-    $pluginIdentity = "$PluginName@$MarketplaceName"
-    $pluginOutput = (& $CodexCli plugin list 2>&1 | Out-String)
-    if ($LASTEXITCODE -ne 0) { return $false }
-    $pattern = '(?m)^\s*' + [System.Text.RegularExpressions.Regex]::Escape($pluginIdentity) + '\s+installed,\s+enabled\s+' + [System.Text.RegularExpressions.Regex]::Escape($PluginVersion) + '\s+'
-    return $pluginOutput -match $pattern
-}
-
-function Install-ManagedPlugin {
-    param(
-        [Parameter(Mandatory)][string]$CodexHome,
-        [Parameter(Mandatory)][string]$MarketplaceRoot,
-        [Parameter(Mandatory)][string]$PluginName,
-        [Parameter(Mandatory)][string]$MarketplaceName,
-        [Parameter(Mandatory)][string]$PluginSource
-    )
-
-    $codexCli = Get-CodexCliPath
-    Assert-WorkflowControllerNode
-    $plugin = Get-ManagedPluginIdentity -PluginSource $PluginSource -PluginName $PluginName
-    $cachePath = Join-Path (Join-Path (Join-Path (Join-Path $CodexHome 'plugins\cache') $MarketplaceName) $PluginName) $plugin.Version
-    $hadCodexHome = Test-Path Env:CODEX_HOME
-    $previousCodexHome = $env:CODEX_HOME
-    try {
-        $env:CODEX_HOME = $CodexHome
-        Repair-ManagedPluginCacheMcpHomes -CodexHome $CodexHome -MarketplaceName $MarketplaceName -PluginName $PluginName
-        & $codexCli plugin marketplace add $MarketplaceRoot
-        if ($LASTEXITCODE -ne 0) { throw "Could not register plugin marketplace: $MarketplaceRoot" }
-        $marketplaceOutput = (& $codexCli plugin marketplace list 2>&1 | Out-String)
-        if ($LASTEXITCODE -ne 0 -or $marketplaceOutput -notmatch ('(?m)^\s*' + [System.Text.RegularExpressions.Regex]::Escape($MarketplaceName) + '\s+')) {
-            throw "Codex did not retain marketplace registration after add: $MarketplaceName. Output: $marketplaceOutput"
-        }
-        Repair-ManagedPluginCacheMcpHomes -CodexHome $CodexHome -MarketplaceName $MarketplaceName -PluginName $PluginName
-        $cacheMatches = Test-ManagedPluginCacheMatchesSource -PluginSource $plugin.Source -CachePath $cachePath -CodexHome $CodexHome
-        $pluginActive = Test-ManagedPluginIsActive -CodexCli $codexCli -PluginName $PluginName -MarketplaceName $MarketplaceName -PluginVersion $plugin.Version
-        if (-not ($cacheMatches -and $pluginActive)) {
-            # An enabled entry that the CLI cannot list is not a usable install.
-            # Remove that stale identity before re-adding so Codex cannot retain
-            # an old config/cache snapshot and silently no-op the requested fix.
-            $pluginRemoveOutput = (& $codexCli plugin remove "$PluginName@$MarketplaceName" 2>&1 | Out-String)
-            if ($LASTEXITCODE -ne 0) {
-                Write-Warning "Codex could not remove a stale managed plugin before reinstall; continuing with plugin add. Output: $pluginRemoveOutput"
-            }
-            $pluginAddOutput = (& $codexCli plugin add "$PluginName@$MarketplaceName" 2>&1 | Out-String)
-            if ($LASTEXITCODE -ne 0) {
-                $cacheMatches = Test-ManagedPluginCacheMatchesSource -PluginSource $plugin.Source -CachePath $cachePath -CodexHome $CodexHome
-                $pluginActive = Test-ManagedPluginIsActive -CodexCli $codexCli -PluginName $PluginName -MarketplaceName $MarketplaceName -PluginVersion $plugin.Version
-                if (-not ($cacheMatches -and $pluginActive)) {
-                    throw "Could not install managed plugin: $PluginName@$MarketplaceName. Codex CLI output: $pluginAddOutput"
-                }
-                Write-Warning "Codex reported an error while cleaning an older plugin cache entry, but the requested plugin cache and active configuration were verified. Original output: $pluginAddOutput"
-            }
-        }
-        Install-ManagedPluginDependencies -CachePath $cachePath -PluginName $PluginName
-        # Codex plugin add may rewrite config.toml from an in-memory snapshot.
-        # Register once more after it so the final durable config keeps both the
-        # enabled plugin and its marketplace.
-        & $codexCli plugin marketplace add $MarketplaceRoot
-        if ($LASTEXITCODE -ne 0) { throw "Could not retain plugin marketplace after install: $MarketplaceRoot" }
-        $marketplaceOutput = (& $codexCli plugin marketplace list 2>&1 | Out-String)
-        if ($LASTEXITCODE -ne 0 -or $marketplaceOutput -notmatch ('(?m)^\s*' + [System.Text.RegularExpressions.Regex]::Escape($MarketplaceName) + '\s+')) {
-            throw "Codex did not retain marketplace registration after plugin install: $MarketplaceName. Output: $marketplaceOutput"
-        }
-        $finalCacheMatches = Test-ManagedPluginCacheMatchesSource -PluginSource $plugin.Source -CachePath $cachePath -CodexHome $CodexHome
-        $finalPluginActive = Test-ManagedPluginIsActive -CodexCli $codexCli -PluginName $PluginName -MarketplaceName $MarketplaceName -PluginVersion $plugin.Version
-        if (-not $finalPluginActive) {
-            throw "Codex did not retain the exact managed plugin version after add: $PluginName@$MarketplaceName ($($plugin.Version))"
-        }
-        if (-not $finalCacheMatches) {
-            Write-Warning "Managed plugin cache differs from the source after semantic MCP validation; retaining the verified active plugin: $PluginName@$MarketplaceName"
-        }
-    } finally {
-        if ($hadCodexHome) {
-            $env:CODEX_HOME = $previousCodexHome
-        } else {
-            Remove-Item Env:CODEX_HOME -ErrorAction SilentlyContinue
-        }
-    }
-}
-
-function Remove-RetiredWorkflowPlugin {
-    param([Parameter(Mandatory)][string]$CodexHome)
-
-    $pluginId = 'workflow-controller@ai-vibecode-superpower-local'
-    $configPath = Join-Path $CodexHome 'config.toml'
-    if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) { return }
-    $escapedPluginId = [System.Text.RegularExpressions.Regex]::Escape($pluginId)
-    $pattern = '^\s*\[plugins\.(?:"' + $escapedPluginId + '"|''' + $escapedPluginId + ''')\]\s*(?:#.*)?$'
-    if (-not ([System.IO.File]::ReadAllLines($configPath) | Where-Object { $_ -match $pattern })) { return }
-
-    $codexCli = Get-CodexCliPath
-    $hadCodexHome = Test-Path Env:CODEX_HOME
-    $previousCodexHome = $env:CODEX_HOME
-    try {
-        $env:CODEX_HOME = $CodexHome
-        for ($attempt = 1; $attempt -le 8; $attempt++) {
-            & $codexCli plugin remove $pluginId
-            if ($LASTEXITCODE -eq 0) { return }
-            $exitCode = $LASTEXITCODE
-            if ($attempt -lt 8) { Start-Sleep -Seconds 1 }
-        }
-        throw "Could not remove retired workflow plugin after 8 attempts: $pluginId (exit code $exitCode)"
-    } finally {
-        if ($hadCodexHome) { $env:CODEX_HOME = $previousCodexHome }
-        else { Remove-Item Env:CODEX_HOME -ErrorAction SilentlyContinue }
-    }
-}
-
-$scriptRoot = Split-Path -Parent $PSCommandPath
-$sourceAgents = Join-Path $scriptRoot 'codex-global-config\AGENTS.md'
-$sourceConfig = Join-Path $scriptRoot 'codex-global-config\config.toml'
-$sourceModelProviderSettings = Join-Path $scriptRoot 'codex-global-config\model-provider-settings.toml'
-$sourceDocs = Join-Path $scriptRoot 'codex-global-config\docs'
-$managedAgentRoleDirectoryName = 'ai-vibecode-superpower'
-$sourceAgentRoles = Join-Path $scriptRoot "codex-global-config\agents\$managedAgentRoleDirectoryName"
-$sourceAgentRoleManifest = Join-Path $scriptRoot 'codex-global-config\agents\ai-vibecode-superpower.sha256'
-$managedAgentRoleContracts = @(
-    [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_luna_high.toml'; RoleName = 'avsp_luna_high'; Model = 'gpt-5.6-luna'; ReasoningEffort = 'high'; SandboxMode = 'read-only' }
-    [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_luna_xhigh.toml'; RoleName = 'avsp_luna_xhigh'; Model = 'gpt-5.6-luna'; ReasoningEffort = 'xhigh'; SandboxMode = 'read-only' }
-    [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_luna_high_executor.toml'; RoleName = 'avsp_luna_high_executor'; Model = 'gpt-5.6-luna'; ReasoningEffort = 'high'; SandboxMode = 'danger-full-access' }
-    [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_luna_xhigh_executor.toml'; RoleName = 'avsp_luna_xhigh_executor'; Model = 'gpt-5.6-luna'; ReasoningEffort = 'xhigh'; SandboxMode = 'danger-full-access' }
-    [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_sol_high.toml'; RoleName = 'avsp_sol_high'; Model = 'gpt-5.6-sol'; ReasoningEffort = 'high'; SandboxMode = 'read-only' }
-    [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_sol_max.toml'; RoleName = 'avsp_sol_max'; Model = 'gpt-5.6-sol'; ReasoningEffort = 'max'; SandboxMode = 'read-only' }
-    [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_sol_xhigh.toml'; RoleName = 'avsp_sol_xhigh'; Model = 'gpt-5.6-sol'; ReasoningEffort = 'xhigh'; SandboxMode = 'read-only' }
-    [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_terra_high.toml'; RoleName = 'avsp_terra_high'; Model = 'gpt-5.6-terra'; ReasoningEffort = 'high'; SandboxMode = 'danger-full-access' }
-    [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_terra_xhigh.toml'; RoleName = 'avsp_terra_xhigh'; Model = 'gpt-5.6-terra'; ReasoningEffort = 'xhigh'; SandboxMode = 'read-only' }
-    [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_terra_xhigh_readonly.toml'; RoleName = 'avsp_terra_xhigh_readonly'; Model = 'gpt-5.6-terra'; ReasoningEffort = 'xhigh'; SandboxMode = 'read-only' }
-    [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_terra_low_readonly.toml'; RoleName = 'avsp_terra_low_readonly'; Model = 'gpt-5.6-terra'; ReasoningEffort = 'low'; SandboxMode = 'read-only' }
-    [pscustomobject]@{ FileName = 'ai-vibecode-superpower-avsp_terra_medium_readonly.toml'; RoleName = 'avsp_terra_medium_readonly'; Model = 'gpt-5.6-terra'; ReasoningEffort = 'medium'; SandboxMode = 'read-only' }
+$stage = Join-Path $homePath ('.install-stage-' + [Guid]::NewGuid().ToString('N'))
+$backup = $null
+$targets = @(
+    @{ Name='AGENTS.md'; Target=(Join-Path $homePath 'AGENTS.md'); Candidate=(Join-Path $stage 'AGENTS.md'); Kind='File'; BackedUp=$false; InstallStarted=$false },
+    @{ Name='config.toml'; Target=$existingConfig; Candidate=(Join-Path $stage 'config.toml'); Kind='File'; BackedUp=$false; InstallStarted=$false },
+    @{ Name='docs'; Target=(Join-Path $homePath 'docs'); Candidate=(Join-Path $stage 'docs'); Kind='Directory'; BackedUp=$false; InstallStarted=$false },
+    @{ Name='agents/ai-vibecode-superpower'; Target=(Join-Path $homePath 'agents\ai-vibecode-superpower'); Candidate=(Join-Path $stage 'agents\ai-vibecode-superpower'); Kind='Directory'; BackedUp=$false; InstallStarted=$false }
 )
-$managedPluginName = 'agnets-workflow'
-$managedMarketplaceName = 'ai-vibecode-superpower-local'
-$sourcePlugin = Join-Path $scriptRoot "plugins\$managedPluginName"
-$sourceMarketplace = Join-Path $scriptRoot '.agents\plugins\marketplace.json'
-$sourcePluginSkills = Join-Path $sourcePlugin 'skills'
-$sourceStandaloneSkills = Join-Path $scriptRoot 'skills'
-$managedPluginSkillNames = @(
-    'orchestrate-model-workflow'
-    'workflow-controller'
-)
-$legacyPluginSkillNamesToRemove = @('adaptive-efficiency')
-$managedStandaloneSkillNames = @(
-    'agent-toolchain'
-    'gpt-image-2-cli'
-    'project-doc-planner'
-)
-
-if (-not (Test-Path -LiteralPath $sourceAgents -PathType Leaf)) { throw "Missing source file: $sourceAgents" }
-if (-not (Test-Path -LiteralPath $sourceConfig -PathType Leaf)) { throw "Missing source file: $sourceConfig" }
-if (-not (Test-Path -LiteralPath $sourceModelProviderSettings -PathType Leaf)) { throw "Missing source file: $sourceModelProviderSettings" }
-if (-not (Test-Path -LiteralPath $sourceDocs -PathType Container)) { throw "Missing source directory: $sourceDocs" }
-if (-not (Test-Path -LiteralPath $sourceAgentRoles -PathType Container)) { throw "Missing source directory: $sourceAgentRoles" }
-if (-not (Test-Path -LiteralPath $sourceAgentRoleManifest -PathType Leaf)) { throw "Missing source file: $sourceAgentRoleManifest" }
-if (-not (Test-Path -LiteralPath $sourceMarketplace -PathType Leaf)) { throw "Missing source file: $sourceMarketplace" }
-if (-not (Test-Path -LiteralPath $sourcePlugin -PathType Container)) { throw "Missing source directory: $sourcePlugin" }
-Assert-ManagedAgentRoleProfiles -RoleDirectory $sourceAgentRoles -Contracts $managedAgentRoleContracts -ManifestPath $sourceAgentRoleManifest
-if (-not (Test-Path -LiteralPath $sourcePluginSkills -PathType Container)) { throw "Missing source directory: $sourcePluginSkills" }
-if (-not (Test-Path -LiteralPath $sourceStandaloneSkills -PathType Container)) { throw "Missing source directory: $sourceStandaloneSkills" }
-foreach ($skillName in $managedPluginSkillNames) {
-    if (-not (Test-Path -LiteralPath (Join-Path $sourcePluginSkills $skillName) -PathType Container)) {
-        throw "Missing managed plugin skill: $skillName"
-    }
-}
-foreach ($skillName in $managedStandaloneSkillNames) {
-    if (-not (Test-Path -LiteralPath (Join-Path $sourceStandaloneSkills $skillName) -PathType Container)) {
-        throw "Missing managed standalone skill: $skillName"
-    }
-}
-
-$userProfile = $env:USERPROFILE
-if ([string]::IsNullOrWhiteSpace($userProfile)) { $userProfile = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile) }
-if ([string]::IsNullOrWhiteSpace($userProfile)) { throw 'Could not determine the current user profile directory' }
-$codexHome = Join-Path $userProfile '.codex'
-$codexHome = Get-AbsolutePath -Path $codexHome
-
-if ([System.IO.Path]::GetPathRoot($codexHome).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar) -eq $codexHome.TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)) {
-    throw "Refusing to install into a filesystem root: $codexHome"
-}
-Assert-NoReparsePoints -Path $codexHome
-Assert-CodexDesktopStopped
-
-$agentsTarget = Join-Path $codexHome 'agents'
-$targetAgentRoles = Join-Path $agentsTarget $managedAgentRoleDirectoryName
-
-$targets = @{
-    'AGENTS.md' = $sourceAgents
-    'config.toml' = $sourceConfig
-    'docs' = $sourceDocs
-}
-foreach ($name in $targets.Keys) {
-    if (Test-SamePath -Left (Join-Path $codexHome $name) -Right $targets[$name]) {
-        throw "Destination target overlaps its source: $(Join-Path $codexHome $name)"
-    }
-}
-if (Test-SamePath -Left $targetAgentRoles -Right $sourceAgentRoles) {
-    throw "Destination target overlaps its source: $targetAgentRoles"
-}
-
-$installMutex = $null
-$stageRoot = $null
-$backupDirectory = $null
-$skillsTarget = Join-Path $codexHome 'skills'
-$agentsParentCreated = $false
-$skillsParentCreated = $false
-$transactionTargets = [System.Collections.Generic.List[object]]::new()
+foreach ($name in $skillNames) { $targets += @{ Name="skills/$name"; Target=(Join-Path $homePath "skills\$name"); Candidate=(Join-Path $stage "skills\$name"); Kind='Directory'; BackedUp=$false; InstallStarted=$false } }
+foreach ($target in $targets) { Assert-InstallTarget $target.Target $target.Kind }
+foreach ($container in @((Join-Path $homePath 'agents'),(Join-Path $homePath 'skills'),(Join-Path $homePath 'backups'))) { Assert-InstallContainer $container }
 
 try {
-    New-Item -ItemType Directory -Path $codexHome -Force | Out-Null
-    $installMutex = Get-InstallMutex -CodexHome $codexHome
-    $stageRoot = New-UniqueDirectory -Parent $codexHome -Prefix '.install-stage-'
-    Copy-Item -LiteralPath $sourceAgents -Destination (Join-Path $stageRoot 'AGENTS.md') -Force
-    Copy-Item -LiteralPath $sourceConfig -Destination (Join-Path $stageRoot 'template-config.toml') -Force
-    Copy-Item -LiteralPath $sourceDocs -Destination (Join-Path $stageRoot 'docs') -Recurse -Force
-    $stagedAgents = Join-Path $stageRoot 'agents'
-    New-Item -ItemType Directory -Path $stagedAgents | Out-Null
-    $stagedAgentRoles = Join-Path $stagedAgents $managedAgentRoleDirectoryName
-    Copy-Item -LiteralPath $sourceAgentRoles -Destination $stagedAgentRoles -Recurse -Force
-    $stagedStandaloneSkills = Join-Path $stageRoot 'skills'
-    New-Item -ItemType Directory -Path $stagedStandaloneSkills | Out-Null
-    foreach ($skillName in $managedStandaloneSkillNames) {
-        Copy-Item -LiteralPath (Join-Path $sourceStandaloneSkills $skillName) -Destination (Join-Path $stagedStandaloneSkills $skillName) -Recurse -Force
-    }
-    Expand-CodexHomePlaceholders -Root $stageRoot -CodexHome $codexHome
-    foreach ($name in @('AGENTS.md', 'template-config.toml', 'docs', (Join-Path 'agents' $managedAgentRoleDirectoryName))) {
-        if (-not (Test-ExistingPath -Path (Join-Path $stageRoot $name))) { throw "Staging failed for: $name" }
-    }
-    Assert-ManagedAgentRoleProfiles -RoleDirectory $stagedAgentRoles -Contracts $managedAgentRoleContracts -ManifestPath $sourceAgentRoleManifest
-    foreach ($skillName in $managedStandaloneSkillNames) {
-        if (-not (Test-ExistingPath -Path (Join-Path $stagedStandaloneSkills $skillName))) { throw "Staging failed for standalone skill: $skillName" }
-    }
+    New-Item -ItemType Directory -Path $homePath -Force | Out-Null
+    Assert-NoReparseChain $homePath
+    New-Item -ItemType Directory -Path $stage -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $stage 'agents') -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $stage 'skills') -Force | Out-Null
+    Copy-Item $sourceAgents (Join-Path $stage 'AGENTS.md')
+    Copy-Item $sourceDocs (Join-Path $stage 'docs') -Recurse
+    Copy-Item $sourceRoles (Join-Path $stage 'agents') -Recurse
+    foreach ($name in $skillNames) { Copy-Item (Join-Path $sourceSkills $name) (Join-Path $stage 'skills') -Recurse }
+    Merge-Config $sourceConfig $existingConfig $sourceProvider (Join-Path $stage 'config.toml')
+    Expand-Placeholders $stage $homePath
+    Assert-RoleProfiles (Join-Path $stage 'agents\ai-vibecode-superpower') $sourceManifest
 
-    $configTarget = Join-Path $codexHome 'config.toml'
-    $mergedConfig = Join-Path $stageRoot 'merged-config.toml'
-    Assert-InstallTarget -Path $configTarget -Kind File
-    Assert-SafeTomlMergeInput -Path (Join-Path $stageRoot 'template-config.toml')
-    Assert-SafeTomlMergeInput -Path $sourceModelProviderSettings
-    if (Test-Path -LiteralPath $configTarget -PathType Leaf) { Assert-SafeTomlMergeInput -Path $configTarget }
-    $managedSettings = Get-ManagedTomlSettings -Path (Join-Path $stageRoot 'template-config.toml')
-    Merge-ManagedTomlSettings -Settings $managedSettings -ExistingPath $configTarget -OutputPath $mergedConfig
-    $managedModelProviderSettings = Get-ManagedModelProviderSettings -Path $sourceModelProviderSettings
-    Merge-ManagedModelProviderSettings -Settings $managedModelProviderSettings -ExistingPath $mergedConfig -OutputPath $mergedConfig
-    Assert-SafeTomlMergeInput -Path $mergedConfig
-
-    $transactionTargets.Add([pscustomobject]@{ Name = 'AGENTS.md'; Target = (Join-Path $codexHome 'AGENTS.md'); Candidate = (Join-Path $stageRoot 'AGENTS.md'); Kind = 'File'; Operation = 'Replace'; WasPresent = $false; BackedUp = $false; InstallStarted = $false })
-    $transactionTargets.Add([pscustomobject]@{ Name = 'config.toml'; Target = $configTarget; Candidate = $mergedConfig; Kind = 'File'; Operation = 'Replace'; WasPresent = $false; BackedUp = $false; InstallStarted = $false })
-    $transactionTargets.Add([pscustomobject]@{ Name = 'docs'; Target = (Join-Path $codexHome 'docs'); Candidate = (Join-Path $stageRoot 'docs'); Kind = 'Directory'; Operation = 'Replace'; WasPresent = $false; BackedUp = $false; InstallStarted = $false })
-    $transactionTargets.Add([pscustomobject]@{ Name = (Join-Path 'agents' $managedAgentRoleDirectoryName); Target = $targetAgentRoles; Candidate = $stagedAgentRoles; Kind = 'Directory'; Operation = 'Replace'; WasPresent = $false; BackedUp = $false; InstallStarted = $false })
-    foreach ($skillName in $managedStandaloneSkillNames) {
-        $sourceSkill = Join-Path $sourceStandaloneSkills $skillName
-        $targetSkill = Join-Path $skillsTarget $skillName
-        if (Test-SamePath -Left $targetSkill -Right $sourceSkill) { throw "Destination target overlaps its source: $targetSkill" }
-        $transactionTargets.Add([pscustomobject]@{ Name = (Join-Path 'skills' $skillName); Target = $targetSkill; Candidate = (Join-Path $stagedStandaloneSkills $skillName); Kind = 'Directory'; Operation = 'Replace'; WasPresent = $false; BackedUp = $false; InstallStarted = $false })
-    }
-    foreach ($skillName in $managedPluginSkillNames) {
-        $transactionTargets.Add([pscustomobject]@{ Name = (Join-Path 'skills' $skillName); Target = (Join-Path $skillsTarget $skillName); Candidate = $null; Kind = 'Directory'; Operation = 'Remove'; WasPresent = $false; BackedUp = $false; InstallStarted = $false })
-    }
-    foreach ($legacySkillName in $legacyPluginSkillNamesToRemove) {
-        $transactionTargets.Add([pscustomobject]@{ Name = (Join-Path 'skills' $legacySkillName); Target = (Join-Path $skillsTarget $legacySkillName); Candidate = $null; Kind = 'Directory'; Operation = 'Remove'; WasPresent = $false; BackedUp = $false; InstallStarted = $false })
-    }
-
-    # Validate every destination and the backup root before any managed target is replaced or removed.
-    Assert-InstallContainer -Path $agentsTarget
-    Assert-NoReservedAgentRoleNameConflict -AgentsDirectory $agentsTarget -ManagedRoleDirectory $targetAgentRoles
-    Assert-InstallContainer -Path $skillsTarget
-    $backupRoot = Join-Path $codexHome 'backups'
-    Assert-InstallContainer -Path $backupRoot
-    foreach ($target in $transactionTargets) {
-        Assert-InstallTarget -Path $target.Target -Kind $target.Kind
-        $target.WasPresent = Test-ExistingPath -Path $target.Target
-    }
-
-    if (-not (Test-Path -LiteralPath $agentsTarget -PathType Container)) {
-        New-Item -ItemType Directory -Path $agentsTarget | Out-Null
-        $agentsParentCreated = $true
-    }
-    if (-not (Test-Path -LiteralPath $skillsTarget -PathType Container)) {
-        New-Item -ItemType Directory -Path $skillsTarget | Out-Null
-        $skillsParentCreated = $true
-    }
-    if ($transactionTargets.Where({ $_.WasPresent }).Count -gt 0) {
-        New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
-        $backupDirectory = New-UniqueDirectory -Parent $backupRoot -Prefix 'backup-'
-    }
-    foreach ($target in $transactionTargets.Where({ $_.Operation -eq 'Replace' })) {
-        if ($target.WasPresent) {
-            $backupTarget = Join-Path $backupDirectory $target.Name
+    $backupRoot = Join-Path $homePath 'backups'
+    New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
+    Assert-InstallContainer $backupRoot
+    $backup = Join-Path $backupRoot ('backup-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $backup | Out-Null
+    foreach ($target in $targets) {
+        if (Test-Path -LiteralPath $target.Target) {
+            $backupTarget = Join-Path $backup $target.Name
             New-Item -ItemType Directory -Path (Split-Path -Parent $backupTarget) -Force | Out-Null
             Move-Item -LiteralPath $target.Target -Destination $backupTarget
             $target.BackedUp = $true
         }
-        $target.InstallStarted = $true
-        if ($target.Operation -eq 'Replace') {
+        if ($null -ne $target.Candidate) {
+            $target.InstallStarted = $true
+            New-Item -ItemType Directory -Path (Split-Path -Parent $target.Target) -Force | Out-Null
             Move-Item -LiteralPath $target.Candidate -Destination $target.Target
         }
     }
-
-    # Do not leave the retired controller installed beside the v3-only plugin.
-    Remove-RetiredWorkflowPlugin -CodexHome $codexHome
-
-    # Plugin commands update config.toml. Run them only after its staged version
-    # is installed, while the transaction can still restore the previous config.
-    Install-ManagedPlugin -CodexHome $codexHome -MarketplaceRoot $scriptRoot -PluginName $managedPluginName -MarketplaceName $managedMarketplaceName -PluginSource $sourcePlugin
-    $managedPlugin = Get-ManagedPluginIdentity -PluginSource $sourcePlugin -PluginName $managedPluginName
-    if (-not (Test-ManagedPluginIsActive -CodexCli (Get-CodexCliPath) -PluginName $managedPluginName -MarketplaceName $managedMarketplaceName -PluginVersion $managedPlugin.Version)) {
-        throw "Codex did not retain the managed workflow plugin after installation"
-    }
-
-    foreach ($target in $transactionTargets.Where({ $_.Operation -eq 'Remove' })) {
-        if ($target.WasPresent) {
-            $backupTarget = Join-Path $backupDirectory $target.Name
-            New-Item -ItemType Directory -Path (Split-Path -Parent $backupTarget) -Force | Out-Null
-            Move-Item -LiteralPath $target.Target -Destination $backupTarget
-            $target.BackedUp = $true
-        }
-        $target.InstallStarted = $true
-    }
-
-    # Re-validate the installed role directory, not only the staging copy.
-    # Codex Desktop/CLI loads role profiles at process start and does not hot-reload them.
-    Assert-ManagedAgentRoleProfiles -RoleDirectory $targetAgentRoles -Contracts $managedAgentRoleContracts -ManifestPath $sourceAgentRoleManifest
-
-    Write-Host "Codex configuration installed in: $codexHome"
-    Write-Host "Managed plugin installed: $managedPluginName@$managedMarketplaceName"
-    Write-Host 'Managed standalone skills installed; obsolete global copies of plugin skills removed.'
-    if ($null -ne $backupDirectory) {
-        Write-Host "Backup directory: $backupDirectory"
-    } else {
-        Write-Host 'Backup directory: none (no managed targets existed)'
-    }
-    try {
-        Remove-OldInstallBackups -BackupRoot $backupRoot -Keep 5
-    } catch {
-        Write-Warning "Installed successfully, but old backup retention could not complete: $($_.Exception.Message)"
-    }
-    Write-Warning 'Restart Codex Desktop/CLI before starting a new workflow so newly installed agent roles are loaded.'
+    Assert-RoleProfiles (Join-Path $homePath 'agents\ai-vibecode-superpower') $sourceManifest
+    Write-Host "Codex configuration installed in: $homePath"
+    Write-Host 'Standalone skills and managed agent roles installed.'
+    Write-Host "Backup directory: $backup"
 }
 catch {
-    $rollbackErrors = Invoke-InstallRollback -Targets $transactionTargets -BackupDirectory $backupDirectory -AgentsTarget $agentsTarget -AgentsParentCreated $agentsParentCreated -SkillsTarget $skillsTarget -SkillsParentCreated $skillsParentCreated
-    foreach ($rollbackError in $rollbackErrors) {
-        Write-Warning "$rollbackError Backup directory retained: $backupDirectory"
+    $original = $_.Exception.Message
+    $rollbackErrors = [Collections.Generic.List[string]]::new()
+    foreach ($target in $targets) {
+        if (-not $target.InstallStarted) { continue }
+        try {
+            if (Test-Path -LiteralPath $target.Target) {
+                $item = Get-Item -LiteralPath $target.Target -Force
+                if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Refusing to remove reparse point during rollback: $($target.Target)" }
+                Remove-Item -LiteralPath $target.Target -Recurse -Force
+            }
+        } catch { $rollbackErrors.Add("Could not remove installed target $($target.Target): $($_.Exception.Message)") }
     }
+    foreach ($target in $targets) {
+        if (-not $target.BackedUp -or $null -eq $backup) { continue }
+        $backupTarget = Join-Path $backup $target.Name
+        if (-not (Test-Path -LiteralPath $backupTarget)) { continue }
+        try {
+            if (-not (Test-Path -LiteralPath $target.Target)) { New-Item -ItemType Directory -Path (Split-Path -Parent $target.Target) -Force | Out-Null; Move-Item -LiteralPath $backupTarget -Destination $target.Target }
+        } catch { $rollbackErrors.Add("Could not restore target $($target.Target): $($_.Exception.Message)") }
+    }
+    if ($rollbackErrors.Count -gt 0) { throw "$original; rollback incomplete: $($rollbackErrors -join '; ') Backup retained at $backup" }
     throw
 }
 finally {
-    if ($null -ne $stageRoot -and (Test-Path -LiteralPath $stageRoot -PathType Container)) {
-        Remove-Item -LiteralPath $stageRoot -Recurse -Force
-    }
-    if ($null -ne $installMutex) {
-        $installMutex.ReleaseMutex()
-        $installMutex.Dispose()
-    }
+    if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
 }

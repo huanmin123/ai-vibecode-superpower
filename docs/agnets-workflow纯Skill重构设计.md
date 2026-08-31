@@ -1,8 +1,8 @@
 # 多模型工作流纯 Skill 重构设计
 
-> 状态：设计阶段产物，已根据 2026-08-30 首次独立 Sol 审核修订
+> 状态：设计与迁移验收记录，已根据 2026-08-30 首次独立 Sol 审核修订
 >
-> 本文只确定目标设计和后续迁移契约。本任务不删除 MCP、不修改安装器、不部署，也不声称当前运行行为已经改变。
+> 本文保留设计阶段的事实基线；迁移实施与验证结果以文末实施记录为准。
 
 ## 结论
 
@@ -156,35 +156,35 @@ Skill 可以说明“需要互补取证”“需要受控执行”“需要独�
 4. 共享文件、数据或外部状态由 main/root 安排唯一执行者和串行顺序。若宿主没有可验证的路径锁，不得声称并行写入安全。
 5. 失败导致范围、风险或授权变化时回到 Plan，不能在原任务内静默扩大。
 
-## 9. 确定的删除、迁移与升级契约
+## 9. 确定的删除与全新安装契约
 
 ### 9.1 源仓库迁移
 
 1. 在根 `skills/orchestrate-model-workflow/` 建立精简 skill，只保留 `SKILL.md` 和必要的 `agents/openai.yaml`。
 2. 改写所有 12 个 role prompt：保留 role 名称、model、effort、sandbox 和核心职责；删除 `workflow_*`、固定审核 JSON、`coordinator_task_path`、claim、review digest、audit context、artifact 与固定升级链，并更新 SHA-256 manifest。
 3. 删除整个 `plugins/agnets-workflow/` 源树，包括两个 skill、references、MCP descriptor、plugin manifest、package、scripts 和旧测试。
-4. 从 marketplace 删除 `agnets-workflow` entry；没有其他 plugin 时允许移除空 marketplace 注册，但安装器必须保留对其他现存 plugin 的通用行为，不能按字符串误删无关配置。
+4. 从 marketplace 删除 `agnets-workflow` entry；安装器不修改 marketplace，也不管理其他 plugin。
 5. 更新根 `README.md`、`docs/README.md`、根 `AGENTS.md` 和 `codex-global-config/AGENTS.md` 的权威链接、触发规则、安装说明与工具调用契约，移除 controller/MCP 语义。
 
 ### 9.2 安装目标
 
-安装后的唯一工作流 skill 路径是 `$CODEX_HOME/skills/orchestrate-model-workflow`；12 个 role 继续位于受管 agent role 目录。用户配置中不得存在已启用的 `agnets-workflow@ai-vibecode-superpower-local`、旧 `workflow-controller@ai-vibecode-superpower-local` 或 `workflow-controller` MCP server。
+全新安装后的工作流 skill 路径是 `$CODEX_HOME/skills/orchestrate-model-workflow`；12 个 role 位于受管 agent role 目录。新安装器只负责这些新目标，不读取、迁移、停用或删除旧 plugin、旧 skill、旧 cache、旧 state 或旧配置；旧版由用户自行卸载。
 
 Windows 与 POSIX 安装器应：
 
 - 把 `orchestrate-model-workflow` 加入现有 standalone skill 清单；
-- 移除工作流 plugin source、marketplace、MCP descriptor、Node/SQLite 预检、MCP cache 展开/修复和 plugin 安装步骤；
-- 通过 Codex plugin remove 或等价受支持入口停用两个已知旧 plugin identity；
-- 在事务备份范围内移除精确受管的旧全局 `workflow-controller` skill 和 `agnets-workflow` plugin cache，先验证解析后的目标位于用户 Codex home 的受管 cache 路径，不递归处理未知路径；
+- 只复制仓库中声明的 standalone skills、12 个 role、全局文档和 config；
+- 不执行 Node/SQLite 预检，不注册 plugin 或 MCP，也不修改 marketplace；
+- 不调用 Codex plugin 管理命令，不接管旧 plugin registry、旧 cache 或旧 state；
 - 安装失败时恢复本次事务改动，不覆盖其他用户配置或无关 plugin。
 
 ### 9.3 旧状态边界
 
-`$CODEX_HOME/state/agnets-workflow/current` 中的 SQLite 和 artifacts 不再被新 skill 读取、迁移或接管。安装器默认保留这类历史状态，不把“停用 MCP”扩大为不可恢复的数据删除；它们只是惰性历史数据，不得再有活动服务读取。需要清理时另行取得用户授权，并对精确路径做备份或可恢复删除。
+新 skill 不读取、迁移或接管任何旧 state。安装器也不清理旧 state；旧版清理由用户自行完成。
 
 ### 9.4 版本和激活契约
 
-最终不存在新的 `agnets-workflow` plugin version、`package.json` 或 `.codex-plugin/plugin.json`。实施提交必须同时完成源树迁移、安装器变更和测试，不能发布“新 plugin 版本但旧 MCP 仍可发现”的过渡态。升级验证以以下激活状态为准：standalone skill 可发现；12 role 可加载；两个旧 plugin identity 均未启用；MCP 工具列表没有 `workflow-controller`；旧 state 即使保留也不会启动进程。
+最终只分发 standalone skill、12 个 role 和全局文档/config，不创建 `agnets-workflow` plugin、`package.json` 或 `.codex-plugin/plugin.json`。本项目只验证全新安装；旧版卸载和旧 plugin 激活状态不属于新安装器的责任边界。
 
 ## 10. 测试与验收
 
@@ -194,17 +194,16 @@ Windows 与 POSIX 安装器应：
 - 在 `skills/orchestrate-model-workflow`、`codex-global-config/AGENTS.md` 和 12 个 role prompt 中执行 allowlist 扫描：不得出现 `workflow_`、`routing_schema_version`、`claim_id`、`coordinator_task_path`、`review_history_digest`、`audit-context` 或固定审核 JSON 契约。
 - `rg` 确认源仓库不再存在 `plugins/agnets-workflow`、`.mcp.json` 注册、`workflow-controller` skill 或 Node/SQLite controller 安装检查。
 - 校验新 skill frontmatter、`agents/openai.yaml` 和安装后源/目标文件一致性。
-- 安装器测试必须验证只安装 standalone skill 与 12 role，并停用旧 plugin；不得继续断言旧 `.mcp.json` 或 controller cache 有效。
+- 安装器测试必须验证只安装 standalone skill 与 12 role，不依赖旧 plugin、MCP 或 controller cache。
 
 ### 10.2 临时 Codex home
 
-在隔离 home 分别验证全新安装和从当前 plugin 版本升级：
+在隔离 home 验证全新安装：
 
 1. skill 可发现并能触发；
 2. 12 role 逐一加载，model/effort/sandbox 与源一致；
-3. plugin list/config/MCP 工具面没有工作流 plugin 或 controller；
-4. 旧受管 cache 被事务性清理，旧 state 保留但无进程读取；
-5. 安装失败可回滚，不影响无关用户配置。
+3. 安装不要求 Codex plugin registry 或旧 MCP 可用；
+4. 安装失败可回滚，不影响安装目标之外的用户配置。
 
 ### 10.3 代表性行为
 
@@ -216,21 +215,21 @@ Windows 与 POSIX 安装器应：
 | --- | --- | --- |
 | R1：基于事实并保留 role/model 调度 | 第 1、5 节列出实际依赖和 12 role；明确 prompt 可改、身份与路由保留。 | 12 role 静态校验、manifest 和逐一加载通过。 |
 | R2：保留五阶段，删除 MCP/协议，由 Codex 调度 | 第 3、6、7、9 节确定 standalone 布局、五阶段、自主调度和删除范围。 | 无 controller 协议引用，代表性任务无需 MCP 完成。 |
-| R3：设计完整且本任务不实施 | 第 2-10 节确定目标、非目标、布局、升级、风险和验证；页首声明当前仅设计。 | 后续实现按完整契约通过静态、安装和行为验证。 |
-| R4：独立 Sol 二审并修复 blocker | 首次二审发现 role/reference 与升级契约缺口，本文已按 finding 修订。 | 新的独立升级审核无 blocker；失败则继续修订，不得交付关闭。 |
+| R3：设计与实现边界清晰 | 第 2-10 节确定目标、非目标、布局、安装、风险和验证；实现已按该边界落地。 | 仍需以安装后和代表性行为实测补齐运行证据。 |
+| R4：独立 Sol 二审并修复 blocker | 首次二审发现 role/reference 与安装契约缺口，本文已按 finding 修订。 | 新的独立安装审核无 blocker；失败则继续修订，不得交付关闭。 |
 | V1：成本与效率 | 第 10.3 节要求同类任务对比。 | 给出 token、耗时、调用数和成功率的实际对照。 |
 
 ## 11. 风险和待验证项
 
 1. 移除 controller 后程序化审计、并发锁、跨会话恢复和关闭检查会消失；自然语言交接、diff、测试和复审不能声称与其等价。
 2. 当前环境之外的命名 role、model、agent 生命周期、消息和等待语义仍未知，必须以安装后实测为准。
-3. 旧 plugin cache 清理涉及用户 Codex home，必须限定在已解析的受管路径并纳入安装器事务；旧 state 默认保留。
+3. 新安装只写入声明的受管目标；用户 home 中其他内容（包括旧版残留）不在本项目安装器范围内。
 4. 工作区已有未提交修改与后续迁移文件重叠，实施前必须重新核对并在现有内容上增量修改。
 5. 取消 plugin 后 marketplace 可能变为空；是否保留空 marketplace 基础设施只影响通用插件管理，不得影响 standalone skill 或误删其他 plugin。
 6. controller 消失可能减少 token、启动和状态维护成本，也可能增加人工协调或重复取证，必须用代表性任务测量。
 
 ## 12. 本任务边界与结论
 
-本次只新增并修订 `docs/agnets-workflow纯Skill重构设计.md`。当前仓库仍是 plugin + workflow-controller MCP；运行时、安装器、README、AGENTS、marketplace、测试和 role 均未因本文改变，也没有部署。
+本次迁移已新增根目录 standalone skill，改写安装器、README、AGENTS、marketplace 和 12 个 role，并删除 `plugins/agnets-workflow/` 源树；未部署到真实用户 Codex home，旧用户级 state 未读取或删除。
 
-目标方案已经确定为“standalone skill + 12 个去控制器协议的 role”，不再把 plugin 去向、workflow-controller skill、role prompt 清理、旧 cache/state 或激活目标留到实施时决定。只有后续实现通过静态、临时 home、代表性行为和新的独立复审，才能报告迁移完成。
+目标方案已经落地为“standalone skill + 12 个去控制器协议的 role”。静态检查、standalone 合同测试，以及使用合同夹具覆盖嵌套 home、占位符、provider 配置合并和失败回滚的隔离 PowerShell/POSIX 全新安装演练已通过；真实 Codex Desktop 激活、代表性行为对照和独立 Sol 末端复审仍是未验证项，不在本次部署范围内。
