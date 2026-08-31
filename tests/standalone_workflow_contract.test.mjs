@@ -51,13 +51,12 @@ test('standalone workflow skill has the five behavior stages and no obsolete pro
     assert.doesNotMatch(text, new RegExp(forbidden));
   }
   assert.match(text, /默认优先选择 Luna/);
-  assert.match(text, /fallback 是局部、临时且可重新评估的选择/);
+  assert.match(text, /fallback 仅对本次派发生效，是临时且可重新评估的选择/);
   assert.match(text, /恢复后优先回到 Luna/);
-  assert.match(text, /按功能、模块或文件形成互不重叠的负责区域/);
-  assert.match(text, /只能修改事先分配的最小功能、模块或文件范围/);
-  assert.match(text, /最小范围/);
-  assert.match(text, /只有确实存在独立边界时才并发/);
-  assert.match(text, /互不相关且边界清晰的工作应保持可并行/);
+  assert.match(text, /按功能、模块或文件形成非重叠区域/);
+  assert.match(text, /只能修改事先分配的最小范围/);
+  assert.match(text, /仅在存在独立边界时并发/);
+  assert.match(text, /边界清晰的工作保持并行/);
   assert.doesNotMatch(text, /路径锁|并行写入安全|所有.*串行/);
 });
 
