@@ -149,6 +149,69 @@ assert_safe_toml_merge_input() {
             }
             return !basic && !literal && array_depth == 0 && inline_depth == 0
         }
+        function hex_digit(character, position) {
+            position = index("0123456789abcdef", tolower(character))
+            return position ? position - 1 : -1
+        }
+        function safe_quoted_key(key, quote, position, character, digits, count, codepoint, decoded, digit_value) {
+            quoted_key_value = ""
+            if (length(key) < 2) return 0
+            quote = substr(key, 1, 1)
+            if (quote != "\"" && quote != "\047") return 0
+            if (substr(key, length(key), 1) != quote) return 0
+            decoded = ""
+            for (position = 2; position < length(key); position++) {
+                character = substr(key, position, 1)
+                if (character ~ /[[:cntrl:]]/) return 0
+                if (quote == "\047") {
+                    if (character == "\047") return 0
+                    decoded = decoded character
+                    continue
+                }
+                if (character == "\"") return 0
+                if (character != "\\") { decoded = decoded character; continue }
+                position++
+                if (position >= length(key)) return 0
+                character = substr(key, position, 1)
+                if (character == "u" || character == "U") {
+                    count = (character == "u") ? 4 : 8
+                    if (position + count >= length(key)) return 0
+                    codepoint = 0
+                    for (digits = 1; digits <= count; digits++) {
+                        digit_value = hex_digit(substr(key, position + digits, 1))
+                        if (digit_value < 0) return 0
+                        codepoint = codepoint * 16 + digit_value
+                    }
+                    if (codepoint > 1114111 || (codepoint >= 55296 && codepoint <= 57343)) return 0
+                    if (codepoint >= 32 && codepoint <= 126) decoded = decoded sprintf("%c", codepoint)
+                    else decoded = decoded "\001"
+                    position += count
+                } else if (character == "\"" || character == "\\") decoded = decoded character
+                else if (character == "b" || character == "t" || character == "n" || character == "f" || character == "r") decoded = decoded "\001"
+                else return 0
+            }
+            quoted_key_value = decoded
+            return 1
+        }
+        function safe_key(key) {
+            key_identity = key
+            if (key ~ /^[A-Za-z][A-Za-z0-9_-]*$/) return 1
+            if (!safe_quoted_key(key)) return 0
+            key_identity = quoted_key_value
+            return 1
+        }
+        function assignment_separator(line, position, character, basic, literal) {
+            basic = 0; literal = 0
+            for (position = 1; position <= length(line); position++) {
+                character = substr(line, position, 1)
+                if (basic) { if (character == "\\") position++; else if (character == "\"") basic = 0; continue }
+                if (literal) { if (character == "\047") literal = 0; continue }
+                if (character == "\"") basic = 1
+                else if (character == "\047") literal = 1
+                else if (character == "=") return position
+            }
+            return 0
+        }
         BEGIN { section = "root" }
         {
             line = trim($0)
@@ -156,12 +219,14 @@ assert_safe_toml_merge_input() {
             if (line ~ /"""/ || line ~ /\047\047\047/) { fail("multiline strings are not supported"); next }
             if (line ~ /^\[\[/) { if (line !~ /^\[\[[^]]+\]\][[:space:]]*(#.*)?$/) fail("ambiguous array table header"); section = "other"; next }
             if (line ~ /^\[/) { if (line !~ /^\[[^]]+\][[:space:]]*(#.*)?$/) { fail("ambiguous table header"); next }; header = line; sub(/^\[/, "", header); sub(/\][[:space:]]*(#.*)?$/, "", header); section = header; next }
-            if (index(line, "=") == 0) { fail("unrecognized line"); next }
-            key = trim(substr(line, 1, index(line, "=") - 1)); value = substr(line, index(line, "=") + 1)
+            separator = assignment_separator(line)
+            if (separator == 0) { fail("unrecognized line"); next }
+            key = trim(substr(line, 1, separator - 1)); value = substr(line, separator + 1)
             if (!closed(value)) { fail("cross-line or unclosed value"); next }
-            if (key !~ /^[A-Za-z][A-Za-z0-9_-]*$/) { fail("unsupported key syntax"); next }
-            managed = (section == "root" && (key == "model" || key == "model_reasoning_effort" || key == "sandbox_mode" || key == "approval_policy" || key == "approvals_reviewer")) || (section == "agents" && (key == "max_threads" || key == "max_depth")) || (section == "features" && key == "goals")
-            if (managed && seen[section "/" key]++) fail("repeated managed key")
+            if (!safe_key(key)) { fail("unsupported key syntax"); next }
+            managed = (section == "root" && (key_identity == "model" || key_identity == "model_reasoning_effort" || key_identity == "sandbox_mode" || key_identity == "approval_policy" || key_identity == "approvals_reviewer")) || (section == "agents" && (key_identity == "max_threads" || key_identity == "max_depth")) || (section == "features" && key_identity == "goals")
+            if (managed && key != key_identity) { fail("quoted key aliases a managed key"); next }
+            if (managed && seen[section "/" key_identity]++) fail("repeated managed key")
         }
         END { exit invalid ? 1 : 0 }
     ' "$config_path"; then

@@ -103,7 +103,7 @@ test('PowerShell installer deploys the standalone skill into an isolated nested 
   try {
     await mkdir(path.dirname(codexHome), { recursive: true });
     await mkdir(codexHome, { recursive: true });
-    await writeFile(path.join(codexHome, 'config.toml'), 'keep_me = "untouched"\nmodel = "old"\n\n[model_providers.local]\nname = "local"\nrequest_max_retries = 1\nstream_max_retries = 2\nstream_idle_timeout_ms = 3\nwebsocket_connect_timeout_ms = 4\n\n[agents]\nmax_threads = 1\nmax_depth = 1\n\n[features]\ngoals = false\n');
+    await writeFile(path.join(codexHome, 'config.toml'), 'keep_me = "untouched"\n"custom.setting" = "root quoted"\nmodel = "old"\n\n[desktop.open-in-target-preferences.perPath]\n"/Users/example/project" = "cursor"\n"part=key" = "equals"\n\n[tui.model_availability_nux]\n"gpt-5.5" = true\n\n[model_providers.local]\nname = "local"\nrequest_max_retries = 1\nstream_max_retries = 2\nstream_idle_timeout_ms = 3\nwebsocket_connect_timeout_ms = 4\n\n[agents]\nmax_threads = 1\nmax_depth = 1\n\n[features]\ngoals = false\n');
     const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', path.join(repository, 'install-codex.ps1')], {
       env: { ...process.env, CODEX_HOME: codexHome },
     });
@@ -115,7 +115,43 @@ test('PowerShell installer deploys the standalone skill into an isolated nested 
     assert.match(agents, /codex-powershell-contract-/i);
     const config = await readFile(path.join(codexHome, 'config.toml'), 'utf8');
     assert.match(config, /keep_me = "untouched"/);
+    assert.match(config, /"custom\.setting" = "root quoted"/);
+    assert.match(config, /"\/Users\/example\/project" = "cursor"/);
+    assert.match(config, /"part=key" = "equals"/);
+    assert.match(config, /"gpt-5\.5" = true/);
     assert.match(config, /\[model_providers\.local\][\s\S]*request_max_retries = 120[\s\S]*stream_max_retries = 120[\s\S]*stream_idle_timeout_ms = 300000[\s\S]*websocket_connect_timeout_ms = 15000/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('PowerShell installer rejects unsafe non-bare TOML keys', { skip: process.platform !== 'win32' }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'codex-powershell-unsafe-toml-'));
+  const codexHome = path.join(root, 'nested', '.codex');
+  try {
+    await mkdir(codexHome, { recursive: true });
+    await writeFile(path.join(codexHome, 'config.toml'), '[agents]\n"max_threads" = 1\n');
+    const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', path.join(repository, 'install-codex.ps1')], {
+      env: { ...process.env, CODEX_HOME: codexHome },
+    });
+    assert.notEqual(result.code, 0, result.stdout);
+    assert.match(result.stdout + '\n' + result.stderr, /Quoted TOML key aliases a managed key/i);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('PowerShell installer rejects non-scalar Unicode escapes in quoted TOML keys', { skip: process.platform !== 'win32' }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'codex-powershell-invalid-unicode-'));
+  const codexHome = path.join(root, 'nested', '.codex');
+  try {
+    await mkdir(codexHome, { recursive: true });
+    await writeFile(path.join(codexHome, 'config.toml'), '[custom]\n"\\uD800" = true\n');
+    const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', path.join(repository, 'install-codex.ps1')], {
+      env: { ...process.env, CODEX_HOME: codexHome },
+    });
+    assert.notEqual(result.code, 0, result.stdout);
+    assert.match(result.stdout + '\n' + result.stderr, /Unsupported TOML key syntax/i);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -128,7 +164,7 @@ test('POSIX installer deploys a fresh standalone home without legacy prerequisit
   const codexHome = path.join(root, 'missing', 'nested', '.codex');
   const relativeHome = path.relative(repository, codexHome).split(path.sep).join('/');
   try {
-    const result = await runResult(shell, ['-c', './install-codex.sh'], {
+    const result = await runResult(shell, ['install-codex.sh'], {
       cwd: repository,
       env: { ...process.env, CODEX_HOME: relativeHome },
     });
@@ -140,6 +176,68 @@ test('POSIX installer deploys a fresh standalone home without legacy prerequisit
     const config = await readFile(path.join(codexHome, 'config.toml'), 'utf8');
     assert.match(config, /^model = "gpt-5\.6-terra"/m);
     assert.match(config, /\[features\]\ngoals = true/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('POSIX installer preserves safe quoted TOML keys', async (t) => {
+  const shell = await findPosixShell();
+  if (!shell) return t.skip('POSIX shell is unavailable');
+  const root = await mkdtemp(path.join(repository, '.codex-posix-quoted-contract-'));
+  const codexHome = path.join(root, 'nested', '.codex');
+  try {
+    await mkdir(codexHome, { recursive: true });
+    await writeFile(path.join(codexHome, 'config.toml'), 'keep_me = "untouched"\n"custom.setting" = "root quoted"\nmodel = "old"\n\n[desktop.open-in-target-preferences.perPath]\n"/Users/example/project" = "cursor"\n"part=key" = "equals"\n\n[tui.model_availability_nux]\n"gpt-5.5" = true\n\n[model_providers.local]\nname = "local"\nrequest_max_retries = 1\nstream_max_retries = 2\nstream_idle_timeout_ms = 3\nwebsocket_connect_timeout_ms = 4\n\n[agents]\nmax_threads = 1\nmax_depth = 1\n\n[features]\ngoals = false\n');
+    const result = await runResult(shell, ['install-codex.sh'], {
+      cwd: repository,
+      env: { ...process.env, CODEX_HOME: codexHome },
+    });
+    assert.equal(result.code, 0, result.stdout + '\n' + result.stderr);
+    const config = await readFile(path.join(codexHome, 'config.toml'), 'utf8');
+    assert.match(config, /"custom\.setting" = "root quoted"/);
+    assert.match(config, /"\/Users\/example\/project" = "cursor"/);
+    assert.match(config, /"part=key" = "equals"/);
+    assert.match(config, /"gpt-5\.5" = true/);
+    assert.match(config, /^model = "gpt-5\.6-terra"/m);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('POSIX installer rejects unsafe non-bare TOML keys', async (t) => {
+  const shell = await findPosixShell();
+  if (!shell) return t.skip('POSIX shell is unavailable');
+  const root = await mkdtemp(path.join(repository, '.codex-posix-unsafe-toml-'));
+  const codexHome = path.join(root, 'nested', '.codex');
+  try {
+    await mkdir(codexHome, { recursive: true });
+    await writeFile(path.join(codexHome, 'config.toml'), '[agents]\n"max_threads" = 1\n');
+    const result = await runResult(shell, ['install-codex.sh'], {
+      cwd: repository,
+      env: { ...process.env, CODEX_HOME: codexHome },
+    });
+    assert.notEqual(result.code, 0, result.stdout);
+    assert.match(result.stdout + '\n' + result.stderr, /unsupported TOML syntax for safe merge: quoted key aliases a managed key/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('POSIX installer rejects non-scalar Unicode escapes in quoted TOML keys', async (t) => {
+  const shell = await findPosixShell();
+  if (!shell) return t.skip('POSIX shell is unavailable');
+  const root = await mkdtemp(path.join(repository, '.codex-posix-invalid-unicode-'));
+  const codexHome = path.join(root, 'nested', '.codex');
+  try {
+    await mkdir(codexHome, { recursive: true });
+    await writeFile(path.join(codexHome, 'config.toml'), '[custom]\n"\\uD800" = true\n');
+    const result = await runResult(shell, ['install-codex.sh'], {
+      cwd: repository,
+      env: { ...process.env, CODEX_HOME: codexHome },
+    });
+    assert.notEqual(result.code, 0, result.stdout);
+    assert.match(result.stdout + '\n' + result.stderr, /unsupported TOML syntax for safe merge: unsupported key syntax/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

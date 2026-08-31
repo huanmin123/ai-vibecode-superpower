@@ -73,21 +73,118 @@ function Assert-RoleProfiles([string]$Directory, [string]$Manifest) {
 }
 
 function Assert-SafeTomlMergeInput([string]$Path) {
+    function ConvertFrom-SafeQuotedTomlKey([string]$Key) {
+        if ($Key.Length -lt 2) { return $null }
+        $quote = $Key[0]
+        if ($quote -ne '"' -and $quote -ne "'") { return $null }
+        if ($Key[$Key.Length - 1] -ne $quote) { return $null }
+        $decoded = [Text.StringBuilder]::new()
+        for ($i = 1; $i -lt $Key.Length - 1; $i++) {
+            $character = $Key[$i]
+            if ([int][char]$character -lt 32 -or [int][char]$character -eq 127) { return $null }
+            if ($quote -eq "'") {
+                if ($character -eq "'") { return $null }
+                [void]$decoded.Append($character)
+                continue
+            }
+            if ($character -eq '"') { return $null }
+            if ($character -ne '\') { [void]$decoded.Append($character); continue }
+            $i++
+            if ($i -ge $Key.Length - 1) { return $null }
+            $character = $Key[$i]
+            if ($character -eq 'u' -or $character -eq 'U') {
+                $count = if ($character -eq 'u') { 4 } else { 8 }
+                if ($i + $count -ge $Key.Length - 1) { return $null }
+                $hex = $Key.Substring($i + 1, $count)
+                for ($digit = 1; $digit -le $count; $digit++) {
+                    if ($Key[$i + $digit] -notmatch '^[0-9A-Fa-f]$') { return $null }
+                }
+                $codePoint = [Convert]::ToUInt32($hex, 16)
+                if ($codePoint -gt 0x10FFFF -or ($codePoint -ge 0xD800 -and $codePoint -le 0xDFFF)) { return $null }
+                [void]$decoded.Append([char]::ConvertFromUtf32($codePoint))
+                $i += $count
+            } elseif ($character -eq '"' -or $character -eq '\') {
+                [void]$decoded.Append($character)
+            } elseif ($character -in @('b','t','n','f','r')) {
+                $escaped = switch ($character) { 'b' { [char]8 } 't' { "`t" } 'n' { "`n" } 'f' { [char]12 } 'r' { "`r" } }
+                [void]$decoded.Append($escaped)
+            } else {
+                return $null
+            }
+        }
+        return [pscustomobject]@{ Value = $decoded.ToString() }
+    }
+    function Find-TomlAssignmentSeparator([string]$Line) {
+        $basic = $false; $literal = $false
+        for ($i = 0; $i -lt $Line.Length; $i++) {
+            $character = $Line[$i]
+            if ($basic) {
+                if ($character -eq '\') { $i++ } elseif ($character -eq '"') { $basic = $false }
+                continue
+            }
+            if ($literal) {
+                if ($character -eq "'") { $literal = $false }
+                continue
+            }
+            if ($character -eq '"') { $basic = $true }
+            elseif ($character -eq "'") { $literal = $true }
+            elseif ($character -eq '=') { return $i }
+        }
+        return -1
+    }
+    function Test-ClosedTomlValue([string]$Value) {
+        $basic = $false; $literal = $false; $arrayDepth = 0; $inlineDepth = 0
+        for ($i = 0; $i -lt $Value.Length; $i++) {
+            $character = $Value[$i]
+            if ($basic) {
+                if ($character -eq '\') { $i++ } elseif ($character -eq '"') { $basic = $false }
+                continue
+            }
+            if ($literal) {
+                if ($character -eq "'") { $literal = $false }
+                continue
+            }
+            if ($character -eq '"') { $basic = $true }
+            elseif ($character -eq "'") { $literal = $true }
+            elseif ($character -eq '[') { $arrayDepth++ }
+            elseif ($character -eq ']') { $arrayDepth-- }
+            elseif ($character -eq '{') { $inlineDepth++ }
+            elseif ($character -eq '}') { $inlineDepth-- }
+            if ($arrayDepth -lt 0 -or $inlineDepth -lt 0) { return $false }
+        }
+        return -not $basic -and -not $literal -and $arrayDepth -eq 0 -and $inlineDepth -eq 0
+    }
     $section = 'root'; $seen = @{}
     foreach ($line in [IO.File]::ReadLines($Path)) {
         $trimmed = $line.Trim()
         if ([string]::IsNullOrWhiteSpace($trimmed) -or $trimmed.StartsWith('#')) { continue }
         if ($trimmed.Contains('"""') -or $trimmed.Contains("'''")) { throw "Unsupported multiline TOML in $Path" }
-        if ($trimmed -match '^\[\[([^\]]+)\]\]') { $section = '__array__'; continue }
-        if ($trimmed -match '^\[([^\]]+)\]') { $section = $Matches[1].Trim(); continue }
-        if ($trimmed -notmatch '=') { throw "Unsupported TOML line in ${Path}: $line" }
-        $key = $trimmed.Substring(0, $trimmed.IndexOf('=')).Trim()
-        if ($key -notmatch '^[A-Za-z][A-Za-z0-9_-]*$') { continue }
-        $managed = ($section -eq 'root' -and $key -in @('model','model_reasoning_effort','sandbox_mode','approval_policy','approvals_reviewer')) -or
-            ($section -eq 'agents' -and $key -in @('max_threads','max_depth')) -or
-            ($section -eq 'features' -and $key -eq 'goals')
+        if ($trimmed.StartsWith('[[')) {
+            if ($trimmed -notmatch '^\[\[[^\]]+\]\]\s*(#.*)?$') { throw ('Unsupported TOML array table header in ' + $Path + ': ' + $trimmed) }
+            $section = '__array__'; continue
+        }
+        if ($trimmed.StartsWith('[')) {
+            if ($trimmed -notmatch '^\[[^\]]+\]\s*(#.*)?$') { throw ('Unsupported TOML table header in ' + $Path + ': ' + $trimmed) }
+            $header = $trimmed.Substring(1, $trimmed.IndexOf(']') - 1)
+            $section = $header.Trim(); continue
+        }
+        $separator = Find-TomlAssignmentSeparator $trimmed
+        if ($separator -lt 0) { throw "Unsupported TOML line in ${Path}: $line" }
+        $key = $trimmed.Substring(0, $separator).Trim()
+        $value = $trimmed.Substring($separator + 1)
+        if (-not (Test-ClosedTomlValue $value)) { throw ('Unsupported TOML value syntax in ' + $Path + ': ' + $value) }
+        $keyIdentity = $key
+        if ($key -notmatch '^[A-Za-z][A-Za-z0-9_-]*$') {
+            $quotedKey = ConvertFrom-SafeQuotedTomlKey $key
+            if ($null -eq $quotedKey) { throw ('Unsupported TOML key syntax in ' + $Path + ': ' + $key) }
+            $keyIdentity = $quotedKey.Value
+        }
+        $managed = ($section -eq 'root' -and $keyIdentity -in @('model','model_reasoning_effort','sandbox_mode','approval_policy','approvals_reviewer')) -or
+            ($section -eq 'agents' -and $keyIdentity -in @('max_threads','max_depth')) -or
+            ($section -eq 'features' -and $keyIdentity -eq 'goals')
         if ($managed) {
-            $identity = "$section/$key"
+            if ($key -ne $keyIdentity) { throw "Quoted TOML key aliases a managed key in ${Path}: $section/$key" }
+            $identity = "$section/$keyIdentity"
             if ($seen.ContainsKey($identity)) { throw "Repeated managed TOML key in ${Path}: $identity" }
             $seen[$identity] = $true
         }
