@@ -56,11 +56,19 @@ test('standalone workflow skill has the five behavior stages and no obsolete pro
   assert.match(text, /不应只交给单个 agent 串行执行/);
   assert.match(text, /无法安全拆分、拆分成本高于收益或当前工具受限时，才使用单 agent/);
   assert.match(text, /fallback 仅对本次派发生效，是临时且可重新评估的选择/);
-  assert.match(text, /恢复后优先回到 Luna/);
+  assert.match(text, /职责、权限和验收能力等价的 fallback/);
+  assert.match(text, /无法证明等价时停止并报告/);
+  assert.match(text, /恢复后优先回到原始 role/);
+  assert.match(text, /若原始职责允许同等选择，再优先选择可用的 Luna/);
   assert.match(text, /按功能、模块或文件形成非重叠区域/);
   assert.match(text, /只能修改事先分配的最小范围/);
   assert.match(text, /共享部分按必要顺序处理/);
   assert.match(text, /边界清晰的工作保持并行/);
+  assert.match(text, /不再等待该 agent 或原样重复派发/);
+  assert.match(text, /拒绝条件已经改变时可以重新派发/);
+  assert.match(text, /拒绝不等于 role\/model 不可用，不触发 fallback/);
+  assert.match(text, /不得把写入任务派给只读 role/);
+  assert.match(text, /授权、权限、范围和责任边界均已满足时直接继续/);
   assert.doesNotMatch(text, /路径锁|并行写入安全|所有.*串行/);
   for (const role of [
     'avsp_luna_high', 'avsp_luna_xhigh', 'avsp_luna_high_executor', 'avsp_luna_xhigh_executor',
