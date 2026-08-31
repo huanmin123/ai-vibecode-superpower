@@ -15,6 +15,7 @@ const skillInterface = path.join(repository, 'skills', 'orchestrate-model-workfl
 const roles = path.join(repository, 'codex-global-config', 'agents', 'ai-vibecode-superpower');
 const manifest = path.join(repository, 'codex-global-config', 'agents', 'ai-vibecode-superpower.sha256');
 const posixInstaller = path.join(repository, 'install-codex.sh');
+const ripgrepDoc = path.join(repository, 'codex-global-config', 'docs', 'system', 'rg.md');
 const run = promisify(execFile);
 
 function normalizedHash(buffer) {
@@ -52,8 +53,9 @@ test('global behavior rules do not hard-code obsolete host tool protocols', asyn
     'functions.wait', 'functions.exec', 'collaboration.wait_agent',
     'collaboration.send_message', 'request_user_input', 'fallback_error', 'fallback_reason'
   ]) assert.doesNotMatch(text, new RegExp(obsolete.replaceAll('.', '\\.'), 'u'));
-  assert.match(text, /未知不得静默降级/);
-  assert.match(text, /异步任务被动等待优先/);
+  assert.match(text, /保持正常语义/);
+  assert.match(text, /不静默降级或改变业务行为/);
+  assert.match(text, /按影响范围验证/);
 });
 
 test('standalone workflow skill has the five behavior stages and no obsolete protocol terms', async () => {
@@ -125,6 +127,25 @@ test('POSIX installer has no compatibility or legacy-removal surface', async () 
   const text = await readFile(posixInstaller, 'utf8');
   assert.doesNotMatch(text, /get_legacy_plugin_state|remove_legacy_plugins|workflow-controller|agnets-workflow|plugin remove/);
   assert.match(text, /source_model_provider_settings=/);
+});
+
+test('direct ripgrep release examples verify SHA-256 before extraction', async () => {
+  const text = await readFile(ripgrepDoc, 'utf8');
+  const windows = text.slice(text.indexOf('## Windows'), text.indexOf('## macOS'));
+  const macos = text.slice(text.indexOf('## macOS'), text.indexOf('## Linux'));
+  const linux = text.slice(text.indexOf('## Linux'));
+  const assertBefore = (section, required, extraction) => {
+    const requiredIndex = section.indexOf(required);
+    const extractionIndex = section.indexOf(extraction);
+    assert.notEqual(requiredIndex, -1, `missing checksum step: ${required}`);
+    assert.notEqual(extractionIndex, -1, `missing extraction step: ${extraction}`);
+    assert.ok(requiredIndex < extractionIndex, `${required} must run before ${extraction}`);
+  };
+  assertBefore(windows, '$checksumAsset = "$asset.sha256"', 'Expand-Archive');
+  assertBefore(windows, 'Get-FileHash', 'Expand-Archive');
+  assertBefore(macos, 'shasum -a 256', 'tar -xzf');
+  assertBefore(linux, 'sha256sum', 'tar -xzf');
+  assertBefore(linux, 'shasum', 'tar -xzf');
 });
 
 test('PowerShell installer deploys the standalone skill into an isolated nested home', { skip: process.platform !== 'win32' }, async (t) => {
@@ -272,9 +293,59 @@ test('POSIX installer rejects non-scalar Unicode escapes in quoted TOML keys', a
   }
 });
 
+test('POSIX installer normalizes parent segments without rejecting a safe explicit target', async (t) => {
+  const shell = await findPosixShell();
+  if (!shell) return t.skip('POSIX shell is unavailable');
+  const root = await mkdtemp(path.join(repository, '.codex-posix-normalized-home-'));
+  const cwd = path.join(root, 'workspace');
+  const codexHome = path.join(cwd, 'target', '.codex');
+  try {
+    await mkdir(cwd, { recursive: true });
+    const result = await runResult(shell, [posixInstaller], {
+      cwd,
+      env: { ...process.env, CODEX_HOME: 'unused/../target/.codex' },
+    });
+    assert.equal(result.code, 0, result.stdout + '\n' + result.stderr);
+    assert.ok(result.stdout.includes(`Codex configuration installed in: ${codexHome}`), result.stdout);
+    assert.match(await readFile(path.join(codexHome, 'AGENTS.md'), 'utf8'), /保持正常语义/);
+    assert.equal(await readdir(path.join(cwd, 'unused')).catch(() => null), null);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('POSIX installer rejects paths that normalize to the filesystem root before writing', { skip: process.platform === 'win32' }, async (t) => {
+  const shell = await findPosixShell();
+  if (!shell) return t.skip('POSIX shell is unavailable');
+  const root = await mkdtemp(path.join(repository, '.codex-posix-root-alias-'));
+  const fakeBin = path.join(root, 'bin');
+  const blockedMkdir = path.join(fakeBin, 'mkdir');
+  const relativeRoot = path.relative(repository, path.parse(repository).root).split(path.sep).join('/');
+  try {
+    await mkdir(fakeBin, { recursive: true });
+    await writeFile(blockedMkdir, '#!/bin/sh\nprintf "%s\\n" "unexpected mkdir: $*" >&2\nexit 99\n', { mode: 0o755 });
+    for (const value of ['/.', '/..', '/../../', relativeRoot]) {
+      const result = await runResult(shell, [posixInstaller], {
+        cwd: repository,
+        env: { ...process.env, CODEX_HOME: value, PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ''}` },
+      });
+      assert.notEqual(result.code, 0, `installer unexpectedly accepted root alias: ${value}`);
+      assert.match(result.stdout + '\n' + result.stderr, /Refusing unsafe Codex home: \/$/m);
+      assert.doesNotMatch(result.stderr, /unexpected mkdir/);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('installer sources statically enforce target boundaries and transactional state', async () => {
   const text = await readFile(posixInstaller, 'utf8');
-  assert.ok(text.indexOf('mkdir -p "$(dirname -- "$raw_home")"') < text.indexOf('codex_home=$(CDPATH= cd --'));
+  const normalizationIndex = text.indexOf('codex_home=$(normalize_absolute_path "$raw_home")');
+  const parentCreationIndex = text.indexOf('mkdir -p "$(dirname -- "$codex_home")"');
+  assert.notEqual(normalizationIndex, -1);
+  assert.notEqual(parentCreationIndex, -1);
+  assert.ok(normalizationIndex < parentCreationIndex);
+  assert.match(text, /case "\$codex_home" in \/\|\.\) die "Refusing unsafe Codex home:/);
   assert.match(text, /script_dir=\$\(CDPATH= cd --/);
   assert.match(text, /source_model_provider_settings=/);
   assert.match(text, /sed "s\|<CODEX_HOME>\|\$escaped_home\|g;/);

@@ -38,11 +38,21 @@ $target = switch ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture.T
 $asset = "ripgrep-$version-$target.zip"
 $temp = Join-Path $env:TEMP ('ripgrep-' + [System.Guid]::NewGuid().ToString('N'))
 $archive = Join-Path $temp $asset
+$checksumAsset = "$asset.sha256"
+$checksumFile = Join-Path $temp $checksumAsset
 $expanded = Join-Path $temp 'expanded'
-New-Item -ItemType Directory -Path $temp -Force | Out-Null
 try {
+  New-Item -ItemType Directory -Path $temp -Force | Out-Null
   Invoke-WebRequest -Uri "https://github.com/BurntSushi/ripgrep/releases/download/$version/$asset" -OutFile $archive -TimeoutSec 60
-  # 所选 Release 提供上游校验和或签名时，在解压前完成验证。
+  Invoke-WebRequest -Uri "https://github.com/BurntSushi/ripgrep/releases/download/$version/$checksumAsset" -OutFile $checksumFile -TimeoutSec 60
+  $checksumLine = Get-Content -LiteralPath $checksumFile -Raw
+  $checksumPattern = '(?m)^([0-9A-Fa-f]{64})\s+\*?' + [regex]::Escape($asset) + '\s*$'
+  $expectedHash = [regex]::Match($checksumLine, $checksumPattern)
+  if (-not $expectedHash.Success) { throw "校验和文件中没有 $asset 的有效 SHA-256" }
+  $actualHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash
+  if (-not [StringComparer]::OrdinalIgnoreCase.Equals($actualHash, $expectedHash.Groups[1].Value)) {
+    throw "ripgrep 下载包 SHA-256 校验失败：期望 $($expectedHash.Groups[1].Value)，实际 $actualHash"
+  }
   Expand-Archive -LiteralPath $archive -DestinationPath $expanded -Force
   $source = Join-Path $expanded "ripgrep-$version-$target\rg.exe"
   if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw '发布包中没有预期的 rg.exe' }
@@ -87,6 +97,20 @@ asset="ripgrep-$version-$target.tar.gz"
 temp=$(mktemp -d "${TMPDIR:-/tmp}/ripgrep.XXXXXX")
 trap 'rm -rf "$temp"' EXIT
 curl -fL -o "$temp/$asset" "https://github.com/BurntSushi/ripgrep/releases/download/$version/$asset"
+checksum_asset="$asset.sha256"
+curl -fL -o "$temp/$checksum_asset" "https://github.com/BurntSushi/ripgrep/releases/download/$version/$checksum_asset"
+expected_hash=$(awk -v file="$asset" 'NF >= 2 && length($1) == 64 && $1 ~ /^[[:xdigit:]]+$/ { name=$2; sub(/^\*/, "", name); if (name == file) { print tolower($1); found=1; exit }} END { if (!found) exit 1 }' "$temp/$checksum_asset") || { printf '%s\n' "校验和文件中没有 $asset 的有效 SHA-256" >&2; exit 1; }
+case "$expected_hash" in
+  (????????????????????????????????????????????????????????????????) : ;;
+  (*) printf '%s\n' '校验和文件中的 SHA-256 格式无效' >&2; exit 1 ;;
+esac
+command -v shasum >/dev/null 2>&1 || { printf '%s\n' '未找到 shasum，无法验证 SHA-256' >&2; exit 1; }
+actual_line=$(shasum -a 256 "$temp/$asset")
+actual_hash=${actual_line%% *}
+case "$actual_hash" in
+  ("$expected_hash") : ;;
+  (*) printf '%s\n' "ripgrep 下载包 SHA-256 校验失败：期望 $expected_hash，实际 $actual_hash" >&2; exit 1 ;;
+esac
 tar -xzf "$temp/$asset" -C "$temp"
 rg_bin=$(find "$temp" -type f -name rg -perm -111 -print -quit)
 test -n "$rg_bin"
@@ -132,6 +156,26 @@ asset="ripgrep-$version-$target.tar.gz"
 temp=$(mktemp -d "${TMPDIR:-/tmp}/ripgrep.XXXXXX")
 trap 'rm -rf "$temp"' EXIT
 curl -fL -o "$temp/$asset" "https://github.com/BurntSushi/ripgrep/releases/download/$version/$asset"
+checksum_asset="$asset.sha256"
+curl -fL -o "$temp/$checksum_asset" "https://github.com/BurntSushi/ripgrep/releases/download/$version/$checksum_asset"
+expected_hash=$(awk -v file="$asset" 'NF >= 2 && length($1) == 64 && $1 ~ /^[[:xdigit:]]+$/ { name=$2; sub(/^\*/, "", name); if (name == file) { print tolower($1); found=1; exit }} END { if (!found) exit 1 }' "$temp/$checksum_asset") || { printf '%s\n' "校验和文件中没有 $asset 的有效 SHA-256" >&2; exit 1; }
+case "$expected_hash" in
+  (????????????????????????????????????????????????????????????????) : ;;
+  (*) printf '%s\n' '校验和文件中的 SHA-256 格式无效' >&2; exit 1 ;;
+esac
+if checksum_tool=$(command -v sha256sum); then
+  actual_line=$("$checksum_tool" "$temp/$asset")
+elif checksum_tool=$(command -v shasum); then
+  actual_line=$("$checksum_tool" -a 256 "$temp/$asset")
+else
+  printf '%s\n' '未找到 sha256sum 或 shasum，无法验证 SHA-256' >&2
+  exit 1
+fi
+actual_hash=${actual_line%% *}
+case "$actual_hash" in
+  ("$expected_hash") : ;;
+  (*) printf '%s\n' "ripgrep 下载包 SHA-256 校验失败：期望 $expected_hash，实际 $actual_hash" >&2; exit 1 ;;
+esac
 tar -xzf "$temp/$asset" -C "$temp"
 rg_bin=$(find "$temp" -type f -name rg -perm -111 -print -quit)
 test -n "$rg_bin"
@@ -139,6 +183,7 @@ mkdir -p "$HOME/.local/bin"
 install -m 0755 "$rg_bin" "$HOME/.local/bin/rg"
 export PATH="$HOME/.local/bin:$PATH"
 rg --version
+command -v rg
 ```
 
 macOS/Linux 的用户级安装后若新会话找不到 `rg`，将 `export PATH="$HOME/.local/bin:$PATH"` 加入实际登录 Shell 的配置文件一次。

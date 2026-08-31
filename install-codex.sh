@@ -65,19 +65,47 @@ assert_directory_container() {
     fi
 }
 
+normalize_absolute_path() {
+    printf '%s\n' "$1" | awk -F/ '
+        $0 !~ /^\// { exit 1 }
+        {
+            depth = 0
+            for (i = 1; i <= NF; i++) {
+                part = $i
+                if (part == "" || part == ".") continue
+                if (part == "..") {
+                    if (depth > 0) depth--
+                    continue
+                }
+                components[++depth] = part
+            }
+            if (depth == 0) {
+                print "/"
+                next
+            }
+            normalized = ""
+            for (i = 1; i <= depth; i++) normalized = normalized "/" components[i]
+            print normalized
+        }
+    '
+}
+
 : "$HOME"
 raw_home=$HOME/.codex
 if printenv CODEX_HOME >/dev/null 2>&1; then raw_home=$(printenv CODEX_HOME); fi
 case "$raw_home" in
+    ''|.) die "Refusing unsafe Codex home: $raw_home" ;;
     /*) ;;
     *) raw_home=$(CDPATH= cd -- . && printf '%s/%s' "$PWD" "$raw_home") ;;
 esac
-case "$raw_home" in /|.) die "Refusing unsafe Codex home: $raw_home" ;; esac
 assert_path_chain "$raw_home" || die "Unsafe Codex home path: $raw_home"
-mkdir -p "$(dirname -- "$raw_home")"
-assert_path_chain "$raw_home" || die "Unsafe Codex home path: $raw_home"
-codex_home=$(CDPATH= cd -- "$(dirname -- "$raw_home")" && printf '%s/%s' "$(pwd -P)" "$(basename -- "$raw_home")")
+codex_home=$(normalize_absolute_path "$raw_home") || die "Could not normalize Codex home: $raw_home"
 case "$codex_home" in /|.) die "Refusing unsafe Codex home: $codex_home" ;; esac
+assert_path_chain "$codex_home" || die "Unsafe Codex home path: $codex_home"
+mkdir -p "$(dirname -- "$codex_home")"
+assert_path_chain "$codex_home" || die "Unsafe Codex home path: $codex_home"
+home_parent=$(CDPATH= cd -- "$(dirname -- "$codex_home")" && pwd -P) || die "Could not resolve Codex home parent: $codex_home"
+codex_home=$home_parent/$(basename -- "$codex_home")
 mkdir -p "$codex_home"
 assert_path_chain "$codex_home" || die "Unsafe Codex home path: $codex_home"
 
