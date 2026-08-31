@@ -9,6 +9,7 @@ import test from 'node:test';
 import { promisify } from 'node:util';
 
 const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const globalAgents = path.join(repository, 'codex-global-config', 'AGENTS.md');
 const skill = path.join(repository, 'skills', 'orchestrate-model-workflow', 'SKILL.md');
 const skillInterface = path.join(repository, 'skills', 'orchestrate-model-workflow', 'agents', 'openai.yaml');
 const roles = path.join(repository, 'codex-global-config', 'agents', 'ai-vibecode-superpower');
@@ -43,6 +44,17 @@ async function findPosixShell() {
 function posixHome(codexHome) {
   return path.relative(repository, codexHome).split(path.sep).join('/');
 }
+
+test('global behavior rules do not hard-code obsolete host tool protocols', async () => {
+  const text = await readFile(globalAgents, 'utf8');
+  assert.doesNotMatch(text, /^## 工具调用契约$/m);
+  for (const obsolete of [
+    'functions.wait', 'functions.exec', 'collaboration.wait_agent',
+    'collaboration.send_message', 'request_user_input', 'fallback_error', 'fallback_reason'
+  ]) assert.doesNotMatch(text, new RegExp(obsolete.replaceAll('.', '\\.'), 'u'));
+  assert.match(text, /未知不得静默降级/);
+  assert.match(text, /异步任务被动等待优先/);
+});
 
 test('standalone workflow skill has the five behavior stages and no obsolete protocol terms', async () => {
   const text = await readFile(skill, 'utf8');
