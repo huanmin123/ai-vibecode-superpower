@@ -1,12 +1,14 @@
 # ripgrep 安装
 
-本文件按 Windows、macOS 和 Linux 分节。仅当当前平台的 `rg` 可用性检查失败时读取对应章节：Windows 使用 `Get-Command rg`，macOS/Linux 使用 `command -v rg`；安装完成后必须重新运行 `rg --version` 并确认实际解析到的路径。
+本文件按 Windows、macOS 和 Linux 分节。仅当当前平台已确认 `rg` 缺失或不可执行时读取对应章节：Windows 使用 `Get-Command rg.exe -CommandType Application` 确认可执行文件，macOS/Linux 使用 `command -v rg`。命令路径存在但版本或实际执行报错时，先保留原始错误并诊断，不直接安装另一个副本。安装完成后必须重新运行 `rg --version` 并确认实际解析到的路径。
 
-优先使用当前系统已有的包管理器。直接下载 Release 时，核对目标架构；上游提供可信摘要或签名时必须验证，未提供时记录 HTTPS 下载的残余完整性风险。不要从第三方镜像或未经核对的转发链接安装。
+优先使用当前系统已有的包管理器。直接下载 Release 时，核对目标架构；上游同时提供可用的可信摘要或签名时必须在解压前验证，未提供时记录 HTTPS 下载的残余完整性风险。不要从第三方镜像或未经核对的转发链接安装。
+
+安装会修改系统包、用户目录或持久化 `PATH`；未获得对应的状态变更授权时，只报告缺失和影响，不执行安装。
 
 ## Windows
 
-优先使用已存在的包管理器，只执行第一个匹配分支：
+确认 `rg` 缺失且需要安装时，优先使用已存在的包管理器，只执行第一个匹配分支：
 
 ```powershell
 $ErrorActionPreference = 'Stop'
@@ -17,12 +19,12 @@ if (Get-Command winget.exe -ErrorAction SilentlyContinue) {
 } elseif (Get-Command choco.exe -ErrorAction SilentlyContinue) {
   & choco.exe install ripgrep -y
 } else {
-  throw '未找到包管理器，使用下方官方 Release 流程'
+  throw '未找到包管理器；在获准安装时读取下方官方 Release 流程'
 }
 if ($LASTEXITCODE -ne 0) { throw "ripgrep 安装失败：$LASTEXITCODE" }
 ```
 
-没有包管理器时安装官方 Release 到用户目录：
+没有包管理器且已获准安装时，将官方 Release 安装到用户目录：
 
 ```powershell
 $ErrorActionPreference = 'Stop'
@@ -40,7 +42,7 @@ $expanded = Join-Path $temp 'expanded'
 New-Item -ItemType Directory -Path $temp -Force | Out-Null
 try {
   Invoke-WebRequest -Uri "https://github.com/BurntSushi/ripgrep/releases/download/$version/$asset" -OutFile $archive -TimeoutSec 60
-  # Verify an upstream checksum or signature here when the selected Release publishes one.
+  # 所选 Release 提供上游校验和或签名时，在解压前完成验证。
   Expand-Archive -LiteralPath $archive -DestinationPath $expanded -Force
   $source = Join-Path $expanded "ripgrep-$version-$target\rg.exe"
   if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw '发布包中没有预期的 rg.exe' }
@@ -63,7 +65,7 @@ try {
 
 ## macOS
 
-有 Homebrew 时：
+有 Homebrew 且已获准安装时：
 
 ```sh
 brew install ripgrep
@@ -71,7 +73,7 @@ rg --version
 command -v rg
 ```
 
-没有 Homebrew 时安装官方 Release 到用户目录：
+没有 Homebrew 且已获准安装时，将官方 Release 安装到用户目录：
 
 ```sh
 set -eu
@@ -97,7 +99,7 @@ command -v rg
 
 ## Linux
 
-根据 `/etc/os-release` 只执行一组：
+根据 `/etc/os-release` 且已获准安装时只执行一组：
 
 ```sh
 # Debian / Ubuntu
@@ -116,7 +118,7 @@ apk add ripgrep
 sudo zypper --non-interactive install ripgrep
 ```
 
-没有 root/sudo 或没有匹配包管理器时安装官方静态 Release：
+没有 root/sudo 或没有匹配包管理器且已获准安装时，安装官方静态 Release：
 
 ```sh
 set -eu

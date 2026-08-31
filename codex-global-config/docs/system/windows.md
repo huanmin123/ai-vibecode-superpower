@@ -2,12 +2,12 @@
 
 ## 默认环境
 
-- 本机命令使用 64 位 PowerShell 7 (`pwsh.exe`)；`powershell.exe` 仅表示 Windows PowerShell 5.1。
+- 本机命令优先使用可用的 PowerShell 7 (`pwsh.exe`)；只有任务依赖位数时再核对 64 位。`powershell.exe` 表示 Windows PowerShell 5.1，仅在兼容性有明确依据时使用，不把两者静默视为等价替代。
 - Codex 配置中的 `desktop.integratedTerminalShell = "powershell"` 是产品枚举值，不改成 `pwsh`。
-- 每条命令设置工作目录，不依赖 Profile、alias、虚拟环境激活或上一条命令的状态。
-- 终端调用的 `workdir` 必须是已存在的绝对目录，先用 `Test-Path -LiteralPath <目录> -PathType Container` 或 `Resolve-Path -LiteralPath <目录>` 核实；文件路径、文档路径和命令文本都不能作为 `workdir`。
-- `workdir` 是终端工具的调用参数，不属于 PowerShell 命令。读取全局文档时保持已验证的工作目录不变，以 `Get-Content -LiteralPath <文档绝对路径> -Raw` 读取文件；不要把多个前置文档读取与后续操作合并到同一终端调用。
-- 出现 `Io`、退出码 `-1` 或 Windows 错误 `267`（目录名称无效）而命令未开始执行时，先重新核对工具调用的 `workdir`；除非有后续证据，不得断言是文档路径、工具解析或远端系统的原因。
+- 依赖仓库或目标文件的命令设置明确工作目录；纯版本查询、工具定位或系统诊断可沿用当前目录。不依赖 Profile、alias、虚拟环境激活或上一条命令的状态。
+- 终端调用的 `workdir` 必须是已存在的绝对目录；仅在命令需要指定目录或工具返回目录无效时，用 `Test-Path -LiteralPath <目录> -PathType Container` 或 `Resolve-Path -LiteralPath <目录>` 核实。文件路径、文档路径和命令文本都不能作为 `workdir`。
+- `workdir` 是终端工具的调用参数，不属于 PowerShell 命令。读取全局文档时使用已验证的工作目录和 `Get-Content -LiteralPath <文档绝对路径> -Raw`；涉及写入或外部操作时，将前置读取与操作分开，除非命令本身需要前置输出。
+- 出现 `Io`、退出码 `-1` 或 Windows 错误 `267`（目录名称无效）而命令未开始执行时，先重新核对工具调用的 `workdir`；只有后续证据支持时，才能断言是文档路径、工具解析或远端系统的原因。
 - 同名命令可能来自 PowerShell Alias、脚本、Windows 工具或多套第三方工具；`sort`、`where`、`tee`、`cat`、`rm` 等名称尤其容易遮蔽。行为或版本受来源影响时使用 `Get-Command <name> -All`，再调用确认后的完整路径、`.exe` 或 `.cmd`，不只按命令名猜测。
 
 任务确实受版本或工具来源影响时检查一次：
@@ -15,7 +15,7 @@
 ```powershell
 $PSVersionTable.PSVersion
 [Environment]::Is64BitProcess
-Get-Command pwsh.exe, rg, git.exe -All -ErrorAction SilentlyContinue
+Get-Command pwsh.exe, rg.exe, git.exe -All -ErrorAction SilentlyContinue
 ```
 
 ## PowerShell 写法
@@ -33,6 +33,7 @@ Get-Command pwsh.exe, rg, git.exe -All -ErrorAction SilentlyContinue
 - 命令对象和可执行路径字符串不得混用。`Get-Command` 结果命名为 `$rgCommand`、`$sshCommand`，从其读取一次 `.Source` 后保存为 `$rgPath`、`$sshPath`；路径字符串用 `& $rgPath` 直接调用，不再访问 `$rgPath.Source`。调用前不确定类型时检查 `$value.GetType().FullName`。
 
 ```powershell
+# 先为当前任务设置实际仓库路径；$repo 只是占位符。
 $git = (Get-Command git.exe -ErrorAction Stop | Select-Object -First 1).Source
 $gitArgs = @('-C', $repo, 'status', '--short')
 & $git @gitArgs
@@ -66,18 +67,19 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P) || exit
 ## `rg`
 
 ```powershell
-$rgCommand = Get-Command rg -ErrorAction SilentlyContinue | Select-Object -First 1
-if (-not $rgCommand) { throw '未找到 rg，执行下方安装流程' }
+$rgCommand = Get-Command rg.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+if (-not $rgCommand) { throw '未找到 rg；仅在获准安装时读取下方流程' }
 $rgPath = $rgCommand.Source
+if (-not (Test-Path -LiteralPath $rgPath -PathType Leaf)) { throw "rg 路径不可执行：$rgPath" }
 & $rgPath --version
 if ($LASTEXITCODE -ne 0) { throw "rg 验证失败：$LASTEXITCODE" }
 ```
 
-缺失时立即按 [ripgrep 安装](rg.md#windows) 执行一个匹配流程，安装后重新验证。
+确认缺失后按 [ripgrep 安装](rg.md#windows) 选择一个匹配流程，安装后重新验证；不要因为版本输出异常就静默覆盖现有安装。
 
 ## 进程与端口
 
-端口占用先查 PID 和命令行；只停止本任务启动的进程：
+端口占用先查 PID 和命令行；以下 `$port` 是当前任务的占位符。只停止本任务启动且已核对命令行的进程：
 
 ```powershell
 $listeners = Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction Stop
@@ -87,13 +89,13 @@ $processes = foreach ($processId in @($listeners.OwningProcess | Sort-Object -Un
 $processes | Select-Object ProcessId, ExecutablePath, CommandLine
 ```
 
-后台服务保存 PID、完整启动命令和日志，并验证监听端口或健康检查。端口被其他任务占用时换端口，不批量结束同名进程。
+查询无输出只代表当前权限下未发现，不代表全局不存在；权限错误或字段缺失必须保留为未知。后台服务保存 PID、完整启动命令和日志，并验证监听端口或健康检查。端口被其他任务占用时先报告占用者及证据；只有项目明确支持动态端口或用户明确允许时才更换端口，不批量结束同名进程。
 
 ## 常用工具链
 
-- Git：先运行 `git status --short`；用户已有修改不覆盖，不自动 reset/clean/restore/stash。
+- Git：需要检查仓库状态时运行 `git status --short`；用户已有修改不覆盖，不自动 reset/clean/restore/stash。
 - Node.js：按锁文件选择 npm/pnpm/Yarn/Bun；调用 Windows shim 时使用 `npm.cmd`、`npx.cmd`、`pnpm.cmd`、`yarn.cmd`。
 - Python：优先 `.venv\Scripts\python.exe`，否则使用项目指定入口或 `py.exe -3`；始终通过同一解释器运行 `-m pip`、`-m pytest`。
-- Java：优先 `gradlew.bat`、`mvnw.cmd`；Docker 先用 `docker version` 判断 daemon 是否可用。
+- Java：优先 `gradlew.bat`、`mvnw.cmd`；需要 Docker 时再用 `docker version` 判断 daemon 是否可用。
 
 验证从最贴近的项目命令开始，再按风险扩大到格式、类型、测试和构建。其他 Shell 或 WSL 的成功不能替代 Windows 本地结果。
