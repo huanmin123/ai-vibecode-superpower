@@ -23,6 +23,9 @@ description: "在复杂开发、实现、修复、架构设计、Bug 诊断、�
 - `avsp_luna_xhigh_executor`：已定方案但需要更深局部理解的受控写入。
 - `avsp_terra_high`：受保护写入、共享状态、风险分流、执行监管和集成。
 - `avsp_terra_xhigh`：证据充分、范围有界的定案或常规复审，只读。
+- `avsp_terra_xhigh_readonly`：Sol 只读 role 或模型本次确认不可用时，替代同一复审职责，只读并说明独立性下降。
+- `avsp_terra_low_readonly`：Luna/high 本次确认不可用时，替代同一只读取证或预审职责。
+- `avsp_terra_medium_readonly`：Luna/xhigh 本次确认不可用时，替代同一只读取证或预审职责。
 - `avsp_sol_high`：多约束、跨域或高复杂度的独立复审，只读。
 - `avsp_sol_xhigh`：证据冲突、根因未证实、缺少可靠 oracle 或需受约束重设计，只读。
 - `avsp_sol_max`：前级 Sol 有效失败修复后的最高强度独立复审，只读。
@@ -43,12 +46,12 @@ main/root 基于证据明确目标、范围、非目标、授权、验收、验�
 
 ## Critique
 
-完成会改变被审对象的验证后，由未参与写入的只读 role 独立核对目标、范围、diff/产物、测试、回归、需求覆盖和未验证项。常规定案可用 Terra/xhigh；复杂或高不确定性使用 Sol。发现 blocker 时回到 Plan/Work 精确修复，再选择新的独立复审者；不得把失败包装为通过。
+完成实施及相关验证后，由未参与写入的只读 role 独立核对目标、范围、diff/产物、测试、回归、需求覆盖和未验证项。常规定案可用 Terra/xhigh；复杂或高不确定性使用 Sol。发现 blocker 时回到 Plan/Work 精确修复，再选择新的独立复审者；不得把失败包装为通过。
 
 ## Promote
 
 只有验收满足、独立复审无 blocker、当前 diff 与验证仍匹配且没有必需工作时才交付。Promote 不授权安装、发布、部署、推送或其他外部状态变更。
 
-## 错误、恢复和并发
+## 错误与恢复
 
 保留原始 provider/宿主错误、已尝试操作、影响范围和缺失条件。中断后重新盘点原生 agent 状态、工作区 diff 和输出；无法证明旧执行者已停止时，不得接管其范围。风险、授权或范围改变时回到 Plan，不得静默扩大。

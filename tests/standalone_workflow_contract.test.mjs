@@ -58,6 +58,12 @@ test('standalone workflow skill has the five behavior stages and no obsolete pro
   assert.match(text, /仅在存在独立边界时并发/);
   assert.match(text, /边界清晰的工作保持并行/);
   assert.doesNotMatch(text, /路径锁|并行写入安全|所有.*串行/);
+  for (const role of [
+    'avsp_luna_high', 'avsp_luna_xhigh', 'avsp_luna_high_executor', 'avsp_luna_xhigh_executor',
+    'avsp_terra_high', 'avsp_terra_xhigh', 'avsp_terra_xhigh_readonly',
+    'avsp_terra_low_readonly', 'avsp_terra_medium_readonly',
+    'avsp_sol_high', 'avsp_sol_xhigh', 'avsp_sol_max'
+  ]) assert.match(text, new RegExp(role));
 });
 
 test('all twelve managed roles remain hash-addressed with model routing fields', async () => {
