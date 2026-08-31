@@ -1,5 +1,4 @@
 interface:
   display_name: "多模型开发工作流"
-  short_description: "按证据和执行风险选择 Luna、Terra 与 Sol"
-  default_prompt: "使用 $orchestrate-model-workflow 组织 Explore、Plan、Work、Critique、Promote；默认优先选择可用的 Luna，仅在本次确认不可用时临时选择对应替代，后续重新探测，并在交付前独立复审。"
-
+  short_description: "并行优先地编排 Luna、Terra 与 Sol"
+  default_prompt: "使用 $orchestrate-model-workflow 组织复杂任务；可拆任务优先多 agent 并行，默认优先选择可用的 Luna，仅在本次确认不可用时临时选择职责等价的替代，后续重新探测，并在交付前独立复审。"

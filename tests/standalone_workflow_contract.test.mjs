@@ -10,6 +10,7 @@ import { promisify } from 'node:util';
 
 const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const skill = path.join(repository, 'skills', 'orchestrate-model-workflow', 'SKILL.md');
+const skillInterface = path.join(repository, 'skills', 'orchestrate-model-workflow', 'agents', 'openai.yaml');
 const roles = path.join(repository, 'codex-global-config', 'agents', 'ai-vibecode-superpower');
 const manifest = path.join(repository, 'codex-global-config', 'agents', 'ai-vibecode-superpower.sha256');
 const posixInstaller = path.join(repository, 'install-codex.sh');
@@ -51,11 +52,14 @@ test('standalone workflow skill has the five behavior stages and no obsolete pro
     assert.doesNotMatch(text, new RegExp(forbidden));
   }
   assert.match(text, /默认优先选择 Luna/);
+  assert.match(text, /默认并行优先/);
+  assert.match(text, /不应只交给单个 agent 串行执行/);
+  assert.match(text, /无法安全拆分、拆分成本高于收益或当前工具受限时，才使用单 agent/);
   assert.match(text, /fallback 仅对本次派发生效，是临时且可重新评估的选择/);
   assert.match(text, /恢复后优先回到 Luna/);
   assert.match(text, /按功能、模块或文件形成非重叠区域/);
   assert.match(text, /只能修改事先分配的最小范围/);
-  assert.match(text, /仅在存在独立边界时并发/);
+  assert.match(text, /共享部分按必要顺序处理/);
   assert.match(text, /边界清晰的工作保持并行/);
   assert.doesNotMatch(text, /路径锁|并行写入安全|所有.*串行/);
   for (const role of [
@@ -64,6 +68,8 @@ test('standalone workflow skill has the five behavior stages and no obsolete pro
     'avsp_terra_low_readonly', 'avsp_terra_medium_readonly',
     'avsp_sol_high', 'avsp_sol_xhigh', 'avsp_sol_max'
   ]) assert.match(text, new RegExp(role));
+  const interfaceText = await readFile(skillInterface, 'utf8');
+  assert.match(interfaceText, /可拆任务优先多 agent 并行/);
 });
 
 test('all twelve managed roles remain hash-addressed with model routing fields', async () => {
