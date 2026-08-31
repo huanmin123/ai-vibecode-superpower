@@ -40,9 +40,13 @@ async function findPosixShell() {
   return null;
 }
 
+function posixHome(codexHome) {
+  return path.relative(repository, codexHome).split(path.sep).join('/');
+}
+
 test('standalone workflow skill has the five behavior stages and no obsolete protocol terms', async () => {
   const text = await readFile(skill, 'utf8');
-  assert.match(text, /^---\nname: orchestrate-model-workflow\n/);
+  assert.match(text, /^---\r?\nname: orchestrate-model-workflow\r?\n/);
   for (const stage of ['Explore', 'Plan', 'Work', 'Critique', 'Promote']) assert.match(text, new RegExp(`\\b${stage}\\b`));
   for (const forbidden of [
     'workflow_controller', 'workflow_', 'claim_id', 'routing_schema_version',
@@ -176,11 +180,10 @@ test('POSIX installer deploys a fresh standalone home without legacy prerequisit
   if (!shell) return t.skip('POSIX shell is unavailable');
   const root = await mkdtemp(path.join(repository, '.codex-posix-contract-'));
   const codexHome = path.join(root, 'missing', 'nested', '.codex');
-  const relativeHome = path.relative(repository, codexHome).split(path.sep).join('/');
   try {
     const result = await runResult(shell, ['install-codex.sh'], {
       cwd: repository,
-      env: { ...process.env, CODEX_HOME: relativeHome },
+      env: { ...process.env, CODEX_HOME: posixHome(codexHome) },
     });
     assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
     const installed = await readFile(path.join(codexHome, 'skills', 'orchestrate-model-workflow', 'SKILL.md'), 'utf8');
@@ -205,7 +208,7 @@ test('POSIX installer preserves safe quoted TOML keys', async (t) => {
     await writeFile(path.join(codexHome, 'config.toml'), 'keep_me = "untouched"\n"custom.setting" = "root quoted"\nmodel = "old"\n\n[desktop.open-in-target-preferences.perPath]\n"/Users/example/project" = "cursor"\n"part=key" = "equals"\n\n[tui.model_availability_nux]\n"gpt-5.5" = true\n\n[model_providers.local]\nname = "local"\nrequest_max_retries = 1\nstream_max_retries = 2\nstream_idle_timeout_ms = 3\nwebsocket_connect_timeout_ms = 4\n\n[agents]\nmax_threads = 1\nmax_depth = 1\n\n[features]\ngoals = false\n');
     const result = await runResult(shell, ['install-codex.sh'], {
       cwd: repository,
-      env: { ...process.env, CODEX_HOME: codexHome },
+      env: { ...process.env, CODEX_HOME: posixHome(codexHome) },
     });
     assert.equal(result.code, 0, result.stdout + '\n' + result.stderr);
     const config = await readFile(path.join(codexHome, 'config.toml'), 'utf8');
@@ -229,7 +232,7 @@ test('POSIX installer rejects unsafe non-bare TOML keys', async (t) => {
     await writeFile(path.join(codexHome, 'config.toml'), '[agents]\n"max_threads" = 1\n');
     const result = await runResult(shell, ['install-codex.sh'], {
       cwd: repository,
-      env: { ...process.env, CODEX_HOME: codexHome },
+      env: { ...process.env, CODEX_HOME: posixHome(codexHome) },
     });
     assert.notEqual(result.code, 0, result.stdout);
     assert.match(result.stdout + '\n' + result.stderr, /unsupported TOML syntax for safe merge: quoted key aliases a managed key/);
@@ -248,7 +251,7 @@ test('POSIX installer rejects non-scalar Unicode escapes in quoted TOML keys', a
     await writeFile(path.join(codexHome, 'config.toml'), '[custom]\n"\\uD800" = true\n');
     const result = await runResult(shell, ['install-codex.sh'], {
       cwd: repository,
-      env: { ...process.env, CODEX_HOME: codexHome },
+      env: { ...process.env, CODEX_HOME: posixHome(codexHome) },
     });
     assert.notEqual(result.code, 0, result.stdout);
     assert.match(result.stdout + '\n' + result.stderr, /unsupported TOML syntax for safe merge: unsupported key syntax/);
