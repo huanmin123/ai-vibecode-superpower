@@ -80,6 +80,7 @@ test('standalone workflow skill has the five behavior stages and no obsolete pro
     assert.doesNotMatch(text, new RegExp(forbidden));
   }
   assert.match(text, /默认优先选择 Luna/);
+  assert.match(text, /风险与回滚、验收、验证、停止条件/);
   assert.match(text, /默认并行优先/);
   assert.match(text, /不应只交给单个 agent 串行执行/);
   assert.match(text, /无法安全拆分、拆分成本高于收益或当前工具受限时，才使用单 agent/);
@@ -138,6 +139,8 @@ test('zcode workflow skill variant keeps the stages and drops codex-only mechani
   assert.match(text, /默认并行优先/);
   assert.match(text, /fallback 仅对本次派发生效，是临时且可重新评估的选择/);
   assert.match(text, /不得把写入任务派给只读角色/);
+  assert.match(text, /风险与回滚、验收、验证、停止条件/);
+  assert.match(text, /等价替代只有向上替补/);
   for (const forbidden of [
     'CODEX_HOME', 'coordinator_thread_id', 'gpt-5\\.6', 'sandbox_mode', 'avsp_'
   ]) assert.doesNotMatch(text, new RegExp(forbidden));
@@ -174,6 +177,8 @@ test('all five managed zcode agents stay hash-addressed with model routing front
     assert.match(frontmatter, new RegExp(`^thoughtLevel: ${expected.thoughtLevel}$`, 'm'), `thoughtLevel allocation mismatch: ${file}`);
     assert.match(frontmatter, new RegExp(`^name: ${path.basename(file, '.md').replace(/\./g, '\\.')}$`, 'm'));
   }
+  const lowBody = await readFile(path.join(zcodeRoles, 'glm_5.3_flash_low.md'), 'utf8');
+  assert.match(lowBody, /建议升级到 `glm_5\.3_flash_high` 取证/);
 });
 
 test('zcode sources do not leak codex placeholders or model ids', async () => {
