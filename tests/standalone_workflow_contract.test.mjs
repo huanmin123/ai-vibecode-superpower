@@ -10,12 +10,22 @@ import { promisify } from 'node:util';
 
 const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const globalAgents = path.join(repository, 'codex-global-config', 'AGENTS.md');
-const skill = path.join(repository, 'skills', 'orchestrate-model-workflow', 'SKILL.md');
-const skillInterface = path.join(repository, 'skills', 'orchestrate-model-workflow', 'agents', 'openai.yaml');
+const skill = path.join(repository, 'codex-global-config', 'skills', 'orchestrate-model-workflow', 'SKILL.md');
+const skillInterface = path.join(repository, 'codex-global-config', 'skills', 'orchestrate-model-workflow', 'agents', 'openai.yaml');
 const roles = path.join(repository, 'codex-global-config', 'agents', 'ai-vibecode-superpower');
 const manifest = path.join(repository, 'codex-global-config', 'agents', 'ai-vibecode-superpower.sha256');
-const posixInstaller = path.join(repository, 'install-codex.sh');
-const ripgrepDoc = path.join(repository, 'codex-global-config', 'docs', 'system', 'rg.md');
+const posixInstaller = path.join(repository, 'install.sh');
+const powerInstaller = path.join(repository, 'install.ps1');
+const ripgrepDoc = path.join(repository, 'shared', 'docs', 'system', 'rg.md');
+const zcodeAgents = path.join(repository, 'zcode-global-config', 'AGENTS.md');
+const zcodeDocsReadme = path.join(repository, 'zcode-global-config', 'docs', 'README.md');
+const zcodeSkill = path.join(repository, 'zcode-global-config', 'skills', 'orchestrate-model-workflow', 'SKILL.md');
+const zcodeRoles = path.join(repository, 'zcode-global-config', 'agents', 'ai-vibecode-superpower');
+const zcodeManifest = path.join(repository, 'zcode-global-config', 'agents', 'ai-vibecode-superpower.sha256');
+const zcodePosixInstaller = path.join(repository, 'install.sh');
+const zcodeRoleNames = [
+  'glm_5.3_flash_low', 'glm_5.3_flash_high', 'glm_5.3_flash_max', 'glm_5.3_high', 'glm_5.3_max'
+];
 const run = promisify(execFile);
 
 function normalizedHash(buffer) {
@@ -89,10 +99,10 @@ test('standalone workflow skill has the five behavior stages and no obsolete pro
   assert.match(text, /授权、权限、范围和责任边界均已满足时直接继续/);
   assert.doesNotMatch(text, /路径锁|并行写入安全|所有.*串行/);
   for (const role of [
-    'avsp_luna_high', 'avsp_luna_xhigh', 'avsp_luna_high_executor', 'avsp_luna_xhigh_executor',
-    'avsp_terra_high', 'avsp_terra_xhigh', 'avsp_terra_xhigh_readonly',
-    'avsp_terra_low_readonly', 'avsp_terra_medium_readonly',
-    'avsp_sol_high', 'avsp_sol_xhigh', 'avsp_sol_max'
+    'gpt_5.6_luna_high', 'gpt_5.6_luna_xhigh', 'gpt_5.6_luna_high_executor', 'gpt_5.6_luna_xhigh_executor',
+    'gpt_5.6_terra_high', 'gpt_5.6_terra_xhigh', 'gpt_5.6_terra_xhigh_readonly',
+    'gpt_5.6_terra_low_readonly', 'gpt_5.6_terra_medium_readonly',
+    'gpt_5.6_sol_high', 'gpt_5.6_sol_xhigh', 'gpt_5.6_sol_max'
   ]) assert.match(text, new RegExp(role));
   const interfaceText = await readFile(skillInterface, 'utf8');
   assert.match(interfaceText, /可拆任务优先多 agent 并行/);
@@ -117,8 +127,78 @@ test('all twelve managed roles remain hash-addressed with model routing fields',
   }
 });
 
+test('zcode workflow skill variant keeps the stages and drops codex-only mechanics', async () => {
+  const text = await readFile(zcodeSkill, 'utf8');
+  assert.match(text, /^---\r?\nname: orchestrate-model-workflow\r?\n/);
+  for (const stage of ['Explore', 'Plan', 'Work', 'Critique', 'Promote']) assert.match(text, new RegExp(`\\b${stage}\\b`));
+  for (const role of zcodeRoleNames) assert.match(text, new RegExp(`\\b${role.replace(/\./g, '\\.')}\\b`));
+  assert.match(text, /subagent_type/);
+  assert.match(text, /<ZCODE_HOME>/);
+  assert.match(text, /模型_版本_类型_思考档/);
+  assert.match(text, /默认并行优先/);
+  assert.match(text, /fallback 仅对本次派发生效，是临时且可重新评估的选择/);
+  assert.match(text, /不得把写入任务派给只读角色/);
+  for (const forbidden of [
+    'CODEX_HOME', 'coordinator_thread_id', 'gpt-5\\.6', 'sandbox_mode', 'avsp_'
+  ]) assert.doesNotMatch(text, new RegExp(forbidden));
+});
+
+test('all five managed zcode agents stay hash-addressed with model routing frontmatter', async () => {
+  const expectedAllocation = {
+    'glm_5.3_flash_low.md': { model: 'GLM-5.3-Flash', thoughtLevel: 'low' },
+    'glm_5.3_flash_high.md': { model: 'GLM-5.3-Flash', thoughtLevel: 'high' },
+    'glm_5.3_flash_max.md': { model: 'GLM-5.3-Flash', thoughtLevel: 'max' },
+    'glm_5.3_high.md': { model: 'GLM-5.3', thoughtLevel: 'high' },
+    'glm_5.3_max.md': { model: 'GLM-5.3', thoughtLevel: 'max' }
+  };
+  const lines = (await readFile(zcodeManifest, 'utf8')).trim().split(/\r?\n/);
+  assert.equal(lines.length, 5);
+  const entries = new Map(lines.map((line) => {
+    const match = line.trim().match(/^([0-9a-f]{64})\s+([^\s]+)$/);
+    assert.ok(match, `invalid zcode manifest line: ${line}`);
+    return [match[2], match[1]];
+  }));
+  const files = (await readdir(zcodeRoles)).filter((name) => name.endsWith('.md')).sort();
+  assert.equal(files.length, 5);
+  for (const file of files) {
+    const source = await readFile(path.join(zcodeRoles, file));
+    assert.equal(entries.get(file), normalizedHash(source), `zcode manifest hash mismatch: ${file}`);
+    const text = source.toString('utf8');
+    const frontmatterEnd = text.indexOf('\n---', 3);
+    assert.ok(frontmatterEnd > 0, `zcode agent frontmatter unterminated: ${file}`);
+    const frontmatter = text.slice(0, frontmatterEnd);
+    for (const key of ['name', 'description', 'model', 'thoughtLevel']) assert.match(frontmatter, new RegExp(`^${key}:`, 'm'));
+    const expected = expectedAllocation[file];
+    assert.ok(expected, `unexpected zcode agent file: ${file}`);
+    assert.match(frontmatter, new RegExp(`^model: ${expected.model.replace(/\./g, '\\.')}$`, 'm'), `model allocation mismatch: ${file}`);
+    assert.match(frontmatter, new RegExp(`^thoughtLevel: ${expected.thoughtLevel}$`, 'm'), `thoughtLevel allocation mismatch: ${file}`);
+    assert.match(frontmatter, new RegExp(`^name: ${path.basename(file, '.md').replace(/\./g, '\\.')}$`, 'm'));
+  }
+});
+
+test('zcode sources do not leak codex placeholders or model ids', async () => {
+  const files = [zcodeAgents, zcodeDocsReadme, zcodeSkill, ...((await readdir(zcodeRoles)).filter((name) => name.endsWith('.md')).map((name) => path.join(zcodeRoles, name)))];
+  for (const file of files) {
+    const text = await readFile(file, 'utf8');
+    assert.doesNotMatch(text, /CODEX_HOME|gpt-5\.6|avsp_/, `codex leakage in: ${file}`);
+  }
+});
+
+test('merged installer sources register the zcode client with transactional state', async () => {
+  const text = await readFile(zcodePosixInstaller, 'utf8');
+  assert.match(text, /client_label=ZCode/);
+  assert.match(text, /home_env=ZCODE_HOME/);
+  assert.match(text, /default_home=\.zcode/);
+  assert.match(text, /placeholder=ZCODE_HOME/);
+  assert.match(text, /client_label=Codex/);
+  assert.match(text, /placeholder=CODEX_HOME/);
+  assert.match(text, /sed "s\|<\$\{placeholder\}>\|\$escaped_home\|g;/);
+  assert.match(text, /mark_state backed-up/);
+  assert.match(text, /mark_state install-started/);
+});
+
 test('PowerShell installer has no compatibility or legacy-removal surface', async () => {
-  const text = await readFile(path.join(repository, 'install-codex.ps1'), 'utf8');
+  const text = await readFile(powerInstaller, 'utf8');
   assert.doesNotMatch(text, /Get-LegacyPluginState|Remove-LegacyPlugins|workflow-controller|agnets-workflow|plugin remove/);
   assert.match(text, /Expand-Placeholders/);
 });
@@ -155,7 +235,7 @@ test('PowerShell installer deploys the standalone skill into an isolated nested 
     await mkdir(path.dirname(codexHome), { recursive: true });
     await mkdir(codexHome, { recursive: true });
     await writeFile(path.join(codexHome, 'config.toml'), 'keep_me = "untouched"\n"custom.setting" = "root quoted"\nmodel = "old"\n\n[desktop.open-in-target-preferences.perPath]\n"/Users/example/project" = "cursor"\n"part=key" = "equals"\n\n[tui.model_availability_nux]\n"gpt-5.5" = true\n\n[model_providers.local]\nname = "local"\nrequest_max_retries = 1\nstream_max_retries = 2\nstream_idle_timeout_ms = 3\nwebsocket_connect_timeout_ms = 4\n\n[agents]\nmax_threads = 1\nmax_depth = 1\n\n[features]\ngoals = false\n');
-    const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', path.join(repository, 'install-codex.ps1')], {
+    const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'codex'], {
       env: { ...process.env, CODEX_HOME: codexHome },
     });
     assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
@@ -182,7 +262,7 @@ test('PowerShell installer rejects unsafe non-bare TOML keys', { skip: process.p
   try {
     await mkdir(codexHome, { recursive: true });
     await writeFile(path.join(codexHome, 'config.toml'), '[agents]\n"max_threads" = 1\n');
-    const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', path.join(repository, 'install-codex.ps1')], {
+    const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'codex'], {
       env: { ...process.env, CODEX_HOME: codexHome },
     });
     assert.notEqual(result.code, 0, result.stdout);
@@ -198,7 +278,7 @@ test('PowerShell installer rejects non-scalar Unicode escapes in quoted TOML key
   try {
     await mkdir(codexHome, { recursive: true });
     await writeFile(path.join(codexHome, 'config.toml'), '[custom]\n"\\uD800" = true\n');
-    const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', path.join(repository, 'install-codex.ps1')], {
+    const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'codex'], {
       env: { ...process.env, CODEX_HOME: codexHome },
     });
     assert.notEqual(result.code, 0, result.stdout);
@@ -214,7 +294,7 @@ test('POSIX installer deploys a fresh standalone home without legacy prerequisit
   const root = await mkdtemp(path.join(repository, '.codex-posix-contract-'));
   const codexHome = path.join(root, 'missing', 'nested', '.codex');
   try {
-    const result = await runResult(shell, ['install-codex.sh'], {
+    const result = await runResult(shell, ['install.sh', 'codex'], {
       cwd: repository,
       env: { ...process.env, CODEX_HOME: posixHome(codexHome) },
     });
@@ -239,7 +319,7 @@ test('POSIX installer preserves safe quoted TOML keys', async (t) => {
   try {
     await mkdir(codexHome, { recursive: true });
     await writeFile(path.join(codexHome, 'config.toml'), 'keep_me = "untouched"\n"custom.setting" = "root quoted"\nmodel = "old"\n\n[desktop.open-in-target-preferences.perPath]\n"/Users/example/project" = "cursor"\n"part=key" = "equals"\n\n[tui.model_availability_nux]\n"gpt-5.5" = true\n\n[model_providers.local]\nname = "local"\nrequest_max_retries = 1\nstream_max_retries = 2\nstream_idle_timeout_ms = 3\nwebsocket_connect_timeout_ms = 4\n\n[agents]\nmax_threads = 1\nmax_depth = 1\n\n[features]\ngoals = false\n');
-    const result = await runResult(shell, ['install-codex.sh'], {
+    const result = await runResult(shell, ['install.sh', 'codex'], {
       cwd: repository,
       env: { ...process.env, CODEX_HOME: posixHome(codexHome) },
     });
@@ -263,7 +343,7 @@ test('POSIX installer rejects unsafe non-bare TOML keys', async (t) => {
   try {
     await mkdir(codexHome, { recursive: true });
     await writeFile(path.join(codexHome, 'config.toml'), '[agents]\n"max_threads" = 1\n');
-    const result = await runResult(shell, ['install-codex.sh'], {
+    const result = await runResult(shell, ['install.sh', 'codex'], {
       cwd: repository,
       env: { ...process.env, CODEX_HOME: posixHome(codexHome) },
     });
@@ -282,7 +362,7 @@ test('POSIX installer rejects non-scalar Unicode escapes in quoted TOML keys', a
   try {
     await mkdir(codexHome, { recursive: true });
     await writeFile(path.join(codexHome, 'config.toml'), '[custom]\n"\\uD800" = true\n');
-    const result = await runResult(shell, ['install-codex.sh'], {
+    const result = await runResult(shell, ['install.sh', 'codex'], {
       cwd: repository,
       env: { ...process.env, CODEX_HOME: posixHome(codexHome) },
     });
@@ -301,12 +381,14 @@ test('POSIX installer normalizes parent segments without rejecting a safe explic
   const codexHome = path.join(cwd, 'target', '.codex');
   try {
     await mkdir(cwd, { recursive: true });
-    const result = await runResult(shell, [posixInstaller], {
+    const result = await runResult(shell, [posixInstaller, 'codex'], {
       cwd,
       env: { ...process.env, CODEX_HOME: 'unused/../target/.codex' },
     });
     assert.equal(result.code, 0, result.stdout + '\n' + result.stderr);
-    assert.ok(result.stdout.includes(`Codex configuration installed in: ${codexHome}`), result.stdout);
+    const reportedHome = result.stdout.match(/Codex configuration installed in: (\S+)/)?.[1] ?? '';
+    const styleInsensitive = (value) => value.replaceAll('\\', '/').replace(/^([A-Za-z]):/, '/$1').toLowerCase();
+    assert.equal(styleInsensitive(reportedHome), styleInsensitive(codexHome), result.stdout);
     assert.match(await readFile(path.join(codexHome, 'AGENTS.md'), 'utf8'), /保持正常语义/);
     assert.equal(await readdir(path.join(cwd, 'unused')).catch(() => null), null);
   } finally {
@@ -325,7 +407,7 @@ test('POSIX installer rejects paths that normalize to the filesystem root before
     await mkdir(fakeBin, { recursive: true });
     await writeFile(blockedMkdir, '#!/bin/sh\nprintf "%s\\n" "unexpected mkdir: $*" >&2\nexit 99\n', { mode: 0o755 });
     for (const value of ['/.', '/..', '/../../', relativeRoot]) {
-      const result = await runResult(shell, [posixInstaller], {
+      const result = await runResult(shell, [posixInstaller, 'codex'], {
         cwd: repository,
         env: { ...process.env, CODEX_HOME: value, PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ''}` },
       });
@@ -340,16 +422,102 @@ test('POSIX installer rejects paths that normalize to the filesystem root before
 
 test('installer sources statically enforce target boundaries and transactional state', async () => {
   const text = await readFile(posixInstaller, 'utf8');
-  const normalizationIndex = text.indexOf('codex_home=$(normalize_absolute_path "$raw_home")');
-  const parentCreationIndex = text.indexOf('mkdir -p "$(dirname -- "$codex_home")"');
+  const normalizationIndex = text.indexOf('client_home=$(normalize_absolute_path "$raw_home")');
+  const parentCreationIndex = text.indexOf('mkdir -p "$(dirname -- "$client_home")"');
   assert.notEqual(normalizationIndex, -1);
   assert.notEqual(parentCreationIndex, -1);
   assert.ok(normalizationIndex < parentCreationIndex);
-  assert.match(text, /case "\$codex_home" in \/\|\.\) die "Refusing unsafe Codex home:/);
+  assert.match(text, /case "\$client_home" in \/\|\.\) die "Refusing unsafe \$client_label home:/);
   assert.match(text, /script_dir=\$\(CDPATH= cd --/);
   assert.match(text, /source_model_provider_settings=/);
-  assert.match(text, /sed "s\|<CODEX_HOME>\|\$escaped_home\|g;/);
+  assert.match(text, /sed "s\|<\$\{placeholder\}>\|\$escaped_home\|g;/);
   assert.match(text, /mark_state backed-up/);
   assert.match(text, /mark_state install-started/);
-  assert.match(text, /assert_directory_container "\$codex_home\/backups"/);
+  assert.match(text, /assert_directory_container "\$client_home\/backups"/);
+});
+
+test('PowerShell zcode installer composes shared and zcode sources and leaves unmanaged state untouched', { skip: process.platform !== 'win32' }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'zcode-powershell-contract-'));
+  const zcodeHome = path.join(root, 'missing', 'nested', '.zcode');
+  try {
+    await mkdir(zcodeHome, { recursive: true });
+    await mkdir(path.join(zcodeHome, 'cli'), { recursive: true });
+    await writeFile(path.join(zcodeHome, 'cli', 'config.json'), '{"keep":"me"}\n');
+    const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'zcode'], {
+      env: { ...process.env, ZCODE_HOME: zcodeHome },
+    });
+    assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+    const agents = await readFile(path.join(zcodeHome, 'AGENTS.md'), 'utf8');
+    assert.doesNotMatch(agents, /<ZCODE_HOME>|\$ZCODE_HOME/);
+    assert.match(agents, /zcode-powershell-contract-/i);
+    const installedSkill = await readFile(path.join(zcodeHome, 'skills', 'orchestrate-model-workflow', 'SKILL.md'), 'utf8');
+    assert.match(installedSkill, /^---\r?\nname: orchestrate-model-workflow\r?\n/);
+    assert.doesNotMatch(installedSkill, /<ZCODE_HOME>/);
+    const agentFiles = (await readdir(path.join(zcodeHome, 'agents', 'ai-vibecode-superpower'))).filter((name) => name.endsWith('.md'));
+    assert.equal(agentFiles.length, 5);
+    const docsReadme = await readFile(path.join(zcodeHome, 'docs', 'README.md'), 'utf8');
+    assert.match(docsReadme, /ZCode 全局参考文档/);
+    const systemDocs = await readdir(path.join(zcodeHome, 'docs', 'system'));
+    for (const expected of ['README.md', 'windows.md', 'rg.md', 'ssh.md', 'linux.md', 'macos.md', '跨系统操作示例.md']) {
+      assert.ok(systemDocs.includes(expected), `missing shared system doc: ${expected}`);
+    }
+    for (const sharedSkill of ['agent-toolchain', 'project-doc-planner']) {
+      assert.match(await readFile(path.join(zcodeHome, 'skills', sharedSkill, 'SKILL.md'), 'utf8'), /^---/);
+    }
+    const cliConfig = await readFile(path.join(zcodeHome, 'cli', 'config.json'), 'utf8');
+    assert.match(cliConfig, /"keep": ?"me"/);
+    assert.equal(await readdir(path.join(zcodeHome, 'skills')).then((names) => names.length), 3);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('POSIX zcode installer deploys a fresh home without codex configuration', async (t) => {
+  const shell = await findPosixShell();
+  if (!shell) return t.skip('POSIX shell is unavailable');
+  const root = await mkdtemp(path.join(repository, '.zcode-posix-contract-'));
+  const zcodeHome = path.join(root, 'missing', 'nested', '.zcode');
+  try {
+    const result = await runResult(shell, ['install.sh', 'zcode'], {
+      cwd: repository,
+      env: { ...process.env, ZCODE_HOME: posixHome(zcodeHome) },
+    });
+    assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+    const agents = await readFile(path.join(zcodeHome, 'AGENTS.md'), 'utf8');
+    assert.doesNotMatch(agents, /<ZCODE_HOME>|\$ZCODE_HOME/);
+    const installedSkill = await readFile(path.join(zcodeHome, 'skills', 'orchestrate-model-workflow', 'SKILL.md'), 'utf8');
+    assert.match(installedSkill, /^---\nname: orchestrate-model-workflow\n/);
+    assert.doesNotMatch(installedSkill, /<ZCODE_HOME>/);
+    const agentFiles = (await readdir(path.join(zcodeHome, 'agents', 'ai-vibecode-superpower'))).filter((name) => name.endsWith('.md'));
+    assert.equal(agentFiles.length, 5);
+    const systemDocs = await readdir(path.join(zcodeHome, 'docs', 'system'));
+    for (const expected of ['README.md', 'windows.md', 'rg.md', 'ssh.md', 'linux.md', 'macos.md', '跨系统操作示例.md']) {
+      assert.ok(systemDocs.includes(expected), `missing shared system doc: ${expected}`);
+    }
+    assert.equal(await readFile(path.join(zcodeHome, 'config.toml'), 'utf8').then(() => true, () => false), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('merged POSIX installer requires an explicit client when stdin is not interactive', async (t) => {
+  const shell = await findPosixShell();
+  if (!shell) return t.skip('POSIX shell is unavailable');
+  const result = await runResult(shell, ['install.sh'], { cwd: repository });
+  assert.notEqual(result.code, 0, result.stdout);
+  assert.match(result.stdout + '\n' + result.stderr, /No client specified\. Usage: sh install\.sh <codex\|zcode>/);
+});
+
+test('merged POSIX installer rejects unknown clients', async (t) => {
+  const shell = await findPosixShell();
+  if (!shell) return t.skip('POSIX shell is unavailable');
+  const result = await runResult(shell, ['install.sh', 'unknown-client'], { cwd: repository });
+  assert.notEqual(result.code, 0, result.stdout);
+  assert.match(result.stdout + '\n' + result.stderr, /Unknown client: unknown-client/);
+});
+
+test('merged PowerShell installer requires an explicit client when input is redirected', { skip: process.platform !== 'win32' }, async () => {
+  const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller], { cwd: repository });
+  assert.notEqual(result.code, 0, result.stdout);
+  assert.match(result.stdout + '\n' + result.stderr, /No client specified\. Usage: \.\\install\.ps1 -Client <codex\|zcode>/);
 });

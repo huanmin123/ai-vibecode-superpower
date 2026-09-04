@@ -1,8 +1,8 @@
 # ai-vibecode-superpower
 
-> 把 Codex 从“单次对话工具”升级为一套面向复杂开发的工程协作系统：**更快推进、更强判断、更少浪费**。
+> 把 Codex 与 ZCode 从“单次对话工具”升级为一套面向复杂开发的工程协作系统：**更快推进、更强判断、更少浪费**。
 
-`ai-vibecode-superpower` 是可安装的 Codex 配置包。它为复杂开发建立可追溯的取证、执行、验证与独立复查闭环；小任务仍然保持直接、轻量，不为工作流而工作流。
+`ai-vibecode-superpower` 是可安装的 Codex / ZCode 配置包。它为复杂开发建立可追溯的取证、执行、验证与独立复查闭环；小任务仍然保持直接、轻量，不为工作流而工作流。两个宿主共享同一套平台文档和通用 skills；全局指令、agent 角色、工作流变体和安装行为的差异通过 `codex-global-config/` 与 `zcode-global-config/` 目录隔离。
 
 ## 你真正得到的提升
 
@@ -55,7 +55,7 @@ flowchart LR
 
 这不是“多开几个 agent”。它是一套明确分工的工程闭环：低成本工作尽量并行和复用，高强度判断只在证据不足、风险上升或需要独立复查时介入；每次交付都要经过与任务风险相称的验证。
 
-`orchestrate-model-workflow` 是 standalone skill，只提供行为级路由和质量门建议；Codex 原生负责 agent 创建、通信、等待和汇总，不引入额外控制平面。
+`orchestrate-model-workflow` 是 standalone skill，只提供行为级路由和质量门建议；宿主（Codex 或 ZCode）原生负责 agent 创建、通信、等待和汇总，不引入额外控制平面。
 
 ## 适合什么场景
 
@@ -64,11 +64,15 @@ flowchart LR
 | 单文件、改法明确、低风险调整 | 直接完成并运行贴近改动的验证。 |
 | 跨文件实现、未知根因、需要扫描大型代码库 | 用并行取证和证据驱动定案，减少盲目修改。 |
 | 多模块改造、共享状态、外部副作用或高回归风险 | 使用工作流 skill 的受控写入与任务级质量门。 |
-| 需要反复交接或独立验收 | 由 Codex 原生 agent 协作并保留可核对证据。 |
+| 需要反复交接或独立验收 | 由宿主原生 agent 协作并保留可核对证据。 |
 
 ## 快速安装
 
-### 前置条件
+每个平台一个安装器：`install.ps1`（Windows）与 `install.sh`（macOS/Linux）。直接运行后按提示交互选择客户端（Codex / ZCode），或在命令中直接指定客户端跳过交互；共享内容由所选客户端的安装流程一并安装，宿主专属内容各装各的。新增客户端时在两个安装器的客户端注册表中加入一项即可。
+
+### Codex
+
+前置条件：
 
 - macOS/Linux 还需要 `rg`（ripgrep）。
 - 安装前完全退出 Codex Desktop；否则运行中的应用可能把配置覆盖回去。
@@ -77,27 +81,19 @@ flowchart LR
 
 这是全新的 standalone 工作流安装布局，不迁移或卸载任何旧版 plugin、skill、cache 或 state；如本机仍有旧版，请由用户先自行卸载。
 
-### Windows（PowerShell 7）
-
-在仓库根目录运行：
+**Windows（PowerShell 7）**，在仓库根目录运行：
 
 ```powershell
-& .\install-codex.ps1
+& .\install.ps1 -Client codex
 ```
 
-安装前先完整退出所有 Codex Desktop 窗口，并确认其 `app-server` 进程已经结束，避免活动进程把配置覆盖回去。安装成功后重新启动 Codex，并在新会话中使用 standalone skill。
-
-### macOS 或 Linux
-
-在仓库根目录运行：
+**macOS 或 Linux**：
 
 ```sh
-sh ./install-codex.sh
+sh ./install.sh codex
 ```
 
-安装前先完整退出 Codex Desktop；安装成功后重新启动并新建会话。
-
-安装成功后，完全重启 Codex Desktop 或 Codex CLI 进程，使配置和能力生效。若使用 CC-Switch，请确认它没有覆盖安装脚本写入的 Codex 配置。
+安装前先完整退出所有 Codex Desktop 窗口，并确认其 `app-server` 进程已经结束，避免活动进程把配置覆盖回去。安装成功后完全重启 Codex Desktop 或 Codex CLI 进程，并在新会话中使用 standalone skill。若使用 CC-Switch，请确认它没有覆盖安装脚本写入的 Codex 配置。
 
 如果安装时未退出应用，或配置看起来没有生效，可核对以下配置是否仍存在：
 
@@ -114,23 +110,43 @@ max_depth = 5
 goals = true
 ```
 
+### ZCode
+
+- 安装前退出 ZCode 会话；安装成功后重启 ZCode，使 `~/.zcode/agents` 的角色和 `~/.zcode/skills` 生效。
+- ZCode 变体包含 5 个角色，按统一公式 `模型_版本_类型_思考档` 命名：`glm_5.3_flash_low`（常规取证）、`glm_5.3_flash_high`（深度取证）、`glm_5.3_flash_max`（写代码主力）、`glm_5.3_high`（审核主力）、`glm_5.3_max`（终审）；GLM-5.3 不使用 low 档。`gpt-image-2-cli` 是 Codex 专属，不会安装到 ZCode。
+- 安装器只管理 `AGENTS.md`、`docs/`、`agents/ai-vibecode-superpower/` 和受管的 skills；不修改 ZCode 的 `cli/`、`v2/`、插件缓存或用户自建的其它 skills/agents。已有的 `AGENTS.md` 会先备份再替换。
+
+**Windows（PowerShell 7）**，在仓库根目录运行：
+
+```powershell
+& .\install.ps1 -Client zcode
+```
+
+**macOS 或 Linux**：
+
+```sh
+sh ./install.sh zcode
+```
+
 ## 使用方式与可选能力
 
 安装并重启后，直接在目标项目描述目标、范围和限制即可。复杂任务会根据实际需要进入协作闭环；不需要时保持轻量。
 
 | 能力 | 何时使用 | 你会得到 |
 | --- | --- | --- |
-| [`agent-toolchain`](skills/agent-toolchain/SKILL.md) | 首次接入、升级、修复、维护或审查 CodeGraph/RTK | 对目标项目进行受控接入与维护。 |
-| [`orchestrate-model-workflow`](skills/orchestrate-model-workflow/SKILL.md) | 跨文件实现、复杂取证或独立验收 | 按证据和风险选择 role，并保留可核对的验证闭环。 |
-| [`project-doc-planner`](skills/project-doc-planner/SKILL.md) | 新项目或大型改造的文档规划 | 可维护的项目级文档结构。 |
-| [`gpt-image-2-cli`](skills/gpt-image-2-cli/SKILL.md) | 需要生成或编辑图片素材 | 通过命令行调用图像生成能力。 |
+| [`agent-toolchain`](shared/skills/agent-toolchain/SKILL.md) | 首次接入、升级、修复、维护或审查 CodeGraph/RTK | 对目标项目进行受控接入与维护。 |
+| [`orchestrate-model-workflow`](codex-global-config/skills/orchestrate-model-workflow/SKILL.md) | 跨文件实现、复杂取证或独立验收 | 按证据和风险选择 role，并保留可核对的验证闭环。 |
+| [`project-doc-planner`](shared/skills/project-doc-planner/SKILL.md) | 新项目或大型改造的文档规划 | 可维护的项目级文档结构。 |
+| [`gpt-image-2-cli`](codex-global-config/skills/gpt-image-2-cli/SKILL.md) | 需要生成或编辑图片素材 | 通过命令行调用图像生成能力。 |
+
+`orchestrate-model-workflow` 是双变体 skill：Codex 版与 ZCode 版按宿主机制差异分离维护，ZCode 版见 [`zcode-global-config/skills/orchestrate-model-workflow/SKILL.md`](zcode-global-config/skills/orchestrate-model-workflow/SKILL.md)。
 
 例如：“使用 `$agent-toolchain` 给这个项目接入工具链”，或“使用 `$orchestrate-model-workflow` 组织这个复杂任务”。工具链接入完成后，普通开发不需要再次触发 `$agent-toolchain`。
 
 ## 进一步阅读
 
-- [`orchestrate-model-workflow`](skills/orchestrate-model-workflow/SKILL.md)：工作流路由、交接与验收规范。
-- [agent role profiles](codex-global-config/agents/ai-vibecode-superpower/)：role 的本地权限与输出边界。
-- [Windows 安装脚本](install-codex.ps1) / [macOS/Linux 安装脚本](install-codex.sh)。
+- [`orchestrate-model-workflow`（Codex 版）](codex-global-config/skills/orchestrate-model-workflow/SKILL.md) / [（ZCode 版）](zcode-global-config/skills/orchestrate-model-workflow/SKILL.md)：工作流路由、交接与验收规范。
+- [agent role profiles（Codex）](codex-global-config/agents/ai-vibecode-superpower/) / [（ZCode）](zcode-global-config/agents/ai-vibecode-superpower/)：role 的本地权限与输出边界。
+- [统一安装器：Windows](install.ps1) / [macOS/Linux](install.sh)（交互选择或指定 `codex` / `zcode` 客户端）。
 
 问题或建议：QQ群 `1105515344`
