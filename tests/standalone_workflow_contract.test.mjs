@@ -99,6 +99,7 @@ test('standalone workflow skill has the five behavior stages and no obsolete pro
   assert.match(text, /不得把写入任务派给只读 role/);
   assert.match(text, /授权、权限、范围和责任边界均已满足时直接继续/);
   assert.doesNotMatch(text, /路径锁|并行写入安全|所有.*串行/);
+  const rolePattern = (role) => new RegExp(role.replace(/\./g, '\\.'));
   for (const role of [
     'gpt_6_astra_high', 'gpt_6_astra_xhigh', 'gpt_6_astra_max',
     'gpt_6_sol_high', 'gpt_6_sol_xhigh',
@@ -106,9 +107,31 @@ test('standalone workflow skill has the five behavior stages and no obsolete pro
     'gpt_5.6_sol_high', 'gpt_5.6_sol_xhigh', 'gpt_5.6_sol_max',
     'gpt_5.6_terra_high', 'gpt_5.6_terra_xhigh', 'gpt_5.6_terra_low_readonly', 'gpt_5.6_terra_medium_readonly',
     'gpt_5.6_luna_high', 'gpt_5.6_luna_xhigh', 'gpt_5.6_luna_high_executor', 'gpt_5.6_luna_xhigh_executor'
-  ]) assert.match(text, new RegExp(role));
+  ]) assert.match(text, rolePattern(role));
+  assert.doesNotMatch('gpt_5x6_sol_high', rolePattern('gpt_5.6_sol_high'));
   const interfaceText = await readFile(skillInterface, 'utf8');
   assert.match(interfaceText, /可拆任务优先多 agent 并行/);
+});
+
+test('protected execution roles and Luna executors allow the direct handoff matrix', async () => {
+  const executors = [
+    'gpt_6_luna_high_executor', 'gpt_6_luna_xhigh_executor',
+    'gpt_5.6_luna_high_executor', 'gpt_5.6_luna_xhigh_executor'
+  ];
+  for (const role of ['gpt_6_sol_high', 'gpt_5.6_terra_high']) {
+    const text = await readFile(path.join(roles, `${role}.toml`), 'utf8');
+    assert.match(text, /仅在对应 gpt-6-luna 角色或模型本次确认不可用时使用降级角色/u);
+    const delegation = text.match(/可直接委派的执行子节点仅限 ([^。]+)。/u);
+    assert.ok(delegation, `${role} must list its permitted execution children`);
+    for (const executor of executors) assert.ok(delegation[1].includes(executor), `${role} must permit ${executor}`);
+  }
+  for (const executor of executors) {
+    const text = await readFile(path.join(roles, `${executor}.toml`), 'utf8');
+    const accepted = text.match(/只接受([^。]+)的直接委派/u);
+    assert.ok(accepted, `${executor} must define its direct-delegation boundary`);
+    assert.match(accepted[1], /`gpt_6_sol_high`/);
+    assert.match(accepted[1], /`gpt_5\.6_terra_high`/);
+  }
 });
 
 test('all twenty managed roles remain hash-addressed with model routing fields', async () => {
