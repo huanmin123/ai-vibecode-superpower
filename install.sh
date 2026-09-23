@@ -125,7 +125,7 @@ case "$client" in
         home_env=CODEX_HOME
         default_home=.codex
         role_kind=toml
-        expected_roles=12
+        expected_roles=20
         placeholder=CODEX_HOME
         source_roles=$script_dir/codex-global-config/agents/ai-vibecode-superpower
         source_manifest=$script_dir/codex-global-config/agents/ai-vibecode-superpower.sha256

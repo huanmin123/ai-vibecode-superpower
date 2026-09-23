@@ -100,25 +100,27 @@ test('standalone workflow skill has the five behavior stages and no obsolete pro
   assert.match(text, /授权、权限、范围和责任边界均已满足时直接继续/);
   assert.doesNotMatch(text, /路径锁|并行写入安全|所有.*串行/);
   for (const role of [
-    'gpt_5.6_luna_high', 'gpt_5.6_luna_xhigh', 'gpt_5.6_luna_high_executor', 'gpt_5.6_luna_xhigh_executor',
-    'gpt_5.6_terra_high', 'gpt_5.6_terra_xhigh', 'gpt_5.6_terra_xhigh_readonly',
-    'gpt_5.6_terra_low_readonly', 'gpt_5.6_terra_medium_readonly',
-    'gpt_5.6_sol_high', 'gpt_5.6_sol_xhigh', 'gpt_5.6_sol_max'
+    'gpt_6_astra_high', 'gpt_6_astra_xhigh', 'gpt_6_astra_max',
+    'gpt_6_sol_high', 'gpt_6_sol_xhigh',
+    'gpt_6_luna_high', 'gpt_6_luna_xhigh', 'gpt_6_luna_high_executor', 'gpt_6_luna_xhigh_executor',
+    'gpt_5.6_sol_high', 'gpt_5.6_sol_xhigh', 'gpt_5.6_sol_max',
+    'gpt_5.6_terra_high', 'gpt_5.6_terra_xhigh', 'gpt_5.6_terra_low_readonly', 'gpt_5.6_terra_medium_readonly',
+    'gpt_5.6_luna_high', 'gpt_5.6_luna_xhigh', 'gpt_5.6_luna_high_executor', 'gpt_5.6_luna_xhigh_executor'
   ]) assert.match(text, new RegExp(role));
   const interfaceText = await readFile(skillInterface, 'utf8');
   assert.match(interfaceText, /可拆任务优先多 agent 并行/);
 });
 
-test('all twelve managed roles remain hash-addressed with model routing fields', async () => {
+test('all twenty managed roles remain hash-addressed with model routing fields', async () => {
   const lines = (await readFile(manifest, 'utf8')).trim().split(/\r?\n/);
-  assert.equal(lines.length, 12);
+  assert.equal(lines.length, 20);
   const entries = new Map(lines.map((line) => {
     const match = line.trim().match(/^([0-9a-f]{64})\s+([^\s]+)$/);
     assert.ok(match, `invalid manifest line: ${line}`);
     return [match[1], match[2]];
   }));
   const files = (await readdir(roles)).filter((name) => name.endsWith('.toml')).sort();
-  assert.equal(files.length, 12);
+  assert.equal(files.length, 20);
   for (const file of files) {
     const source = await readFile(path.join(roles, file));
     assert.ok([...entries].some(([hash, name]) => name === file && hash === normalizedHash(source)));
@@ -309,7 +311,7 @@ test('POSIX installer deploys a fresh standalone home without legacy prerequisit
     const agents = await readFile(path.join(codexHome, 'AGENTS.md'), 'utf8');
     assert.doesNotMatch(agents, /<CODEX_HOME>|\$CODEX_HOME/);
     const config = await readFile(path.join(codexHome, 'config.toml'), 'utf8');
-    assert.match(config, /^model = "gpt-5\.6-terra"/m);
+    assert.match(config, /^model = "gpt-6-sol"/m);
     assert.match(config, /\[features\]\ngoals = true/);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -334,7 +336,7 @@ test('POSIX installer preserves safe quoted TOML keys', async (t) => {
     assert.match(config, /"\/Users\/example\/project" = "cursor"/);
     assert.match(config, /"part=key" = "equals"/);
     assert.match(config, /"gpt-5\.5" = true/);
-    assert.match(config, /^model = "gpt-5\.6-terra"/m);
+    assert.match(config, /^model = "gpt-6-sol"/m);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

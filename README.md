@@ -98,7 +98,7 @@ sh ./install.sh codex
 如果安装时未退出应用，或配置看起来没有生效，可核对以下配置是否仍存在：
 
 ```toml
-model = "gpt-5.6-terra"
+model = "gpt-6-sol"
 model_reasoning_effort = "high"
 sandbox_mode = "danger-full-access"
 

@@ -23,7 +23,7 @@
 - 共享平台文档与工具无关 skills：`shared/`（`docs/system/`、`agent-toolchain`、`project-doc-planner`），由两个安装器共同安装。
 - Codex 全局行为规范：`codex-global-config/AGENTS.md`；安装后对应用户级 Codex home 中的 `AGENTS.md`。ZCode 对应 `zcode-global-config/AGENTS.md` 与用户级 ZCode home（`~/.zcode`）。
 - 工作流路由、交接与验收：`codex-global-config/skills/orchestrate-model-workflow/SKILL.md`（Codex 变体）与 `zcode-global-config/skills/orchestrate-model-workflow/SKILL.md`（ZCode 变体）。
-- role 本地权限与输出边界：`codex-global-config/agents/ai-vibecode-superpower/`（12 个 toml role）与 `zcode-global-config/agents/ai-vibecode-superpower/`（5 个 md agent）。角色命名统一为 `模型_版本_类型_思考档`（如 `glm_5.3_flash_low`、`gpt_5.6_luna_high`），同模型同档位冲突时追加职责后缀。
+- role 本地权限与输出边界：`codex-global-config/agents/ai-vibecode-superpower/`（20 个 toml role：9 个 gpt-6 主力 + 11 个 gpt-5.6 降级落点）与 `zcode-global-config/agents/ai-vibecode-superpower/`（5 个 md agent）。角色命名统一为 `模型_版本_类型_思考档`（如 `glm_5.3_flash_low`、`gpt_6_astra_max`），同模型同档位冲突时追加职责后缀。
 - 安装与合并逻辑：`install.ps1`、`install.sh`（每平台一个安装器，交互选择客户端或以 `-Client`/位置参数指定）；不要直接编辑已安装的全局副本作为最终修改。
 
 ## 修改与验证
