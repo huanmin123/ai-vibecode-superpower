@@ -26,6 +26,21 @@ const zcodePosixInstaller = path.join(repository, 'install.sh');
 const zcodeRoleNames = [
   'glm_5.3_flash_low', 'glm_5.3_flash_high', 'glm_5.3_flash_max', 'glm_5.3_high', 'glm_5.3_max'
 ];
+const bracketedTables = [
+  '[hooks.state."browser@openai-bundled:plugin.json#hooks[0]:stop:0:0"]',
+  'enabled = true',
+  '',
+  '[[skills."configured[0]#example"]]',
+  'path = "local"',
+  '',
+  '[model_providers."local[0]#example"]',
+  'name = "local"',
+  'request_max_retries = 1',
+  'stream_max_retries = 2',
+  'stream_idle_timeout_ms = 3',
+  'websocket_connect_timeout_ms = 4',
+  ''
+].join('\n');
 const run = promisify(execFile);
 
 function normalizedHash(buffer) {
@@ -264,7 +279,7 @@ test('PowerShell installer deploys the standalone skill into an isolated nested 
   try {
     await mkdir(path.dirname(codexHome), { recursive: true });
     await mkdir(codexHome, { recursive: true });
-    await writeFile(path.join(codexHome, 'config.toml'), 'keep_me = "untouched"\n"custom.setting" = "root quoted"\nmodel = "old"\n\n[desktop.open-in-target-preferences.perPath]\n"/Users/example/project" = "cursor"\n"part=key" = "equals"\n\n[tui.model_availability_nux]\n"gpt-5.5" = true\n\n[model_providers.local]\nname = "local"\nrequest_max_retries = 1\nstream_max_retries = 2\nstream_idle_timeout_ms = 3\nwebsocket_connect_timeout_ms = 4\n\n[agents]\nmax_threads = 1\nmax_depth = 1\n\n[features]\ngoals = false\n');
+    await writeFile(path.join(codexHome, 'config.toml'), 'keep_me = "untouched"\n"custom.setting" = "root quoted"\nmodel = "old"\n\n[desktop.open-in-target-preferences.perPath]\n"/Users/example/project" = "cursor"\n"part=key" = "equals"\n\n[tui.model_availability_nux]\n"gpt-5.5" = true\n\n[model_providers.local]\nname = "local"\nrequest_max_retries = 1\nstream_max_retries = 2\nstream_idle_timeout_ms = 3\nwebsocket_connect_timeout_ms = 4\n\n[agents]\nmax_threads = 1\nmax_depth = 1\n\n[features]\ngoals = false\n\n' + bracketedTables);
     const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'codex'], {
       env: { ...process.env, CODEX_HOME: codexHome },
     });
@@ -281,6 +296,9 @@ test('PowerShell installer deploys the standalone skill into an isolated nested 
     assert.match(config, /"part=key" = "equals"/);
     assert.match(config, /"gpt-5\.5" = true/);
     assert.match(config, /\[model_providers\.local\][\s\S]*request_max_retries = 120[\s\S]*stream_max_retries = 120[\s\S]*stream_idle_timeout_ms = 300000[\s\S]*websocket_connect_timeout_ms = 15000/);
+    assert.match(config, /\[hooks\.state\."browser@openai-bundled:plugin\.json#hooks\[0\]:stop:0:0"\]\r?\nenabled = true/);
+    assert.match(config, /\[\[skills\."configured\[0\]#example"\]\]\r?\npath = "local"/);
+    assert.match(config, /\[model_providers\."local\[0\]#example"\][\s\S]*request_max_retries = 120[\s\S]*websocket_connect_timeout_ms = 15000/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -318,6 +336,22 @@ test('PowerShell installer rejects non-scalar Unicode escapes in quoted TOML key
   }
 });
 
+test('PowerShell installer rejects a table header with trailing syntax', { skip: process.platform !== 'win32' }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'codex-powershell-invalid-header-'));
+  const codexHome = path.join(root, 'nested', '.codex');
+  try {
+    await mkdir(codexHome, { recursive: true });
+    await writeFile(path.join(codexHome, 'config.toml'), '[hooks.state."quoted[0]"] trailing\nenabled = true\n');
+    const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'codex'], {
+      env: { ...process.env, CODEX_HOME: codexHome },
+    });
+    assert.notEqual(result.code, 0, result.stdout);
+    assert.match(result.stdout + '\n' + result.stderr, /Unsupported TOML table header/i);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('POSIX installer deploys a fresh standalone home without legacy prerequisites', async (t) => {
   const shell = await findPosixShell();
   if (!shell) return t.skip('POSIX shell is unavailable');
@@ -348,7 +382,7 @@ test('POSIX installer preserves safe quoted TOML keys', async (t) => {
   const codexHome = path.join(root, 'nested', '.codex');
   try {
     await mkdir(codexHome, { recursive: true });
-    await writeFile(path.join(codexHome, 'config.toml'), 'keep_me = "untouched"\n"custom.setting" = "root quoted"\nmodel = "old"\n\n[desktop.open-in-target-preferences.perPath]\n"/Users/example/project" = "cursor"\n"part=key" = "equals"\n\n[tui.model_availability_nux]\n"gpt-5.5" = true\n\n[model_providers.local]\nname = "local"\nrequest_max_retries = 1\nstream_max_retries = 2\nstream_idle_timeout_ms = 3\nwebsocket_connect_timeout_ms = 4\n\n[agents]\nmax_threads = 1\nmax_depth = 1\n\n[features]\ngoals = false\n');
+    await writeFile(path.join(codexHome, 'config.toml'), 'keep_me = "untouched"\n"custom.setting" = "root quoted"\nmodel = "old"\n\n[desktop.open-in-target-preferences.perPath]\n"/Users/example/project" = "cursor"\n"part=key" = "equals"\n\n[tui.model_availability_nux]\n"gpt-5.5" = true\n\n[model_providers.local]\nname = "local"\nrequest_max_retries = 1\nstream_max_retries = 2\nstream_idle_timeout_ms = 3\nwebsocket_connect_timeout_ms = 4\n\n[agents]\nmax_threads = 1\nmax_depth = 1\n\n[features]\ngoals = false\n\n' + bracketedTables);
     const result = await runResult(shell, ['install.sh', 'codex'], {
       cwd: repository,
       env: { ...process.env, CODEX_HOME: posixHome(codexHome) },
@@ -360,6 +394,9 @@ test('POSIX installer preserves safe quoted TOML keys', async (t) => {
     assert.match(config, /"part=key" = "equals"/);
     assert.match(config, /"gpt-5\.5" = true/);
     assert.match(config, /^model = "gpt-6-sol"/m);
+    assert.match(config, /\[hooks\.state\."browser@openai-bundled:plugin\.json#hooks\[0\]:stop:0:0"\]\nenabled = true/);
+    assert.match(config, /\[\[skills\."configured\[0\]#example"\]\]\npath = "local"/);
+    assert.match(config, /\[model_providers\."local\[0\]#example"\][\s\S]*request_max_retries = 120[\s\S]*websocket_connect_timeout_ms = 15000/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -398,6 +435,25 @@ test('POSIX installer rejects non-scalar Unicode escapes in quoted TOML keys', a
     });
     assert.notEqual(result.code, 0, result.stdout);
     assert.match(result.stdout + '\n' + result.stderr, /unsupported TOML syntax for safe merge: unsupported key syntax/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('POSIX installer rejects a table header with trailing syntax', async (t) => {
+  const shell = await findPosixShell();
+  if (!shell) return t.skip('POSIX shell is unavailable');
+  const root = await mkdtemp(path.join(repository, '.codex-posix-invalid-header-'));
+  const codexHome = path.join(root, 'nested', '.codex');
+  try {
+    await mkdir(codexHome, { recursive: true });
+    await writeFile(path.join(codexHome, 'config.toml'), '[hooks.state."quoted[0]"] trailing\nenabled = true\n');
+    const result = await runResult(shell, ['install.sh', 'codex'], {
+      cwd: repository,
+      env: { ...process.env, CODEX_HOME: posixHome(codexHome) },
+    });
+    assert.notEqual(result.code, 0, result.stdout);
+    assert.match(result.stdout + '\n' + result.stderr, /unsupported TOML syntax for safe merge: ambiguous table header/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

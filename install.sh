@@ -360,13 +360,32 @@ assert_safe_toml_merge_input() {
             }
             return 0
         }
+        function table_header(line, opening, position, character, basic, literal, suffix) {
+            basic = 0; literal = 0
+            for (position = opening + 1; position <= length(line); position++) {
+                character = substr(line, position, 1)
+                if (basic) { if (character == "\\") position++; else if (character == "\"") basic = 0; continue }
+                if (literal) { if (character == "\047") literal = 0; continue }
+                if (character == "\"") { basic = 1; continue }
+                if (character == "\047") { literal = 1; continue }
+                if (character == "[") return 0
+                if (character == "]") {
+                    if (opening == 2 && substr(line, position + 1, 1) != "]") return 0
+                    suffix = substr(line, position + opening)
+                    if (suffix !~ /^[[:space:]]*(#.*)?$/) return 0
+                    header = trim(substr(line, opening + 1, position - opening - 1))
+                    return header != ""
+                }
+            }
+            return 0
+        }
         BEGIN { section = "root" }
         {
             line = trim($0)
             if (line == "" || line ~ /^#/) next
             if (line ~ /"""/ || line ~ /\047\047\047/) { fail("multiline strings are not supported"); next }
-            if (line ~ /^\[\[/) { if (line !~ /^\[\[[^]]+\]\][[:space:]]*(#.*)?$/) fail("ambiguous array table header"); section = "other"; next }
-            if (line ~ /^\[/) { if (line !~ /^\[[^]]+\][[:space:]]*(#.*)?$/) { fail("ambiguous table header"); next }; header = line; sub(/^\[/, "", header); sub(/\][[:space:]]*(#.*)?$/, "", header); section = header; next }
+            if (line ~ /^\[\[/) { if (!table_header(line, 2)) fail("ambiguous array table header"); section = "other"; next }
+            if (line ~ /^\[/) { if (!table_header(line, 1)) { fail("ambiguous table header"); next }; section = header; next }
             separator = assignment_separator(line)
             if (separator == 0) { fail("unrecognized line"); next }
             key = trim(substr(line, 1, separator - 1)); value = substr(line, separator + 1)
@@ -395,6 +414,19 @@ merge_managed_config() {
         function managed(section, key) {
             return (section == "root" && (key == "model" || key == "model_reasoning_effort" || key == "sandbox_mode" || key == "approval_policy" || key == "approvals_reviewer")) || (section == "agents" && (key == "max_threads" || key == "max_depth")) || (section == "features" && key == "goals")
         }
+        function table_name(line, position, character, basic, literal) {
+            sub(/^[[:space:]]*\[/, "", line)
+            basic = 0; literal = 0
+            for (position = 1; position <= length(line); position++) {
+                character = substr(line, position, 1)
+                if (basic) { if (character == "\\") position++; else if (character == "\"") basic = 0; continue }
+                if (literal) { if (character == "\047") literal = 0; continue }
+                if (character == "\"") basic = 1
+                else if (character == "\047") literal = 1
+                else if (character == "]") { line = substr(line, 1, position - 1); gsub(/^[[:space:]]+|[[:space:]]+$/, "", line); return line }
+            }
+            return ""
+        }
         function flush_managed(section, key, position, count) {
             if (section == "root") { order[1]="model"; order[2]="model_reasoning_effort"; order[3]="sandbox_mode"; order[4]="approval_policy"; order[5]="approvals_reviewer"; count=5 }
             else if (section == "agents") { order[1]="max_threads"; order[2]="max_depth"; count=2 }
@@ -409,7 +441,7 @@ merge_managed_config() {
         }
         FILENAME == ARGV[1] {
             if ($0 ~ /^[[:space:]]*\[\[/) { source_section="other"; next }
-            if ($0 ~ /^[[:space:]]*\[[^]]+\]/) { header=$0; sub(/^[[:space:]]*\[/,"",header); sub(/\][[:space:]]*(#.*)?$/,"",header); source_section=(header=="agents" || header=="features") ? header : "other"; next }
+            if ($0 ~ /^[[:space:]]*\[/) { header=table_name($0); source_section=(header=="agents" || header=="features") ? header : "other"; next }
             if (index($0,"=")>0) { key=substr($0,1,index($0,"=")-1); gsub(/^[[:space:]]+|[[:space:]]+$/,"",key); if (managed(source_section,key)) { value[source_section SUBSEP key]=substr($0,index($0,"=")+1); gsub(/^[[:space:]]+|[[:space:]]+$/,"",value[source_section SUBSEP key]) } }
             next
         }
@@ -419,9 +451,9 @@ merge_managed_config() {
         }
         {
             if ($0 ~ /^[[:space:]]*\[\[/) { flush_managed(current); flush_provider(); current="other"; in_provider=0; for (provider_key in provider_seen) delete provider_seen[provider_key]; print; next }
-            if ($0 ~ /^[[:space:]]*\[[^]]+\]/) {
+            if ($0 ~ /^[[:space:]]*\[/) {
                 flush_managed(current); flush_provider()
-                header=$0; sub(/^[[:space:]]*\[/,"",header); sub(/\][[:space:]]*(#.*)?$/,"",header); gsub(/^[[:space:]]+|[[:space:]]+$/,"",header)
+                header=table_name($0)
                 current=(header=="agents" || header=="features") ? header : "other"; in_provider=is_provider_section(header); if (in_provider) provider_found=1; for (provider_key in provider_seen) delete provider_seen[provider_key]; if (current=="agents" || current=="features") present[current]=1; print; next
             }
             if (in_provider && $0 ~ /^[[:space:]]*[A-Za-z][A-Za-z0-9_-]*[[:space:]]*=/) { key=$0; sub(/^[[:space:]]*/,"",key); sub(/[[:space:]]*=.*/,"",key); if (key in provider_value && !provider_seen[key]) { print key " = " provider_value[key]; provider_seen[key]=1; next } }
