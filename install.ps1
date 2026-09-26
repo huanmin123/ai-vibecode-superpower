@@ -103,6 +103,37 @@ function Assert-ManagedRoles([string]$Kind, [string]$Directory, [string]$Manifes
     if ($Kind -eq 'toml') { Assert-TomlRoles $Directory $Manifest $ExpectedCount } else { Assert-AgentProfiles $Directory $Manifest $ExpectedCount }
 }
 
+function Get-TomlTableHeader([string]$Line) {
+    $trimmed = $Line.Trim()
+    if (-not $trimmed.StartsWith('[')) { return $null }
+    $array = $trimmed.StartsWith('[[')
+    $opening = if ($array) { 2 } else { 1 }
+    $basic = $false; $literal = $false
+    for ($i = $opening; $i -lt $trimmed.Length; $i++) {
+        $character = $trimmed[$i]
+        if ($basic) {
+            if ($character -eq '\') { $i++ } elseif ($character -eq '"') { $basic = $false }
+            continue
+        }
+        if ($literal) {
+            if ($character -eq "'") { $literal = $false }
+            continue
+        }
+        if ($character -eq '"') { $basic = $true; continue }
+        if ($character -eq "'") { $literal = $true; continue }
+        if ($character -eq '[') { throw "Unsupported TOML table header: $Line" }
+        if ($character -eq ']') {
+            if ($array -and ($i + 1 -ge $trimmed.Length -or $trimmed[$i + 1] -ne ']')) { throw "Unsupported TOML array table header: $Line" }
+            $closing = if ($array) { 2 } else { 1 }
+            if ($trimmed.Substring($i + $closing) -notmatch '^\s*(#.*)?$') { throw "Unsupported TOML table header: $Line" }
+            $header = $trimmed.Substring($opening, $i - $opening).Trim()
+            if ($header.Length -eq 0) { throw "Unsupported TOML table header: $Line" }
+            return [pscustomobject]@{ Value = $header; IsArray = $array }
+        }
+    }
+    throw "Unsupported TOML table header: $Line"
+}
+
 function Assert-SafeTomlMergeInput([string]$Path) {
     function ConvertFrom-SafeQuotedTomlKey([string]$Key) {
         $KeyLength = $Key.Length
@@ -191,14 +222,10 @@ function Assert-SafeTomlMergeInput([string]$Path) {
         $trimmed = $line.Trim()
         if ([string]::IsNullOrWhiteSpace($trimmed) -or $trimmed.StartsWith('#')) { continue }
         if ($trimmed.Contains('"""') -or $trimmed.Contains("'''")) { throw "Unsupported multiline TOML in $Path" }
-        if ($trimmed.StartsWith('[[')) {
-            if ($trimmed -notmatch '^\[\[[^\]]+\]\]\s*(#.*)?$') { throw ('Unsupported TOML array table header in ' + $Path + ': ' + $trimmed) }
-            $section = '__array__'; continue
-        }
         if ($trimmed.StartsWith('[')) {
-            if ($trimmed -notmatch '^\[[^\]]+\]\s*(#.*)?$') { throw ('Unsupported TOML table header in ' + $Path + ': ' + $trimmed) }
-            $header = $trimmed.Substring(1, $trimmed.IndexOf(']') - 1)
-            $section = $header.Trim(); continue
+            $table = Get-TomlTableHeader $trimmed
+            $section = if ($table.IsArray) { '__array__' } else { $table.Value }
+            continue
         }
         $separator = Find-TomlAssignmentSeparator $trimmed
         if ($separator -lt 0) { throw "Unsupported TOML line in ${Path}: $line" }
@@ -231,8 +258,11 @@ function Get-ManagedConfigValues([string]$Path) {
     }
     $section = 'root'
     foreach ($line in Get-Content -LiteralPath $Path) {
-        if ($line -match '^\s*\[\[([^\]]+)\]\]') { $section = '__array__'; continue }
-        if ($line -match '^\s*\[([^\]]+)\]') { $section = $Matches[1].Trim(); continue }
+        if ($line.TrimStart().StartsWith('[')) {
+            $table = Get-TomlTableHeader $line
+            $section = if ($table.IsArray) { '__array__' } else { $table.Value }
+            continue
+        }
         if ($values.Contains($section) -and $line -match '^\s*([A-Za-z][A-Za-z0-9_-]*)\s*=\s*(.+)$') {
             $key = $Matches[1]
             if ($values[$section].Contains($key)) { $values[$section][$key] = $Matches[2].Trim() }
@@ -273,10 +303,11 @@ function Merge-Config([string]$Template, [string]$Existing, [string]$Provider, [
         }
     }
     foreach ($line in $lines) {
-        if ($line -match '^\s*\[\[([^\]]+)\]\]') { & $flush $section; $section = '__array__'; $providerSection = $false; $providerSeen = @{}; $outputLines.Add($line); continue }
-        if ($line -match '^\s*\[([^\]]+)\]') {
+        if ($line.TrimStart().StartsWith('[')) {
             & $flush $section
-            $header = $Matches[1].Trim()
+            $table = Get-TomlTableHeader $line
+            if ($table.IsArray) { $section = '__array__'; $providerSection = $false; $providerSeen = @{}; $outputLines.Add($line); continue }
+            $header = $table.Value
             $section = if ($header -in @('agents','features')) { $header } else { '__other__' }
             if ($section -in @('agents','features')) { $seenSections[$section] = $true }
             $providerSection = $header -match '^model_providers\.(?:[A-Za-z0-9_-]+|"[^"]+"|''[^'']+'')$'
@@ -315,7 +346,7 @@ $root = Split-Path -Parent $PSCommandPath
 $sourceSystemDocs = Join-Path $root 'shared\docs\system'
 $clientProfiles = [ordered]@{
     codex = @{
-        Label = 'Codex'; HomeEnv = 'CODEX_HOME'; DefaultHome = '.codex'; RoleKind = 'toml'; RoleCount = 12; Placeholder = 'CODEX_HOME'
+        Label = 'Codex'; HomeEnv = 'CODEX_HOME'; DefaultHome = '.codex'; RoleKind = 'toml'; RoleCount = 20; Placeholder = 'CODEX_HOME'
         Roles = Join-Path $root 'codex-global-config\agents\ai-vibecode-superpower'
         Manifest = Join-Path $root 'codex-global-config\agents\ai-vibecode-superpower.sha256'
         Instructions = Join-Path $root 'codex-global-config\AGENTS.md'
