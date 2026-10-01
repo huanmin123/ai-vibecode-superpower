@@ -117,48 +117,47 @@ test('standalone workflow skill has the five behavior stages and no obsolete pro
   const rolePattern = (role) => new RegExp(role.replace(/\./g, '\\.'));
   for (const role of [
     'gpt_6_astra_high', 'gpt_6_astra_xhigh', 'gpt_6_astra_max',
-    'gpt_6.1_sol_high', 'gpt_6.1_sol_xhigh',
-    'gpt_6_luna_high', 'gpt_6_luna_xhigh', 'gpt_6_luna_high_executor', 'gpt_6_luna_xhigh_executor',
-    'gpt_5.6_sol_high', 'gpt_5.6_sol_xhigh', 'gpt_5.6_sol_max',
-    'gpt_5.6_terra_high', 'gpt_5.6_terra_xhigh', 'gpt_5.6_terra_low_readonly', 'gpt_5.6_terra_medium_readonly',
-    'gpt_5.6_luna_high', 'gpt_5.6_luna_xhigh', 'gpt_5.6_luna_high_executor', 'gpt_5.6_luna_xhigh_executor'
+    'gpt_6.1_sol_high', 'gpt_6.1_sol_xhigh', 'gpt_6_sol_high', 'gpt_6_sol_xhigh',
+    'gpt_6_luna_high', 'gpt_6_luna_xhigh', 'gpt_6_luna_high_executor', 'gpt_6_luna_xhigh_executor'
   ]) assert.match(text, rolePattern(role));
-  assert.doesNotMatch('gpt_5x6_sol_high', rolePattern('gpt_5.6_sol_high'));
+  assert.doesNotMatch('gpt_6x1_sol_high', rolePattern('gpt_6.1_sol_high'));
+  assert.doesNotMatch(text, /gpt_5\.6|terra/);
   const interfaceText = await readFile(skillInterface, 'utf8');
   assert.match(interfaceText, /可拆任务优先多 agent 并行/);
 });
 
 test('protected execution roles and Luna executors allow the direct handoff matrix', async () => {
-  const executors = [
-    'gpt_6_luna_high_executor', 'gpt_6_luna_xhigh_executor',
-    'gpt_5.6_luna_high_executor', 'gpt_5.6_luna_xhigh_executor'
-  ];
-  for (const role of ['gpt_6.1_sol_high', 'gpt_5.6_terra_high']) {
+  const executors = ['gpt_6_luna_high_executor', 'gpt_6_luna_xhigh_executor'];
+  for (const role of ['gpt_6.1_sol_high', 'gpt_6_sol_high']) {
     const text = await readFile(path.join(roles, `${role}.toml`), 'utf8');
-    assert.match(text, /仅在对应 gpt-6-luna 角色或模型本次确认不可用时使用降级角色/u);
     const delegation = text.match(/可直接委派的执行子节点仅限 ([^。]+)。/u);
     assert.ok(delegation, `${role} must list its permitted execution children`);
     for (const executor of executors) assert.ok(delegation[1].includes(executor), `${role} must permit ${executor}`);
+    assert.doesNotMatch(delegation[1], /5\.6|terra/);
+  }
+  for (const role of ['gpt_6_sol_high', 'gpt_6_sol_xhigh']) {
+    const text = await readFile(path.join(roles, `${role}.toml`), 'utf8');
+    assert.match(text, /仅在 `gpt_6\.1_sol_(?:high|xhigh)` 角色或 gpt-6\.1-sol 模型已确认不可用时/u);
   }
   for (const executor of executors) {
     const text = await readFile(path.join(roles, `${executor}.toml`), 'utf8');
     const accepted = text.match(/只接受([^。]+)的直接委派/u);
     assert.ok(accepted, `${executor} must define its direct-delegation boundary`);
     assert.match(accepted[1], /`gpt_6\.1_sol_high`/);
-    assert.match(accepted[1], /`gpt_5\.6_terra_high`/);
+    assert.doesNotMatch(accepted[1], /terra/);
   }
 });
 
-test('all twenty managed roles remain hash-addressed with model routing fields', async () => {
+test('all eleven managed roles remain hash-addressed with model routing fields', async () => {
   const lines = (await readFile(manifest, 'utf8')).trim().split(/\r?\n/);
-  assert.equal(lines.length, 20);
+  assert.equal(lines.length, 11);
   const entries = new Map(lines.map((line) => {
     const match = line.trim().match(/^([0-9a-f]{64})\s+([^\s]+)$/);
     assert.ok(match, `invalid manifest line: ${line}`);
     return [match[1], match[2]];
   }));
   const files = (await readdir(roles)).filter((name) => name.endsWith('.toml')).sort();
-  assert.equal(files.length, 20);
+  assert.equal(files.length, 11);
   for (const file of files) {
     const source = await readFile(path.join(roles, file));
     assert.ok([...entries].some(([hash, name]) => name === file && hash === normalizedHash(source)));

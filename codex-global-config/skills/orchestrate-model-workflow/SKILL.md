@@ -36,15 +36,9 @@ description: "用于复杂开发、跨文件实现或修复、架构设计、Bug
 - `gpt_6_luna_high_executor`：目标、授权、范围、验收和停止条件已明确时的受控写入。
 - `gpt_6_luna_xhigh_executor`：已定方案但需要更深局部理解的受控写入。
 
-以下 gpt-5.6 角色是降级落点，仅在对应 gpt-6/gpt-6.1 角色或模型本次确认不可用时使用，并保留原始不可用错误：
+`gpt_6_sol_high` / `gpt_6_sol_xhigh` 是同型降级落点，仅在对应 gpt-6.1-sol 角色或模型本次确认不可用时使用，并保留原始不可用错误：`gpt_6_sol_high` 替代 `gpt_6.1_sol_high` 的保护执行、执行监管与集成职责；`gpt_6_sol_xhigh` 替代 `gpt_6.1_sol_xhigh` 的有界定案与常规复审职责。
 
-- `gpt_5.6_sol_high` / `gpt_5.6_sol_xhigh` / `gpt_5.6_sol_max`：复审线终点，替代对应的 `gpt_6_astra_*` 复审职责。
-- `gpt_5.6_terra_high` / `gpt_5.6_terra_xhigh`：主力线终点，替代 `gpt_6.1_sol_high` 与 `gpt_6.1_sol_xhigh` 的保护执行、定案与集成职责。
-- `gpt_5.6_luna_high` / `gpt_5.6_luna_xhigh`：快速线第一步，替代对应的 `gpt_6_luna_*` 只读取证。
-- `gpt_5.6_luna_high_executor` / `gpt_5.6_luna_xhigh_executor`：快速写入第一步，替代对应的 `gpt_6_luna_*_executor`。
-- `gpt_5.6_terra_low_readonly` / `gpt_5.6_terra_medium_readonly`：快速线终点，在 `gpt_6_luna_*` 与 `gpt_5.6_luna_*` 均不可用时替代同一只读取证或预审。
-
-模型降级链：复审线 `gpt-6-astra -> gpt-6.1-sol -> gpt-5.6-sol`；主力线 `gpt-6.1-sol -> gpt-5.6-terra`；快速线 `gpt-6-luna -> gpt-5.6-luna -> gpt-5.6-terra`。astra 复审职责不可用时优先由只读的 `gpt_6.1_sol_xhigh` 替代，其职责或强度不足时落到 5.6-sol 终点。
+模型回退链：复审线 `gpt-6-astra -> gpt-6.1-sol -> gpt-6-sol`；主力线 `gpt-6.1-sol -> gpt-6-sol`；快速线 `gpt-6-luna` 没有更低位落点，luna 不可用时由主代理直接完成对应取证，luna executor 不可用时由 Sol 直接负责该次受控写入。astra 复审职责不可用时优先由只读的 `gpt_6.1_sol_xhigh` 替代，其职责或强度不足时落到 `gpt_6_sol_xhigh` 终点。
 
 风险、权限、上下文和验收条件相当且角色可用时，默认优先选择 Luna；只有职责确实需要受保护执行、复杂定案或独立复审时才选择 Sol 或 Astra。role 的 `sandbox_mode` 是配置意图，不单独证明硬隔离。每次派发前核验当前宿主权限和 role/model 可用性；只有本次明确确认不可用时，才为本次操作选择职责、权限和验收能力等价的 fallback，并保留原始错误和发生时点。无法证明等价时停止并报告。fallback 仅对本次派发生效，是临时且可重新评估的选择；重试、进入下一阶段或再次需要该 role 时必须重新探测，恢复后优先回到原始 role；若原始职责允许同等选择，再优先选择可用的 Luna。普通超时、证据不足或执行失败不应被静默降级。
 

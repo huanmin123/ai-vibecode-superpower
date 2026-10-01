@@ -346,7 +346,7 @@ $root = Split-Path -Parent $PSCommandPath
 $sourceSystemDocs = Join-Path $root 'shared\docs\system'
 $clientProfiles = [ordered]@{
     codex = @{
-        Label = 'Codex'; HomeEnv = 'CODEX_HOME'; DefaultHome = '.codex'; RoleKind = 'toml'; RoleCount = 20; Placeholder = 'CODEX_HOME'
+        Label = 'Codex'; HomeEnv = 'CODEX_HOME'; DefaultHome = '.codex'; RoleKind = 'toml'; RoleCount = 11; Placeholder = 'CODEX_HOME'
         Roles = Join-Path $root 'codex-global-config\agents\ai-vibecode-superpower'
         Manifest = Join-Path $root 'codex-global-config\agents\ai-vibecode-superpower.sha256'
         Instructions = Join-Path $root 'codex-global-config\AGENTS.md'
