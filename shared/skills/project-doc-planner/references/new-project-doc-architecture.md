@@ -204,7 +204,7 @@ docs/
 - 环境加载脚本应在可行时强制隔离：dev/test 不得指向生产数据库、生产 Redis/缓存库、生产命名空间或生产根密钥。
 - 只有 `test/README.md` 和环境加载脚本都记录时，test 才可以复用 dev。
 - 生产发布备份应按 `YYYY-MM-DD_NNN` 版本化，包含产物、发布说明、校验和、回滚步骤和当前发布指针。
-- 真实密钥、DSN、Authorization header、cookie、API key 和密码不得出现在公开文档、包文档、截图、聊天输出或日志中。
+- 真实密钥、DSN、Authorization header、cookie、API key 和密码不得出现在公开文档、包文档、聊天输出或日志中。
 
 ## AI 交付流水线基线
 
