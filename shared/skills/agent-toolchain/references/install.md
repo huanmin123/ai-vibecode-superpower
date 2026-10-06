@@ -13,16 +13,16 @@
 ## 接入顺序
 
 1. 运行 `configure`：仅在不存在冲突时写入 CodeGraph 与 AOCI 的 MCP 配置（Codex 写入 `.codex/config.toml` 的 `[mcp_servers.codegraph]` 与 `[mcp_servers.aoci]`，ZCode 写入 `.zcode/config.json` 的 `mcp.servers` 两项；AOCI 的 `command` 为受管公共入口 `aoci`/`aoci.exe` 的绝对路径，`args` 为 `--repo <项目绝对路径> mcp`）、`/.codegraph/` 与所接入客户端目录（Codex 为 `/.codex/`，ZCode 为 `/.zcode/`）的忽略规则及项目根 `AGENTS.md` 的唯一 `## CodeGraph 与 RTK` 受管标题。客户端按项目现有 `.codex/`、`.zcode/` 目录自动探测，两者都有则都接入；都未探测到时，交互终端由驱动询问用户，非交互调用必须传 `--client codex|zcode|both`（按当前会话宿主选择，不确定时先询问用户）。该标题内同时包含运行时工具规则和 `$agent-toolchain` 管理路由；旧版 `## AI 工具` 标题不会被覆盖。AOCI 的 `AGENTS.md` 规则区块不在 `configure` 阶段写入。
-2. 运行 `bootstrap --dry-run`，核对将安装的受管工具。
-3. 运行 `bootstrap --apply`：CodeGraph 使用官方固定 npm 包且禁用安装脚本；RTK 与 AOCI 使用固定官方 release 归档，并校验摘要与二进制架构。
+2. 运行 `bootstrap --dry-run`，核对将安装的受管工具与 AOCI 认知初始化预览。
+3. 运行 `bootstrap --apply`：CodeGraph 使用官方固定 npm 包且禁用安装脚本；RTK 与 AOCI 使用固定官方 release 归档，并校验摘要与二进制架构。安装成功后若项目根缺少 `aoci.txt` 或 `.aoci/baseline.json`，自动执行 `init-aoci` 补建（已初始化的项目跳过）。
 4. 运行 `init-codegraph`：新建 CodeGraph 索引，或对已有索引执行一次增量同步。
-5. 运行 `init-aoci`：项目根尚无 `aoci.txt` 时调用 `aoci init --locale zh-CN`（不传 `--agent`，宿主 MCP 配置已由 `configure` 写入），生成认知骨架、`AGENTS.md` 托管区块、`.aoci/` 治理目录和根目录 `.gitattributes`（LF 行尾，已存在时不改写）；`.aoci/baseline.json` 缺失时运行 `aoci scan` 建立基线，已存在时跳过（`aoci scan` 拒绝覆盖既有基线）。两份资产齐备时不再执行 init 或 scan，仅运行 `aoci status`，因此本命令幂等可复跑。
+5. 运行 `init-aoci`：项目根尚无 `aoci.txt` 时调用 `aoci init --locale zh-CN`（不传 `--agent`，宿主 MCP 配置已由 `configure` 写入），生成认知骨架、`AGENTS.md` 托管区块、`.aoci/` 治理目录和根目录 `.gitattributes`（LF 行尾，已存在时不改写）；`.aoci/baseline.json` 缺失时运行 `aoci scan` 建立基线，已存在时跳过（`aoci scan` 拒绝覆盖既有基线）。两份资产齐备时不再执行 init 或 scan，仅运行 `aoci status`，因此本命令幂等可复跑；`bootstrap` 与 `upgrade` 安装成功后会在认知未初始化时自动执行本命令。
 6. 运行完整 `doctor`，再执行一次与当前任务相关的 CodeGraph 查询或 `codegraph status`。
 
 ## 升级顺序
 
 1. 运行 `upgrade --project <目标项目> --dry-run`，核对该驱动内置的受支持版本、下载来源和后续索引操作。
-2. 运行 `upgrade --project <目标项目> --apply`。它会仅在当前受管工具不满足内置版本时安装；CodeGraph 有版本变化时执行 `codegraph index` 全量重建，没有变化时保留索引；AOCI 只更新二进制并保留认知卷。
+2. 运行 `upgrade --project <目标项目> --apply`。它会仅在当前受管工具不满足内置版本时安装；CodeGraph 有版本变化时执行 `codegraph index` 全量重建，没有变化时保留索引；AOCI 只更新二进制并保留认知卷。工具就绪后若 AOCI 认知未初始化，同样自动执行 `init-aoci` 补建。
 3. 将命令输出中的完整 `doctor` 结果交付给用户；失败时保留原始错误，停止而不以手工替代安装器继续。
 
 ## 调用驱动

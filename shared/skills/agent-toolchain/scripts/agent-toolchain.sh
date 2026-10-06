@@ -514,17 +514,17 @@ args = [
 }
 
 load_trusted_manifest() {
-  CODEGRAPH_VERSION=1.6.0
+  CODEGRAPH_VERSION=1.6.2
   CODEGRAPH_NPM_PACKAGE='@colbymchenry/codegraph'
-  RTK_VERSION=0.46.0
+  RTK_VERSION=0.51.0
   RTK_DARWIN_ARM64_ASSET=rtk-aarch64-apple-darwin.tar.gz
-  RTK_DARWIN_ARM64_SHA256=484e5dd2b4bfdbbb910727a0ba1e2d63b2e23efa922cfcc7300fd131bca3e10a
+  RTK_DARWIN_ARM64_SHA256=8817d8b71afc02ac8bf06eb24bcc41c306592ab735b68e8fee9db1ba0de7cb59
   RTK_DARWIN_X64_ASSET=rtk-x86_64-apple-darwin.tar.gz
-  RTK_DARWIN_X64_SHA256=67eb651fa9cfc4a4ea65876242eb71b8837abdac40521d0dd363214ec1a068dd
+  RTK_DARWIN_X64_SHA256=bd39c8153f4147358360c7dc51665a8131cc9ee16f81f69a9402ffa500be3cc2
   RTK_LINUX_ARM64_ASSET=rtk-aarch64-unknown-linux-gnu.tar.gz
-  RTK_LINUX_ARM64_SHA256=e8c2e1787f46017ea7c5a711b2bc6a7f7cf61c7ad69385b4c1e4daff1135dcd1
+  RTK_LINUX_ARM64_SHA256=8d6d1aad9e69b42481eda7039507d1f7ee93698f87713cecd873d287c1931632
   RTK_LINUX_X64_ASSET=rtk-x86_64-unknown-linux-musl.tar.gz
-  RTK_LINUX_X64_SHA256=79aa5b89c69566feceb66c8a27cfbe52237fc7ee3e683115f43745a3262d21
+  RTK_LINUX_X64_SHA256=5028d3b19a8f0990d30fec9fbb07e32782bc5698e618fb1861aad8a9ccba4eb5
   AOCI_VERSION=0.1.0-rc18
   AOCI_DARWIN_ARM64_ASSET=aoci_0.1.0-rc18_darwin_arm64.tar.gz
   AOCI_DARWIN_ARM64_SHA256=d49fd9216454b98c46a42850ef14072bc2fbe1a5261352a8349b03f7ceaf154a
@@ -1301,6 +1301,15 @@ bootstrap() {
   if [ "$APPLY" -eq 1 ] && is_ready rtk; then
     RTK_TELEMETRY_DISABLED=1 "$(managed_binary rtk)" telemetry disable >/dev/null 2>&1 || note "RTK 当前版本不支持 telemetry disable；调用 RTK 时必须显式传入 RTK_TELEMETRY_DISABLED=1"
   fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    if aoci_cognition_needs_init; then
+      note "dry-run: AOCI 认知未初始化；安装成功后将自动执行 init-aoci 补建"
+    else
+      note "dry-run: AOCI 认知已初始化；不执行 init-aoci"
+    fi
+    return
+  fi
+  init_aoci_if_needed
 }
 
 init_codegraph() {
@@ -1335,6 +1344,21 @@ init_aoci() {
   note "AOCI 首次认知索引由宿主 Agent 在重启会话后按 AGENTS.md 托管区块自动完成"
 }
 
+aoci_cognition_needs_init() {
+  [ -f "$PROJECT/aoci.txt" ] && [ -f "$PROJECT/.aoci/baseline.json" ] && return 1
+  return 0
+}
+
+init_aoci_if_needed() {
+  is_ready aoci || return 0
+  if aoci_cognition_needs_init; then
+    note "检测到 AOCI 认知未初始化；自动执行 init-aoci 补建"
+    init_aoci
+  else
+    note "AOCI 认知已初始化；跳过自动补建"
+  fi
+}
+
 rebuild_codegraph_index() {
   is_ready codegraph || die "CodeGraph 尚未安装"
   assert_codegraph_index_safe
@@ -1358,7 +1382,14 @@ upgrade() {
   is_ready aoci || aoci_needs_upgrade=1
   if [ "$codegraph_needs_upgrade" -eq 0 ] && [ "$rtk_needs_upgrade" -eq 0 ] && [ "$aoci_needs_upgrade" -eq 0 ]; then
     note "CodeGraph、RTK 与 AOCI 已是当前受支持版本；不下载或重建索引"
-    [ "$DRY_RUN" -eq 1 ] && note "dry-run: 将运行完整 doctor"
+    if [ "$DRY_RUN" -eq 1 ]; then
+      if aoci_cognition_needs_init; then
+        note "dry-run: AOCI 认知未初始化；将自动执行 init-aoci 补建"
+      fi
+      note "dry-run: 将运行完整 doctor"
+      return
+    fi
+    init_aoci_if_needed
     doctor
     return
   fi

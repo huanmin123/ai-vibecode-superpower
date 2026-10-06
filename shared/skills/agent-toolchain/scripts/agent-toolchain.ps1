@@ -382,8 +382,8 @@ args = [
 
 function Load-TrustedManifest {
   $script:Manifest = [ordered]@{
-    CODEGRAPH_VERSION = '1.6.0'; CODEGRAPH_NPM_PACKAGE = '@colbymchenry/codegraph'; RTK_VERSION = '0.46.0'
-    RTK_WIN32_X64_ASSET = 'rtk-x86_64-pc-windows-msvc.zip'; RTK_WIN32_X64_SHA256 = '9bc5acd54d35a916e4a561435963e0acf2f1a0115cf43dcfe2b719f361c8a970'
+    CODEGRAPH_VERSION = '1.6.2'; CODEGRAPH_NPM_PACKAGE = '@colbymchenry/codegraph'; RTK_VERSION = '0.51.0'
+    RTK_WIN32_X64_ASSET = 'rtk-x86_64-pc-windows-msvc.zip'; RTK_WIN32_X64_SHA256 = '1623e9b45d28b15122d69e7314776e1123a804224885ce07e7182fb40080f05c'
     AOCI_VERSION = '0.1.0-rc18'; AOCI_WIN32_X64_ASSET = 'aoci_0.1.0-rc18_windows_amd64.zip'; AOCI_WIN32_X64_SHA256 = '012072baeead1d37062e431f3191d3338e2e67789baec79549a8e0fd12c4a09b'
   }
 }
@@ -960,6 +960,12 @@ function Invoke-Bootstrap {
     $telemetryExitCode = $LASTEXITCODE
     if ($telemetryExitCode -ne 0) { Fail "RTK telemetry disable 失败：$telemetryExitCode $($telemetryOutput -join ' ')" }
   }
+  if ($script:DryRun) {
+    if (Test-AociCognitionNeedsInit) { Note 'dry-run: AOCI 认知未初始化；安装成功后将自动执行 init-aoci 补建' }
+    else { Note 'dry-run: AOCI 认知已初始化；不执行 init-aoci' }
+    return
+  }
+  Invoke-AociCognitionOnboarding
 }
 
 function Invoke-InitCodeGraph {
@@ -999,6 +1005,18 @@ function Invoke-InitAoci {
   Note 'AOCI 首次认知索引由宿主 Agent 在重启会话后按 AGENTS.md 托管区块自动完成'
 }
 
+function Test-AociCognitionNeedsInit {
+  if (-not (Test-Path -LiteralPath (Join-Path $script:Project 'aoci.txt') -PathType Leaf)) { return $true }
+  return -not (Test-Path -LiteralPath (Join-Path $script:Project '.aoci/baseline.json') -PathType Leaf)
+}
+
+function Invoke-AociCognitionOnboarding {
+  if (-not (Test-Ready 'aoci')) { return }
+  if (-not (Test-AociCognitionNeedsInit)) { Note 'AOCI 认知已初始化；跳过自动补建'; return }
+  Note '检测到 AOCI 认知未初始化；自动执行 init-aoci 补建'
+  Invoke-InitAoci
+}
+
 function Invoke-RebuildCodeGraphIndex {
   if (-not (Test-Ready 'codegraph')) { Fail 'CodeGraph 尚未安装' }
   $indexDirectory = Join-Path $script:Project '.codegraph'
@@ -1029,7 +1047,12 @@ function Invoke-Upgrade {
   $aociNeedsUpgrade = -not (Test-Ready 'aoci')
   if (-not $codeGraphNeedsUpgrade -and -not $rtkNeedsUpgrade -and -not $aociNeedsUpgrade) {
     Note 'CodeGraph、RTK 与 AOCI 已是当前受支持版本；不下载或重建索引'
-    if ($script:DryRun) { Note 'dry-run: 将运行完整 doctor' }
+    if ($script:DryRun) {
+      if (Test-AociCognitionNeedsInit) { Note 'dry-run: AOCI 认知未初始化；将自动执行 init-aoci 补建' }
+      Note 'dry-run: 将运行完整 doctor'
+      return
+    }
+    Invoke-AociCognitionOnboarding
     Invoke-Doctor
     return
   }
