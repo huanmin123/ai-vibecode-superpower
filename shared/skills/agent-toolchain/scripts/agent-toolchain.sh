@@ -15,14 +15,16 @@ Usage:
   agent-toolchain.sh bootstrap --project PATH --dry-run|--apply
   agent-toolchain.sh upgrade --project PATH --dry-run|--apply
   agent-toolchain.sh init-codegraph --project PATH
+  agent-toolchain.sh init-aoci --project PATH
   agent-toolchain.sh maintain --project PATH [--sync]
   agent-toolchain.sh rollback rtk VERSION
+  agent-toolchain.sh rollback aoci VERSION
 EOF
 }
 
 command_name() {
   case "$1" in
-    codegraph|rtk) printf '%s\n' "$1" ;;
+    codegraph|rtk|aoci) printf '%s\n' "$1" ;;
     *) die "不支持的工具：$1" ;;
   esac
 }
@@ -45,7 +47,7 @@ parse_args() {
       --dry-run) DRY_RUN=1; shift ;;
       --quick) QUICK=1; shift ;;
       --sync) SYNC=1; shift ;;
-      codegraph|rtk) [ "$ACTION" = rollback ] || die "未知参数：$1"; ROLLBACK_TOOL=$1; shift ;;
+      codegraph|rtk|aoci) [ "$ACTION" = rollback ] || die "未知参数：$1"; ROLLBACK_TOOL=$1; shift ;;
       *)
         if [ "$ACTION" = rollback ] && [ -z "$ROLLBACK_VERSION" ]; then
           ROLLBACK_VERSION=$1; shift
@@ -199,7 +201,9 @@ managed_agents_section() {
     }
     function is_setext_underline(value) { return value ~ "^[ ]?[ ]?[ ]?-+[ \t]*$" }
     function is_h2(line_no) {
-      return is_atx_h2(lines[line_no]) || (line_no < NR && lines[line_no] ~ "^[ ]?[ ]?[ ]?[^[:space:]].*$" && is_setext_underline(lines[line_no + 1]))
+      if (is_atx_h2(lines[line_no])) return 1
+      if (lines[line_no] ~ /^<!--[ ]*aoci:begin[ ]*-->$/) return 1
+      return (line_no < NR && lines[line_no] ~ "^[ ]?[ ]?[ ]?[^[:space:]].*$" && is_setext_underline(lines[line_no + 1]))
     }
     { if (NR == 1) sub(/^\xef\xbb\xbf/, ""); sub(/\r$/, ""); lines[NR] = $0 }
     END {
@@ -282,11 +286,14 @@ configure_project() {
   assert_plain_file_or_absent "$ignore"
 
   codex_config_needs_write=0
+  codex_aoci_needs_write=0
   zcode_config_needs_write=0
   agents_needs_write=0
   ignore_needs_codegraph=0
+  ignore_needs_aoci_backup=0
   ignore_needs_codex=0
   ignore_needs_zcode=0
+  aoci_command="$TOOLCHAIN_BIN/aoci"
   agents_heading='## CodeGraph 与 RTK'
   agents_block='## CodeGraph 与 RTK
 
@@ -310,16 +317,31 @@ configure_project() {
     else
       codex_config_needs_write=1
     fi
+    if [ -f "$codex_config" ] && rg -q '^\[mcp_servers\.aoci\][[:space:]]*$' "$codex_config"; then
+      aoci_body=$(toml_table_body "$codex_config" '[mcp_servers.aoci]') || die ".codex/config.toml 的 AOCI 主表重复或无效"
+      aoci_command_pattern=$(printf '%s' "$aoci_command" | sed 's/[][\.^$*+?(){}|]/\\&/g')
+      aoci_repo_pattern=$(printf '%s' "$PROJECT" | sed 's/[][\.^$*+?(){}|]/\\&/g')
+      printf '%s\n' "$aoci_body" | rg -q "^command[[:space:]]*=[[:space:]]*\"$aoci_command_pattern\"[[:space:]]*\$" || die ".codex/config.toml 的 AOCI command 冲突"
+      printf '%s\n' "$aoci_body" | rg -q '^[[:space:]]*"--repo",[[:space:]]*$' || die ".codex/config.toml 的 AOCI args 冲突"
+      printf '%s\n' "$aoci_body" | rg -q "^[[:space:]]*\"$aoci_repo_pattern\",[[:space:]]*\$" || die ".codex/config.toml 的 AOCI args 冲突"
+      printf '%s\n' "$aoci_body" | rg -q '^[[:space:]]*"mcp",[[:space:]]*$' || die ".codex/config.toml 的 AOCI args 冲突"
+    elif [ -f "$codex_config" ] && rg -q '^\[mcp_servers\.aoci\.' "$codex_config"; then
+      die ".codex/config.toml 存在不完整的 AOCI 表"
+    else
+      codex_aoci_needs_write=1
+    fi
   fi
 
   if [ "$wire_zcode" -eq 1 ]; then
     if [ -f "$zcode_config" ]; then
       command -v python3 >/dev/null 2>&1 || die '合并已存在的 .zcode/config.json 需要 python3；未写入任何文件'
-      python3 - "$zcode_config" <<'PYEOF'
+      python3 - "$zcode_config" "$aoci_command" "$PROJECT" <<'PYEOF'
 import json
 import sys
 
 path = sys.argv[1]
+aoci_command = sys.argv[2]
+aoci_args = ['--repo', sys.argv[3], 'mcp']
 with open(path, 'r', encoding='utf-8') as handle:
     data = json.load(handle)
 if not isinstance(data, dict):
@@ -355,6 +377,21 @@ else:
     with open(path, 'w', encoding='utf-8') as handle:
         json.dump(data, handle, indent=2, ensure_ascii=False)
         handle.write('\n')
+if 'aoci' in servers:
+    server = servers['aoci']
+    if (not isinstance(server, dict)
+            or server.get('command') != aoci_command
+            or list(server.get('args') or []) != aoci_args):
+        raise SystemExit('.zcode/config.json 的 AOCI 配置冲突')
+else:
+    servers['aoci'] = {
+        'type': 'stdio',
+        'command': aoci_command,
+        'args': aoci_args,
+    }
+    with open(path, 'w', encoding='utf-8') as handle:
+        json.dump(data, handle, indent=2, ensure_ascii=False)
+        handle.write('\n')
 PYEOF
     else
       zcode_config_needs_write=1
@@ -382,6 +419,9 @@ PYEOF
   if [ ! -f "$ignore" ] || ! rg -q '^/\.codegraph/\r?$' "$ignore"; then
     ignore_needs_codegraph=1
   fi
+  if [ ! -f "$ignore" ] || ! rg -q '^/AGENTS\.md\.backup\.\*\r?$' "$ignore"; then
+    ignore_needs_aoci_backup=1
+  fi
   if [ "$wire_codex" -eq 1 ]; then
     if [ ! -f "$ignore" ] || ! rg -q '^/\.codex/\r?$' "$ignore"; then
       ignore_needs_codex=1
@@ -406,6 +446,13 @@ args = [
 CODEGRAPH_TELEMETRY = "0"
 CODEGRAPH_NO_UPDATE_CHECK = "1"
 DO_NOT_TRACK = "1"'
+    [ "$codex_aoci_needs_write" -eq 0 ] || append_project_text "$codex_config" "[mcp_servers.aoci]
+command = \"$aoci_command\"
+args = [
+    \"--repo\",
+    \"$PROJECT\",
+    \"mcp\",
+]"
   fi
   if [ "$wire_zcode" -eq 1 ]; then
     [ -e "$zcode_dir" ] || mkdir "$zcode_dir"
@@ -422,6 +469,11 @@ DO_NOT_TRACK = "1"'
           "CODEGRAPH_NO_UPDATE_CHECK": "1",
           "DO_NOT_TRACK": "1"
         }
+      },
+      "aoci": {
+        "type": "stdio",
+        "command": "'"$aoci_command"'",
+        "args": ["--repo", "'"$PROJECT"'", "mcp"]
       }
     }
   }
@@ -432,6 +484,14 @@ DO_NOT_TRACK = "1"'
   ignore_write=''
   if [ "$ignore_needs_codegraph" -eq 1 ]; then
     ignore_write='/.codegraph/'
+  fi
+  if [ "$ignore_needs_aoci_backup" -eq 1 ]; then
+    if [ -n "$ignore_write" ]; then
+      ignore_write="$ignore_write
+/AGENTS.md.backup.*"
+    else
+      ignore_write='/AGENTS.md.backup.*'
+    fi
   fi
   if [ "$ignore_needs_codex" -eq 1 ]; then
     if [ -n "$ignore_write" ]; then
@@ -450,7 +510,7 @@ DO_NOT_TRACK = "1"'
     fi
   fi
   [ -z "$ignore_write" ] || append_project_text "$ignore" "$ignore_write"
-  note "项目 CodeGraph 与 RTK 受管配置已就绪"
+  note "项目 CodeGraph、RTK 与 AOCI 受管配置已就绪"
 }
 
 load_trusted_manifest() {
@@ -465,15 +525,24 @@ load_trusted_manifest() {
   RTK_LINUX_ARM64_SHA256=e8c2e1787f46017ea7c5a711b2bc6a7f7cf61c7ad69385b4c1e4daff1135dcd1
   RTK_LINUX_X64_ASSET=rtk-x86_64-unknown-linux-musl.tar.gz
   RTK_LINUX_X64_SHA256=79aa5b89c69566feceb66c8a27cfbe52237fc7ee3e683115f43745a3262d21
+  AOCI_VERSION=0.1.0-rc18
+  AOCI_DARWIN_ARM64_ASSET=aoci_0.1.0-rc18_darwin_arm64.tar.gz
+  AOCI_DARWIN_ARM64_SHA256=d49fd9216454b98c46a42850ef14072bc2fbe1a5261352a8349b03f7ceaf154a
+  AOCI_DARWIN_X64_ASSET=aoci_0.1.0-rc18_darwin_amd64.tar.gz
+  AOCI_DARWIN_X64_SHA256=2f2ab91e1032d6611fa56aa02e074158aa5540108df4c8b5c43bbf5621386010
+  AOCI_LINUX_ARM64_ASSET=aoci_0.1.0-rc18_linux_arm64.tar.gz
+  AOCI_LINUX_ARM64_SHA256=18a2f3f34af93f2f211074b1e454a7434d1f1a3846d0c68e55580f252073531b
+  AOCI_LINUX_X64_ASSET=aoci_0.1.0-rc18_linux_amd64.tar.gz
+  AOCI_LINUX_X64_SHA256=f37d045b6dbb1e945ac92ad969452e348ffe3825350cdd58dcd144c921899031
   select_platform_assets
 }
 
 select_platform_assets() {
   case "$PLATFORM" in
-    darwin-arm64) RTK_ASSET=$RTK_DARWIN_ARM64_ASSET; RTK_SHA256=$RTK_DARWIN_ARM64_SHA256 ;;
-    darwin-x64) RTK_ASSET=$RTK_DARWIN_X64_ASSET; RTK_SHA256=$RTK_DARWIN_X64_SHA256 ;;
-    linux-arm64) RTK_ASSET=$RTK_LINUX_ARM64_ASSET; RTK_SHA256=$RTK_LINUX_ARM64_SHA256 ;;
-    linux-x64) RTK_ASSET=$RTK_LINUX_X64_ASSET; RTK_SHA256=$RTK_LINUX_X64_SHA256 ;;
+    darwin-arm64) RTK_ASSET=$RTK_DARWIN_ARM64_ASSET; RTK_SHA256=$RTK_DARWIN_ARM64_SHA256; AOCI_ASSET=$AOCI_DARWIN_ARM64_ASSET; AOCI_SHA256=$AOCI_DARWIN_ARM64_SHA256 ;;
+    darwin-x64) RTK_ASSET=$RTK_DARWIN_X64_ASSET; RTK_SHA256=$RTK_DARWIN_X64_SHA256; AOCI_ASSET=$AOCI_DARWIN_X64_ASSET; AOCI_SHA256=$AOCI_DARWIN_X64_SHA256 ;;
+    linux-arm64) RTK_ASSET=$RTK_LINUX_ARM64_ASSET; RTK_SHA256=$RTK_LINUX_ARM64_SHA256; AOCI_ASSET=$AOCI_LINUX_ARM64_ASSET; AOCI_SHA256=$AOCI_LINUX_ARM64_SHA256 ;;
+    linux-x64) RTK_ASSET=$RTK_LINUX_X64_ASSET; RTK_SHA256=$RTK_LINUX_X64_SHA256; AOCI_ASSET=$AOCI_LINUX_X64_ASSET; AOCI_SHA256=$AOCI_LINUX_X64_SHA256 ;;
     *) die "当前 POSIX 驱动不支持的平台：$PLATFORM" ;;
   esac
 }
@@ -487,6 +556,10 @@ tool_value() {
     rtk:asset) printf '%s\n' "$RTK_ASSET" ;;
     rtk:sha) printf '%s\n' "$RTK_SHA256" ;;
     rtk:url) printf '%s\n' "https://github.com/rtk-ai/rtk/releases/download/v$RTK_VERSION/$RTK_ASSET" ;;
+    aoci:version) printf '%s\n' "$AOCI_VERSION" ;;
+    aoci:asset) printf '%s\n' "$AOCI_ASSET" ;;
+    aoci:sha) printf '%s\n' "$AOCI_SHA256" ;;
+    aoci:url) printf '%s\n' "https://github.com/aoci-spec/aoci-code/releases/download/v$AOCI_VERSION/$AOCI_ASSET" ;;
     *) die "未知工具字段：$tool:$field" ;;
   esac
 }
@@ -495,7 +568,7 @@ binary_in_dir() {
   tool=$1
   directory=$2
   case "$tool" in
-    rtk) printf '%s/rtk\n' "$directory" ;;
+    rtk|aoci) printf '%s/%s\n' "$directory" "$tool" ;;
     *) die "不支持的工具：$tool" ;;
   esac
 }
@@ -530,7 +603,7 @@ codegraph_npm_ready() {
 managed_binary() {
   case "$1" in
     codegraph) codegraph_npm_binary || die "CodeGraph npm 全局入口不可用" ;;
-    rtk) binary_in_dir rtk "$TOOLCHAIN_HOME/rtk/current" ;;
+    rtk|aoci) binary_in_dir "$1" "$TOOLCHAIN_HOME/$1/current" ;;
     *) die "不支持的工具：$1" ;;
   esac
 }
@@ -610,11 +683,11 @@ EOF
 run_tool_version() {
   tool=$1
   binary=$2
-  if [ "$tool" = rtk ]; then
-    RTK_TELEMETRY_DISABLED=1 "$binary" --version
-  else
-    CODEGRAPH_TELEMETRY=0 CODEGRAPH_NO_UPDATE_CHECK=1 DO_NOT_TRACK=1 CODEGRAPH_NO_DOWNLOAD=1 "$binary" --version
-  fi
+  case "$tool" in
+    rtk) RTK_TELEMETRY_DISABLED=1 "$binary" --version ;;
+    codegraph) CODEGRAPH_TELEMETRY=0 CODEGRAPH_NO_UPDATE_CHECK=1 DO_NOT_TRACK=1 CODEGRAPH_NO_DOWNLOAD=1 "$binary" --version ;;
+    *) "$binary" --version ;;
+  esac
 }
 
 run_codegraph() {
@@ -629,12 +702,18 @@ version_matches() {
   case "$tool" in
     codegraph) [ "$output" = "$expected" ] ;;
     rtk) [ "$output" = "rtk $expected" ] ;;
+    aoci) case "$output" in "aoci version $expected "*) return 0 ;; *) return 1 ;; esac ;;
     *) return 1 ;;
   esac
 }
 
 version_is_safe() {
-  case "$1" in
+  value=$1
+  case "$value" in
+    *[0-9]-rc) return 1 ;;
+    *[0-9]-rc[0-9]*) value="${value%%-rc*}${value#*-rc}" ;;
+  esac
+  case "$value" in
     ''|*[!0-9.]*|.*|*..*|*.) return 1 ;;
     *) return 0 ;;
   esac
@@ -648,7 +727,7 @@ verify_failure() {
 verify_version_dir() {
   tool=$1
   version=$2
-  [ "$tool" = rtk ] || { verify_failure "只有 RTK 使用受管版本目录"; return 1; }
+  case "$tool" in rtk|aoci) ;; *) { verify_failure "只有 RTK 与 AOCI 使用受管版本目录"; return 1; } ;; esac
   version_is_safe "$version" || { verify_failure "版本格式"; return 1; }
   tool_dir="$TOOLCHAIN_HOME/$tool"
   version_dir=${3:-"$tool_dir/$version"}
@@ -696,7 +775,7 @@ is_ready() {
 quick_verify_version_dir() {
   tool=$1
   version=$2
-  [ "$tool" = rtk ] || return 1
+  case "$tool" in rtk|aoci) ;; *) return 1 ;; esac
   version_is_safe "$version" || return 1
   tool_dir="$TOOLCHAIN_HOME/$tool"
   version_dir="$tool_dir/$version"
@@ -749,7 +828,7 @@ assert_codegraph_index_safe() {
 doctor() {
   doctor_failed=0
   if [ "$QUICK" -eq 1 ]; then
-    for tool in codegraph rtk; do
+    for tool in codegraph rtk aoci; do
       if quick_is_ready "$tool"; then
         note "$tool: ready ($(managed_binary "$tool"))"
       else
@@ -758,11 +837,12 @@ doctor() {
       fi
     done
     note "codegraph-index: skipped (--quick)"
+    note "aoci-cognition: skipped (--quick)"
     [ "$doctor_failed" -eq 0 ] || return 1
     return 0
   fi
   assert_codegraph_index_safe
-  for tool in codegraph rtk; do
+  for tool in codegraph rtk aoci; do
     if is_ready "$tool"; then
       note "$tool: ready ($(managed_binary "$tool"))"
     else
@@ -777,6 +857,15 @@ doctor() {
       note "codegraph-index: needs_init"
       doctor_failed=1
     fi
+  fi
+  if [ ! -f "$PROJECT/aoci.txt" ]; then
+    note "aoci-cognition: needs_init"
+    doctor_failed=1
+  elif [ ! -f "$PROJECT/.aoci/baseline.json" ]; then
+    note "aoci-baseline: needs_scan"
+    doctor_failed=1
+  else
+    note "aoci-cognition: initialized"
   fi
   [ "$doctor_failed" -eq 0 ] || return 1
 }
@@ -992,10 +1081,24 @@ restore_publication() {
   fi
 }
 
+write_aoci_public_link() {
+  path="$TOOLCHAIN_BIN/aoci"
+  target="$TOOLCHAIN_HOME/aoci/current/aoci"
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    [ -L "$path" ] && [ "$(readlink "$path")" = "$target" ] || die "$path 已被非受管理目标占用"
+    return
+  fi
+  atomic_link "$target" "$path"
+  INSTALL_PUBLIC_CREATED=1
+}
+
 switch_current() {
   tool=$1
   version=$2
-  [ "$tool" = rtk ] || die "仅 RTK 支持受管版本回滚；CodeGraph 固定为 npm 审查版本"
+  case "$tool" in
+    rtk|aoci) ;;
+    *) die "仅 RTK 与 AOCI 支持受管版本回滚；CodeGraph 固定为 npm 审查版本" ;;
+  esac
   version_is_safe "$version" || die "不安全的版本号：$version"
   tool_dir="$TOOLCHAIN_HOME/$tool"
   version_dir="$tool_dir/$version"
@@ -1005,13 +1108,19 @@ switch_current() {
   if [ -e "$tool_dir/current" ] && [ ! -L "$tool_dir/current" ]; then
     die "受管理目录中的 current 不是 symlink"
   fi
-  write_rtk_launcher
+  case "$tool" in
+    rtk) write_rtk_launcher ;;
+    aoci) write_aoci_public_link ;;
+  esac
   atomic_link "$version_dir" "$tool_dir/current"
 }
 
 install_tool() {
   tool=$1
-  [ "$tool" = rtk ] || die "CodeGraph 必须通过官方 npm 包安装"
+  case "$tool" in
+    rtk|aoci) ;;
+    *) die "CodeGraph 必须通过官方 npm 包安装" ;;
+  esac
   version=$(tool_value "$tool" version)
   url=$(tool_value "$tool" url)
   expected_sha=$(tool_value "$tool" sha)
@@ -1179,6 +1288,13 @@ bootstrap() {
   if [ "$rtk_result" -ne 0 ]; then
     die "RTK 安装失败；CodeGraph npm 安装保留，以便修复网络后重试。"
   fi
+  set +e
+  (set -e; install_tool aoci)
+  aoci_result=$?
+  set -e
+  if [ "$aoci_result" -ne 0 ]; then
+    die "AOCI 安装失败；CodeGraph 与 RTK 安装保留，以便修复网络后重试。"
+  fi
   if [ "$APPLY" -eq 1 ] && is_ready codegraph; then
     run_codegraph "$(managed_binary codegraph)" telemetry off >/dev/null 2>&1 || note "CodeGraph 当前版本不支持 telemetry off；MCP 环境变量仍会禁用遥测"
   fi
@@ -1201,6 +1317,24 @@ init_codegraph() {
   (cd "$PROJECT" && run_codegraph "$(managed_binary codegraph)" status)
 }
 
+init_aoci() {
+  is_ready aoci || die "AOCI 尚未安装"
+  binary=$(managed_binary aoci)
+  if [ ! -f "$PROJECT/aoci.txt" ]; then
+    note "aoci.txt 不存在；初始化认知骨架与 AGENTS.md 托管区块"
+    "$binary" --repo "$PROJECT" init --locale zh-CN || die "aoci init 失败"
+  else
+    note "aoci.txt 已存在；保留认知卷"
+  fi
+  if [ ! -f "$PROJECT/.aoci/baseline.json" ]; then
+    "$binary" --repo "$PROJECT" scan || die "aoci scan 失败"
+  else
+    note ".aoci/baseline.json 已存在；跳过 scan（基线损坏需要重建时，先删除该文件再运行本命令）"
+  fi
+  "$binary" --repo "$PROJECT" status || die "aoci status 失败"
+  note "AOCI 首次认知索引由宿主 Agent 在重启会话后按 AGENTS.md 托管区块自动完成"
+}
+
 rebuild_codegraph_index() {
   is_ready codegraph || die "CodeGraph 尚未安装"
   assert_codegraph_index_safe
@@ -1218,10 +1352,12 @@ upgrade() {
   [ "$APPLY" -ne "$DRY_RUN" ] || die "upgrade 必须且只能指定 --dry-run 或 --apply"
   codegraph_needs_upgrade=0
   rtk_needs_upgrade=0
+  aoci_needs_upgrade=0
   is_ready codegraph || codegraph_needs_upgrade=1
   is_ready rtk || rtk_needs_upgrade=1
-  if [ "$codegraph_needs_upgrade" -eq 0 ] && [ "$rtk_needs_upgrade" -eq 0 ]; then
-    note "CodeGraph 与 RTK 已是当前受支持版本；不下载或重建索引"
+  is_ready aoci || aoci_needs_upgrade=1
+  if [ "$codegraph_needs_upgrade" -eq 0 ] && [ "$rtk_needs_upgrade" -eq 0 ] && [ "$aoci_needs_upgrade" -eq 0 ]; then
+    note "CodeGraph、RTK 与 AOCI 已是当前受支持版本；不下载或重建索引"
     [ "$DRY_RUN" -eq 1 ] && note "dry-run: 将运行完整 doctor"
     doctor
     return
@@ -1232,6 +1368,9 @@ upgrade() {
       note "dry-run: CodeGraph 升级后将执行 codegraph index 全量重建"
     else
       note "dry-run: CodeGraph 已是当前受支持版本；将保留现有索引"
+    fi
+    if [ "$aoci_needs_upgrade" -eq 1 ]; then
+      note "dry-run: AOCI 升级只更新受管二进制；项目认知卷是 Git 资产，不重建"
     fi
     note "dry-run: 将运行完整 doctor"
     return
@@ -1255,7 +1394,11 @@ maintain() {
 
 rollback() {
   [ -n "$ROLLBACK_TOOL" ] && [ -n "$ROLLBACK_VERSION" ] || die "rollback 需要工具和版本"
-  [ "$ROLLBACK_TOOL" = rtk ] || die "CodeGraph 使用 npm 固定版本安装，不支持此回滚命令"
+  case "$ROLLBACK_TOOL" in
+    rtk|aoci) ;;
+    codegraph) die "CodeGraph 使用 npm 固定版本安装，不支持此回滚命令" ;;
+    *) die "未知回滚工具：$ROLLBACK_TOOL" ;;
+  esac
   version_is_safe "$ROLLBACK_VERSION" || die "不安全的回滚版本"
   switch_current "$ROLLBACK_TOOL" "$ROLLBACK_VERSION"
   note "$ROLLBACK_TOOL 已切换到 $ROLLBACK_VERSION"
@@ -1264,7 +1407,7 @@ rollback() {
 main() {
   parse_args "$@"
   case "$ACTION" in
-    doctor|bootstrap|upgrade|init-codegraph|maintain)
+    doctor|bootstrap|upgrade|init-codegraph|init-aoci|maintain)
       detect_platform
       check_project
       load_trusted_manifest
@@ -1287,6 +1430,7 @@ main() {
     bootstrap) bootstrap ;;
     upgrade) upgrade ;;
     init-codegraph) init_codegraph ;;
+    init-aoci) init_aoci ;;
     maintain) maintain ;;
     rollback) rollback ;;
   esac

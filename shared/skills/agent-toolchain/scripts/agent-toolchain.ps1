@@ -20,8 +20,10 @@ Usage:
   agent-toolchain.ps1 bootstrap --project PATH --dry-run|--apply
   agent-toolchain.ps1 upgrade --project PATH --dry-run|--apply
   agent-toolchain.ps1 init-codegraph --project PATH
+  agent-toolchain.ps1 init-aoci --project PATH
   agent-toolchain.ps1 maintain --project PATH [--sync]
   agent-toolchain.ps1 rollback rtk VERSION
+  agent-toolchain.ps1 rollback aoci VERSION
 '@ | Write-Output
 }
 
@@ -58,6 +60,7 @@ function Get-PlatformName {
 }
 
 function Parse-Arguments {
+  if ($null -eq $DriverArgs) { $DriverArgs = @() }
   $script:Action = if ($Action) { $Action } else { '' }
   if ($script:Action -eq '' -and $DriverArgs.Count -eq 1 -and $DriverArgs[0] -in @('help', '-h', '--help')) {
     $script:Action = $DriverArgs[0]
@@ -84,6 +87,7 @@ function Parse-Arguments {
       }
       'codegraph' { if ($script:Action -ne 'rollback') { Fail "未知参数：$argument" }; $script:RollbackTool = $argument; $index += 1 }
       'rtk' { if ($script:Action -ne 'rollback') { Fail "未知参数：$argument" }; $script:RollbackTool = $argument; $index += 1 }
+      'aoci' { if ($script:Action -ne 'rollback') { Fail "未知参数：$argument" }; $script:RollbackTool = $argument; $index += 1 }
       default {
         if ($script:Action -eq 'rollback' -and -not $script:RollbackVersion) {
           $script:RollbackVersion = $argument
@@ -163,6 +167,11 @@ function Test-AgentsH2At([string[]]$Lines, [int]$Index) {
   return $Index + 1 -lt $Lines.Count -and $Lines[$Index] -match '^[ ]{0,3}\S.*$' -and $Lines[$Index + 1] -match '^[ ]{0,3}-+[ \t]*$'
 }
 
+function Test-AgentsSectionBoundary([string]$Line) {
+  if ($Line -match '^[ ]{0,3}##[ \t]+') { return $true }
+  return $Line -match '^<!--[ ]*aoci:begin[ ]*-->$'
+}
+
 function Get-ManagedAgentsSection([string[]]$Lines, [string]$Heading) {
   $headingCandidates = @(Get-AgentsHeadingCandidates $Lines $Heading)
   if ($headingCandidates.Count -ne 1) {
@@ -173,7 +182,7 @@ function Get-ManagedAgentsSection([string[]]$Lines, [string]$Heading) {
   if ($candidate.Kind -ne 'atx' -or $Lines[$candidate.Index] -cne $Heading) { Fail 'AGENTS.md 的 CodeGraph 与 RTK 受管标题冲突' }
   $sectionLines = [System.Collections.Generic.List[string]]::new()
   for ($index = $candidate.Index; $index -lt $Lines.Count; $index += 1) {
-    if ($index -gt $candidate.Index -and (Test-AgentsH2At $Lines $index)) { break }
+    if ($index -gt $candidate.Index -and (Test-AgentsSectionBoundary $Lines[$index])) { break }
     [void]$sectionLines.Add($Lines[$index])
   }
   while ($sectionLines.Count -gt 0 -and [string]::IsNullOrEmpty($sectionLines[$sectionLines.Count - 1])) {
@@ -230,8 +239,10 @@ function Configure-Project {
   Assert-PlainFileOrAbsent $agentsPath
   Assert-PlainFileOrAbsent $ignorePath
 
-  $needsCodexConfig = $false; $needsZcodeConfig = $false; $needsAgents = $false
-  $needsIgnoreCodegraph = $false; $needsIgnoreCodex = $false; $needsIgnoreZcode = $false
+  $needsCodexConfig = $false; $needsCodexAoci = $false; $needsZcodeConfig = $false; $needsAgents = $false
+  $needsIgnoreCodegraph = $false; $needsIgnoreAociBackup = $false; $needsIgnoreCodex = $false; $needsIgnoreZcode = $false
+  $aociCommand = ((Join-Path $ToolchainBin 'aoci.exe') -replace '\\', '/')
+  $projectPosix = ($script:Project -replace '\\', '/')
   $agentsHeading = '## CodeGraph 与 RTK'
   $agentsBlock = @(
     '## CodeGraph 与 RTK'
@@ -252,6 +263,14 @@ function Configure-Project {
       Fail '.codex/config.toml 存在不完整的 CodeGraph 表'
     } else {
       $needsCodexConfig = $true
+    }
+    if ($configText -match '(?m)^\[mcp_servers\.aoci\]\s*$') {
+      $aociBody = Get-TomlTableBody $codexConfigPath '[mcp_servers.aoci]'
+      if ($aociBody -notmatch ('(?m)^command\s*=\s*"' + [regex]::Escape($aociCommand) + '"\s*$') -or $aociBody -notmatch '(?m)^\s*"--repo",\s*$' -or $aociBody -notmatch ('(?m)^\s*"' + [regex]::Escape($projectPosix) + '",\s*$') -or $aociBody -notmatch '(?m)^\s*"mcp",\s*$') { Fail '.codex/config.toml 的 AOCI 配置冲突' }
+    } elseif ($configText -match '(?m)^\[mcp_servers\.aoci\.') {
+      Fail '.codex/config.toml 存在不完整的 AOCI 表'
+    } else {
+      $needsCodexAoci = $true
     }
   }
 
@@ -282,6 +301,17 @@ function Configure-Project {
       }
       $needsZcodeConfig = $true
     }
+    if ($zcodeServers.Contains('aoci')) {
+      $existingAoci = $zcodeServers['aoci']
+      if ($existingAoci -isnot [System.Collections.IDictionary] -or $existingAoci['command'] -ne $aociCommand -or (@($existingAoci['args']) -join ',') -ne "--repo,$projectPosix,mcp") { Fail '.zcode/config.json 的 AOCI 配置冲突' }
+    } else {
+      $zcodeServers['aoci'] = [ordered]@{
+        type = 'stdio'
+        command = $aociCommand
+        args = @('--repo', $projectPosix, 'mcp')
+      }
+      $needsZcodeConfig = $true
+    }
   }
 
   $agentsText = if (Test-Path -LiteralPath $agentsPath) { Get-Content -LiteralPath $agentsPath -Raw } else { '' }
@@ -299,6 +329,7 @@ function Configure-Project {
 
   $ignoreText = if (Test-Path -LiteralPath $ignorePath) { Get-Content -LiteralPath $ignorePath -Raw } else { '' }
   if ($ignoreText -notmatch '(?m)^/\.codegraph/\s*$') { $needsIgnoreCodegraph = $true }
+  if ($ignoreText -notmatch '(?m)^/AGENTS\.md\.backup\.\*\s*$') { $needsIgnoreAociBackup = $true }
   if ($wireCodex -and $ignoreText -notmatch '(?m)^/\.codex/\s*$') { $needsIgnoreCodex = $true }
   if ($wireZcode -and $ignoreText -notmatch '(?m)^/\.zcode/\s*$') { $needsIgnoreZcode = $true }
 
@@ -319,6 +350,17 @@ CODEGRAPH_NO_UPDATE_CHECK = "1"
 DO_NOT_TRACK = "1"
 '@
     }
+    if ($needsCodexAoci) {
+      Append-ProjectText $codexConfigPath @"
+[mcp_servers.aoci]
+command = "$aociCommand"
+args = [
+    "--repo",
+    "$projectPosix",
+    "mcp",
+]
+"@
+    }
   }
   if ($wireZcode) {
     if (-not (Test-Path -LiteralPath $zcodeDirectory)) { New-Item -ItemType Directory -Path $zcodeDirectory | Out-Null }
@@ -331,32 +373,35 @@ DO_NOT_TRACK = "1"
   }
   $ignoreWrite = @()
   if ($needsIgnoreCodegraph) { $ignoreWrite += '/.codegraph/' }
+  if ($needsIgnoreAociBackup) { $ignoreWrite += '/AGENTS.md.backup.*' }
   if ($needsIgnoreCodex) { $ignoreWrite += '/.codex/' }
   if ($needsIgnoreZcode) { $ignoreWrite += '/.zcode/' }
   if ($ignoreWrite.Count -gt 0) { Append-ProjectText $ignorePath ($ignoreWrite -join "`n") }
-  Note '项目 CodeGraph 与 RTK 受管配置已就绪'
+  Note '项目 CodeGraph、RTK 与 AOCI 受管配置已就绪'
 }
 
 function Load-TrustedManifest {
   $script:Manifest = [ordered]@{
     CODEGRAPH_VERSION = '1.6.0'; CODEGRAPH_NPM_PACKAGE = '@colbymchenry/codegraph'; RTK_VERSION = '0.46.0'
     RTK_WIN32_X64_ASSET = 'rtk-x86_64-pc-windows-msvc.zip'; RTK_WIN32_X64_SHA256 = '9bc5acd54d35a916e4a561435963e0acf2f1a0115cf43dcfe2b719f361c8a970'
+    AOCI_VERSION = '0.1.0-rc18'; AOCI_WIN32_X64_ASSET = 'aoci_0.1.0-rc18_windows_amd64.zip'; AOCI_WIN32_X64_SHA256 = '012072baeead1d37062e431f3191d3338e2e67789baec79549a8e0fd12c4a09b'
   }
 }
 
-function Get-ToolValue([ValidateSet('codegraph', 'rtk')][string]$Tool, [ValidateSet('version', 'asset', 'sha', 'url')][string]$Field) {
+function Get-ToolValue([ValidateSet('codegraph', 'rtk', 'aoci')][string]$Tool, [ValidateSet('version', 'asset', 'sha', 'url')][string]$Field) {
   if ($Field -eq 'version') {
     if ($Tool -eq 'codegraph') { return $script:Manifest.CODEGRAPH_VERSION }
+    if ($Tool -eq 'aoci') { return $script:Manifest.AOCI_VERSION }
     return $script:Manifest.RTK_VERSION
   }
   if ($Tool -eq 'codegraph') { Fail "CodeGraph 只支持 version 字段；其余信息由 npm 管理" }
   $prefix = if ($script:PlatformName -eq 'win32-x64') { 'WIN32_X64' } else { Fail "未实现的平台：$script:PlatformName" }
-  $keyPrefix = if ($Tool -eq 'codegraph') { "CODEGRAPH_$prefix" } else { "RTK_$prefix" }
+  $keyPrefix = if ($Tool -eq 'aoci') { "AOCI_$prefix" } else { "RTK_$prefix" }
   if ($Field -eq 'asset') { return $script:Manifest["${keyPrefix}_ASSET"] }
   if ($Field -eq 'sha') { return $script:Manifest["${keyPrefix}_SHA256"] }
   $version = Get-ToolValue $Tool 'version'
   $asset = Get-ToolValue $Tool 'asset'
-  $repository = if ($Tool -eq 'codegraph') { 'colbymchenry/codegraph' } else { 'rtk-ai/rtk' }
+  $repository = if ($Tool -eq 'aoci') { 'aoci-spec/aoci-code' } elseif ($Tool -eq 'codegraph') { 'colbymchenry/codegraph' } else { 'rtk-ai/rtk' }
   return "https://github.com/$repository/releases/download/v$version/$asset"
 }
 
@@ -401,11 +446,11 @@ function Test-CodeGraphNpmReady {
 }
 function Get-Binary([string]$Tool, [string]$Directory) {
   if ($Tool -eq 'codegraph') { return Get-CodeGraphNpmBinary }
-  return Join-Path $Directory 'rtk.exe'
+  return Join-Path $Directory "$Tool.exe"
 }
 
 function Assert-SafeVersion([string]$Version) {
-  if ($Version -notmatch '^[0-9]+(?:\.[0-9]+)+$') { Fail "不安全的版本号：$Version" }
+  if ($Version -notmatch '^[0-9]+(?:\.[0-9]+)+(?:-rc[0-9]+)?$') { Fail "不安全的版本号：$Version" }
 }
 
 function Get-PeMachine([string]$Path) {
@@ -448,7 +493,7 @@ function Invoke-ToolVersion([string]$Tool, [string]$Binary) {
 }
 
 function Verify-VersionDirectory([string]$Tool, [string]$Version, [string]$Directory = '') {
-  if ($Tool -ne 'rtk') { Fail '只有 RTK 使用受管版本目录' }
+  if ($Tool -notin @('rtk', 'aoci')) { Fail '只有 RTK 与 AOCI 使用受管版本目录' }
   Assert-SafeVersion $Version
   if (-not $Directory) { $Directory = Get-VersionDirectory $Tool $Version }
   $toolDirectory = Get-ToolDirectory $Tool
@@ -464,10 +509,12 @@ function Verify-VersionDirectory([string]$Tool, [string]$Version, [string]$Direc
     $receipt[$Matches[1]] = $Matches[2]
   }
   if ($receipt.tool -ne $Tool -or $receipt.version -ne $Version -or $receipt.archive_sha256 -ne (Get-ToolValue $Tool 'sha') -or $receipt.binary_sha256 -ne (Get-Sha256 $binary)) { Fail '安装验证失败：receipt 摘要' }
-  Assert-PeX64 $binary 'RTK'
+  Assert-PeX64 $binary $Tool
   $expectedVersion = Get-ToolValue $Tool 'version'
-  $expectedOutput = if ($Tool -eq 'codegraph') { $expectedVersion } else { "rtk $expectedVersion" }
-  if ((Invoke-ToolVersion $Tool $binary) -ne $expectedOutput) { Fail '安装验证失败：版本输出' }
+  $versionOutput = Invoke-ToolVersion $Tool $binary
+  if ($Tool -eq 'aoci') {
+    if ($versionOutput -notmatch "^aoci version $([regex]::Escape($expectedVersion))(\s|\()") { Fail '安装验证失败：版本输出' }
+  } elseif ($versionOutput -ne "rtk $expectedVersion") { Fail '安装验证失败：版本输出' }
 }
 
 function Get-CodeGraphLauncher {
@@ -495,12 +542,12 @@ exit /b %ERRORLEVEL%
 "@
 }
 
-function Get-PublicRtkBinary { return Join-Path $ToolchainBin 'rtk.exe' }
+function Get-PublicToolBinary([string]$Tool) { return Join-Path $ToolchainBin "$Tool.exe" }
 
-function Test-PublicRtkBinary([string]$Version) {
+function Test-PublicToolBinary([string]$Tool, [string]$Version) {
   try {
-    $publicPath = Get-PublicRtkBinary
-    $target = Get-Binary 'rtk' (Get-VersionDirectory 'rtk' $Version)
+    $publicPath = Get-PublicToolBinary $Tool
+    $target = Get-Binary $Tool (Get-VersionDirectory $Tool $Version)
     if (-not (Test-Path -LiteralPath $publicPath -PathType Leaf) -or -not (Test-Path -LiteralPath $target -PathType Leaf)) { return $false }
     $publicItem = Get-Item -LiteralPath $publicPath -Force
     if ($publicItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { return $false }
@@ -523,24 +570,24 @@ function Remove-LegacyRtkLauncher {
   Remove-Item -LiteralPath $legacyPath -Force
 }
 
-function Ensure-PublicRtkBinary([string]$Version) {
+function Ensure-PublicToolBinary([string]$Tool, [string]$Version) {
   Assert-SafeVersion $Version
-  Verify-VersionDirectory 'rtk' $Version
+  Verify-VersionDirectory $Tool $Version
   Assert-LegacyRtkLauncherSafe
-  $publicPath = Get-PublicRtkBinary
+  $publicPath = Get-PublicToolBinary $Tool
   if (Test-Path -LiteralPath $publicPath) {
     $publicItem = Get-Item -LiteralPath $publicPath -Force
     if (($publicItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -or $publicItem.PSIsContainer) { Fail "$publicPath 必须是普通文件" }
-    if (Test-PublicRtkBinary $Version) {
+    if (Test-PublicToolBinary $Tool $Version) {
       Remove-LegacyRtkLauncher
       return
     }
-    $currentVersion = Get-CurrentVersion 'rtk'
-    if (-not $currentVersion -or -not (Test-PublicRtkBinary $currentVersion)) { Fail "$publicPath 已被非受管理目标占用" }
+    $currentVersion = Get-CurrentVersion $Tool
+    if (-not $currentVersion -or -not (Test-PublicToolBinary $Tool $currentVersion)) { Fail "$publicPath 已被非受管理目标占用" }
   }
-  $target = Get-Binary 'rtk' (Get-VersionDirectory 'rtk' $Version)
-  $temporary = Join-Path $ToolchainBin ".rtk-$([Guid]::NewGuid().ToString('N')).tmp"
-  $backup = Join-Path $ToolchainBin ".rtk-$([Guid]::NewGuid().ToString('N')).bak"
+  $target = Get-Binary $Tool (Get-VersionDirectory $Tool $Version)
+  $temporary = Join-Path $ToolchainBin ".$Tool-$([Guid]::NewGuid().ToString('N')).tmp"
+  $backup = Join-Path $ToolchainBin ".$Tool-$([Guid]::NewGuid().ToString('N')).bak"
   try {
     New-Item -ItemType HardLink -Path $temporary -Target $target | Out-Null
     if (Test-Path -LiteralPath $publicPath -PathType Leaf) {
@@ -552,15 +599,15 @@ function Ensure-PublicRtkBinary([string]$Version) {
     if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
     if (Test-Path -LiteralPath $backup) { Remove-Item -LiteralPath $backup -Force }
   }
-  if (-not (Test-PublicRtkBinary $Version)) { Fail 'RTK 原生公共入口验证失败' }
+  if (-not (Test-PublicToolBinary $Tool $Version)) { Fail "$Tool 原生公共入口验证失败" }
   Remove-LegacyRtkLauncher
 }
 
 function Ensure-PublicLauncher([string]$Tool, [string]$Version = '') {
   New-Item -ItemType Directory -Path $ToolchainBin -Force | Out-Null
-  if ($Tool -eq 'rtk') {
-    if ([string]::IsNullOrWhiteSpace($Version)) { Fail 'RTK 公共入口缺少版本号' }
-    Ensure-PublicRtkBinary $Version
+  if ($Tool -in @('rtk', 'aoci')) {
+    if ([string]::IsNullOrWhiteSpace($Version)) { Fail "$Tool 公共入口缺少版本号" }
+    Ensure-PublicToolBinary $Tool $Version
     return
   }
   $path = Join-Path $ToolchainBin "$Tool.cmd"
@@ -599,7 +646,7 @@ function Get-CurrentVersion([string]$Tool) {
   $currentFile = Get-CurrentFile $Tool
   if (-not (Test-Path -LiteralPath $currentFile -PathType Leaf)) { return $null }
   $version = (Get-Content -LiteralPath $currentFile -Raw).Trim()
-  if ($version -notmatch '^[0-9]+(?:\.[0-9]+)+$') { return $null }
+  if ($version -notmatch '^[0-9]+(?:\.[0-9]+)+(?:-rc[0-9]+)?$') { return $null }
   return $version
 }
 
@@ -632,9 +679,9 @@ function Test-Ready([string]$Tool) {
     if ($Tool -eq 'codegraph') { return Test-CodeGraphNpmReady }
     $version = Get-ToolValue $Tool 'version'
     if ((Get-CurrentVersion $Tool) -ne $version) { return $false }
-    if (Test-Path -LiteralPath (Join-Path $ToolchainBin 'rtk.cmd')) { return $false }
+    if ($Tool -eq 'rtk' -and (Test-Path -LiteralPath (Join-Path $ToolchainBin 'rtk.cmd'))) { return $false }
     Verify-VersionDirectory $Tool $version
-    return Test-PublicRtkBinary $version
+    return Test-PublicToolBinary $Tool $version
   } catch { return $false }
 }
 
@@ -643,7 +690,7 @@ function Test-QuickReady([string]$Tool) {
     if ($Tool -eq 'codegraph') { return Test-CodeGraphNpmReady }
     $version = Get-ToolValue $Tool 'version'
     if ((Get-CurrentVersion $Tool) -ne $version) { return $false }
-    if (Test-Path -LiteralPath (Join-Path $ToolchainBin 'rtk.cmd')) { return $false }
+    if ($Tool -eq 'rtk' -and (Test-Path -LiteralPath (Join-Path $ToolchainBin 'rtk.cmd'))) { return $false }
     $directory = Get-VersionDirectory $Tool $version
     if (-not (Test-Path -LiteralPath $directory -PathType Container)) { return $false }
     Assert-NoReparsePoints $directory
@@ -656,10 +703,7 @@ function Test-QuickReady([string]$Tool) {
       $receipt[$Matches[1]] = $Matches[2]
     }
     if ($receipt.tool -ne $Tool -or $receipt.version -ne $version) { return $false }
-    if ($Tool -eq 'codegraph') {
-      if (-not (Test-Path -LiteralPath (Join-Path $directory 'node.exe') -PathType Leaf) -or -not (Test-Path -LiteralPath (Join-Path $directory 'lib/dist/bin/codegraph.js') -PathType Leaf)) { return $false }
-    }
-    return Test-PublicRtkBinary $version
+    return Test-PublicToolBinary $Tool $version
   } catch { return $false }
 }
 
@@ -759,15 +803,15 @@ function Assert-SafeZip([string]$Archive) {
   } finally { $zip.Dispose() }
 }
 
-function Install-Tool([ValidateSet('codegraph', 'rtk')][string]$Tool) {
-  if ($Tool -ne 'rtk') { Fail 'CodeGraph 必须通过官方 npm 包安装' }
+function Install-Tool([ValidateSet('codegraph', 'rtk', 'aoci')][string]$Tool) {
+  if ($Tool -notin @('rtk', 'aoci')) { Fail 'CodeGraph 必须通过官方 npm 包安装' }
   $version = Get-ToolValue $Tool 'version'
   if (Test-Ready $Tool) { Note "$Tool $version 已就绪"; return }
   $destination = Get-VersionDirectory $Tool $version
   if (Test-Path -LiteralPath $destination) {
     Verify-VersionDirectory $Tool $version
     if ($script:DryRun) {
-      Note "dry-run: 发布已校验的 $Tool $version 到 $ToolchainBin\\rtk.exe"
+      Note "dry-run: 发布已校验的 $Tool $version 到 $ToolchainBin\\$Tool.exe"
       return
     }
     Set-CurrentVersion $Tool $version
@@ -777,7 +821,7 @@ function Install-Tool([ValidateSet('codegraph', 'rtk')][string]$Tool) {
   if ($script:DryRun) {
     Note "dry-run: 下载 $(Get-ToolValue $Tool 'url')"
     Note "dry-run: 验证 SHA-256 $(Get-ToolValue $Tool 'sha')"
-    Note "dry-run: 安装到 $destination 并创建 $ToolchainBin\\rtk.exe"
+    Note "dry-run: 安装到 $destination 并创建 $ToolchainBin\\$Tool.exe"
     return
   }
   $workDirectory = Join-Path ([System.IO.Path]::GetTempPath()) "agent-toolchain-$([Guid]::NewGuid().ToString('N'))"
@@ -791,16 +835,20 @@ function Install-Tool([ValidateSet('codegraph', 'rtk')][string]$Tool) {
     $extract = Join-Path $workDirectory 'extract'
     Expand-Archive -LiteralPath $archive -DestinationPath $extract -Force
     Assert-NoReparsePoints $extract
-    $candidates = @(Get-ChildItem -LiteralPath $extract -Filter 'rtk.exe' -File -Recurse)
-    if ($candidates.Count -ne 1) { Fail '归档中 RTK binary 数量异常' }
-    $bundleRoot = $candidates[0].Directory.FullName
-    Assert-PeX64 $candidates[0].FullName 'RTK'
+    $candidates = @(Get-ChildItem -LiteralPath $extract -Filter "$Tool.exe" -File -Recurse)
+    if ($candidates.Count -ne 1) { Fail "归档中 $Tool binary 数量异常" }
+    Assert-PeX64 $candidates[0].FullName $Tool
     $toolDirectory = Get-ToolDirectory $Tool
     New-Item -ItemType Directory -Path $toolDirectory -Force | Out-Null
     Assert-NoReparsePoints $toolDirectory
     $stage = Join-Path $toolDirectory ".install-$version-$([Guid]::NewGuid().ToString('N'))"
     New-Item -ItemType Directory -Path $stage | Out-Null
-    Get-ChildItem -LiteralPath $bundleRoot -Force | Copy-Item -Destination $stage -Recurse -Force
+    if ($Tool -eq 'aoci') {
+      Copy-Item -LiteralPath $candidates[0].FullName -Destination (Join-Path $stage "$Tool.exe")
+    } else {
+      $bundleRoot = $candidates[0].Directory.FullName
+      Get-ChildItem -LiteralPath $bundleRoot -Force | Copy-Item -Destination $stage -Recurse -Force
+    }
     $binary = Get-Binary $Tool $stage
     $receipt = @("tool=$Tool", "version=$version", "archive_sha256=$(Get-Sha256 $archive)", "binary_sha256=$(Get-Sha256 $binary)", "url=$(Get-ToolValue $Tool 'url')")
     [System.IO.File]::WriteAllLines((Join-Path $stage 'receipt'), $receipt, [System.Text.UTF8Encoding]::new($false))
@@ -871,21 +919,27 @@ function Assert-CodeGraphIndexSafe {
 function Invoke-Doctor {
   $failed = $false
   if ($script:Quick) {
-    foreach ($tool in @('codegraph', 'rtk')) {
+    foreach ($tool in @('codegraph', 'rtk', 'aoci')) {
       if (Test-QuickReady $tool) { Note "$($tool): ready ($(Get-Binary $tool (Get-VersionDirectory $tool (Get-ToolValue $tool 'version'))))" } else { Note "$($tool): missing"; $failed = $true }
     }
     Note 'codegraph-index: skipped (--quick)'
+    Note 'aoci-cognition: skipped (--quick)'
     if ($failed) { Fail '健康检查未通过' }
     return
   }
   Assert-CodeGraphIndexSafe
-  foreach ($tool in @('codegraph', 'rtk')) {
+  foreach ($tool in @('codegraph', 'rtk', 'aoci')) {
     if (Test-Ready $tool) { Note "$($tool): ready ($(Get-Binary $tool (Get-VersionDirectory $tool (Get-ToolValue $tool 'version'))))" } else { Note "$($tool): missing"; $failed = $true }
   }
   $indexDirectory = Join-Path $script:Project '.codegraph'
   if ((Test-Ready 'codegraph') -and (Test-Path -LiteralPath $indexDirectory -PathType Container) -and (Get-ChildItem -LiteralPath $indexDirectory -Force | Where-Object { $_.Name -ne '.gitignore' } | Select-Object -First 1)) {
     Invoke-WithCodeGraphEnvironment { Push-Location -LiteralPath $script:Project; try { & (Get-Binary 'codegraph' (Get-VersionDirectory 'codegraph' (Get-ToolValue 'codegraph' 'version'))) status; if ($LASTEXITCODE -ne 0) { Fail 'CodeGraph 索引状态异常' } } finally { Pop-Location } }
   } else { Note 'codegraph-index: needs_init'; $failed = $true }
+  $aociIndexFile = Join-Path $script:Project 'aoci.txt'
+  $aociBaseline = Join-Path $script:Project '.aoci/baseline.json'
+  if (-not (Test-Path -LiteralPath $aociIndexFile -PathType Leaf)) { Note 'aoci-cognition: needs_init'; $failed = $true }
+  elseif (-not (Test-Path -LiteralPath $aociBaseline -PathType Leaf)) { Note 'aoci-baseline: needs_scan'; $failed = $true }
+  else { Note 'aoci-cognition: initialized' }
   if ($failed) { Fail '健康检查未通过' }
 }
 
@@ -895,6 +949,7 @@ function Invoke-Bootstrap {
   try {
     Install-CodeGraphNpm
     Install-Tool 'rtk'
+    Install-Tool 'aoci'
   } catch {
     throw
   }
@@ -919,6 +974,29 @@ function Invoke-InitCodeGraph {
     }
   }
   Invoke-WithCodeGraphEnvironment { Push-Location -LiteralPath $script:Project; try { $binary = Get-Binary 'codegraph' (Get-VersionDirectory 'codegraph' (Get-ToolValue 'codegraph' 'version')); & $binary init; if ($LASTEXITCODE -ne 0) { Fail 'CodeGraph init 失败' }; & $binary status; if ($LASTEXITCODE -ne 0) { Fail 'CodeGraph status 失败' } } finally { Pop-Location } }
+}
+
+function Invoke-InitAoci {
+  if (-not (Test-Ready 'aoci')) { Fail 'AOCI 尚未安装' }
+  $binary = Get-Binary 'aoci' (Get-VersionDirectory 'aoci' (Get-ToolValue 'aoci' 'version'))
+  $aociIndexFile = Join-Path $script:Project 'aoci.txt'
+  $aociBaseline = Join-Path $script:Project '.aoci/baseline.json'
+  if (-not (Test-Path -LiteralPath $aociIndexFile -PathType Leaf)) {
+    Note 'aoci.txt 不存在；初始化认知骨架与 AGENTS.md 托管区块'
+    & $binary --repo $script:Project init --locale zh-CN
+    if ($LASTEXITCODE -ne 0) { Fail 'aoci init 失败' }
+  } else {
+    Note 'aoci.txt 已存在；保留认知卷'
+  }
+  if (-not (Test-Path -LiteralPath $aociBaseline -PathType Leaf)) {
+    & $binary --repo $script:Project scan
+    if ($LASTEXITCODE -ne 0) { Fail 'aoci scan 失败' }
+  } else {
+    Note '.aoci/baseline.json 已存在；跳过 scan（基线损坏需要重建时，先删除该文件再运行本命令）'
+  }
+  & $binary --repo $script:Project status
+  if ($LASTEXITCODE -ne 0) { Fail 'aoci status 失败' }
+  Note 'AOCI 首次认知索引由宿主 Agent 在重启会话后按 AGENTS.md 托管区块自动完成'
 }
 
 function Invoke-RebuildCodeGraphIndex {
@@ -948,8 +1026,9 @@ function Invoke-Upgrade {
   if ($script:Apply -eq $script:DryRun) { Fail 'upgrade 必须且只能指定 --dry-run 或 --apply' }
   $codeGraphNeedsUpgrade = -not (Test-Ready 'codegraph')
   $rtkNeedsUpgrade = -not (Test-Ready 'rtk')
-  if (-not $codeGraphNeedsUpgrade -and -not $rtkNeedsUpgrade) {
-    Note 'CodeGraph 与 RTK 已是当前受支持版本；不下载或重建索引'
+  $aociNeedsUpgrade = -not (Test-Ready 'aoci')
+  if (-not $codeGraphNeedsUpgrade -and -not $rtkNeedsUpgrade -and -not $aociNeedsUpgrade) {
+    Note 'CodeGraph、RTK 与 AOCI 已是当前受支持版本；不下载或重建索引'
     if ($script:DryRun) { Note 'dry-run: 将运行完整 doctor' }
     Invoke-Doctor
     return
@@ -958,6 +1037,7 @@ function Invoke-Upgrade {
   if ($script:DryRun) {
     if ($codeGraphNeedsUpgrade) { Note 'dry-run: CodeGraph 升级后将执行 codegraph index 全量重建' }
     else { Note 'dry-run: CodeGraph 已是当前受支持版本；将保留现有索引' }
+    if ($aociNeedsUpgrade) { Note 'dry-run: AOCI 升级只更新受管二进制；项目认知卷是 Git 资产，不重建' }
     Note 'dry-run: 将运行完整 doctor'
     return
   }
@@ -974,11 +1054,12 @@ function Invoke-Maintain {
 
 function Invoke-Rollback {
   if (-not $script:RollbackTool -or -not $script:RollbackVersion) { Fail 'rollback 需要工具和版本' }
-  if ($script:RollbackTool -ne 'rtk') { Fail 'CodeGraph 使用 npm 固定版本安装，不支持此回滚命令' }
+  if ($script:RollbackTool -eq 'codegraph') { Fail 'CodeGraph 使用 npm 固定版本安装，不支持此回滚命令' }
+  if ($script:RollbackTool -notin @('rtk', 'aoci')) { Fail "未知回滚工具：$($script:RollbackTool)" }
   Assert-SafeVersion $script:RollbackVersion
   Verify-VersionDirectory $script:RollbackTool $script:RollbackVersion
   Set-CurrentVersion $script:RollbackTool $script:RollbackVersion
-  Note "$script:RollbackTool 已切换到 $script:RollbackVersion"
+  Note "$($script:RollbackTool) 已切换到 $($script:RollbackVersion)"
 }
 
 Parse-Arguments
@@ -988,6 +1069,7 @@ switch ($script:Action) {
   'bootstrap' { $script:PlatformName = Get-PlatformName; Check-Project; Load-TrustedManifest; Invoke-Bootstrap }
   'upgrade' { $script:PlatformName = Get-PlatformName; Check-Project; Load-TrustedManifest; Invoke-Upgrade }
   'init-codegraph' { $script:PlatformName = Get-PlatformName; Check-Project; Load-TrustedManifest; Invoke-InitCodeGraph }
+  'init-aoci' { $script:PlatformName = Get-PlatformName; Check-Project; Load-TrustedManifest; Invoke-InitAoci }
   'maintain' { $script:PlatformName = Get-PlatformName; Check-Project; Load-TrustedManifest; Invoke-Maintain }
   'rollback' { $script:PlatformName = Get-PlatformName; Load-TrustedManifest; Invoke-Rollback }
   'help' { Show-Usage }

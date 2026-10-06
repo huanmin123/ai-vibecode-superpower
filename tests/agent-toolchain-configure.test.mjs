@@ -33,6 +33,15 @@ function assertCodegraphJson(config) {
   assert.equal(server.env?.DO_NOT_TRACK, '1');
 }
 
+function assertAociJson(config, project) {
+  const parsed = JSON.parse(config);
+  const server = parsed.mcp?.servers?.aoci;
+  assert.ok(server, 'mcp.servers.aoci missing');
+  assert.equal(server.type, 'stdio');
+  assert.match(server.command, /[/\\]aoci(\.exe)?$/, `aoci command must target the managed public binary: ${server.command}`);
+  assert.deepEqual(server.args, ['--repo', project.replace(/\\/g, '/'), 'mcp']);
+}
+
 test('configure wires both clients and stays idempotent (PowerShell)', { skip: process.platform !== 'win32' }, async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'agent-toolchain-configure-'));
   const project = path.join(root, 'target-project');
@@ -43,11 +52,17 @@ test('configure wires both clients and stays idempotent (PowerShell)', { skip: p
     const codexConfig = await readFile(path.join(project, '.codex', 'config.toml'), 'utf8');
     assert.match(codexConfig, /^\[mcp_servers\.codegraph\]$/m);
     assert.match(codexConfig, /^command = "codegraph"$/m);
+    assert.match(codexConfig, /^\[mcp_servers\.aoci\]$/m);
+    assert.match(codexConfig, /^command = ".*aoci\.exe"$/m);
+    assert.match(codexConfig, /^    "--repo",$/m);
+    assert.match(codexConfig, new RegExp(`^    "${project.replace(/\\/g, '/').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}",$`, 'm'));
     const zcodeConfig = await readFile(path.join(project, '.zcode', 'config.json'), 'utf8');
     assertCodegraphJson(zcodeConfig);
+    assertAociJson(zcodeConfig, project);
     assert.match(await readFile(path.join(project, 'AGENTS.md'), 'utf8'), /^## CodeGraph 与 RTK$/m);
     const gitignore = await readFile(path.join(project, '.gitignore'), 'utf8');
     assert.match(gitignore, /^\/\.codegraph\/$/m);
+    assert.match(gitignore, /^\/AGENTS\.md\.backup\.\*$/m);
     assert.match(gitignore, /^\/\.codex\/$/m);
     assert.match(gitignore, /^\/\.zcode\/$/m);
 
@@ -57,9 +72,24 @@ test('configure wires both clients and stays idempotent (PowerShell)', { skip: p
     assert.equal(await readFile(path.join(project, '.codex', 'config.toml'), 'utf8'), codexConfig, 'idempotent run rewrote .codex/config.toml');
     assert.equal(await readFile(path.join(project, '.gitignore'), 'utf8'), gitignore, 'idempotent run rewrote .gitignore');
 
+    const agentsWithAoci = `${await readFile(path.join(project, 'AGENTS.md'), 'utf8')}\n<!-- aoci:begin -->\n## AOCI 仓库认知\n\nAOCI init 追加的托管区块。\n<!-- aoci:end -->\n`;
+    await writeFile(path.join(project, 'AGENTS.md'), agentsWithAoci);
+    result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerShellDriver, 'configure', '--project', project]);
+    assert.equal(result.code, 0, `re-configure after aoci block must stay idempotent:\n${result.stdout}\n${result.stderr}`);
+    assert.equal(await readFile(path.join(project, 'AGENTS.md'), 'utf8'), agentsWithAoci, 're-configure rewrote AGENTS.md around the aoci block');
+
     const tampered = JSON.parse(zcodeConfig);
     tampered.mcp.servers.codegraph.command = 'other';
     await writeFile(path.join(project, '.zcode', 'config.json'), JSON.stringify(tampered, null, 2));
+    result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerShellDriver, 'configure', '--project', project]);
+    assert.notEqual(result.code, 0, result.stdout);
+    assert.match(result.stdout + '\n' + result.stderr, /\.zcode\/config\.json/);
+
+    const restored = JSON.parse(zcodeConfig);
+    await writeFile(path.join(project, '.zcode', 'config.json'), JSON.stringify(restored, null, 2));
+    const tamperedAoci = JSON.parse(zcodeConfig);
+    tamperedAoci.mcp.servers.aoci.args = ['--repo', 'WRONG', 'mcp'];
+    await writeFile(path.join(project, '.zcode', 'config.json'), JSON.stringify(tamperedAoci, null, 2));
     result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerShellDriver, 'configure', '--project', project]);
     assert.notEqual(result.code, 0, result.stdout);
     assert.match(result.stdout + '\n' + result.stderr, /\.zcode\/config\.json/);
@@ -78,6 +108,7 @@ test('configure merges into an existing zcode config without dropping keys (Powe
     assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
     const parsed = JSON.parse(await readFile(path.join(project, '.zcode', 'config.json'), 'utf8'));
     assertCodegraphJson(JSON.stringify(parsed));
+    assertAociJson(JSON.stringify(parsed), project);
     assert.equal(parsed.mcp.servers.other.command, 'foo');
     assert.deepEqual(parsed.custom, { keep: true });
     const entries = await readdir(path.join(project, '.zcode'));
@@ -114,9 +145,12 @@ test('posix driver stays syntactically valid and keeps the client wiring branche
   assert.match(text, /--client\) \[ "\$#" -ge 2 \] \|\| die "--client 缺少取值"/);
   assert.match(text, /wire_codex=1; wire_zcode=1/);
   assert.match(text, /mcp\.servers/);
-  assert.match(text, /python3 - "\$zcode_config"/);
+  assert.match(text, /python3 - "\$zcode_config" "\$aoci_command" "\$PROJECT"/);
   assert.match(text, /\[ -t 0 \]/);
   assert.match(text, /Enter number or name \(q to quit\)/);
+  assert.match(text, /init-aoci/);
+  assert.match(text, /install_tool aoci/);
+  assert.match(text, /aoci-cognition: needs_init/);
 });
 
 test('powerShell driver keeps the interactive client prompt behind a tty guard', async () => {
@@ -136,8 +170,12 @@ test('configure wires both clients (POSIX)', { skip: process.platform === 'win32
     await mkdir(project, { recursive: true });
     const result = await runResult('sh', [posixDriver, 'configure', '--project', project, '--client', 'both'], { cwd: repository });
     assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
-    assert.match(await readFile(path.join(project, '.codex', 'config.toml'), 'utf8'), /^\[mcp_servers\.codegraph\]$/m);
-    assertCodegraphJson(await readFile(path.join(project, '.zcode', 'config.json'), 'utf8'));
+    const codexToml = await readFile(path.join(project, '.codex', 'config.toml'), 'utf8');
+    assert.match(codexToml, /^\[mcp_servers\.codegraph\]$/m);
+    assert.match(codexToml, /^\[mcp_servers\.aoci\]$/m);
+    const zcodeJson = await readFile(path.join(project, '.zcode', 'config.json'), 'utf8');
+    assertCodegraphJson(zcodeJson);
+    assertAociJson(zcodeJson, project);
     const gitignore = await readFile(path.join(project, '.gitignore'), 'utf8');
     assert.match(gitignore, /^\/\.codegraph\/$/m);
     assert.match(gitignore, /^\/\.codex\/$/m);
