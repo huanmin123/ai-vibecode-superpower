@@ -36,4 +36,4 @@
 - CodeGraph 项目配置与索引均不入库：`.codegraph/` 是本地索引缓存，`.codex/`、`.zcode/` 是本机客户端目录；`configure` 会把对应忽略规则写入项目 `.gitignore`，并一并忽略 `/AGENTS.md.backup.*`（AOCI init 在追加 AGENTS.md 区块前留下的内容哈希备份，属本机安全网，不入库）。
 - AOCI 的认知资产必须入库：`aoci.txt`、`aoci.meta.txt`、`aoci.code.txt`、`.aoci/config.json`、`.aoci/baseline.json` 与 `AGENTS.md` 不得加入 `.gitignore`，被忽略的文件会被 AOCI 静默跳过、认知索引建不起来；`.aoci/` 内部的运行时草稿与证据由其自带 `.aoci/.gitignore` 管理。
 - CodeGraph 与 AOCI 的 MCP 配置生效通常需要新建会话或重启对应客户端（Codex/ZCode）。
-- `doctor` 通过只证明当前受管工具和索引可用；AOCI 的首次认知索引由宿主 Agent 重启会话后按 `AGENTS.md` 托管区块自动完成（`automation.mode=auto` 下自动连续执行、失败自动修复重试），后续每次实际使用仍须以当前源文件、`rg`、未跟踪文件和刚修改文件复核结果。
+- `doctor` 通过只证明当前受管工具和索引可用；AOCI 的首次认知索引由宿主 Agent 重启会话后按 `AGENTS.md` 托管区块自动完成（`automation.mode=auto` 下自动连续执行、失败自动修复重试），首次索引建立后可能出现 `scope_change_required` 治理标记，其处置（真人审批边界）见 [`diagnose-and-maintain.md`](diagnose-and-maintain.md)；后续每次实际使用仍须以当前源文件、`rg`、未跟踪文件和刚修改文件复核结果。
