@@ -1,0 +1,7 @@
+interface:
+  display_name: "视觉美学通用原理"
+  short_description: "为视觉产出提供组织原理与评审动线，防结构性下限"
+  default_prompt: "使用 $visual-aesthetics 为视觉产出建立组织约束，并按维度动线评审最终呈现。"
+
+policy:
+  allow_implicit_invocation: true

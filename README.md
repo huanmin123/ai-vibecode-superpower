@@ -75,7 +75,6 @@ flowchart LR
 前置条件：
 
 - macOS/Linux 还需要 `rg`（ripgrep）。
-- 安装前完全退出 Codex Desktop；否则运行中的应用可能把配置覆盖回去。
 
 安装器会解析当前用户的 Codex home，再把全局文档中的路径占位符替换为绝对路径；已安装的 `AGENTS.md` 和 `docs/` 不依赖模型展开环境变量。安装失败时会尝试从本次安装生成的备份恢复；名称不匹配、符号链接或 junction 内容不会删除。备份目录由安装器输出，清理策略由维护者另行管理。
 
@@ -93,9 +92,9 @@ flowchart LR
 sh ./install.sh codex
 ```
 
-安装前先完整退出所有 Codex Desktop 窗口，并确认其 `app-server` 进程已经结束，避免活动进程把配置覆盖回去。安装成功后完全重启 Codex Desktop 或 Codex CLI 进程，并在新会话中使用 standalone skill。若使用 CC-Switch，请确认它没有覆盖安装脚本写入的 Codex 配置。
+可在 Codex 运行时安装，无需先退出应用；运行中的应用此后仍可能把配置覆盖回去。安装完成后完全重启 Codex Desktop 或 Codex CLI 进程，在新会话中使用 standalone skill，并按下方清单核对受管配置是否仍在。若使用 CC-Switch，请确认它没有覆盖安装脚本写入的 Codex 配置。
 
-如果安装时未退出应用，或配置看起来没有生效，可核对以下配置是否仍存在：
+如果配置看起来没有生效（包括在 Codex 运行期间安装的情况），可核对以下配置是否仍存在：
 
 ```toml
 model = "gpt-6.1-sol"
@@ -112,7 +111,7 @@ goals = true
 
 ### ZCode
 
-- 安装前退出 ZCode 会话；安装成功后重启 ZCode，使 `~/.zcode/agents` 的角色和 `~/.zcode/skills` 生效。
+- 可在 ZCode 会话运行时安装；安装成功后重启 ZCode，使 `~/.zcode/agents` 的角色和 `~/.zcode/skills` 生效。
 - ZCode 变体包含 5 个角色，按统一公式 `模型_版本_类型_思考档` 命名：`glm_5.3_flash_low`（常规取证）、`glm_5.3_flash_high`（深度取证）、`glm_5.3_flash_max`（写代码主力）、`glm_5.3_high`（审核主力）、`glm_5.3_max`（终审）；glm-5.3 不使用 low 档。`gpt-image-2-cli` 是 Codex 专属，不会安装到 ZCode。
 - 安装器只管理 `AGENTS.md`、`docs/`、`agents/ai-vibecode-superpower/` 和受管的 skills；不修改 ZCode 的 `cli/`、`v2/`、插件缓存或用户自建的其它 skills/agents。已有的 `AGENTS.md` 会先备份再替换。
 
@@ -137,6 +136,7 @@ sh ./install.sh zcode
 | [`agent-toolchain`](shared/skills/agent-toolchain/SKILL.md) | 首次接入、升级、修复、维护或审查 CodeGraph/RTK | 对目标项目进行受控接入与维护。 |
 | [`orchestrate-model-workflow`](codex-global-config/skills/orchestrate-model-workflow/SKILL.md) | 跨文件实现、复杂取证或独立验收 | 按证据和风险选择 role，并保留可核对的验证闭环。 |
 | [`project-doc-planner`](shared/skills/project-doc-planner/SKILL.md) | 新项目或大型改造的文档规划 | 可维护的项目级文档结构。 |
+| [`visual-aesthetics`](shared/skills/visual-aesthetics/SKILL.md) | 任何有可见外观的产出、修改或评审 | 视觉保底：失败模式、兜底纪律与评审动线。 |
 | [`gpt-image-2-cli`](codex-global-config/skills/gpt-image-2-cli/SKILL.md) | 需要生成或编辑图片素材 | 通过命令行调用图像生成能力。 |
 
 `orchestrate-model-workflow` 是双变体 skill：Codex 版与 ZCode 版按宿主机制差异分离维护，ZCode 版见 [`zcode-global-config/skills/orchestrate-model-workflow/SKILL.md`](zcode-global-config/skills/orchestrate-model-workflow/SKILL.md)。

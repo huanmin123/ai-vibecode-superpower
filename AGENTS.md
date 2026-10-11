@@ -20,7 +20,7 @@
 
 ## 权威来源
 
-- 共享平台文档与工具无关 skills：`shared/`（`docs/system/`、`agent-toolchain`、`project-doc-planner`），由两个安装器共同安装。
+- 共享平台文档与工具无关 skills：`shared/`（`docs/system/`、`agent-toolchain`、`project-doc-planner`、`visual-aesthetics`），由两个安装器共同安装。
 - Codex 全局行为规范：`codex-global-config/AGENTS.md`；安装后对应用户级 Codex home 中的 `AGENTS.md`。ZCode 对应 `zcode-global-config/AGENTS.md` 与用户级 ZCode home（`~/.zcode`）。
 - 工作流路由、交接与验收：`codex-global-config/skills/orchestrate-model-workflow/SKILL.md`（Codex 变体）与 `zcode-global-config/skills/orchestrate-model-workflow/SKILL.md`（ZCode 变体）。
 - role 本地权限与输出边界：`codex-global-config/agents/ai-vibecode-superpower/`（11 个 toml role：luna / sol / astra 三型，sol 含 gpt-6.1 主力与 gpt-6 同型回退）与 `zcode-global-config/agents/ai-vibecode-superpower/`（5 个 md agent）。角色命名统一为 `模型_版本_类型_思考档`（如 `glm_5.3_flash_low`、`gpt_6_astra_max`），同模型同档位冲突时追加职责后缀。

@@ -134,7 +134,7 @@ case "$client" in
         source_config=$script_dir/codex-global-config/config.toml
         source_model_provider_settings=$script_dir/codex-global-config/model-provider-settings.toml
         client_skills=$script_dir/codex-global-config/skills
-        skill_specs='agent-toolchain:shared gpt-image-2-cli:codex project-doc-planner:shared orchestrate-model-workflow:codex'
+        skill_specs='agent-toolchain:shared gpt-image-2-cli:codex project-doc-planner:shared visual-aesthetics:shared orchestrate-model-workflow:codex'
         has_config=1
         ;;
     zcode)
@@ -149,7 +149,7 @@ case "$client" in
         source_instructions=$script_dir/zcode-global-config/AGENTS.md
         source_docs=$script_dir/zcode-global-config/docs
         client_skills=$script_dir/zcode-global-config/skills
-        skill_specs='agent-toolchain:shared project-doc-planner:shared orchestrate-model-workflow:zcode'
+        skill_specs='agent-toolchain:shared project-doc-planner:shared visual-aesthetics:shared orchestrate-model-workflow:zcode'
         ;;
 esac
 
@@ -616,6 +616,6 @@ while IFS="$(printf '\t')" read -r target_name target_path candidate_path target
 done < "$manifest"
 assert_managed_roles "$client_home/agents/ai-vibecode-superpower" "$source_manifest"
 completed=1
-printf '%s\n' "$client_label configuration installed in: $client_home" 'Standalone skills and managed agent roles installed.'
+printf '%s\n' "$client_label configuration installed in: $client_home" 'Standalone skills and managed agent roles installed.' "Restart $client_label to load the new configuration and skills."
 if [ "$client" = zcode ]; then printf '%s\n' 'Unmanaged ZCode state (cli/, v2/, plugins, other skills and agents) was not modified.'; fi
 if [ -n "$backup_dir" ]; then printf '%s\n' "Backup directory: $backup_dir"; fi

@@ -71,6 +71,15 @@ function posixHome(codexHome) {
   return path.relative(repository, codexHome).split(path.sep).join('/');
 }
 
+const sharedSkillNames = ['agent-toolchain', 'project-doc-planner', 'visual-aesthetics'];
+
+async function assertSharedSkillsDeployed(skillsDir) {
+  for (const name of sharedSkillNames) {
+    assert.match(await readFile(path.join(skillsDir, name, 'SKILL.md'), 'utf8'), /^---/);
+  }
+  assert.match(await readFile(path.join(skillsDir, 'visual-aesthetics', 'references', 'design-principles.md'), 'utf8'), /^# /);
+}
+
 test('global behavior rules do not hard-code obsolete host tool protocols', async () => {
   const text = await readFile(globalAgents, 'utf8');
   assert.doesNotMatch(text, /^## 工具调用契约$/m);
@@ -285,6 +294,7 @@ test('PowerShell installer deploys the standalone skill into an isolated nested 
     assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
     const installed = await readFile(path.join(codexHome, 'skills', 'orchestrate-model-workflow', 'SKILL.md'), 'utf8');
     assert.match(installed, /^---\r?\nname: orchestrate-model-workflow\r?\n/);
+    await assertSharedSkillsDeployed(path.join(codexHome, 'skills'));
     const agents = await readFile(path.join(codexHome, 'AGENTS.md'), 'utf8');
     assert.doesNotMatch(agents, /<CODEX_HOME>|\$CODEX_HOME/);
     assert.match(agents, /codex-powershell-contract-/i);
@@ -364,6 +374,7 @@ test('POSIX installer deploys a fresh standalone home without legacy prerequisit
     assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
     const installed = await readFile(path.join(codexHome, 'skills', 'orchestrate-model-workflow', 'SKILL.md'), 'utf8');
     assert.match(installed, /^---\nname: orchestrate-model-workflow\n/);
+    await assertSharedSkillsDeployed(path.join(codexHome, 'skills'));
     const agents = await readFile(path.join(codexHome, 'AGENTS.md'), 'utf8');
     assert.doesNotMatch(agents, /<CODEX_HOME>|\$CODEX_HOME/);
     const config = await readFile(path.join(codexHome, 'config.toml'), 'utf8');
@@ -546,12 +557,10 @@ test('PowerShell zcode installer composes shared and zcode sources and leaves un
     for (const expected of ['README.md', 'windows.md', 'rg.md', 'ssh.md', 'linux.md', 'macos.md', '跨系统操作示例.md']) {
       assert.ok(systemDocs.includes(expected), `missing shared system doc: ${expected}`);
     }
-    for (const sharedSkill of ['agent-toolchain', 'project-doc-planner']) {
-      assert.match(await readFile(path.join(zcodeHome, 'skills', sharedSkill, 'SKILL.md'), 'utf8'), /^---/);
-    }
+    await assertSharedSkillsDeployed(path.join(zcodeHome, 'skills'));
     const cliConfig = await readFile(path.join(zcodeHome, 'cli', 'config.json'), 'utf8');
     assert.match(cliConfig, /"keep": ?"me"/);
-    assert.equal(await readdir(path.join(zcodeHome, 'skills')).then((names) => names.length), 3);
+    assert.equal(await readdir(path.join(zcodeHome, 'skills')).then((names) => names.length), 4);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -573,6 +582,7 @@ test('POSIX zcode installer deploys a fresh home without codex configuration', a
     const installedSkill = await readFile(path.join(zcodeHome, 'skills', 'orchestrate-model-workflow', 'SKILL.md'), 'utf8');
     assert.match(installedSkill, /^---\nname: orchestrate-model-workflow\n/);
     assert.doesNotMatch(installedSkill, /<ZCODE_HOME>/);
+    await assertSharedSkillsDeployed(path.join(zcodeHome, 'skills'));
     const agentFiles = (await readdir(path.join(zcodeHome, 'agents', 'ai-vibecode-superpower'))).filter((name) => name.endsWith('.md'));
     assert.equal(agentFiles.length, 5);
     const systemDocs = await readdir(path.join(zcodeHome, 'docs', 'system'));
