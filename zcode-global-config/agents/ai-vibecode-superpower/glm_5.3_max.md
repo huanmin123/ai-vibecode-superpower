@@ -1,7 +1,7 @@
 ---
 name: glm_5.3_max
 description: "只读最高强度独立复审与最终升级验收（终审）。"
-model: glm-5.3
+model: "account:bigmodel-individual-coding-plan/GLM-5.3"
 thoughtLevel: max
 color: orange
 tools: [Read, Bash, WebFetch, WebSearch, TodoWrite]

@@ -1,7 +1,7 @@
 ---
 name: glm_5.3_flash_low
 description: "只读常规取证与实施后预审。"
-model: glm-5.3-flash
+model: "account:bigmodel-individual-coding-plan/GLM-5.3-Flash"
 thoughtLevel: low
 color: cyan
 tools: [Read, Bash, WebFetch, WebSearch, TodoWrite]

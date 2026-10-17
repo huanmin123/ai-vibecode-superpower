@@ -1,7 +1,7 @@
 ---
 name: glm_5.3_high
 description: "只读有界技术定案与常规复审（审核主力）。"
-model: glm-5.3
+model: "account:bigmodel-individual-coding-plan/GLM-5.3"
 thoughtLevel: high
 color: purple
 tools: [Read, Bash, WebFetch, WebSearch, TodoWrite]

@@ -72,12 +72,22 @@ function Assert-TomlRoles([string]$Directory, [string]$Manifest, [int]$ExpectedC
     }
 }
 
-function Assert-AgentProfiles([string]$Directory, [string]$Manifest, [int]$ExpectedCount) {
+function Get-AgentManifestHashes([string]$Manifest) {
     $hashes = @{}
     foreach ($line in Get-Content -LiteralPath $Manifest) {
         if ($line -notmatch '^([0-9a-f]{64}) {2}([^\s]+)$') { throw "Invalid agent manifest: $Manifest" }
-        $hashes[$Matches[2]] = $Matches[1]
+        # A following -notmatch resets $Matches; capture both groups first.
+        $hash = $Matches[1]
+        $name = $Matches[2]
+        if ($name -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*\.(?:md|markdown)$') { throw "Unsafe managed agent name: $name" }
+        $hashes[$name] = $hash
     }
+    if ($hashes.Count -eq 0) { throw "Empty agent manifest: $Manifest" }
+    return $hashes
+}
+
+function Assert-AgentProfiles([string]$Directory, [string]$Manifest, [int]$ExpectedCount) {
+    $hashes = Get-AgentManifestHashes $Manifest
     if ($hashes.Count -ne $ExpectedCount) { throw "Expected $ExpectedCount managed agent hashes" }
     $files = @(Get-ChildItem -LiteralPath $Directory -Filter '*.md' -File)
     if ($files.Count -ne $ExpectedCount) { throw "Expected $ExpectedCount managed agent files" }
@@ -96,6 +106,15 @@ function Assert-AgentProfiles([string]$Directory, [string]$Manifest, [int]$Expec
             if ($key -eq 'name' -and $frontmatter -match '(?m)^name\s*:\s*"?([^\r\n"]+?)"?\s*$') { $name = $Matches[1].Trim() }
         }
         if ($name -ne $file.BaseName) { throw "Agent name mismatch: $($file.Name)/$name" }
+    }
+}
+
+function Assert-AgentProfileFiles([string]$Directory, [string]$Manifest) {
+    $hashes = Get-AgentManifestHashes $Manifest
+    foreach ($name in $hashes.Keys) {
+        $path = Join-Path $Directory $name
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Managed agent file missing: $path" }
+        if ((Get-NormalizedHash $path) -ne $hashes[$name]) { throw "Agent hash mismatch: $name" }
     }
 }
 
@@ -418,9 +437,25 @@ $stage = Join-Path $homePath ('.install-stage-' + [Guid]::NewGuid().ToString('N'
 $backup = $null
 $targets = @(
     @{ Name='AGENTS.md'; Target=(Join-Path $homePath 'AGENTS.md'); Candidate=(Join-Path $stage 'AGENTS.md'); Kind='File'; BackedUp=$false; InstallStarted=$false },
-    @{ Name='docs'; Target=(Join-Path $homePath 'docs'); Candidate=(Join-Path $stage 'docs'); Kind='Directory'; BackedUp=$false; InstallStarted=$false },
-    @{ Name='agents/ai-vibecode-superpower'; Target=(Join-Path $homePath 'agents\ai-vibecode-superpower'); Candidate=(Join-Path $stage 'agents\ai-vibecode-superpower'); Kind='Directory'; BackedUp=$false; InstallStarted=$false }
+    @{ Name='docs'; Target=(Join-Path $homePath 'docs'); Candidate=(Join-Path $stage 'docs'); Kind='Directory'; BackedUp=$false; InstallStarted=$false }
 )
+# md agents are installed flat: the ZCode host only scans the top level of ~/.zcode/agents.
+if ($profile.RoleKind -eq 'md') {
+    foreach ($agentName in (Get-AgentManifestHashes $profile.Manifest).Keys) {
+        $targets += @{ Name="agents/$agentName"; Target=(Join-Path $homePath "agents\$agentName"); Candidate=(Join-Path $stage "agents\$agentName"); Kind='File'; BackedUp=$false; InstallStarted=$false }
+    }
+    $legacyAgentsDir = Join-Path $homePath 'agents\ai-vibecode-superpower'
+    if (Test-Path -LiteralPath $legacyAgentsDir -PathType Container) {
+        try {
+            Assert-AgentProfiles $legacyAgentsDir $profile.Manifest $profile.RoleCount
+            $targets += @{ Name='agents/ai-vibecode-superpower'; Target=$legacyAgentsDir; Candidate=$null; Kind='Directory'; BackedUp=$false; InstallStarted=$false }
+        } catch {
+            Write-Warning "Legacy managed agent directory does not match the manifest; left untouched: $legacyAgentsDir"
+        }
+    }
+} else {
+    $targets += @{ Name='agents/ai-vibecode-superpower'; Target=(Join-Path $homePath 'agents\ai-vibecode-superpower'); Candidate=(Join-Path $stage 'agents\ai-vibecode-superpower'); Kind='Directory'; BackedUp=$false; InstallStarted=$false }
+}
 if ($null -ne $existingConfig) {
     $targets = @(@{ Name='config.toml'; Target=$existingConfig; Candidate=(Join-Path $stage 'config.toml'); Kind='File'; BackedUp=$false; InstallStarted=$false }) + $targets
 }
@@ -437,11 +472,13 @@ try {
     Copy-Item $profile.Instructions (Join-Path $stage 'AGENTS.md')
     Copy-Item $profile.Docs (Join-Path $stage 'docs') -Recurse
     Copy-Item $sourceSystemDocs (Join-Path $stage 'docs\system') -Recurse
-    Copy-Item $profile.Roles (Join-Path $stage 'agents') -Recurse
+    if ($profile.RoleKind -eq 'md') { Copy-Item (Join-Path $profile.Roles '*.md') (Join-Path $stage 'agents') }
+    else { Copy-Item $profile.Roles (Join-Path $stage 'agents') -Recurse }
     foreach ($skill in $profile.Skills) { Copy-Item $skill.Source (Join-Path $stage 'skills') -Recurse }
     if ($null -ne $existingConfig) { Merge-Config $profile.ConfigTemplate $existingConfig $profile.ProviderSettings (Join-Path $stage 'config.toml') }
     Expand-Placeholders $stage $profile.Placeholder $homePath
-    Assert-ManagedRoles $profile.RoleKind (Join-Path $stage 'agents\ai-vibecode-superpower') $profile.Manifest $profile.RoleCount
+    $stageRolesPath = if ($profile.RoleKind -eq 'md') { Join-Path $stage 'agents' } else { Join-Path $stage 'agents\ai-vibecode-superpower' }
+    Assert-ManagedRoles $profile.RoleKind $stageRolesPath $profile.Manifest $profile.RoleCount
 
     $backupRoot = Join-Path $homePath 'backups'
     New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
@@ -461,7 +498,8 @@ try {
             Move-Item -LiteralPath $target.Candidate -Destination $target.Target
         }
     }
-    Assert-ManagedRoles $profile.RoleKind (Join-Path $homePath 'agents\ai-vibecode-superpower') $profile.Manifest $profile.RoleCount
+    if ($profile.RoleKind -eq 'md') { Assert-AgentProfileFiles (Join-Path $homePath 'agents') $profile.Manifest }
+    else { Assert-ManagedRoles $profile.RoleKind (Join-Path $homePath 'agents\ai-vibecode-superpower') $profile.Manifest $profile.RoleCount }
     Write-Host "$label configuration installed in: $homePath"
     Write-Host 'Standalone skills and managed agent roles installed.'
     Write-Host "Restart $label to load the new configuration and skills."

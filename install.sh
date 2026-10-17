@@ -211,6 +211,17 @@ manifest_hash() {
     awk -v requested="$requested_role" '$0 ~ /^[0-9a-f]{64}  [^[:space:]]+$/ && $2 == requested { print $1; found = 1 } END { if (!found) exit 1 }' "$manifest_path"
 }
 
+# md agent 平铺安装（新版 ZCode 宿主只扫描 ~/.zcode/agents 顶层），文件名以 manifest 为准并做安全校验。
+agent_manifest_names() {
+    names=$(awk '$0 ~ /^[0-9a-f]{64}  [^[:space:]]+$/ { print $2 }' "$source_manifest")
+    name_count=$(printf '%s\n' "$names" | wc -l)
+    [ "$name_count" -eq "$expected_roles" ] || die "Expected $expected_roles managed agent names"
+    for name in $names; do
+        printf '%s\n' "$name" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*\.(md|markdown)$' || die "Unsafe managed agent name: $name"
+        printf '%s\n' "$name"
+    done
+}
+
 assert_roles_toml() {
     roles_dir=${1:-$source_roles}
     manifest_path=${2:-$source_manifest}
@@ -274,6 +285,30 @@ assert_managed_roles() {
     else
         assert_agents_md "$@"
     fi
+}
+
+# 已安装状态的平铺校验：agents 根目录可能含用户自建文件，只按 manifest 逐文件核对。
+assert_installed_agents_flat() {
+    agents_dir=$1
+    for agent_name in $(agent_manifest_names); do
+        agent_path=$agents_dir/$agent_name
+        [ -f "$agent_path" ] || die "Managed agent file missing: $agent_path"
+        expected_hash=$(manifest_hash "$agent_name") || die "Missing agent hash: $agent_name"
+        [ "$expected_hash" = "$(normalized_lf_sha256 "$agent_path")" ] || die "Agent hash mismatch: $agent_name"
+    done
+}
+
+# legacy 子目录探测：用 return 而非 die，允许在 if 条件上下文安全失败。
+legacy_dir_matches_manifest() {
+    probe_dir=$1
+    [ "$(wc -l < "$source_manifest")" -eq "$expected_roles" ] || return 1
+    for probe_name in $(agent_manifest_names); do
+        probe_path=$probe_dir/$probe_name
+        [ -f "$probe_path" ] || return 1
+        probe_expected=$(manifest_hash "$probe_name") || return 1
+        [ "$probe_expected" = "$(normalized_lf_sha256 "$probe_path")" ] || return 1
+    done
+    return 0
 }
 
 assert_safe_toml_merge_input() {
@@ -474,12 +509,29 @@ merge_managed_config() {
 
 for target_spec in \
     "$client_home/AGENTS.md file" \
-    "$client_home/docs directory" \
-    "$client_home/agents/ai-vibecode-superpower directory"; do
+    "$client_home/docs directory"; do
     target_path=${target_spec% *}
     target_kind=${target_spec##* }
     assert_target "$target_path" "$target_kind" || die "Unsafe install target: $target_path"
 done
+if [ "$role_kind" = toml ]; then
+    assert_target "$client_home/agents/ai-vibecode-superpower" directory || die "Unsafe install target: $client_home/agents/ai-vibecode-superpower"
+else
+    agent_manifest_names >/dev/null
+    for agent_name in $(agent_manifest_names); do
+        assert_target "$client_home/agents/$agent_name" file || die "Unsafe install target: $client_home/agents/$agent_name"
+    done
+fi
+legacy_agents_dir=$client_home/agents/ai-vibecode-superpower
+legacy_agents_managed=0
+if [ "$role_kind" = md ] && [ -d "$legacy_agents_dir" ]; then
+    if legacy_dir_matches_manifest "$legacy_agents_dir"; then
+        assert_target "$legacy_agents_dir" directory || die "Unsafe install target: $legacy_agents_dir"
+        legacy_agents_managed=1
+    else
+        printf '%s\n' "Warning: legacy managed agent directory does not match the manifest; left untouched: $legacy_agents_dir" >&2
+    fi
+fi
 if [ "$has_config" -eq 1 ]; then
     assert_target "$client_home/config.toml" file || die "Unsafe install target: $client_home/config.toml"
 fi
@@ -557,7 +609,11 @@ mkdir -p -- "$stage_dir/state/backed-up" "$stage_dir/state/install-started" "$st
 cp "$source_instructions" "$stage_dir/AGENTS.md"
 cp -R "$source_docs" "$stage_dir/docs"
 cp -R "$source_system_docs" "$stage_dir/docs/system"
-cp -R "$source_roles" "$stage_dir/agents/"
+if [ "$role_kind" = md ]; then
+    for agent_name in $(agent_manifest_names); do cp "$source_roles/$agent_name" "$stage_dir/agents/$agent_name"; done
+else
+    cp -R "$source_roles" "$stage_dir/agents/"
+fi
 for skill_spec in $skill_specs; do cp -R "$(skill_source_dir "$skill_spec")" "$stage_dir/skills/"; done
 if [ "$has_config" -eq 1 ]; then
     config_input=$source_config
@@ -570,7 +626,11 @@ if [ "$has_config" -eq 1 ]; then
     mv "$stage_dir/merged-config.toml" "$stage_dir/config.toml"
     assert_safe_toml_merge_input "$stage_dir/config.toml"
 fi
-assert_managed_roles "$stage_dir/agents/ai-vibecode-superpower" "$source_manifest"
+if [ "$role_kind" = md ]; then
+    assert_managed_roles "$stage_dir/agents" "$source_manifest"
+else
+    assert_managed_roles "$stage_dir/agents/ai-vibecode-superpower" "$source_manifest"
+fi
 escaped_home=$(printf '%s' "$client_home" | sed 's/[\\&|]/\\&/g')
 file_list=$stage_dir/files.list
 find "$stage_dir" -type f \( -name '*.md' -o -name '*.toml' -o -name '*.txt' \) -print > "$file_list" || die 'Could not enumerate staged text files.'
@@ -586,7 +646,12 @@ manifest=$stage_dir/targets.tsv
 printf 'AGENTS.md\t%s\t%s\tfile\treplace\n' "$client_home/AGENTS.md" "$stage_dir/AGENTS.md" > "$manifest"
 [ "$has_config" -eq 1 ] && printf 'config.toml\t%s\t%s\tfile\treplace\n' "$client_home/config.toml" "$stage_dir/config.toml" >> "$manifest"
 printf 'docs\t%s\t%s\tdirectory\treplace\n' "$client_home/docs" "$stage_dir/docs" >> "$manifest"
-printf 'agents/ai-vibecode-superpower\t%s\t%s\tdirectory\treplace\n' "$client_home/agents/ai-vibecode-superpower" "$stage_dir/agents/ai-vibecode-superpower" >> "$manifest"
+if [ "$role_kind" = md ]; then
+    for agent_name in $(agent_manifest_names); do printf 'agents/%s\t%s\t%s\tfile\treplace\n' "$agent_name" "$client_home/agents/$agent_name" "$stage_dir/agents/$agent_name" >> "$manifest"; done
+    [ "$legacy_agents_managed" -eq 1 ] && printf 'agents/ai-vibecode-superpower\t%s\t-\tdirectory\tbackup-remove\n' "$legacy_agents_dir" >> "$manifest"
+else
+    printf 'agents/ai-vibecode-superpower\t%s\t%s\tdirectory\treplace\n' "$client_home/agents/ai-vibecode-superpower" "$stage_dir/agents/ai-vibecode-superpower" >> "$manifest"
+fi
 for skill_spec in $skill_specs; do printf 'skills/%s\t%s\t%s\tdirectory\treplace\n' "${skill_spec%%:*}" "$client_home/skills/${skill_spec%%:*}" "$stage_dir/skills/${skill_spec%%:*}" >> "$manifest"; done
 has_existing_target=0
 while IFS="$(printf '\t')" read -r target_name target_path candidate_path target_kind target_operation; do
@@ -612,9 +677,21 @@ while IFS="$(printf '\t')" read -r target_name target_path candidate_path target
         assert_path_chain "$target_path" || die "Unsafe install destination: $target_path"
         mkdir -p -- "$(dirname -- "$target_path")"
         mv -- "$candidate_path" "$target_path"
+    elif [ "$target_operation" = backup-remove ]; then
+        if path_exists "$target_path"; then
+            [ -n "$backup_dir" ] || die "Existing target has no backup directory: $target_path"
+            backup_path=$backup_dir/$target_name
+            mkdir -p -- "$(dirname -- "$backup_path")"
+            mv -- "$target_path" "$backup_path"
+            mark_state backed-up "$target_name"
+        fi
     fi
 done < "$manifest"
-assert_managed_roles "$client_home/agents/ai-vibecode-superpower" "$source_manifest"
+if [ "$role_kind" = md ]; then
+    assert_installed_agents_flat "$client_home/agents"
+else
+    assert_managed_roles "$client_home/agents/ai-vibecode-superpower" "$source_manifest"
+fi
 completed=1
 printf '%s\n' "$client_label configuration installed in: $client_home" 'Standalone skills and managed agent roles installed.' "Restart $client_label to load the new configuration and skills."
 if [ "$client" = zcode ]; then printf '%s\n' 'Unmanaged ZCode state (cli/, v2/, plugins, other skills and agents) was not modified.'; fi
