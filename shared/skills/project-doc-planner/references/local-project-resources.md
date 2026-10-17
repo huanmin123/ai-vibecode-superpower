@@ -13,6 +13,8 @@
 
 ## 推荐目录
 
+以下是资源候选集合，只保留实际存在的环境与资源类别，不为凑齐目录创建账号、数据库或发布资料。仅需本地开发事实的项目可直接写一个 `dev/README.md`。环境入口使用 [env-readme-template.md](templates/env-readme-template.md)，资源子目录按下表职责与 [dir-readme-template.md](templates/dir-readme-template.md) 编写，具体操作使用 [operation-guide-template.md](templates/operation-guide-template.md)。
+
 ```text
 .local/project-resources/
 ├── README.md
@@ -59,6 +61,8 @@
             └── rollback.md
 ```
 
+部署记录、发布材料与环境 README 的可复制模板见 [deploy-record-template.md](templates/deploy-record-template.md)、[release-materials-template.md](templates/release-materials-template.md)、[env-readme-template.md](templates/env-readme-template.md)。
+
 ## 文件职责
 
 | 位置 | 职责 |
@@ -89,14 +93,14 @@
 
 `prod/README.md` 还要写：
 
-- 生产操作必须先获得明确确认。
+- 生产高影响操作须有覆盖环境、目标、范围和副作用的明确授权；本次指令已覆盖时不重复询问。
 - 发布前备份范围：env、数据库、缓存/队列、当前 release、反代配置。
 - 每次发布创建 `releases/YYYY-MM-DD_NNN/`，保留 `release.md`、`checksums.txt`、`rollback.md`。
 - 涉及旧数据保留时只做离线导出、清洗、导入、校验和归档，不把旧结构兼容写进运行时代码。
 
 ## 环境加载与隔离脚本
 
-建议配套脚本把文档规则变成硬门禁：
+按实际交付需求复用已有脚本；以下名称是能力建议，不代表脚本已经存在，也不授权本次文档任务直接创建部署工具：
 
 - `scripts/load-local-env.*`：按 `dev/test/prod` 读取私有 env；默认读取 dev。
 - `scripts/preflight.*`：检查依赖、环境、Git 状态、构建前提、目标环境和 secrets 泄露风险。
@@ -106,9 +110,8 @@
 - `scripts/rollback.*`：读取当前 release 和目标 release，执行回滚步骤并验证。
 - `scripts/write-release-log.*`：把命令结果、版本、校验和、验证和后续事项写入固定记录。
 - test 复用 dev 时在脚本和 README 中显式映射，而不是隐式猜测。
-- dev/test 加载前检查数据库名、Redis DB、namespace、端口、服务名或云资源标签，发现生产目标时拒绝加载。
 - 生产 env 加载不作为默认开发命令的一部分；生产变更命令需要显式参数、确认和日志记录。
-- smoke、migration、package、deploy 脚本不得把 DSN、token、Authorization、API Key、Cookie 或密码打印到普通输出。
+- 加载前隔离检查与输出脱敏的门禁规则见 [development-standards.md](development-standards.md) 的"环境资源与上下文规范"。
 
 ## 一条龙交付控制面
 
@@ -117,21 +120,14 @@
 | 人工指令 | AI 执行流 | 默认确认 |
 | --- | --- | --- |
 | 开发、实现、修复 | 读文档 -> 写/更新计划 -> 改代码 -> 本地验证 -> 更新功能/问题/重构文档 | 不需要，除非需求不清 |
-| 发测试 | 加载 test 或 dev 隔离 env -> 迁移/部署 -> smoke -> 记录测试发布结果 | 通常不需要 |
-| 上线 | 生产预检 -> 备份 -> 打包 -> 部署 -> smoke -> 记录 release -> 观察窗口 | 需要明确确认 |
-| 回滚 | 读取 `current-release.txt` 和目标 `rollback.md` -> 评估数据影响 -> 执行 -> smoke -> 记录 | 需要明确确认 |
-| 排查线上问题 | 只读读取 prod runbook/logs -> 执行只读诊断 -> 给出修复计划 | 写操作需要确认 |
+| 发测试 | 加载 test 或 dev 隔离 env -> 按实际契约迁移/部署 -> smoke -> 记录测试发布结果 | 用户指令明确覆盖目标与副作用时执行；共享环境、数据破坏等未覆盖动作先确认 |
+| 上线 | 生产预检 -> 备份 -> 打包 -> 部署 -> smoke -> 记录 release -> 观察窗口 | 核对明确授权；未覆盖时完成准备后确认 |
+| 回滚 | 读取 `current-release.txt` 和目标 `rollback.md` -> 评估数据影响 -> 执行 -> smoke -> 记录 | 核对明确授权；未覆盖时完成评估后确认 |
+| 排查线上问题 | 只读读取 prod runbook/logs -> 执行只读诊断 -> 给出修复计划 | 写操作须有明确授权 |
 
-每条执行流都应具备：
+每条执行流必须具备的要素（入口、环境、脚本、门禁、证据、停止条件、记录位置）统一见 [development-standards.md](development-standards.md) 的"AI 交付流水线规范"。
 
-- 输入：需求描述、计划编号、目标环境、目标 release 或问题编号。
-- 上下文：公开文档入口、私有资源入口、env 文件、账号索引、数据库/缓存边界。
-- 命令：固定脚本或明确命令，不依赖人工现场拼接。
-- 门禁：Git 状态、构建、测试、smoke、备份、回滚材料、敏感信息扫描。
-- 输出：验证摘要、日志路径、release 目录、回滚步骤、后续观察项。
-- 失败策略：失败即停止、自动回滚、要求人工确认或转入问题记录。
-
-如果项目想要“无人值守上线”，必须额外写清预授权边界：允许的分支、时间窗口、变更类型、最大数据影响、自动回滚阈值、通知渠道和审计记录。默认不要让 AI 无确认修改生产。
+如果项目想要"无人值守上线"，其预授权边界与默认禁止规则见 [development-standards.md](development-standards.md) 的"AI 交付流水线规范"。
 
 ## 公开文档同步规则
 
@@ -150,6 +146,7 @@
 ## 安全规则
 
 - `.local/` 和所有真实 env、账号、数据库备份、release 私有包必须被 `.gitignore` 忽略。
+- 同时核对私有路径被忽略且未被 Git 跟踪；忽略规则不改变已跟踪文件。发现已提交秘密时报告位置和影响而不回显值，停止扩散；取消跟踪、历史处理与凭据轮换按各自授权执行。
 - 公开 `docs/`、`AGENTS.md`、提交信息、PR 描述、聊天记录和发布包说明不写明文密钥或连接串。
 - README 可以写文件路径、用途、生成时间、交付对象和脱敏示例；真实值放在私有 env、`.txt`、密钥管理系统或服务器本机文件。
 - 生产发布包不应包含 `.local/`、`.env`、数据库文件、日志、账号文件或真实备份。
@@ -157,10 +154,4 @@
 
 ## AGENTS.md 应包含
 
-- 私有资源目录路径和 Git 忽略要求。
-- Agent 默认读取 dev；test 复用 dev 时的规则；生产操作前必须切换 prod 并获得明确确认。
-- 本地启动命令和是否加载私有 env。
-- dev/test/prod 的隔离红线，例如生产库、生产缓存 DB、生产 namespace 和生产密钥不得用于开发。
-- 用户指令映射：开发、发测试、上线、回滚、线上排查分别走哪些脚本、环境和记录位置。
-- 发布备份和 release 命名规则。
-- 真实凭据只保存在私有目录或密钥系统，禁止写入公开文档和最终回复。
+根目录 `AGENTS.md` 的章节结构与应包含内容统一见 [root-agents-template.md](root-agents-template.md)，不在此重复维护。
