@@ -1,4 +1,0 @@
-interface:
-  display_name: "GPT Image 2 CLI"
-  short_description: "使用 Codex 鉴权和配置运行 gpt-image-2 图像生成"
-  default_prompt: "使用 $gpt-image-2-cli 基于我的 Codex 鉴权和配置，通过 gpt-image-2 生成图像。"

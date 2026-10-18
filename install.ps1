@@ -374,7 +374,6 @@ $clientProfiles = [ordered]@{
         ProviderSettings = Join-Path $root 'codex-global-config\model-provider-settings.toml'
         Skills = @(
             @{ Name = 'agent-toolchain'; Source = (Join-Path $root 'shared\skills\agent-toolchain') },
-            @{ Name = 'gpt-image-2-cli'; Source = (Join-Path $root 'codex-global-config\skills\gpt-image-2-cli') },
             @{ Name = 'project-doc-planner'; Source = (Join-Path $root 'shared\skills\project-doc-planner') },
             @{ Name = 'visual-aesthetics'; Source = (Join-Path $root 'shared\skills\visual-aesthetics') },
             @{ Name = 'orchestrate-model-workflow'; Source = (Join-Path $root 'codex-global-config\skills\orchestrate-model-workflow') }

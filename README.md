@@ -112,7 +112,7 @@ goals = true
 ### ZCode
 
 - 可在 ZCode 会话运行时安装；安装成功后重启 ZCode，使 `~/.zcode/agents` 的角色和 `~/.zcode/skills` 生效。
-- ZCode 变体包含 5 个角色，按统一公式 `模型_版本_类型_思考档` 命名：`glm_5.3_flash_low`（常规取证）、`glm_5.3_flash_high`（深度取证）、`glm_5.3_flash_max`（写代码主力）、`glm_5.3_high`（审核主力）、`glm_5.3_max`（终审）；glm-5.3 不使用 low 档。`gpt-image-2-cli` 是 Codex 专属，不会安装到 ZCode。
+- ZCode 变体包含 5 个角色，按统一公式 `模型_版本_类型_思考档` 命名：`glm_5.3_flash_low`（常规取证）、`glm_5.3_flash_high`（深度取证）、`glm_5.3_flash_max`（写代码主力）、`glm_5.3_high`（审核主力）、`glm_5.3_max`（终审）；glm-5.3 不使用 low 档。
 - 安装器只管理 `AGENTS.md`、`docs/`、按 manifest 平铺安装到 `~/.zcode/agents/` 顶层的 5 个 md agent（新版 ZCode 宿主只扫描该目录顶层，子目录不参与发现）和受管的 skills；不修改 ZCode 的 `cli/`、`v2/`、插件缓存或用户自建的其它 skills/agents。已有的 `AGENTS.md` 会先备份再替换。
 
 **Windows（PowerShell 7）**，在仓库根目录运行：
@@ -137,7 +137,6 @@ sh ./install.sh zcode
 | [`orchestrate-model-workflow`](codex-global-config/skills/orchestrate-model-workflow/SKILL.md) | 跨文件实现、复杂取证或独立验收 | 按证据和风险选择 role，并保留可核对的验证闭环。 |
 | [`project-doc-planner`](shared/skills/project-doc-planner/SKILL.md) | 新项目或大型改造的文档规划 | 可维护的项目级文档结构。 |
 | [`visual-aesthetics`](shared/skills/visual-aesthetics/SKILL.md) | 任何有可见外观的产出、修改或评审 | 视觉保底：失败模式、兜底纪律与评审动线。 |
-| [`gpt-image-2-cli`](codex-global-config/skills/gpt-image-2-cli/SKILL.md) | 需要生成或编辑图片素材 | 通过命令行调用图像生成能力。 |
 
 `orchestrate-model-workflow` 是双变体 skill：Codex 版与 ZCode 版按宿主机制差异分离维护，ZCode 版见 [`zcode-global-config/skills/orchestrate-model-workflow/SKILL.md`](zcode-global-config/skills/orchestrate-model-workflow/SKILL.md)。
 
