@@ -19,6 +19,8 @@
 
 需要复用私有环境事实或发布材料时，再规划 Git 忽略的私有资源层；仅有本地开发或公开配置的项目不因此自动增加 dev/test/prod 分区。交付流程只覆盖项目实际支持的开发、验证和运维能力，不能把建议脚本描述为已有工具。
 
+文档按“草稿 -> 生效 -> 已废弃/已归档 -> 删除”管理生命周期；状态变化必须保留原因、责任人、受影响链接和基线影响。`functions/` 的稳定契约、已产生证据的 `plans/`、`bug/`、`refactors/` 和 `reports/` 默认保留或归档，不因当前任务结束直接删除；`待办与阻塞事项.md` 的已关闭条目仍按清单规则移除，但需要长期保留的过程证据必须先转入对应档案。清理、合并、废弃和删除前的证据、恢复性、链接和索引检查按 [document-cleanup-guide.md](document-cleanup-guide.md) 执行。
+
 ## 候选文档树
 
 ```text
@@ -85,6 +87,7 @@ docs/
 | `functions/` 中长期需求与行为契约 | [feature-design-template.md](templates/feature-design-template.md) |
 | `develop/测试与验证说明.md` | [verification-guide-template.md](templates/verification-guide-template.md) |
 | 安装、运行、构建、部署指南和私有 runbook | [operation-guide-template.md](templates/operation-guide-template.md) |
+| 文档生命周期、清理、归档、合并与删除 | [document-cleanup-guide.md](document-cleanup-guide.md) |
 | 功能开发、问题修复、重构和前后端专题规范 | [development-standards.md](development-standards.md) 中对应章节；写适用范围、项目实际规则、例外依据与维护触发，不再复制无关规范 |
 | 接口/权限、存储、安全/日志专题契约 | 功能设计模板的对应章节和开发规范；内容较大时拆为专题文档并相互链接，保持单一权威来源 |
 
@@ -113,6 +116,8 @@ docs/
 | 大型重构 | `refactors/README.md`、当次重构记录；仅格式变化时更新重构模板 |
 | 阻塞出现或解除、裁决完成、观察项升级 | `待办与阻塞事项.md` 对应分区（保留编号移动）；需长期保留证据时建立 plans/bug/refactors 档案并删除清单条目 |
 | 压测、验收、审计或专项分析产出独立报告 | `reports/README.md` 文件索引、当次报告；计划/问题的验证矩阵链接报告而不复制数据；结论成为长期规则时同步回设计文档 |
+| 文档新增、合并、归档、废弃或删除 | 先读 [document-cleanup-guide.md](document-cleanup-guide.md)；更新受影响目录 `README.md`、入链、替代文档、关联计划/基线和清理记录；有长期证据的记录只归档不删除 |
+| 清理规则、保留期限或归档位置变化 | [document-cleanup-guide.md](document-cleanup-guide.md)、本矩阵及受影响目录 `README.md`；说明生效日期、迁移范围和恢复路径 |
 
 矩阵按实际影响和已保留目录应用，不因命中变更类型创建整套不存在的文件；既有权威文件已覆盖时直接更新并链接。
 
@@ -144,3 +149,4 @@ dev 默认上下文、生产确认门禁、环境隔离与敏感信息脱敏等�
 - 架构文档要稳定耐用，计划文档保持临时性。
 - 链接保持相对路径，以便仓库移动后仍可用。
 - 不要留下模糊的“兼容性策略”表述；明确项目是只遵循当前模型，还是有具体兼容例外。
+- 任何清理都必须先证明目标的生命周期状态、入链、索引、需求基线和恢复路径；不能以“内容看起来过时”作为删除依据。
