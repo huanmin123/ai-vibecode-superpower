@@ -13,6 +13,10 @@
 
 `functions/` 保存长期有效的功能契约，`plans/` 保存阶段性的执行记录。涉及接口、数据或权限契约的功能先写或更新功能设计，计划引用设计并记录需求基线；小改动可直接使用简短计划，已有问题/重构记录能完整覆盖范围与验证时无需再建平行计划。稳定验收口径属于契约，本次任务、验证矩阵与实际结果属于执行记录，并通过需求的 `AC-*` 键追踪。
 
+跨会话共享且尚未关闭的阻塞、待确认、待办和观察项集中在 `docs/待办与阻塞事项.md` 单一清单；条目关闭即删除，需要长期保留的过程与证据仍归入 `plans/`、`bug/`、`refactors/` 档案，清单通过编号锚点和指针区链接这些档案。格式见 [todo-blockers-template.md](templates/todo-blockers-template.md)。
+
+压测、验收、审计和专项分析沉淀的人工报告保存在 `docs/reports/`，只记录测试范围、环境、数据、已证实结论和边界；原始机器产物（JSON、log、profile）放在 Git 忽略目录（例如 `.local/project-resources/`），报告以仓库相对路径引用，不混入 `docs/`。计划仍承载推进过程与本次验证矩阵；报告结论升级为长期规则时同步回对应设计文档。格式见 [report-template.md](templates/report-template.md)。
+
 需要复用私有环境事实或发布材料时，再规划 Git 忽略的私有资源层；仅有本地开发或公开配置的项目不因此自动增加 dev/test/prod 分区。交付流程只覆盖项目实际支持的开发、验证和运维能力，不能把建议脚本描述为已有工具。
 
 ## 候选文档树
@@ -20,6 +24,7 @@
 ```text
 docs/
 ├── README.md
+├── 待办与阻塞事项.md
 ├── architecture/
 │   ├── README.md
 │   ├── 架构总览.md
@@ -44,6 +49,9 @@ docs/
 ├── plans/
 │   ├── README.md
 │   └── 计划模板.md
+├── reports/
+│   ├── README.md
+│   └── 报告模板.md
 ├── develop/
 │   ├── README.md
 │   ├── 安装指南.md
@@ -103,6 +111,8 @@ docs/
 | AI 交付流水线或命令映射变化 | `AGENTS.md`、`docs/develop/`、`docs/deploy/`；更新 `.local/project-resources/README.md` 和相关脚本 |
 | 重复或重要 Bug | `bug/README.md`、当次问题记录；仅格式变化时更新问题模板 |
 | 大型重构 | `refactors/README.md`、当次重构记录；仅格式变化时更新重构模板 |
+| 阻塞出现或解除、裁决完成、观察项升级 | `待办与阻塞事项.md` 对应分区（保留编号移动）；需长期保留证据时建立 plans/bug/refactors 档案并删除清单条目 |
+| 压测、验收、审计或专项分析产出独立报告 | `reports/README.md` 文件索引、当次报告；计划/问题的验证矩阵链接报告而不复制数据；结论成为长期规则时同步回设计文档 |
 
 矩阵按实际影响和已保留目录应用，不因命中变更类型创建整套不存在的文件；既有权威文件已覆盖时直接更新并链接。
 
@@ -110,8 +120,10 @@ docs/
 
 - 新建记录类文档（plans/bug/refactors）默认使用 UTC 时间戳 ID，精确到秒，不用毫秒和顺序编号。ID 形如 `PLAN-YYYYMMDDTHHmmss`、`BUG-YYYYMMDDTHHmmss`、`REFACTOR-YYYYMMDDTHHmmss`，文件名对应为 `计划/问题/重构-YYYYMMDDTHHmmss-短标题.md`。秒级时间戳仍可能碰撞；创建时以排他方式保留目标文件名，冲突则在下一秒重新生成，不覆盖已有记录。已有项目编号惯例可保留。
 - ID 创建后不再修改。标题可以改名，但文件正文和链接中的 ID 必须稳定。
+- `docs/待办与阻塞事项.md` 是在用清单而非档案，条目使用文件内稳定短编号（`B`/`C`/`T`/`W`/`P` + 递增序号），状态变化跨分区移动并保留编号，关闭即删除且编号不复用；需要长期保留的过程记录仍按时间戳 ID 建档。
+- `docs/reports/` 报告不使用编号 ID，文件名用 `<主题>报告-YYYY-MM-DD.md`，同一主题多轮以日期区分；新报告在目录 README 的文件索引登记后才算交付。
 
-记录与私有资源模板：[plan-template.md](templates/plan-template.md)、[bug-template.md](templates/bug-template.md)、[refactor-template.md](templates/refactor-template.md)、[deploy-record-template.md](templates/deploy-record-template.md)、[release-materials-template.md](templates/release-materials-template.md)、[env-readme-template.md](templates/env-readme-template.md)。稳定文档模板见上方映射表。目标项目仅在需要项目专有格式时维护模板副本；副本成为项目格式的权威来源，不要求与 skill 长期机械同步。
+记录与私有资源模板：[plan-template.md](templates/plan-template.md)、[todo-blockers-template.md](templates/todo-blockers-template.md)、[bug-template.md](templates/bug-template.md)、[refactor-template.md](templates/refactor-template.md)、[report-template.md](templates/report-template.md)、[deploy-record-template.md](templates/deploy-record-template.md)、[release-materials-template.md](templates/release-materials-template.md)、[env-readme-template.md](templates/env-readme-template.md)。稳定文档模板见上方映射表。目标项目仅在需要项目专有格式时维护模板副本；副本成为项目格式的权威来源，不要求与 skill 长期机械同步。
 
 ## 开发策略基线
 

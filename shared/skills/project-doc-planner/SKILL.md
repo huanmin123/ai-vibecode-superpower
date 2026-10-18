@@ -34,9 +34,11 @@ description: 设计或更新项目文档架构、根目录 AGENTS.md、开发规
 | `docs/` 及子目录 `README.md` 格式 | [dir-readme-template.md](references/templates/dir-readme-template.md)；项目根 README 保留使用手册定位 |
 | 架构总览格式 | [architecture-overview-template.md](references/templates/architecture-overview-template.md) |
 | 长期测试与验证说明格式 | [verification-guide-template.md](references/templates/verification-guide-template.md) |
+| 压测、验收、审计或专项分析报告格式 | [report-template.md](references/templates/report-template.md) |
 | 安装、运行、构建、部署、回滚或 runbook 格式 | [operation-guide-template.md](references/templates/operation-guide-template.md) |
 | 长期需求与行为契约格式 | [feature-design-template.md](references/templates/feature-design-template.md) |
 | 单次交付计划与证据格式 | [plan-template.md](references/templates/plan-template.md) |
+| 跨会话未完成事项清单（阻塞、待确认、待办、观察项）格式 | [todo-blockers-template.md](references/templates/todo-blockers-template.md) |
 | 问题（bug）记录格式 | [bug-template.md](references/templates/bug-template.md) |
 | 重构记录格式 | [refactor-template.md](references/templates/refactor-template.md) |
 | 部署记录格式 | [deploy-record-template.md](references/templates/deploy-record-template.md) |
