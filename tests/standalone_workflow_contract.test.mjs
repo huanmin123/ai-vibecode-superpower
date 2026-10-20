@@ -122,6 +122,11 @@ test('standalone workflow skill has the five behavior stages and no obsolete pro
   assert.match(text, /拒绝不等于 role\/model 不可用，不触发 fallback/);
   assert.match(text, /不得把写入任务派给只读 role/);
   assert.match(text, /授权、权限、范围和责任边界均已满足时直接继续/);
+  assert.match(text, /主模型 fallback/);
+  assert.match(text, /不指定 `agent_type` 和 `model`，子代理继承当前主模型/);
+  assert.match(text, /余额\/配额耗尽/);
+  assert.match(text, /Critique 改用主模型时必须使用未参与写入的新子代理/);
+  assert.match(text, /主模型 fallback 的每次使用、触发证据和受影响阶段都必须在交付中说明/);
   assert.doesNotMatch(text, /路径锁|并行写入安全|所有.*串行/);
   const rolePattern = (role) => new RegExp(role.replace(/\./g, '\\.'));
   for (const role of [
@@ -189,6 +194,11 @@ test('zcode workflow skill variant keeps the stages and drops codex-only mechani
   assert.match(text, /不得把写入任务派给只读角色/);
   assert.match(text, /风险与回滚、验收、验证、停止条件/);
   assert.match(text, /等价替代只有向上替补/);
+  assert.match(text, /主模型 fallback/);
+  assert.match(text, /subagent_type: "general-purpose"/);
+  assert.match(text, /继承当前会话模型/);
+  assert.match(text, /余额\/配额耗尽/);
+  assert.match(text, /Critique 改用主模型时必须使用未参与写入的新子代理/);
   for (const forbidden of [
     'CODEX_HOME', 'coordinator_thread_id', 'gpt-5\\.6', 'sandbox_mode', 'avsp_'
   ]) assert.doesNotMatch(text, new RegExp(forbidden));
@@ -196,11 +206,11 @@ test('zcode workflow skill variant keeps the stages and drops codex-only mechani
 
 test('all five managed zcode agents stay hash-addressed with model routing frontmatter', async () => {
   const expectedAllocation = {
-    'glm_5.3_flash_low.md': { model: 'glm-5.3-flash', thoughtLevel: 'low' },
-    'glm_5.3_flash_high.md': { model: 'glm-5.3-flash', thoughtLevel: 'high' },
-    'glm_5.3_flash_max.md': { model: 'glm-5.3-flash', thoughtLevel: 'max' },
-    'glm_5.3_high.md': { model: 'glm-5.3', thoughtLevel: 'high' },
-    'glm_5.3_max.md': { model: 'glm-5.3', thoughtLevel: 'max' }
+    'glm_5.3_flash_low.md': { model: '"account:bigmodel-individual-coding-plan/GLM-5.3-Flash"', thoughtLevel: 'low' },
+    'glm_5.3_flash_high.md': { model: '"account:bigmodel-individual-coding-plan/GLM-5.3-Flash"', thoughtLevel: 'high' },
+    'glm_5.3_flash_max.md': { model: '"account:bigmodel-individual-coding-plan/GLM-5.3-Flash"', thoughtLevel: 'max' },
+    'glm_5.3_high.md': { model: '"account:bigmodel-individual-coding-plan/GLM-5.3"', thoughtLevel: 'high' },
+    'glm_5.3_max.md': { model: '"account:bigmodel-individual-coding-plan/GLM-5.3"', thoughtLevel: 'max' }
   };
   const lines = (await readFile(zcodeManifest, 'utf8')).trim().split(/\r?\n/);
   assert.equal(lines.length, 5);
@@ -549,8 +559,9 @@ test('PowerShell zcode installer composes shared and zcode sources and leaves un
     const installedSkill = await readFile(path.join(zcodeHome, 'skills', 'orchestrate-model-workflow', 'SKILL.md'), 'utf8');
     assert.match(installedSkill, /^---\r?\nname: orchestrate-model-workflow\r?\n/);
     assert.doesNotMatch(installedSkill, /<ZCODE_HOME>/);
-    const agentFiles = (await readdir(path.join(zcodeHome, 'agents', 'ai-vibecode-superpower'))).filter((name) => name.endsWith('.md'));
-    assert.equal(agentFiles.length, 5);
+    const agentFiles = (await readdir(path.join(zcodeHome, 'agents'))).filter((name) => name.endsWith('.md'));
+    for (const role of zcodeRoleNames) assert.ok(agentFiles.includes(`${role}.md`), `missing flat agent: ${role}.md`);
+    assert.equal(agentFiles.filter((name) => zcodeRoleNames.includes(name.slice(0, -3))).length, 5);
     const docsReadme = await readFile(path.join(zcodeHome, 'docs', 'README.md'), 'utf8');
     assert.match(docsReadme, /ZCode 全局参考文档/);
     const systemDocs = await readdir(path.join(zcodeHome, 'docs', 'system'));
@@ -583,8 +594,9 @@ test('POSIX zcode installer deploys a fresh home without codex configuration', a
     assert.match(installedSkill, /^---\nname: orchestrate-model-workflow\n/);
     assert.doesNotMatch(installedSkill, /<ZCODE_HOME>/);
     await assertSharedSkillsDeployed(path.join(zcodeHome, 'skills'));
-    const agentFiles = (await readdir(path.join(zcodeHome, 'agents', 'ai-vibecode-superpower'))).filter((name) => name.endsWith('.md'));
-    assert.equal(agentFiles.length, 5);
+    const agentFiles = (await readdir(path.join(zcodeHome, 'agents'))).filter((name) => name.endsWith('.md'));
+    for (const role of zcodeRoleNames) assert.ok(agentFiles.includes(`${role}.md`), `missing flat agent: ${role}.md`);
+    assert.equal(agentFiles.filter((name) => zcodeRoleNames.includes(name.slice(0, -3))).length, 5);
     const systemDocs = await readdir(path.join(zcodeHome, 'docs', 'system'));
     for (const expected of ['README.md', 'windows.md', 'rg.md', 'ssh.md', 'linux.md', 'macos.md', '跨系统操作示例.md']) {
       assert.ok(systemDocs.includes(expected), `missing shared system doc: ${expected}`);
