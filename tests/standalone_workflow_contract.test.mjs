@@ -103,30 +103,25 @@ test('standalone workflow skill has the five behavior stages and no obsolete pro
   ]) {
     assert.doesNotMatch(text, new RegExp(forbidden));
   }
-  assert.match(text, /默认优先选择 Luna/);
+  assert.match(text, /默认优先选择成本最低且能胜任的 Luna/);
   assert.match(text, /风险与回滚、验收、验证、停止条件/);
   assert.match(text, /默认并行优先/);
   assert.match(text, /不应只交给单个 agent 串行执行/);
   assert.match(text, /无法安全拆分、拆分成本高于收益或当前工具受限时，才使用单 agent/);
-  assert.match(text, /fallback 仅对本次派发生效，是临时且可重新评估的选择/);
-  assert.match(text, /职责、权限和验收能力等价的 fallback/);
-  assert.match(text, /无法证明等价时停止并报告/);
-  assert.match(text, /恢复后优先回到原始 role/);
-  assert.match(text, /若原始职责允许同等选择，再优先选择可用的 Luna/);
-  assert.match(text, /按功能、模块或文件形成非重叠区域/);
-  assert.match(text, /只能修改事先分配的最小范围/);
+  assert.match(text, /fallback 只对本次派发生效/);
+  assert.match(text, /职责等价的可用角色/);
+  assert.match(text, /子代理只修改分配范围/);
   assert.match(text, /共享部分按必要顺序处理/);
-  assert.match(text, /边界清晰的工作保持并行/);
-  assert.match(text, /不再等待该 agent 或原样重复派发/);
-  assert.match(text, /拒绝条件已经改变时可以重新派发/);
-  assert.match(text, /拒绝不等于 role\/model 不可用，不触发 fallback/);
-  assert.match(text, /不得把写入任务派给只读 role/);
-  assert.match(text, /授权、权限、范围和责任边界均已满足时直接继续/);
-  assert.match(text, /主模型 fallback/);
-  assert.match(text, /不指定 `agent_type` 和 `model`，子代理继承当前主模型/);
-  assert.match(text, /余额\/配额耗尽/);
-  assert.match(text, /Critique 改用主模型时必须使用未参与写入的新子代理/);
-  assert.match(text, /主模型 fallback 的每次使用、触发证据和受影响阶段都必须在交付中说明/);
+  assert.match(text, /未决选择、权限、依赖或环境问题由主代理解决/);
+  assert.match(text, /拒绝不等于角色或模型不可用，不触发 fallback/);
+  assert.match(text, /不得把写入任务派给只读角色/);
+  assert.match(text, /拒绝场景下，主代理仅在授权、权限、范围和责任边界均已满足时直接继续/);
+  assert.match(text, /角色或模型不可用时，先换职责等价的可用角色/);
+  assert.match(text, /派发一个继承主模型的子代理/);
+  assert.match(text, /承担原角色职责，其余流程不变/);
+  assert.match(text, /主代理不得改为在当前会话内直接执行/);
+  assert.match(text, /恢复后回到原角色/);
+  assert.doesNotMatch(text, /spawn_agent|agent_type|subagent_type/);
   assert.doesNotMatch(text, /路径锁|并行写入安全|所有.*串行/);
   const rolePattern = (role) => new RegExp(role.replace(/\./g, '\\.'));
   for (const role of [
@@ -186,19 +181,21 @@ test('zcode workflow skill variant keeps the stages and drops codex-only mechani
   assert.match(text, /^---\r?\nname: orchestrate-model-workflow\r?\n/);
   for (const stage of ['Explore', 'Plan', 'Work', 'Critique', 'Promote']) assert.match(text, new RegExp(`\\b${stage}\\b`));
   for (const role of zcodeRoleNames) assert.match(text, new RegExp(`\\b${role.replace(/\./g, '\\.')}\\b`));
-  assert.match(text, /subagent_type/);
+  assert.match(text, /角色按名称派发给对应的子代理角色定义/);
   assert.match(text, /<ZCODE_HOME>/);
+  assert.match(text, /宿主只扫描该层，子目录不参与发现/);
+  assert.doesNotMatch(text, /agents\/ai-vibecode-superpower/);
   assert.match(text, /模型_版本_类型_思考档/);
   assert.match(text, /默认并行优先/);
-  assert.match(text, /fallback 仅对本次派发生效，是临时且可重新评估的选择/);
+  assert.match(text, /fallback 只对本次派发生效/);
   assert.match(text, /不得把写入任务派给只读角色/);
+  assert.match(text, /角色或模型不可用时，先换职责等价的可用角色/);
   assert.match(text, /风险与回滚、验收、验证、停止条件/);
-  assert.match(text, /等价替代只有向上替补/);
-  assert.match(text, /主模型 fallback/);
-  assert.match(text, /subagent_type: "general-purpose"/);
-  assert.match(text, /继承当前会话模型/);
-  assert.match(text, /余额\/配额耗尽/);
-  assert.match(text, /Critique 改用主模型时必须使用未参与写入的新子代理/);
+  assert.match(text, /派发一个继承当前会话模型的子代理/);
+  assert.match(text, /承担原角色职责，其余流程不变/);
+  assert.match(text, /主代理不得改为在当前会话内直接执行/);
+  assert.match(text, /恢复后回到原角色/);
+  assert.doesNotMatch(text, /Agent 工具|subagent_type|general-purpose|spawn_agent/);
   for (const forbidden of [
     'CODEX_HOME', 'coordinator_thread_id', 'gpt-5\\.6', 'sandbox_mode', 'avsp_'
   ]) assert.doesNotMatch(text, new RegExp(forbidden));
