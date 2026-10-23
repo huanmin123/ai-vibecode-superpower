@@ -1,0 +1,91 @@
+description = "GPT 预设：Codex 11 角色绑定 gpt-6 / gpt-6.1 系列。"
+
+[codex]
+
+[[codex.role]]
+id = "luna_high"
+name = "gpt_6_luna_high"
+description = "只读 Luna/high 取证与实施后预审角色。"
+effort = "deep"
+readonly = true
+model = "gpt-6-luna"
+
+[[codex.role]]
+id = "luna_xhigh"
+name = "gpt_6_luna_xhigh"
+description = "只读 Luna/xhigh 深入取证与复杂预审角色。"
+model_reasoning_effort = "xhigh"
+readonly = true
+model = "gpt-6-luna"
+
+[[codex.role]]
+id = "luna_high_executor"
+name = "gpt_6_luna_high_executor"
+description = "由主代理或 Sol 直接委派的 Luna/high 默认契约执行叶节点。"
+effort = "deep"
+readonly = false
+model = "gpt-6-luna"
+
+[[codex.role]]
+id = "luna_xhigh_executor"
+name = "gpt_6_luna_xhigh_executor"
+description = "由主代理或 Sol 直接委派的 Luna/xhigh 深入契约执行叶节点。"
+model_reasoning_effort = "xhigh"
+readonly = false
+model = "gpt-6-luna"
+
+[[codex.role]]
+id = "sol_high"
+name = "gpt_6.1_sol_high"
+description = "一级 Sol/high 契约完备、执行风险分流、监管、保护执行与集成负责人。"
+effort = "deep"
+readonly = false
+model = "gpt-6.1-sol"
+
+[[codex.role]]
+id = "sol_xhigh"
+name = "gpt_6.1_sol_xhigh"
+description = "只读 Sol/xhigh 有界技术定案与常规复审角色。"
+model_reasoning_effort = "xhigh"
+readonly = true
+model = "gpt-6.1-sol"
+
+[[codex.role]]
+id = "astra_high"
+name = "gpt_6_astra_high"
+description = "只读 Astra/high 高难技术定案与复杂复审角色。"
+effort = "deep"
+readonly = true
+model = "gpt-6-astra"
+
+[[codex.role]]
+id = "astra_xhigh"
+name = "gpt_6_astra_xhigh"
+description = "只读 Astra/xhigh 未解根因与升级调查角色。"
+model_reasoning_effort = "xhigh"
+readonly = true
+model = "gpt-6-astra"
+
+[[codex.role]]
+id = "astra_max"
+name = "gpt_6_astra_max"
+description = "只读 Astra/max 最高强度复审与最终升级验收角色。"
+effort = "max"
+readonly = true
+model = "gpt-6-astra"
+
+[[codex.role]]
+id = "sol_high_fallback"
+name = "gpt_6_sol_high"
+description = "仅替代不可用的 Sol/6.1 保护写入、执行监管、结果核验与集成角色。"
+effort = "deep"
+readonly = false
+model = "gpt-6-sol"
+
+[[codex.role]]
+id = "sol_xhigh_fallback"
+name = "gpt_6_sol_xhigh"
+description = "仅替代不可用的 Sol/6.1 只读有界技术定案与常规复审角色。"
+model_reasoning_effort = "xhigh"
+readonly = true
+model = "gpt-6-sol"

@@ -12,16 +12,15 @@ const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '.
 const globalAgents = path.join(repository, 'codex-global-config', 'AGENTS.md');
 const skill = path.join(repository, 'codex-global-config', 'skills', 'orchestrate-model-workflow', 'SKILL.md');
 const skillInterface = path.join(repository, 'codex-global-config', 'skills', 'orchestrate-model-workflow', 'agents', 'openai.yaml');
-const roles = path.join(repository, 'codex-global-config', 'agents', 'ai-vibecode-superpower');
-const manifest = path.join(repository, 'codex-global-config', 'agents', 'ai-vibecode-superpower.sha256');
+const presetsRoot = path.join(repository, 'shared', 'roles', 'presets');
+const presetManifest = path.join(repository, 'shared', 'roles', 'presets.sha256');
+const presetGptRoles = path.join(presetsRoot, 'gpt', 'roles');
 const posixInstaller = path.join(repository, 'install.sh');
 const powerInstaller = path.join(repository, 'install.ps1');
 const ripgrepDoc = path.join(repository, 'shared', 'docs', 'system', 'rg.md');
 const zcodeAgents = path.join(repository, 'zcode-global-config', 'AGENTS.md');
 const zcodeDocsReadme = path.join(repository, 'zcode-global-config', 'docs', 'README.md');
 const zcodeSkill = path.join(repository, 'zcode-global-config', 'skills', 'orchestrate-model-workflow', 'SKILL.md');
-const zcodeRoles = path.join(repository, 'zcode-global-config', 'agents', 'ai-vibecode-superpower');
-const zcodeManifest = path.join(repository, 'zcode-global-config', 'agents', 'ai-vibecode-superpower.sha256');
 const zcodePosixInstaller = path.join(repository, 'install.sh');
 const zcodeRoleNames = [
   'glm_5.3_flash_low', 'glm_5.3_flash_high', 'glm_5.3_flash_max', 'glm_5.3_high', 'glm_5.3_max'
@@ -103,7 +102,7 @@ test('standalone workflow skill has the five behavior stages and no obsolete pro
   ]) {
     assert.doesNotMatch(text, new RegExp(forbidden));
   }
-  assert.match(text, /默认优先选择成本最低且能胜任的 Luna/);
+  assert.match(text, /默认优先选择成本最低且能胜任的取证角色/);
   assert.match(text, /风险与回滚、验收、验证、停止条件/);
   assert.match(text, /默认并行优先/);
   assert.match(text, /不应只交给单个 agent 串行执行/);
@@ -123,56 +122,91 @@ test('standalone workflow skill has the five behavior stages and no obsolete pro
   assert.match(text, /恢复后回到原角色/);
   assert.doesNotMatch(text, /spawn_agent|agent_type|subagent_type/);
   assert.doesNotMatch(text, /路径锁|并行写入安全|所有.*串行/);
-  const rolePattern = (role) => new RegExp(role.replace(/\./g, '\\.'));
-  for (const role of [
-    'gpt_6_astra_high', 'gpt_6_astra_xhigh', 'gpt_6_astra_max',
-    'gpt_6.1_sol_high', 'gpt_6.1_sol_xhigh', 'gpt_6_sol_high', 'gpt_6_sol_xhigh',
-    'gpt_6_luna_high', 'gpt_6_luna_xhigh', 'gpt_6_luna_high_executor', 'gpt_6_luna_xhigh_executor'
-  ]) assert.match(text, rolePattern(role));
-  assert.doesNotMatch('gpt_6x1_sol_high', rolePattern('gpt_6.1_sol_high'));
+  assert.match(text, /角色定义的权威来源是 `<CODEX_HOME>\/agents\/ai-vibecode-superpower\/` 下的 toml role/);
+  assert.match(text, /可用角色以下方清单为准/);
+  assert.match(text, /不假定清单之外的角色/);
+  assert.match(text, /<!-- preset-roles -->/);
+  assert.doesNotMatch(text, /gpt_6_luna|gpt_6\.1_sol|gpt_6_astra|gpt_6_sol/);
   assert.doesNotMatch(text, /gpt_5\.6|terra/);
   const interfaceText = await readFile(skillInterface, 'utf8');
   assert.match(interfaceText, /可拆任务优先多 agent 并行/);
 });
 
 test('protected execution roles and Luna executors allow the direct handoff matrix', async () => {
-  const executors = ['gpt_6_luna_high_executor', 'gpt_6_luna_xhigh_executor'];
-  for (const role of ['gpt_6.1_sol_high', 'gpt_6_sol_high']) {
-    const text = await readFile(path.join(roles, `${role}.toml`), 'utf8');
+  const executors = ['luna_high_executor', 'luna_xhigh_executor'];
+  for (const role of ['sol_high', 'sol_high_fallback']) {
+    const text = await readFile(path.join(presetGptRoles, `${role}.md`), 'utf8');
     const delegation = text.match(/可直接委派的执行子节点仅限 ([^。]+)。/u);
     assert.ok(delegation, `${role} must list its permitted execution children`);
-    for (const executor of executors) assert.ok(delegation[1].includes(executor), `${role} must permit ${executor}`);
+    for (const executor of executors) assert.ok(delegation[1].includes(`{{role:${executor}}}`), `${role} must permit ${executor}`);
     assert.doesNotMatch(delegation[1], /5\.6|terra/);
   }
-  for (const role of ['gpt_6_sol_high', 'gpt_6_sol_xhigh']) {
-    const text = await readFile(path.join(roles, `${role}.toml`), 'utf8');
-    assert.match(text, /仅在 `gpt_6\.1_sol_(?:high|xhigh)` 角色或 gpt-6\.1-sol 模型已确认不可用时/u);
+  for (const role of ['sol_high_fallback', 'sol_xhigh_fallback']) {
+    const text = await readFile(path.join(presetGptRoles, `${role}.md`), 'utf8');
+    assert.match(text, /仅在 `\{\{role:sol_(?:high|xhigh)\}\}` 角色或 gpt-6\.1-sol/u);
   }
   for (const executor of executors) {
-    const text = await readFile(path.join(roles, `${executor}.toml`), 'utf8');
+    const text = await readFile(path.join(presetGptRoles, `${executor}.md`), 'utf8');
     const accepted = text.match(/只接受([^。]+)的直接委派/u);
     assert.ok(accepted, `${executor} must define its direct-delegation boundary`);
-    assert.match(accepted[1], /`gpt_6\.1_sol_high`/);
+    assert.match(accepted[1], /`\{\{role:sol_high\}\}`/);
     assert.doesNotMatch(accepted[1], /terra/);
   }
 });
 
-test('all eleven managed roles remain hash-addressed with model routing fields', async () => {
-  const lines = (await readFile(manifest, 'utf8')).trim().split(/\r?\n/);
-  assert.equal(lines.length, 11);
+test('the preset manifest covers every source file of all built-in presets', async () => {
+  const lines = (await readFile(presetManifest, 'utf8')).trim().split(/\r?\n/);
+  assert.equal(lines.length, 22);
   const entries = new Map(lines.map((line) => {
-    const match = line.trim().match(/^([0-9a-f]{64})\s+([^\s]+)$/);
-    assert.ok(match, `invalid manifest line: ${line}`);
-    return [match[1], match[2]];
+    const match = line.trim().match(/^([0-9a-f]{64}) {2}([^\s]+)$/);
+    assert.ok(match, `invalid preset manifest line: ${line}`);
+    return [match[2], match[1]];
   }));
-  const files = (await readdir(roles)).filter((name) => name.endsWith('.toml')).sort();
-  assert.equal(files.length, 11);
-  for (const file of files) {
-    const source = await readFile(path.join(roles, file));
-    assert.ok([...entries].some(([hash, name]) => name === file && hash === normalizedHash(source)));
-    const text = source.toString('utf8');
-    for (const key of ['name', 'model', 'model_reasoning_effort', 'sandbox_mode']) assert.match(text, new RegExp(`^${key}\\s*=`, 'm'));
-    assert.doesNotMatch(text, /workflow_controller|workflow_|claim_id|audit-context|review_history_digest/);
+  for (const preset of ['glm', 'gpt', 'ds']) {
+    const presetFile = path.join(presetsRoot, preset, 'preset.toml');
+    assert.equal(entries.get(`${preset}/preset.toml`), normalizedHash(await readFile(presetFile)), `preset manifest hash mismatch: ${preset}/preset.toml`);
+    const roleDir = path.join(presetsRoot, preset, 'roles');
+    for (const file of (await readdir(roleDir)).filter((name) => name.endsWith('.md')).sort()) {
+      const rel = `${preset}/roles/${file}`;
+      assert.equal(entries.get(rel), normalizedHash(await readFile(path.join(roleDir, file))), `preset manifest hash mismatch: ${rel}`);
+    }
+  }
+});
+
+test('all eleven gpt preset roles carry model routing fields', async () => {
+  const expectedAllocation = {
+    luna_high: { model: 'gpt-6-luna', effort: 'deep' },
+    luna_xhigh: { model: 'gpt-6-luna', nativeEffort: 'xhigh' },
+    luna_high_executor: { model: 'gpt-6-luna', effort: 'deep', readonly: 'false' },
+    luna_xhigh_executor: { model: 'gpt-6-luna', nativeEffort: 'xhigh', readonly: 'false' },
+    sol_high: { model: 'gpt-6.1-sol', effort: 'deep', readonly: 'false' },
+    sol_xhigh: { model: 'gpt-6.1-sol', nativeEffort: 'xhigh' },
+    astra_high: { model: 'gpt-6-astra', effort: 'deep' },
+    astra_xhigh: { model: 'gpt-6-astra', nativeEffort: 'xhigh' },
+    astra_max: { model: 'gpt-6-astra', effort: 'max' },
+    sol_high_fallback: { model: 'gpt-6-sol', effort: 'deep', readonly: 'false' },
+    sol_xhigh_fallback: { model: 'gpt-6-sol', nativeEffort: 'xhigh' }
+  };
+  const text = await readFile(path.join(presetsRoot, 'gpt', 'preset.toml'), 'utf8');
+  const blocks = text.split(/\[\[codex\.role\]\]/).slice(1);
+  assert.equal(blocks.length, 11);
+  const field = (block, key) => block.match(new RegExp(`^${key} = "([^"]*)"`, 'm'))?.[1];
+  for (const [id, expected] of Object.entries(expectedAllocation)) {
+    const block = blocks.find((candidate) => field(candidate, 'id') === id);
+    assert.ok(block, `missing gpt preset role: ${id}`);
+    assert.equal(field(block, 'name'), `gpt_6${id.startsWith('sol_') && !id.includes('fallback') ? '.1_' : '_'}${id.replace('_fallback', '')}`, `name mismatch: ${id}`);
+    assert.ok(field(block, 'description'), `description missing: ${id}`);
+    if (expected.model === null) assert.equal(field(block, 'model'), undefined, `model must be inherited from host default: ${id}`);
+    else assert.equal(field(block, 'model'), expected.model, `model mismatch: ${id}`);
+    if (expected.nativeEffort) {
+      assert.equal(field(block, 'model_reasoning_effort'), expected.nativeEffort, `native effort mismatch: ${id}`);
+      assert.doesNotMatch(block, /^effort = /m, `effort must be absent when native effort is set: ${id}`);
+    } else {
+      assert.equal(field(block, 'effort'), expected.effort, `effort mismatch: ${id}`);
+      assert.doesNotMatch(block, /^model_reasoning_effort = /m, `native effort must be absent when effort is set: ${id}`);
+    }
+    if (expected.readonly === 'false') assert.match(block, /^readonly = false$/m, `readonly mismatch: ${id}`);
+    else assert.match(block, /^readonly = true$/m, `readonly mismatch: ${id}`);
   }
 });
 
@@ -180,12 +214,13 @@ test('zcode workflow skill variant keeps the stages and drops codex-only mechani
   const text = await readFile(zcodeSkill, 'utf8');
   assert.match(text, /^---\r?\nname: orchestrate-model-workflow\r?\n/);
   for (const stage of ['Explore', 'Plan', 'Work', 'Critique', 'Promote']) assert.match(text, new RegExp(`\\b${stage}\\b`));
-  for (const role of zcodeRoleNames) assert.match(text, new RegExp(`\\b${role.replace(/\./g, '\\.')}\\b`));
-  assert.match(text, /角色按名称派发给对应的子代理角色定义/);
+  assert.match(text, /<!-- preset-roles -->/);
+  assert.match(text, /派发前以该目录实际存在的文件核对/);
+  assert.match(text, /不假定清单之外的角色/);
   assert.match(text, /<ZCODE_HOME>/);
   assert.match(text, /宿主只扫描该层，子目录不参与发现/);
+  for (const role of zcodeRoleNames) assert.doesNotMatch(text, new RegExp(role.replace(/\./g, '\\.')));
   assert.doesNotMatch(text, /agents\/ai-vibecode-superpower/);
-  assert.match(text, /模型_版本_类型_思考档/);
   assert.match(text, /默认并行优先/);
   assert.match(text, /fallback 只对本次派发生效/);
   assert.match(text, /不得把写入任务派给只读角色/);
@@ -201,44 +236,81 @@ test('zcode workflow skill variant keeps the stages and drops codex-only mechani
   ]) assert.doesNotMatch(text, new RegExp(forbidden));
 });
 
-test('all five managed zcode agents stay hash-addressed with model routing frontmatter', async () => {
-  const expectedAllocation = {
-    'glm_5.3_flash_low.md': { model: '"account:bigmodel-individual-coding-plan/GLM-5.3-Flash"', thoughtLevel: 'low' },
-    'glm_5.3_flash_high.md': { model: '"account:bigmodel-individual-coding-plan/GLM-5.3-Flash"', thoughtLevel: 'high' },
-    'glm_5.3_flash_max.md': { model: '"account:bigmodel-individual-coding-plan/GLM-5.3-Flash"', thoughtLevel: 'max' },
-    'glm_5.3_high.md': { model: '"account:bigmodel-individual-coding-plan/GLM-5.3"', thoughtLevel: 'high' },
-    'glm_5.3_max.md': { model: '"account:bigmodel-individual-coding-plan/GLM-5.3"', thoughtLevel: 'max' }
-  };
-  const lines = (await readFile(zcodeManifest, 'utf8')).trim().split(/\r?\n/);
-  assert.equal(lines.length, 5);
-  const entries = new Map(lines.map((line) => {
-    const match = line.trim().match(/^([0-9a-f]{64})\s+([^\s]+)$/);
-    assert.ok(match, `invalid zcode manifest line: ${line}`);
-    return [match[2], match[1]];
-  }));
-  const files = (await readdir(zcodeRoles)).filter((name) => name.endsWith('.md')).sort();
-  assert.equal(files.length, 5);
-  for (const file of files) {
-    const source = await readFile(path.join(zcodeRoles, file));
-    assert.equal(entries.get(file), normalizedHash(source), `zcode manifest hash mismatch: ${file}`);
-    const text = source.toString('utf8');
-    const frontmatterEnd = text.indexOf('\n---', 3);
-    assert.ok(frontmatterEnd > 0, `zcode agent frontmatter unterminated: ${file}`);
-    const frontmatter = text.slice(0, frontmatterEnd);
-    for (const key of ['name', 'description', 'model', 'thoughtLevel']) assert.match(frontmatter, new RegExp(`^${key}:`, 'm'));
-    const expected = expectedAllocation[file];
-    assert.ok(expected, `unexpected zcode agent file: ${file}`);
-    assert.match(frontmatter, new RegExp(`^model: ${expected.model.replace(/\./g, '\\.')}$`, 'm'), `model allocation mismatch: ${file}`);
-    assert.match(frontmatter, new RegExp(`^thoughtLevel: ${expected.thoughtLevel}$`, 'm'), `thoughtLevel allocation mismatch: ${file}`);
-    assert.match(frontmatter, new RegExp(`^name: ${path.basename(file, '.md').replace(/\./g, '\\.')}$`, 'm'));
+test('skill skeletons require fresh-instance review when a role carries both duties', async () => {
+  for (const text of [await readFile(skill, 'utf8'), await readFile(zcodeSkill, 'utf8')]) {
+    assert.match(text, /复审复用承担写入职责的角色时必须派发全新实例，不得把写入实例的自述当作事实/);
+    assert.match(text, /由未参与本次写入的独立复审派发独立核对/);
+    assert.doesNotMatch(text, /由未参与写入的只读角色独立核对/);
   }
-  const lowBody = await readFile(path.join(zcodeRoles, 'glm_5.3_flash_low.md'), 'utf8');
-  assert.match(lowBody, /建议升级到 `glm_5\.3_flash_high` 取证/);
+});
+
+test('glm preset keeps five roles with model routing and cross references', async () => {
+  const presetText = await readFile(path.join(presetsRoot, 'glm', 'preset.toml'), 'utf8');
+  assert.match(presetText, /\[zcode\]\nmodel = "account:bigmodel-individual-coding-plan\/GLM-5\.3-Flash"/);
+  const expectedAllocation = {
+    flash_low: { name: 'glm_5.3_flash_low', model: null, effort: 'basic', readonly: true },
+    flash_high: { name: 'glm_5.3_flash_high', model: null, effort: 'deep', readonly: true },
+    flash_max: { name: 'glm_5.3_flash_max', model: null, effort: 'max', readonly: false },
+    review_high: { name: 'glm_5.3_high', model: 'account:bigmodel-individual-coding-plan/GLM-5.3', effort: 'deep', readonly: true },
+    review_max: { name: 'glm_5.3_max', model: 'account:bigmodel-individual-coding-plan/GLM-5.3', effort: 'max', readonly: true }
+  };
+  const blocks = presetText.split(/\[\[zcode\.role\]\]/).slice(1);
+  assert.equal(blocks.length, 5);
+  const field = (block, key) => block.match(new RegExp(`^${key} = "([^"]*)"`, 'm'))?.[1];
+  for (const [id, expected] of Object.entries(expectedAllocation)) {
+    const block = blocks.find((candidate) => field(candidate, 'id') === id);
+    assert.ok(block, `missing glm preset role: ${id}`);
+    assert.equal(field(block, 'name'), expected.name, `name mismatch: ${id}`);
+    assert.ok(field(block, 'description'), `description missing: ${id}`);
+    if (expected.model === null) assert.equal(field(block, 'model'), undefined, `model must be inherited from host default: ${id}`);
+    else assert.equal(field(block, 'model'), expected.model, `model mismatch: ${id}`);
+    assert.equal(field(block, 'effort'), expected.effort, `effort mismatch: ${id}`);
+    assert.match(block, new RegExp(`^readonly = ${expected.readonly}$`, 'm'), `readonly mismatch: ${id}`);
+    assert.doesNotMatch(block, /^thoughtLevel = /m, `native effort must be absent: ${id}`);
+  }
+  const lowBody = await readFile(path.join(presetsRoot, 'glm', 'roles', 'flash_low.md'), 'utf8');
+  assert.match(lowBody, /建议升级到 `\{\{role:flash_high\}\}` 取证/);
+  const reviewHighBody = await readFile(path.join(presetsRoot, 'glm', 'roles', 'review_high.md'), 'utf8');
+  assert.match(reviewHighBody, /升级到 `\{\{role:review_max\}\}` 复审/);
+});
+
+test('ds preset keeps three roles on a single model with max carrying review duty', async () => {
+  const presetText = await readFile(path.join(presetsRoot, 'ds', 'preset.toml'), 'utf8');
+  assert.match(presetText, /\[zcode\]\nmodel = "account:deepseek-coding-plan\/deepseek-v4\.1-flash"/);
+  const expectedAllocation = {
+    flash_low: { name: 'ds_4.1_flash_low', effort: 'basic', readonly: true },
+    flash_high: { name: 'ds_4.1_flash_high', effort: 'deep', readonly: true },
+    flash_max: { name: 'ds_4.1_flash_max', effort: 'max', readonly: false }
+  };
+  const blocks = presetText.split(/\[\[zcode\.role\]\]/).slice(1);
+  assert.equal(blocks.length, 3);
+  const field = (block, key) => block.match(new RegExp(`^${key} = "([^"]*)"`, 'm'))?.[1];
+  for (const [id, expected] of Object.entries(expectedAllocation)) {
+    const block = blocks.find((candidate) => field(candidate, 'id') === id);
+    assert.ok(block, `missing ds preset role: ${id}`);
+    assert.equal(field(block, 'name'), expected.name, `name mismatch: ${id}`);
+    assert.ok(field(block, 'description'), `description missing: ${id}`);
+    assert.equal(field(block, 'model'), undefined, `model must be inherited from host default: ${id}`);
+    assert.equal(field(block, 'effort'), expected.effort, `effort mismatch: ${id}`);
+    assert.match(block, new RegExp(`^readonly = ${expected.readonly}$`, 'm'), `readonly mismatch: ${id}`);
+  }
+  assert.match(field(blocks.find((c) => field(c, 'id') === 'flash_max'), 'skill_desc'), /复审时派发全新实例/);
+  const lowBody = await readFile(path.join(presetsRoot, 'ds', 'roles', 'flash_low.md'), 'utf8');
+  assert.match(lowBody, /升级到 `\{\{role:flash_high\}\}` 取证/);
+  const highBody = await readFile(path.join(presetsRoot, 'ds', 'roles', 'flash_high.md'), 'utf8');
+  assert.match(highBody, /派发 `\{\{role:flash_max\}\}` 或主代理自行处理/);
+  const maxBody = await readFile(path.join(presetsRoot, 'ds', 'roles', 'flash_max.md'), 'utf8');
+  assert.match(maxBody, /承担复审或终审时：始终只读/);
+  assert.match(maxBody, /复审派发必须是全新实例，不得引用或信任写入实例的自述/);
 });
 
 test('zcode sources do not leak codex placeholders or model ids', async () => {
-  const files = [zcodeAgents, zcodeDocsReadme, zcodeSkill, ...((await readdir(zcodeRoles)).filter((name) => name.endsWith('.md')).map((name) => path.join(zcodeRoles, name)))];
-  for (const file of files) {
+  const glmFiles = [zcodeAgents, zcodeDocsReadme, zcodeSkill];
+  const glmDir = path.join(presetsRoot, 'glm');
+  for (const file of (await readdir(glmDir, { recursive: true })).filter((name) => /\.(md|toml)$/.test(name))) {
+    glmFiles.push(path.join(glmDir, file));
+  }
+  for (const file of glmFiles) {
     const text = await readFile(file, 'utf8');
     assert.doesNotMatch(text, /CODEX_HOME|gpt-5\.6|avsp_/, `codex leakage in: ${file}`);
   }
@@ -295,12 +367,18 @@ test('PowerShell installer deploys the standalone skill into an isolated nested 
     await mkdir(path.dirname(codexHome), { recursive: true });
     await mkdir(codexHome, { recursive: true });
     await writeFile(path.join(codexHome, 'config.toml'), 'keep_me = "untouched"\n"custom.setting" = "root quoted"\nmodel = "old"\n\n[desktop.open-in-target-preferences.perPath]\n"/Users/example/project" = "cursor"\n"part=key" = "equals"\n\n[tui.model_availability_nux]\n"gpt-5.5" = true\n\n[model_providers.local]\nname = "local"\nrequest_max_retries = 1\nstream_max_retries = 2\nstream_idle_timeout_ms = 3\nwebsocket_connect_timeout_ms = 4\n\n[agents]\nmax_threads = 1\nmax_depth = 1\n\n[features]\ngoals = false\n\n' + bracketedTables);
-    const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'codex'], {
+    const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'codex', '-Preset', 'gpt'], {
       env: { ...process.env, CODEX_HOME: codexHome },
     });
     assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
     const installed = await readFile(path.join(codexHome, 'skills', 'orchestrate-model-workflow', 'SKILL.md'), 'utf8');
     assert.match(installed, /^---\r?\nname: orchestrate-model-workflow\r?\n/);
+    assert.match(installed, /- `gpt_6_luna_high`：只读 Luna\/high 取证与实施后预审角色。/);
+    assert.doesNotMatch(installed, /<!-- preset-roles -->/);
+    const roleDir = path.join(codexHome, 'agents', 'ai-vibecode-superpower');
+    const roleFiles = (await readdir(roleDir)).filter((name) => name.endsWith('.toml')).sort();
+    assert.equal(roleFiles.length, 11);
+    assert.match(await readFile(path.join(roleDir, 'gpt_6_luna_high.toml'), 'utf8'), /^name = "gpt_6_luna_high"$/m);
     await assertSharedSkillsDeployed(path.join(codexHome, 'skills'));
     const agents = await readFile(path.join(codexHome, 'AGENTS.md'), 'utf8');
     assert.doesNotMatch(agents, /<CODEX_HOME>|\$CODEX_HOME/);
@@ -320,13 +398,59 @@ test('PowerShell installer deploys the standalone skill into an isolated nested 
   }
 });
 
+test('PowerShell installer removes stale managed agents when switching presets', { skip: process.platform !== 'win32' }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'preset-switch-'));
+  const zcodeHome = path.join(root, 'home');
+  try {
+    const env = { ...process.env, ZCODE_HOME: zcodeHome };
+    assert.equal((await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'zcode', '-Preset', 'ds'], { env })).code, 0);
+    await writeFile(path.join(zcodeHome, 'agents', 'custom.md'), 'user custom agent\n');
+    assert.equal((await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'zcode', '-Preset', 'glm'], { env })).code, 0);
+    const names = (await readdir(path.join(zcodeHome, 'agents'))).sort();
+    assert.ok(!names.some((name) => name.startsWith('ds_4.1_flash_')), `stale ds agents must be removed: ${names}`);
+    for (const role of zcodeRoleNames) assert.ok(names.includes(`${role}.md`), `missing glm agent: ${role}`);
+    assert.ok(names.includes('custom.md'), 'user agent must survive preset switch');
+    assert.ok(names.includes('.ai-vibecode-superpower.managed'), 'managed list must be installed');
+    const managed = await readFile(path.join(zcodeHome, 'agents', '.ai-vibecode-superpower.managed'), 'utf8');
+    assert.deepEqual(managed.trim().split('\n'), [...zcodeRoleNames].sort().map((role) => `${role}.md`));
+    const backups = (await readdir(path.join(zcodeHome, 'backups'), { recursive: true })).map((entry) => entry.split(/[\\/]/).pop());
+    assert.ok(backups.includes('ds_4.1_flash_low.md'), 'stale ds agents must be backed up');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('POSIX installer removes stale managed agents when switching presets', async (t) => {
+  const shell = await findPosixShell();
+  if (!shell) return t.skip('POSIX shell is unavailable');
+  const root = await mkdtemp(path.join(repository, '.zcode-posix-switch-'));
+  const zcodeHome = path.join(root, 'home');
+  try {
+    const base = { cwd: repository, env: { ...process.env, ZCODE_HOME: posixHome(zcodeHome) } };
+    assert.equal((await runResult(shell, ['install.sh', 'zcode', 'ds'], base)).code, 0);
+    await writeFile(path.join(zcodeHome, 'agents', 'custom.md'), 'user custom agent\n');
+    assert.equal((await runResult(shell, ['install.sh', 'zcode', 'glm'], base)).code, 0);
+    const names = (await readdir(path.join(zcodeHome, 'agents'))).sort();
+    assert.ok(!names.some((name) => name.startsWith('ds_4.1_flash_')), `stale ds agents must be removed: ${names}`);
+    for (const role of zcodeRoleNames) assert.ok(names.includes(`${role}.md`), `missing glm agent: ${role}`);
+    assert.ok(names.includes('custom.md'), 'user agent must survive preset switch');
+    assert.ok(names.includes('.ai-vibecode-superpower.managed'), 'managed list must be installed');
+    const managed = await readFile(path.join(zcodeHome, 'agents', '.ai-vibecode-superpower.managed'), 'utf8');
+    assert.deepEqual(managed.trim().split('\n'), [...zcodeRoleNames].sort().map((role) => `${role}.md`));
+    const backups = (await readdir(path.join(zcodeHome, 'backups'), { recursive: true })).map((entry) => entry.split(/[\\/]/).pop());
+    assert.ok(backups.includes('ds_4.1_flash_low.md'), 'stale ds agents must be backed up');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('PowerShell installer rejects unsafe non-bare TOML keys', { skip: process.platform !== 'win32' }, async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'codex-powershell-unsafe-toml-'));
   const codexHome = path.join(root, 'nested', '.codex');
   try {
     await mkdir(codexHome, { recursive: true });
     await writeFile(path.join(codexHome, 'config.toml'), '[agents]\n"max_threads" = 1\n');
-    const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'codex'], {
+    const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'codex', '-Preset', 'gpt'], {
       env: { ...process.env, CODEX_HOME: codexHome },
     });
     assert.notEqual(result.code, 0, result.stdout);
@@ -342,7 +466,7 @@ test('PowerShell installer rejects non-scalar Unicode escapes in quoted TOML key
   try {
     await mkdir(codexHome, { recursive: true });
     await writeFile(path.join(codexHome, 'config.toml'), '[custom]\n"\\uD800" = true\n');
-    const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'codex'], {
+    const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'codex', '-Preset', 'gpt'], {
       env: { ...process.env, CODEX_HOME: codexHome },
     });
     assert.notEqual(result.code, 0, result.stdout);
@@ -358,7 +482,7 @@ test('PowerShell installer rejects a table header with trailing syntax', { skip:
   try {
     await mkdir(codexHome, { recursive: true });
     await writeFile(path.join(codexHome, 'config.toml'), '[hooks.state."quoted[0]"] trailing\nenabled = true\n');
-    const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'codex'], {
+    const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'codex', '-Preset', 'gpt'], {
       env: { ...process.env, CODEX_HOME: codexHome },
     });
     assert.notEqual(result.code, 0, result.stdout);
@@ -374,7 +498,7 @@ test('POSIX installer deploys a fresh standalone home without legacy prerequisit
   const root = await mkdtemp(path.join(repository, '.codex-posix-contract-'));
   const codexHome = path.join(root, 'missing', 'nested', '.codex');
   try {
-    const result = await runResult(shell, ['install.sh', 'codex'], {
+    const result = await runResult(shell, ['install.sh', 'codex', 'gpt'], {
       cwd: repository,
       env: { ...process.env, CODEX_HOME: posixHome(codexHome) },
     });
@@ -400,7 +524,7 @@ test('POSIX installer preserves safe quoted TOML keys', async (t) => {
   try {
     await mkdir(codexHome, { recursive: true });
     await writeFile(path.join(codexHome, 'config.toml'), 'keep_me = "untouched"\n"custom.setting" = "root quoted"\nmodel = "old"\n\n[desktop.open-in-target-preferences.perPath]\n"/Users/example/project" = "cursor"\n"part=key" = "equals"\n\n[tui.model_availability_nux]\n"gpt-5.5" = true\n\n[model_providers.local]\nname = "local"\nrequest_max_retries = 1\nstream_max_retries = 2\nstream_idle_timeout_ms = 3\nwebsocket_connect_timeout_ms = 4\n\n[agents]\nmax_threads = 1\nmax_depth = 1\n\n[features]\ngoals = false\n\n' + bracketedTables);
-    const result = await runResult(shell, ['install.sh', 'codex'], {
+    const result = await runResult(shell, ['install.sh', 'codex', 'gpt'], {
       cwd: repository,
       env: { ...process.env, CODEX_HOME: posixHome(codexHome) },
     });
@@ -427,7 +551,7 @@ test('POSIX installer rejects unsafe non-bare TOML keys', async (t) => {
   try {
     await mkdir(codexHome, { recursive: true });
     await writeFile(path.join(codexHome, 'config.toml'), '[agents]\n"max_threads" = 1\n');
-    const result = await runResult(shell, ['install.sh', 'codex'], {
+    const result = await runResult(shell, ['install.sh', 'codex', 'gpt'], {
       cwd: repository,
       env: { ...process.env, CODEX_HOME: posixHome(codexHome) },
     });
@@ -446,7 +570,7 @@ test('POSIX installer rejects non-scalar Unicode escapes in quoted TOML keys', a
   try {
     await mkdir(codexHome, { recursive: true });
     await writeFile(path.join(codexHome, 'config.toml'), '[custom]\n"\\uD800" = true\n');
-    const result = await runResult(shell, ['install.sh', 'codex'], {
+    const result = await runResult(shell, ['install.sh', 'codex', 'gpt'], {
       cwd: repository,
       env: { ...process.env, CODEX_HOME: posixHome(codexHome) },
     });
@@ -465,7 +589,7 @@ test('POSIX installer rejects a table header with trailing syntax', async (t) =>
   try {
     await mkdir(codexHome, { recursive: true });
     await writeFile(path.join(codexHome, 'config.toml'), '[hooks.state."quoted[0]"] trailing\nenabled = true\n');
-    const result = await runResult(shell, ['install.sh', 'codex'], {
+    const result = await runResult(shell, ['install.sh', 'codex', 'gpt'], {
       cwd: repository,
       env: { ...process.env, CODEX_HOME: posixHome(codexHome) },
     });
@@ -484,7 +608,7 @@ test('POSIX installer normalizes parent segments without rejecting a safe explic
   const codexHome = path.join(cwd, 'target', '.codex');
   try {
     await mkdir(cwd, { recursive: true });
-    const result = await runResult(shell, [posixInstaller, 'codex'], {
+    const result = await runResult(shell, [posixInstaller, 'codex', 'gpt'], {
       cwd,
       env: { ...process.env, CODEX_HOME: 'unused/../target/.codex' },
     });
@@ -510,7 +634,7 @@ test('POSIX installer rejects paths that normalize to the filesystem root before
     await mkdir(fakeBin, { recursive: true });
     await writeFile(blockedMkdir, '#!/bin/sh\nprintf "%s\\n" "unexpected mkdir: $*" >&2\nexit 99\n', { mode: 0o755 });
     for (const value of ['/.', '/..', '/../../', relativeRoot]) {
-      const result = await runResult(shell, [posixInstaller, 'codex'], {
+      const result = await runResult(shell, [posixInstaller, 'codex', 'gpt'], {
         cwd: repository,
         env: { ...process.env, CODEX_HOME: value, PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ''}` },
       });
@@ -546,7 +670,7 @@ test('PowerShell zcode installer composes shared and zcode sources and leaves un
     await mkdir(zcodeHome, { recursive: true });
     await mkdir(path.join(zcodeHome, 'cli'), { recursive: true });
     await writeFile(path.join(zcodeHome, 'cli', 'config.json'), '{"keep":"me"}\n');
-    const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'zcode'], {
+    const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'zcode', '-Preset', 'glm'], {
       env: { ...process.env, ZCODE_HOME: zcodeHome },
     });
     assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
@@ -555,6 +679,8 @@ test('PowerShell zcode installer composes shared and zcode sources and leaves un
     assert.match(agents, /zcode-powershell-contract-/i);
     const installedSkill = await readFile(path.join(zcodeHome, 'skills', 'orchestrate-model-workflow', 'SKILL.md'), 'utf8');
     assert.match(installedSkill, /^---\r?\nname: orchestrate-model-workflow\r?\n/);
+    assert.match(installedSkill, /- `glm_5\.3_flash_low`：只读常规取证与实施后预审。/);
+    assert.doesNotMatch(installedSkill, /<!-- preset-roles -->/);
     assert.doesNotMatch(installedSkill, /<ZCODE_HOME>/);
     const agentFiles = (await readdir(path.join(zcodeHome, 'agents'))).filter((name) => name.endsWith('.md'));
     for (const role of zcodeRoleNames) assert.ok(agentFiles.includes(`${role}.md`), `missing flat agent: ${role}.md`);
@@ -580,7 +706,7 @@ test('POSIX zcode installer deploys a fresh home without codex configuration', a
   const root = await mkdtemp(path.join(repository, '.zcode-posix-contract-'));
   const zcodeHome = path.join(root, 'missing', 'nested', '.zcode');
   try {
-    const result = await runResult(shell, ['install.sh', 'zcode'], {
+    const result = await runResult(shell, ['install.sh', 'zcode', 'glm'], {
       cwd: repository,
       env: { ...process.env, ZCODE_HOME: posixHome(zcodeHome) },
     });
@@ -589,6 +715,8 @@ test('POSIX zcode installer deploys a fresh home without codex configuration', a
     assert.doesNotMatch(agents, /<ZCODE_HOME>|\$ZCODE_HOME/);
     const installedSkill = await readFile(path.join(zcodeHome, 'skills', 'orchestrate-model-workflow', 'SKILL.md'), 'utf8');
     assert.match(installedSkill, /^---\nname: orchestrate-model-workflow\n/);
+    assert.match(installedSkill, /- `glm_5\.3_flash_low`：只读常规取证与实施后预审。/);
+    assert.doesNotMatch(installedSkill, /<!-- preset-roles -->/);
     assert.doesNotMatch(installedSkill, /<ZCODE_HOME>/);
     await assertSharedSkillsDeployed(path.join(zcodeHome, 'skills'));
     const agentFiles = (await readdir(path.join(zcodeHome, 'agents'))).filter((name) => name.endsWith('.md'));
@@ -618,6 +746,46 @@ test('merged POSIX installer rejects unknown clients', async (t) => {
   const result = await runResult(shell, ['install.sh', 'unknown-client'], { cwd: repository });
   assert.notEqual(result.code, 0, result.stdout);
   assert.match(result.stdout + '\n' + result.stderr, /Unknown client: unknown-client/);
+});
+
+test('PowerShell installer rejects a preset role without any model binding', { skip: process.platform !== 'win32' }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'preset-bad-model-'));
+  const presetDir = path.join(root, 'myds');
+  try {
+    await mkdir(path.join(presetDir, 'roles'), { recursive: true });
+    await writeFile(path.join(presetDir, 'preset.toml'), 'description = "broken preset"\n\n[zcode]\n\n[[zcode.role]]\nid = "worker"\nname = "my_worker"\ndescription = "worker"\neffort = "max"\nreadonly = false\n');
+    await writeFile(path.join(presetDir, 'roles', 'worker.md'), 'worker body\n');
+    const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'zcode', '-Preset', presetDir], {
+      env: { ...process.env, ZCODE_HOME: path.join(root, 'home') },
+    });
+    assert.notEqual(result.code, 0, result.stdout);
+    assert.match(result.stdout + '\n' + result.stderr, /has no model/i);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('PowerShell installer rejects a preset body referencing an unknown role id', { skip: process.platform !== 'win32' }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'preset-bad-reference-'));
+  const presetDir = path.join(root, 'myds');
+  try {
+    await mkdir(path.join(presetDir, 'roles'), { recursive: true });
+    await writeFile(path.join(presetDir, 'preset.toml'), 'description = "broken preset"\n\n[zcode]\nmodel = "account:bigmodel-individual-coding-plan/GLM-5.3-Flash"\n\n[[zcode.role]]\nid = "worker"\nname = "my_worker"\ndescription = "worker"\neffort = "max"\nreadonly = false\n');
+    await writeFile(path.join(presetDir, 'roles', 'worker.md'), 'escalate to {{role:missing}}\n');
+    const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'zcode', '-Preset', presetDir], {
+      env: { ...process.env, ZCODE_HOME: path.join(root, 'home') },
+    });
+    assert.notEqual(result.code, 0, result.stdout);
+    assert.match(result.stdout + '\n' + result.stderr, /references unknown role id/i);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('merged PowerShell installer requires an explicit preset when input is redirected', { skip: process.platform !== 'win32' }, async () => {
+  const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'zcode'], { cwd: repository });
+  assert.notEqual(result.code, 0, result.stdout);
+  assert.match(result.stdout + '\n' + result.stderr, /No preset specified/i);
 });
 
 test('merged PowerShell installer requires an explicit client when input is redirected', { skip: process.platform !== 'win32' }, async () => {

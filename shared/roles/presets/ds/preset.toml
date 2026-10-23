@@ -1,0 +1,32 @@
+# DeepSeek 预设：单模型 deepseek-v4.1-flash 拆 3 档（2 读 1 写，复审/终审由写入档承担）。
+# 安装前必须把下面的 model 改成你 ZCode Picker 里的实际值（格式 providerId/modelId，
+# provider 段随你登录的账号走）；不改会导致子代理启动失败。
+description = "DeepSeek 预设：ZCode 3 角色绑定 deepseek-v4.1-flash（2 读 1 写，审核由 max 档承担）。"
+
+[zcode]
+model = "account:deepseek-coding-plan/deepseek-v4.1-flash"
+
+[[zcode.role]]
+id = "flash_low"
+name = "ds_4.1_flash_low"
+description = "只读常规取证与实施后预审。"
+effort = "basic"
+readonly = true
+color = "cyan"
+
+[[zcode.role]]
+id = "flash_high"
+name = "ds_4.1_flash_high"
+description = "只读深度取证与复杂预审。"
+effort = "deep"
+readonly = true
+color = "cyan"
+
+[[zcode.role]]
+id = "flash_max"
+name = "ds_4.1_flash_max"
+description = "写代码主力兼复审终审：按委派类型承担受控写入或独立审查。"
+skill_desc = "写代码主力与复审终审（同一角色按委派类型二选一；复审时派发全新实例）。"
+effort = "max"
+readonly = false
+color = "green"

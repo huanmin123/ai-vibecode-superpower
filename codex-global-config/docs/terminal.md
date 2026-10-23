@@ -1,6 +1,6 @@
 # Codex 终端契约
 
-本文件是 Codex 专属的终端调用补充，随全局文档安装到 `<CODEX_HOME>/docs/`；平台无关的 Windows、PowerShell 与跨平台命令规范由 [系统执行规范](system/README.md) 路由的共享文档提供。
+本文件是 Codex 专属的终端调用补充，位于 `<CODEX_HOME>/docs/`；平台无关的 Windows、PowerShell 与跨平台命令规范由 [系统执行规范](system/README.md) 路由的共享文档提供。
 
 - Codex 配置中的 `desktop.integratedTerminalShell = "powershell"` 是产品枚举值，不改成 `pwsh`。
 - 终端调用的 `workdir` 必须是已存在的绝对目录；仅在命令需要指定目录或工具返回目录无效时，用 `Test-Path -LiteralPath <目录> -PathType Container` 或 `Resolve-Path -LiteralPath <目录>` 核实。文件路径、文档路径和命令文本都不能作为 `workdir`。

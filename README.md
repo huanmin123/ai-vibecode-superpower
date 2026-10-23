@@ -68,7 +68,9 @@ flowchart LR
 
 ## 快速安装
 
-每个平台一个安装器：`install.ps1`（Windows）与 `install.sh`（macOS/Linux）。直接运行后按提示交互选择客户端（Codex / ZCode），或在命令中直接指定客户端跳过交互；共享内容由所选客户端的安装流程一并安装，宿主专属内容各装各的。新增客户端时在两个安装器的客户端注册表中加入一项即可。
+每个平台一个安装器：`install.ps1`（Windows）与 `install.sh`（macOS/Linux）。直接运行后按提示交互选择客户端（Codex / ZCode）和角色预设，或在命令中直接指定；共享内容由所选客户端的安装流程一并安装，宿主专属内容各装各的。新增客户端时在两个安装器的客户端注册表中加入一项即可。
+
+**角色预设**：agent 角色不是仓库里的固定文件，而是安装时从 `shared/roles/presets/` 下的预设（如 `glm`、`gpt`、`ds`）翻译生成的宿主配置。预设只绑定模型与职责，内置预设可直接用；只用其他模型或想混合模型（如 GPT 写码 + GLM 复审）时，复制一个预设目录、把各角色的 `model` 改成你宿主里实际可用的模型 ID 即可，详见 [`shared/roles/README.md`](shared/roles/README.md)。`ds` 预设的 `model` 是占位值，安装前必须改成你的实际 Picker 值。安装交互会列出可选预设并标注各客户端的默认值。
 
 ### Codex
 
@@ -112,19 +114,22 @@ goals = true
 ### ZCode
 
 - 可在 ZCode 会话运行时安装；安装成功后重启 ZCode，使 `~/.zcode/agents` 的角色和 `~/.zcode/skills` 生效。
-- ZCode 变体包含 5 个角色，按统一公式 `模型_版本_类型_思考档` 命名：`glm_5.3_flash_low`（常规取证）、`glm_5.3_flash_high`（深度取证）、`glm_5.3_flash_max`（写代码主力）、`glm_5.3_high`（审核主力）、`glm_5.3_max`（终审）；glm-5.3 不使用 low 档。
-- 安装器只管理 `AGENTS.md`、`docs/`、按 manifest 平铺安装到 `~/.zcode/agents/` 顶层的 5 个 md agent（新版 ZCode 宿主只扫描该目录顶层，子目录不参与发现）和受管的 skills；不修改 ZCode 的 `cli/`、`v2/`、插件缓存或用户自建的其它 skills/agents。已有的 `AGENTS.md` 会先备份再替换。
+- 角色由所选预设（默认 `glm`，5 个角色）翻译生成，按公式 `模型_版本_类型_思考档` 命名，例如 `glm_5.3_flash_low`（常规取证）、`glm_5.3_flash_high`（深度取证）、`glm_5.3_flash_max`（写代码主力）、`glm_5.3_high`（审核主力）、`glm_5.3_max`（终审）；换个预设，同一套安装流程生成不同的角色集合。
+- 安装器只管理 `AGENTS.md`、`docs/`、按所选预设渲染后平铺安装到 `~/.zcode/agents/` 顶层的 md agent（新版 ZCode 宿主只扫描该目录顶层，子目录不参与发现）和受管的 skills；不修改 ZCode 的 `cli/`、`v2/`、插件缓存或用户自建的其它 skills/agents。已有的 `AGENTS.md` 会先备份再替换。
 
 **Windows（PowerShell 7）**，在仓库根目录运行：
 
 ```powershell
-& .\install.ps1 -Client zcode
+& .\install.ps1 -Client zcode            # 交互选择预设
+& .\install.ps1 -Client zcode -Preset glm
+& .\install.ps1 -Client zcode -Preset D:\my-presets\deepseek   # 自定义预设目录
 ```
 
 **macOS 或 Linux**：
 
 ```sh
-sh ./install.sh zcode
+sh ./install.sh zcode          # 交互选择预设
+sh ./install.sh zcode glm
 ```
 
 ## 使用方式与可选能力
@@ -145,7 +150,7 @@ sh ./install.sh zcode
 ## 进一步阅读
 
 - [`orchestrate-model-workflow`（Codex 版）](codex-global-config/skills/orchestrate-model-workflow/SKILL.md) / [（ZCode 版）](zcode-global-config/skills/orchestrate-model-workflow/SKILL.md)：工作流路由、交接与验收规范。
-- [agent role profiles（Codex）](codex-global-config/agents/ai-vibecode-superpower/) / [（ZCode）](zcode-global-config/agents/ai-vibecode-superpower/)：role 的本地权限与输出边界。
-- [统一安装器：Windows](install.ps1) / [macOS/Linux](install.sh)（交互选择或指定 `codex` / `zcode` 客户端）。
+- [角色预设与翻译器规范](shared/roles/README.md) / [内置预设](shared/roles/presets/)：角色 schema、翻译规则、内置预设与自定义方法。
+- [统一安装器：Windows](install.ps1) / [macOS/Linux](install.sh)（交互选择或指定 `codex` / `zcode` 客户端与预设）。
 
 问题或建议：QQ群 `1105515344`

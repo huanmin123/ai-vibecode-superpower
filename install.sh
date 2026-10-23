@@ -90,6 +90,68 @@ normalize_absolute_path() {
     '
 }
 
+presets_root=$script_dir/shared/roles/presets
+preset_manifest=$script_dir/shared/roles/presets.sha256
+
+normalized_lf_sha256() {
+    # LF 折叠：逐行去行尾 \r；GNU sed 对无尾换行输入不补 \n，与 ps1 字节折叠算法一致。
+    if command -v sha256sum >/dev/null 2>&1; then
+        sed 's/\r$//' "$1" | sha256sum | awk '{print $1}'
+    else
+        sed 's/\r$//' "$1" | shasum -a 256 | awk '{print $1}'
+    fi
+}
+
+trim_ws() {
+    printf '%s' "$1" | LC_ALL=C sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+# 解析结果的动态变量存取：变量名只由白名单键与整数索引拼出，值经赋值语句写入不做二次求值。
+pset() {
+    pset_value=$2
+    eval "$1=\$pset_value"
+}
+pget() {
+    eval "printf '%s' \"\${$1:-}\""
+}
+
+preset_fail() {
+    if [ "${PRESET_QUIET:-0}" = 1 ]; then
+        exit 1
+    fi
+    die "$1"
+}
+
+# ---- --update-role-manifest 维护模式：重写预设源 manifest，不执行安装 ----
+
+if [ "${1:-}" = "--update-role-manifest" ]; then
+    [ -d "$presets_root" ] || die "Missing presets root: $presets_root"
+    um_tmp_manifest=$preset_manifest.tmp
+    um_tmp_list=$(mktemp) || die 'Could not create temporary file.'
+    um_tmp_files=$(mktemp) || { rm -f -- "$um_tmp_list"; die 'Could not create temporary file.'; }
+    trap 'rm -f -- "$um_tmp_list" "$um_tmp_files" "$um_tmp_manifest"' EXIT HUP INT TERM
+    : > "$um_tmp_manifest"
+    find "$presets_root" -mindepth 1 -maxdepth 1 -type d | LC_ALL=C sort > "$um_tmp_list"
+    um_sources=0
+    while IFS= read -r um_preset_path || [ -n "$um_preset_path" ]; do
+        [ -n "$um_preset_path" ] || continue
+        um_preset_name=$(basename -- "$um_preset_path")
+        [ -f "$um_preset_path/preset.toml" ] || die "Preset missing preset.toml: $um_preset_path"
+        find "$um_preset_path" -type f | LC_ALL=C sort > "$um_tmp_files"
+        while IFS= read -r um_source_path || [ -n "$um_source_path" ]; do
+            [ -n "$um_source_path" ] || continue
+            um_rel=${um_source_path#"$um_preset_path/"}
+            um_hash=$(normalized_lf_sha256 "$um_source_path")
+            printf '%s  %s/%s\n' "$um_hash" "$um_preset_name" "$um_rel" >> "$um_tmp_manifest"
+            um_sources=$((um_sources+1))
+        done < "$um_tmp_files"
+    done < "$um_tmp_list"
+    [ "$um_sources" -gt 0 ] || die "No preset sources found under $presets_root"
+    mv -- "$um_tmp_manifest" "$preset_manifest"
+    printf '%s\n' "Preset manifest updated: $preset_manifest"
+    exit 0
+fi
+
 # ---- 客户端选择：位置参数优先；无参数且为交互终端时进入菜单；否则报用法并退出 ----
 
 client=${1:-}
@@ -125,10 +187,9 @@ case "$client" in
         home_env=CODEX_HOME
         default_home=.codex
         role_kind=toml
-        expected_roles=11
+        host_section=codex
+        default_preset=gpt
         placeholder=CODEX_HOME
-        source_roles=$script_dir/codex-global-config/agents/ai-vibecode-superpower
-        source_manifest=$script_dir/codex-global-config/agents/ai-vibecode-superpower.sha256
         source_instructions=$script_dir/codex-global-config/AGENTS.md
         source_docs=$script_dir/codex-global-config/docs
         source_config=$script_dir/codex-global-config/config.toml
@@ -142,10 +203,9 @@ case "$client" in
         home_env=ZCODE_HOME
         default_home=.zcode
         role_kind=md
-        expected_roles=5
+        host_section=zcode
+        default_preset=glm
         placeholder=ZCODE_HOME
-        source_roles=$script_dir/zcode-global-config/agents/ai-vibecode-superpower
-        source_manifest=$script_dir/zcode-global-config/agents/ai-vibecode-superpower.sha256
         source_instructions=$script_dir/zcode-global-config/AGENTS.md
         source_docs=$script_dir/zcode-global-config/docs
         client_skills=$script_dir/zcode-global-config/skills
@@ -162,7 +222,704 @@ skill_source_dir() {
     esac
 }
 
-required_sources="$source_roles $source_manifest $source_docs $source_system_docs $source_instructions $shared_skills $client_skills"
+# ---- 预设（preset）解析与渲染 ----
+
+# 受限 TOML 表头解析：仅允许 [zcode]、[codex]、[[<host>.role]]；引号表头与未知表统一报错。
+parse_preset_header() {
+    ph_line=$1
+    if ! ph_result=$(printf '%s\n' "$ph_line" | LC_ALL=C awk '
+        {
+            line = $0
+            n = length(line)
+            if (substr(line, 1, 2) == "[[") { arr = 1; start = 3 } else { arr = 0; start = 2 }
+            basic = 0; literal = 0
+            for (pos = start; pos <= n; pos++) {
+                c = substr(line, pos, 1)
+                if (basic) { if (c == "\\") pos++; else if (c == "\"") basic = 0; continue }
+                if (literal) { if (c == "\047") literal = 0; continue }
+                if (c == "\"") { basic = 1; continue }
+                if (c == "\047") { literal = 1; continue }
+                if (c == "[") exit 1
+                if (c == "]") {
+                    closing = arr ? 2 : 1
+                    rest = substr(line, pos + closing)
+                    if (rest !~ /^[[:space:]]*(#.*)?$/) exit 1
+                    header = substr(line, start, pos - start)
+                    gsub(/^[[:space:]]+|[[:space:]]+$/, "", header)
+                    if (header == "") exit 1
+                    if (arr) {
+                        # [[<host>.role]]：必须数组形式且 host 为合法标识（ps1:106 数组正则）
+                        if (header !~ /^[A-Za-z][A-Za-z0-9_-]*\.role$/) exit 1
+                        sub(/\.role$/, "", header)
+                        print header; print 1; exit 0
+                    }
+                    # [<host>]：必须单括号形式且 host ∈ {zcode, codex}（ps1:111 白名单）
+                    if (header != "zcode" && header != "codex") exit 1
+                    print header; print 0; exit 0
+                }
+            }
+            exit 1
+        }
+    '); then
+        preset_fail "Unsupported preset table: $ph_line"
+    fi
+    PH_HOST=$(printf '%s\n' "$ph_result" | LC_ALL=C sed -n '1p')
+    PH_ISROLE=$(printf '%s\n' "$ph_result" | LC_ALL=C sed -n '2p')
+}
+
+# 基本标量解析：true/false（含类型标记）、裸词、带 \" \\ \n \t 转义的双引号字符串。
+parse_preset_scalar() {
+    ps_ctx=$2
+    ps_v=$(trim_ws "$1")
+    case "$ps_v" in
+        true) PSV=true; PSB=1; return 0 ;;
+        false) PSV=false; PSB=1; return 0 ;;
+    esac
+    if printf '%s' "$ps_v" | LC_ALL=C grep -Eq '^[A-Za-z][A-Za-z0-9_-]*$'; then
+        PSV=$ps_v
+        PSB=0
+        return 0
+    fi
+    case "$ps_v" in
+        '"'*'"')
+            ps_inner=${ps_v#\"}
+            ps_inner=${ps_inner%\"}
+            if ! ps_decoded=$(printf '%sX' "$ps_inner" | LC_ALL=C awk -v ctx="$ps_ctx" '
+                {
+                    line = $0
+                    out = ""
+                    n = length(line)
+                    i = 1
+                    while (i <= n) {
+                        c = substr(line, i, 1)
+                        if (c == "\\") {
+                            i++
+                            if (i > n) { printf "Unterminated escape in %s\n", ctx > "/dev/stderr"; exit 1 }
+                            e = substr(line, i, 1)
+                            if (e == "\"") out = out "\""
+                            else if (e == "\\") out = out "\\"
+                            else if (e == "n") out = out "\n"
+                            else if (e == "t") out = out "\t"
+                            else { printf "Unsupported escape in %s: \\%s\n", ctx, e > "/dev/stderr"; exit 1 }
+                        } else if (c == "\"") {
+                            printf "Unescaped double quote in %s\n", ctx > "/dev/stderr"; exit 1
+                        } else {
+                            out = out c
+                        }
+                        i++
+                    }
+                    printf "%s", out
+                }'); then
+                preset_fail "Invalid preset string in $ps_ctx"
+            fi
+            PSV=${ps_decoded%X}
+            PSB=0
+            ;;
+        *) preset_fail "Unsupported preset value in $ps_ctx: $ps_v" ;;
+    esac
+}
+
+# 值解析：数组 [a, b] 逐元素走标量解析；结果经 PSV/PSB/PSC/PSE_<n> 返回。
+parse_preset_value() {
+    pv_ctx=$2
+    pv_v=$(trim_ws "$1")
+    PS_IS_ARRAY=0
+    PSB=0
+    PSC=0
+    PSV=
+    case "$pv_v" in
+        '['*']')
+            PS_IS_ARRAY=1
+            pv_inner=${pv_v#\[}
+            pv_inner=${pv_inner%]}
+            pv_inner=$(trim_ws "$pv_inner")
+            if [ -z "$pv_inner" ]; then
+                return 0
+            fi
+            pv_joined=
+            pv_rest=$pv_inner
+            while [ -n "$pv_rest" ]; do
+                pv_item=${pv_rest%%,*}
+                case "$pv_rest" in
+                    *,*) pv_rest=${pv_rest#*,} ;;
+                    *) pv_rest= ;;
+                esac
+                PSC=$((PSC+1))
+                parse_preset_scalar "$pv_item" "$pv_ctx item"
+                pset "PSE_${PSC}" "$PSV"
+                if [ "$PSC" -eq 1 ]; then pv_joined=$PSV; else pv_joined="$pv_joined, $PSV"; fi
+            done
+            PSV=$pv_joined
+            PSB=0
+            ;;
+        *)
+            parse_preset_scalar "$pv_v" "$pv_ctx"
+            ;;
+    esac
+}
+
+# 解析 preset.toml 到 P_* 全局变量：SET 标志区分"键不存在"与"空值"。
+read_preset() {
+    rp_file=$1
+    PRESET_QUIET=${PRESET_QUIET:-0}
+    rp_bom=$(printf '\357\273\277')
+    rp_first=1
+    P_DESC_SET=0
+    P_DESC=
+    P_SECTION_COUNT=0
+    P_ROLES=0
+    P_HOST_zcode_SET=0
+    P_HOST_codex_SET=0
+    P_HOST_zcode_MODEL_SET=0
+    P_HOST_codex_MODEL_SET=0
+    rp_host=
+    rp_role=
+
+    while IFS= read -r rp_line || [ -n "$rp_line" ]; do
+        if [ "$rp_first" = 1 ]; then
+            rp_first=0
+            rp_line=${rp_line#"$rp_bom"}
+        fi
+        rp_trim=$(trim_ws "$rp_line")
+        if [ -z "$rp_trim" ]; then continue; fi
+        case "$rp_trim" in '#'*) continue ;; esac
+        case "$rp_trim" in
+            '['*)
+                parse_preset_header "$rp_trim"
+                rp_host=$PH_HOST
+                if [ "$(pget "P_HOST_${rp_host}_SET")" = 0 ]; then
+                    pset "P_HOST_${rp_host}_SET" 1
+                    P_SECTION_COUNT=$((P_SECTION_COUNT+1))
+                fi
+                if [ "$PH_ISROLE" = 1 ]; then
+                    P_ROLES=$((P_ROLES+1))
+                    rp_role=$P_ROLES
+                    pset "P_R${rp_role}_HOST" "$rp_host"
+                    for rp_init_key in id name description effort readonly model body color tools thoughtLevel model_reasoning_effort sandbox_mode skill_desc; do
+                        pset "P_R${rp_role}_SET_${rp_init_key}" 0
+                        pset "P_R${rp_role}_ARR_${rp_init_key}" 0
+                    done
+                    pset "P_R${rp_role}_BOOL_readonly" 0
+                    pset "P_R${rp_role}_ARRN_tools" 0
+                else
+                    rp_role=
+                fi
+                continue
+                ;;
+        esac
+        case "$rp_trim" in
+            *=*) rp_key=$(trim_ws "${rp_trim%%=*}"); rp_value_raw=${rp_trim#*=} ;;
+            *) preset_fail "Unsupported preset line in $rp_file: $rp_line" ;;
+        esac
+        if ! printf '%s' "$rp_key" | LC_ALL=C grep -Eq '^[A-Za-z][A-Za-z0-9_-]*$'; then
+            preset_fail "Unsupported preset key in $rp_file: $rp_key"
+        fi
+        if [ -z "$rp_host" ]; then
+            if [ "$rp_key" != description ]; then preset_fail "Unsupported preset root key: $rp_key"; fi
+            if [ "$P_DESC_SET" = 1 ]; then preset_fail 'Repeated preset key: description'; fi
+            parse_preset_scalar "$rp_value_raw" description
+            P_DESC=$PSV
+            P_DESC_SET=1
+        elif [ -z "$rp_role" ]; then
+            if [ "$rp_key" != model ]; then preset_fail "Unsupported preset key in [$rp_host]: $rp_key"; fi
+            if [ "$(pget "P_HOST_${rp_host}_MODEL_SET")" = 1 ]; then preset_fail "Repeated preset key: $rp_host/$rp_key"; fi
+            parse_preset_value "$rp_value_raw" "$rp_host/$rp_key"
+            pset "P_HOST_${rp_host}_MODEL_SET" 1
+            pset "P_HOST_${rp_host}_MODEL" "$PSV"
+        else
+            case "$rp_key" in
+                id|name|description|effort|readonly|model|body|color|tools|thoughtLevel|model_reasoning_effort|sandbox_mode|skill_desc) ;;
+                *) preset_fail "Unsupported preset role key in [$rp_host]: $rp_key" ;;
+            esac
+            if [ "$(pget "P_R${rp_role}_SET_${rp_key}")" = 1 ]; then preset_fail "Repeated preset key: $rp_host/$rp_key"; fi
+            parse_preset_value "$rp_value_raw" "$rp_host/$rp_key"
+            pset "P_R${rp_role}_SET_${rp_key}" 1
+            pset "P_R${rp_role}_${rp_key}" "$PSV"
+            if [ "$rp_key" = readonly ] && [ "$PS_IS_ARRAY" = 0 ] && [ "$PSB" = 1 ]; then pset "P_R${rp_role}_BOOL_readonly" 1; fi
+            if [ "$PS_IS_ARRAY" = 1 ]; then
+                pset "P_R${rp_role}_ARR_${rp_key}" 1
+                pset "P_R${rp_role}_ARRN_${rp_key}" "$PSC"
+                pv_j=1
+                while [ "$pv_j" -le "$PSC" ]; do
+                    pset "P_R${rp_role}_ELEM_${rp_key}_${pv_j}" "$(pget "PSE_${pv_j}")"
+                    pv_j=$((pv_j+1))
+                done
+            fi
+        fi
+    done < "$rp_file"
+
+    if [ "$P_DESC_SET" = 0 ]; then preset_fail "Preset description missing: $rp_file"; fi
+    if [ "$P_SECTION_COUNT" = 0 ]; then preset_fail "Preset has no host section: $rp_file"; fi
+}
+
+# YAML/双引号安全转义：\ → \\、" → \"；结尾哨兵 X 由调用方剥掉，防止命令替换吞掉结尾换行。
+escape_quoted_apply() {
+    printf '%sX' "$1" | LC_ALL=C sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+# 内置预设源校验：按 <name>/ 前缀过滤 manifest 行并逐文件核对规范化 hash。
+verify_preset_sources() {
+    vp_name=$1
+    if [ ! -f "$preset_manifest" ]; then
+        die "Missing preset manifest: $preset_manifest"
+    fi
+    vp_matched=$render_dir/manifest.matched
+    if ! LC_ALL=C awk -v manifest_path="$preset_manifest" -v prefix="$vp_name/" '
+        $0 !~ /^[0-9a-f]{64}  [^[:space:]]+$/ { print "Invalid preset manifest: " manifest_path > "/dev/stderr"; exit 1 }
+        {
+            total++
+            rel = substr($0, 67)
+            if (index(rel, prefix) == 1) print $0
+        }
+        END { if (total == 0) { print "Empty preset manifest: " manifest_path > "/dev/stderr"; exit 1 } }
+    ' "$preset_manifest" > "$vp_matched"; then
+        die "Invalid preset manifest: $preset_manifest"
+    fi
+    vp_count=$(awk 'END { print NR }' "$vp_matched")
+    if [ "$vp_count" -eq 0 ]; then
+        die "Preset not covered by manifest: $vp_name"
+    fi
+    while IFS= read -r vp_line || [ -n "$vp_line" ]; do
+        [ -n "$vp_line" ] || continue
+        vp_expected_hash=${vp_line%%  *}
+        vp_rel=${vp_line#*  }
+        vp_path=$presets_root/$vp_rel
+        [ -f "$vp_path" ] || die "Managed preset source missing: $vp_path"
+        vp_actual=$(normalized_lf_sha256 "$vp_path")
+        [ "$vp_expected_hash" = "$vp_actual" ] || die "Preset source hash mismatch: $vp_rel"
+    done < "$vp_matched"
+}
+
+# 渲染当前宿主小节为角色文件：校验 + 互引解析 + md/toml 产物 + SKILL 角色清单 + 被忽略字段清单。
+render_preset() {
+    rd_files=$render_dir/files
+    mkdir -p -- "$rd_files"
+    : > "$render_dir/names.txt"
+    : > "$render_dir/names.tsv"
+    : > "$render_dir/ignored.txt"
+    : > "$render_dir/route.txt"
+    : > "$render_dir/ids.seen"
+    : > "$render_dir/names.seen"
+    : > "$render_dir/section-roles.txt"
+
+    if [ "$(pget "P_HOST_${host_section}_SET")" != 1 ]; then
+        die "Preset has no [$host_section] section"
+    fi
+    ri=1
+    while [ "$ri" -le "$P_ROLES" ]; do
+        if [ "$(pget "P_R${ri}_HOST")" = "$host_section" ]; then
+            printf '%s\n' "$ri" >> "$render_dir/section-roles.txt"
+        fi
+        ri=$((ri+1))
+    done
+    section_role_count=$(awk 'END { print NR }' "$render_dir/section-roles.txt")
+    if [ "$section_role_count" -eq 0 ]; then
+        die "Preset [$host_section] section declares no roles"
+    fi
+
+    while IFS= read -r vridx || [ -n "$vridx" ]; do
+        [ -n "$vridx" ] || continue
+        for vreq in id name description; do
+            if [ "$(pget "P_R${vridx}_SET_${vreq}")" != 1 ]; then
+                die "Preset role in [$host_section] missing $vreq"
+            fi
+        done
+        vrid=$(pget "P_R${vridx}_id")
+        vrname=$(pget "P_R${vridx}_name")
+        if ! printf '%s' "$vrid" | LC_ALL=C grep -Eq '^[A-Za-z0-9][A-Za-z0-9_-]*$'; then
+            die "Invalid preset role id: $vrid"
+        fi
+        if ! printf '%s' "$vrname" | LC_ALL=C grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*$'; then
+            die "Invalid preset role name: $vrname"
+        fi
+        if LC_ALL=C grep -Fqx -- "$vrid" "$render_dir/ids.seen"; then
+            die "Duplicate role id in [$host_section]: $vrid"
+        fi
+        if LC_ALL=C grep -Fqx -- "$vrname" "$render_dir/names.seen"; then
+            die "Duplicate role name in [$host_section]: $vrname"
+        fi
+        printf '%s\n' "$vrid" >> "$render_dir/ids.seen"
+        printf '%s\n' "$vrname" >> "$render_dir/names.seen"
+        printf '%s\t%s\n' "$vrid" "$vrname" >> "$render_dir/names.tsv"
+    done < "$render_dir/section-roles.txt"
+
+    while IFS= read -r rridx || [ -n "$rridx" ]; do
+        [ -n "$rridx" ] || continue
+        r_id=$(pget "P_R${rridx}_id")
+        r_name=$(pget "P_R${rridx}_name")
+        r_desc=$(pget "P_R${rridx}_description")
+        if [ "$(pget "P_R${rridx}_SET_readonly")" = 1 ]; then
+            if [ "$(pget "P_R${rridx}_BOOL_readonly")" != 1 ]; then
+                die "Role [$host_section]/${r_id}: readonly must be true or false"
+            fi
+            r_readonly=$(pget "P_R${rridx}_readonly")
+        else
+            r_readonly=true
+        fi
+        r_model=
+        if [ "$(pget "P_R${rridx}_SET_model")" = 1 ]; then
+            r_model=$(pget "P_R${rridx}_model")
+        elif [ "$(pget "P_HOST_${host_section}_MODEL_SET")" = 1 ]; then
+            r_model=$(pget "P_HOST_${host_section}_MODEL")
+        fi
+        if [ -z "$(trim_ws "$r_model")" ]; then
+            die "Role [$host_section]/$r_id has no model (neither role model nor [$host_section] model)"
+        fi
+        if [ "$role_kind" = md ]; then
+            r_effort_key=thoughtLevel
+            r_foreign_key=model_reasoning_effort
+        else
+            r_effort_key=model_reasoning_effort
+            r_foreign_key=thoughtLevel
+        fi
+        if [ "$(pget "P_R${rridx}_SET_${r_effort_key}")" = 1 ]; then
+            if [ "$(pget "P_R${rridx}_SET_effort")" = 1 ]; then
+                die "Role [$host_section]/$r_id must not set both effort and $r_effort_key"
+            fi
+            r_effort=$(pget "P_R${rridx}_${r_effort_key}")
+        elif [ "$(pget "P_R${rridx}_SET_effort")" = 1 ]; then
+            r_effort_value=$(pget "P_R${rridx}_effort")
+            case "$r_effort_value" in
+                basic) r_effort=low ;;
+                deep) r_effort=high ;;
+                max) r_effort=max ;;
+                *) die "Role [$host_section]/${r_id}: unsupported effort $r_effort_value" ;;
+            esac
+        elif [ "$(pget "P_R${rridx}_SET_${r_foreign_key}")" = 1 ]; then
+            die "Role [$host_section]/$r_id sets only $r_foreign_key which is not consumed by this host; set effort or $r_effort_key"
+        else
+            die "Role [$host_section]/$r_id has neither effort nor $r_effort_key"
+        fi
+        if [ "$(pget "P_R${rridx}_SET_${r_foreign_key}")" = 1 ]; then
+            printf '%s\n' "[$host_section]/${r_id}: $r_foreign_key is not consumed by this host" >> "$render_dir/ignored.txt"
+        fi
+        if [ "$(pget "P_R${rridx}_SET_body")" = 1 ]; then
+            r_body_rel=$(pget "P_R${rridx}_body")
+        else
+            r_body_rel="$r_id.md"
+        fi
+        r_body_file=$preset_dir/roles/$r_body_rel
+        if [ ! -f "$r_body_file" ]; then
+            die "Role body file missing: $r_body_file"
+        fi
+        if ! LC_ALL=C awk -v sec="$host_section" -v rid="$r_id" -v names_tsv="$render_dir/names.tsv" '
+            BEGIN {
+                while ((getline tsvline < names_tsv) > 0) {
+                    tsvpos = index(tsvline, "\t")
+                    if (tsvpos > 0) refname[substr(tsvline, 1, tsvpos - 1)] = substr(tsvline, tsvpos + 1)
+                }
+            }
+            {
+                line = $0
+                sub(/\r$/, "", line)
+                out = ""
+                while (match(line, /\{\{role:[A-Za-z0-9_-]+\}\}/)) {
+                    ref = substr(line, RSTART + 7, RLENGTH - 9)
+                    if (!(ref in refname)) {
+                        printf "Role [%s]/%s references unknown role id: %s\n", sec, rid, ref > "/dev/stderr"
+                        exit 1
+                    }
+                    out = out substr(line, 1, RSTART - 1) refname[ref]
+                    line = substr(line, RSTART + RLENGTH)
+                }
+                print out line
+            }
+        ' "$r_body_file" > "$render_dir/body.pre.$rridx"; then
+            die "Role [$host_section]/$r_id body references could not be resolved: $r_body_file"
+        fi
+        # 等价 TrimEnd：去掉文末全部空白（含最后一行的行尾空白与结尾空行）。
+        LC_ALL=C awk '
+            { sub(/\r$/, ""); lines[NR] = $0 }
+            END {
+                last = NR
+                while (last >= 1 && lines[last] ~ /^[[:space:]]*$/) last--
+                for (i = 1; i < last; i++) print lines[i]
+                if (last >= 1) { l = lines[last]; sub(/[[:space:]]+$/, "", l); printf "%s", l }
+            }
+        ' "$render_dir/body.pre.$rridx" > "$render_dir/body.$rridx"
+
+        if [ "$role_kind" = md ]; then
+            if [ "$(pget "P_R${rridx}_SET_sandbox_mode")" = 1 ]; then
+                printf '%s\n' "[$host_section]/${r_id}: sandbox_mode is not consumed by ZCode" >> "$render_dir/ignored.txt"
+            fi
+            if [ "$(pget "P_R${rridx}_SET_model_reasoning_effort")" = 1 ]; then
+                printf '%s\n' "[$host_section]/${r_id}: model_reasoning_effort is not consumed by ZCode" >> "$render_dir/ignored.txt"
+            fi
+            if [ "$(pget "P_R${rridx}_SET_color")" = 1 ]; then
+                r_color=$(pget "P_R${rridx}_color")
+            elif [ "$r_readonly" != true ]; then
+                r_color=green
+            elif [ "$r_effort" = max ]; then
+                r_color=orange
+            else
+                r_color=cyan
+            fi
+            r_desc_q=$(escape_quoted_apply "$r_desc"); r_desc_q=${r_desc_q%X}
+            r_model_q=$(escape_quoted_apply "$r_model"); r_model_q=${r_model_q%X}
+            {
+                printf '%s\n' '---'
+                printf 'name: %s\n' "$r_name"
+                printf 'description: "%s"\n' "$r_desc_q"
+                printf 'model: "%s"\n' "$r_model_q"
+                printf 'thoughtLevel: %s\n' "$r_effort"
+                printf 'color: %s\n' "$r_color"
+                if [ "$r_readonly" = true ]; then
+                    if [ "$(pget "P_R${rridx}_SET_tools")" = 1 ]; then
+                        if [ "$(pget "P_R${rridx}_ARR_tools")" != 1 ]; then
+                            die "Role [$host_section]/$r_id: tools must be an array"
+                        fi
+                        r_tools=
+                        r_tool_count=$(pget "P_R${rridx}_ARRN_tools")
+                        rt_j=1
+                        while [ "$rt_j" -le "$r_tool_count" ]; do
+                            rt_elem=$(pget "P_R${rridx}_ELEM_tools_${rt_j}")
+                            if [ -z "$r_tools" ]; then r_tools=$rt_elem; else r_tools="$r_tools, $rt_elem"; fi
+                            rt_j=$((rt_j+1))
+                        done
+                    else
+                        r_tools='Read, Bash, WebFetch, WebSearch, TodoWrite'
+                    fi
+                    printf 'tools: [%s]\n' "$r_tools"
+                else
+                    if [ "$(pget "P_R${rridx}_SET_tools")" = 1 ]; then
+                        die "Role [$host_section]/$r_id must not set tools for a writable role"
+                    fi
+                fi
+                printf '%s\n' '---'
+                printf '%s\n' ''
+                cat "$render_dir/body.$rridx"
+                printf '\n'
+            } > "$rd_files/$r_name.md"
+            printf '%s\n' "$r_name.md" >> "$render_dir/names.txt"
+        else
+            if [ "$(pget "P_R${rridx}_SET_tools")" = 1 ]; then
+                printf '%s\n' "[$host_section]/${r_id}: tools is not consumed by Codex" >> "$render_dir/ignored.txt"
+            fi
+            if [ "$(pget "P_R${rridx}_SET_color")" = 1 ]; then
+                printf '%s\n' "[$host_section]/${r_id}: color is not consumed by Codex" >> "$render_dir/ignored.txt"
+            fi
+            if [ "$(pget "P_R${rridx}_SET_sandbox_mode")" = 1 ]; then
+                r_sandbox=$(pget "P_R${rridx}_sandbox_mode")
+            elif [ "$r_readonly" = true ]; then
+                r_sandbox='read-only'
+            else
+                r_sandbox='danger-full-access'
+            fi
+            r_name_q=$(escape_quoted_apply "$r_name"); r_name_q=${r_name_q%X}
+            r_desc_q=$(escape_quoted_apply "$r_desc"); r_desc_q=${r_desc_q%X}
+            r_model_q=$(escape_quoted_apply "$r_model"); r_model_q=${r_model_q%X}
+            r_effort_q=$(escape_quoted_apply "$r_effort"); r_effort_q=${r_effort_q%X}
+            r_sandbox_q=$(escape_quoted_apply "$r_sandbox"); r_sandbox_q=${r_sandbox_q%X}
+            LC_ALL=C sed -e 's/\\/\\\\/g' -e 's/"""/\\"\\"\\"/g' "$render_dir/body.$rridx" > "$render_dir/body.toml.$rridx"
+            {
+                printf 'name = "%s"\n' "$r_name_q"
+                printf 'description = "%s"\n' "$r_desc_q"
+                printf 'developer_instructions = """\n'
+                cat "$render_dir/body.toml.$rridx"
+                printf '\n"""\n'
+                printf 'model = "%s"\n' "$r_model_q"
+                printf 'model_reasoning_effort = "%s"\n' "$r_effort_q"
+                printf 'sandbox_mode = "%s"\n' "$r_sandbox_q"
+            } > "$rd_files/$r_name.toml"
+            printf '%s\n' "$r_name.toml" >> "$render_dir/names.txt"
+        fi
+
+        if [ "$(pget "P_R${rridx}_SET_skill_desc")" = 1 ]; then
+            r_route_desc=$(pget "P_R${rridx}_skill_desc")
+        else
+            r_route_desc=$r_desc
+        fi
+        printf -- '- `%s`：%s\n' "$r_name" "$r_route_desc" >> "$render_dir/route.txt"
+    done < "$render_dir/section-roles.txt"
+
+    ROLE_COUNT_OUT=$section_role_count
+}
+
+# ---- md 产物结构校验（对应 Assert-AgentFile / Assert-AgentStructure / Assert-AgentFiles）----
+
+assert_agent_file() {
+    af_path=$1
+    af_name=${af_path##*/}
+    af_stem=${af_name%.md}
+    awk -v stem="$af_stem" -v fname="$af_name" '
+        { sub(/\r$/, "") }
+        NR == 1 { if ($0 != "---") { err = 1; exit 1 } in_fm = 1; next }
+        in_fm && $0 == "---" { terminated = 1; exit 0 }
+        in_fm && /^(name|description|model|thoughtLevel)[[:space:]]*:/ {
+            key = $0
+            sub(/[[:space:]]*:.*$/, "", key)
+            seen[key]++
+            if (key == "name") {
+                value = $0
+                sub(/^[^:]*:[[:space:]]*/, "", value)
+                gsub(/^"|"$/, "", value)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+                fm_name = value
+            }
+        }
+        END {
+            if (err) { printf "Agent frontmatter missing: %s\n", fname > "/dev/stderr"; exit 1 }
+            if (!terminated) { printf "Agent frontmatter unterminated: %s\n", fname > "/dev/stderr"; exit 1 }
+            bad = 0
+            split("name description model thoughtLevel", required, " ")
+            for (i = 1; i <= 4; i++) {
+                if (seen[required[i]] != 1) { printf "Agent field missing or repeated: %s/%s\n", fname, required[i] > "/dev/stderr"; bad = 1 }
+            }
+            if (fm_name != stem) { printf "Agent name mismatch: %s/%s\n", fname, fm_name > "/dev/stderr"; bad = 1 }
+            exit bad ? 1 : 0
+        }
+    ' "$af_path"
+}
+
+assert_agent_structure() {
+    as_dir=$1
+    as_expected=$2
+    as_count=0
+    for as_file in "$as_dir"/*.md; do
+        if [ -f "$as_file" ]; then as_count=$((as_count+1)); fi
+    done
+    if [ "$as_count" -ne "$as_expected" ]; then
+        die "Expected $as_expected managed agent files, found $as_count: $as_dir"
+    fi
+    for as_file in "$as_dir"/*.md; do
+        if [ -f "$as_file" ]; then
+            assert_agent_file "$as_file" || die "Invalid agent profile: ${as_file##*/}"
+        fi
+    done
+}
+
+assert_toml_structure() {
+    ts_dir=$1
+    ts_expected=$2
+    ts_count=0
+    for ts_file in "$ts_dir"/*.toml; do
+        if [ -f "$ts_file" ]; then ts_count=$((ts_count+1)); fi
+    done
+    if [ "$ts_count" -ne "$ts_expected" ]; then
+        die "Expected $ts_expected managed role files, found $ts_count: $ts_dir"
+    fi
+    for ts_file in "$ts_dir"/*.toml; do
+        if [ ! -f "$ts_file" ]; then continue; fi
+        if ! LC_ALL=C awk -v fname="${ts_file##*/}" '
+            {
+                if ($0 ~ /^(name|model|model_reasoning_effort|sandbox_mode|description|developer_instructions)[[:space:]]*=/) {
+                    key = $0
+                    sub(/[[:space:]]*=.*$/, "", key)
+                    seen[key]++
+                }
+            }
+            END {
+                bad = 0
+                split("name model model_reasoning_effort sandbox_mode description developer_instructions", required, " ")
+                for (i = 1; i <= 6; i++) {
+                    if (seen[required[i]] != 1) { printf "Role field missing or repeated: %s/%s\n", fname, required[i] > "/dev/stderr"; bad = 1 }
+                }
+                exit bad ? 1 : 0
+            }
+        ' "$ts_file"; then
+            die "Invalid role structure: ${ts_file##*/}"
+        fi
+    done
+}
+
+# legacy 子目录探测：结构校验通过且文件名单与渲染产物一致时返回 0，允许在 if 条件上下文安全失败。
+legacy_dir_matches_render() {
+    lr_dir=$1
+    lr_count=0
+    for lr_file in "$lr_dir"/*.md; do
+        if [ -f "$lr_file" ]; then lr_count=$((lr_count+1)); fi
+    done
+    if [ "$lr_count" -ne "$role_count" ]; then return 1; fi
+    for lr_file in "$lr_dir"/*.md; do
+        if [ -f "$lr_file" ]; then
+            assert_agent_file "$lr_file" || return 1
+        fi
+    done
+    lr_actual=
+    for lr_file in "$lr_dir"/*.md; do
+        if [ -f "$lr_file" ]; then
+            lr_actual="$lr_actual${lr_file##*/}
+"
+        fi
+    done
+    lr_actual=$(printf '%s' "$lr_actual" | LC_ALL=C sort)
+    lr_expected=$(LC_ALL=C sort "$render_dir/names.txt")
+    [ "$lr_actual" = "$lr_expected" ] || return 1
+    return 0
+}
+
+# ---- 预设选择：位置参数优先；未指定且为非交互 stdin 时报错；否则进入菜单 ----
+
+preset_input=${2:-}
+if [ -z "$preset_input" ]; then
+    if [ ! -t 0 ]; then
+        die "No preset specified. Usage: sh install.sh $client <$default_preset|name|path>"
+    fi
+    set --
+    for preset_entry_path in "$presets_root"/*/; do
+        if [ -d "$preset_entry_path" ] && [ -f "${preset_entry_path}preset.toml" ]; then
+            set -- "$@" "$preset_entry_path"
+        fi
+    done
+    if [ "$#" -eq 0 ]; then
+        die "No presets found under: $presets_root"
+    fi
+    printf '%s\n' 'Select the role preset to install:'
+    preset_index=1
+    for preset_entry_path in "$@"; do
+        preset_entry=$(basename -- "$preset_entry_path")
+        preset_mark=
+        if [ "$preset_entry" = "$default_preset" ]; then preset_mark=' [default]'; fi
+        preset_desc=$(PRESET_QUIET=1; export PRESET_QUIET; read_preset "${preset_entry_path}preset.toml"; printf '%s' "$P_DESC") || preset_desc='<unreadable preset>'
+        printf '  %s) %s%s - %s\n' "$preset_index" "$preset_entry" "$preset_mark" "$preset_desc"
+        preset_index=$((preset_index+1))
+    done
+    printf 'Enter number or name (q to quit): '
+    read -r preset_choice
+    case "$preset_choice" in
+        [qQ]) exit 0 ;;
+    esac
+    case "$preset_choice" in
+        ''|*[!0-9]*) preset_input=$preset_choice ;;
+        *)
+            if [ "$preset_choice" -ge 1 ] && [ "$preset_choice" -le "$#" ]; then
+                eval "preset_input=\$(basename -- \"\${$preset_choice}\")"
+            else
+                preset_input=$preset_choice
+            fi
+            ;;
+    esac
+fi
+
+# ---- 预设解析、manifest 校验与渲染（先于路径安全检查与 stage 装配）----
+
+preset_display_name=$preset_input
+if [ -d "$preset_input" ]; then
+    preset_dir=$(CDPATH= cd -- "$preset_input" && pwd -P) || die "Could not resolve preset directory: $preset_input"
+else
+    preset_dir=$presets_root/$preset_input
+fi
+preset_file=$preset_dir/preset.toml
+if [ ! -f "$preset_file" ]; then
+    die "Preset not found: $preset_input (expected $preset_file)"
+fi
+case "$preset_dir" in
+    "$presets_root"|"$presets_root"/*) is_managed_preset=1 ;;
+    *) is_managed_preset=0 ;;
+esac
+render_dir=$(mktemp -d "${TMPDIR:-/tmp}/install-preset-render.XXXXXX") || die 'Could not create preset render directory.'
+trap 'rm -rf -- "$render_dir"' EXIT HUP INT TERM
+if [ "$is_managed_preset" = 1 ]; then
+    verify_preset_sources "$(basename -- "$preset_dir")"
+fi
+read_preset "$preset_file"
+if [ "$(pget "P_HOST_${host_section}_SET")" != 1 ]; then
+    die "Preset '$preset_display_name' has no [$host_section] section and cannot be installed for $client_label"
+fi
+render_preset
+role_count=$ROLE_COUNT_OUT
+
+required_sources="$presets_root $source_docs $source_system_docs $source_instructions $shared_skills $client_skills"
 [ "$has_config" -eq 1 ] && required_sources="$required_sources $source_config $source_model_provider_settings"
 for source_path in $required_sources; do
     [ -e "$source_path" ] || die "Missing source: $source_path"
@@ -196,120 +953,6 @@ home_parent=$(CDPATH= cd -- "$(dirname -- "$client_home")" && pwd -P) || die "Co
 client_home=$home_parent/$(basename -- "$client_home")
 mkdir -p "$client_home"
 assert_path_chain "$client_home" || die "Unsafe $client_label home path: $client_home"
-
-normalized_lf_sha256() {
-    if command -v sha256sum >/dev/null 2>&1; then
-        awk '{ sub(/\r$/, ""); print }' "$1" | sha256sum | awk '{print $1}'
-    else
-        awk '{ sub(/\r$/, ""); print }' "$1" | shasum -a 256 | awk '{print $1}'
-    fi
-}
-
-manifest_hash() {
-    requested_role=$1
-    manifest_path=${2:-$source_manifest}
-    awk -v requested="$requested_role" '$0 ~ /^[0-9a-f]{64}  [^[:space:]]+$/ && $2 == requested { print $1; found = 1 } END { if (!found) exit 1 }' "$manifest_path"
-}
-
-# md agent 平铺安装（新版 ZCode 宿主只扫描 ~/.zcode/agents 顶层），文件名以 manifest 为准并做安全校验。
-agent_manifest_names() {
-    names=$(awk '$0 ~ /^[0-9a-f]{64}  [^[:space:]]+$/ { print $2 }' "$source_manifest")
-    name_count=$(printf '%s\n' "$names" | wc -l)
-    [ "$name_count" -eq "$expected_roles" ] || die "Expected $expected_roles managed agent names"
-    for name in $names; do
-        printf '%s\n' "$name" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*\.(md|markdown)$' || die "Unsafe managed agent name: $name"
-        printf '%s\n' "$name"
-    done
-}
-
-assert_roles_toml() {
-    roles_dir=${1:-$source_roles}
-    manifest_path=${2:-$source_manifest}
-    manifest_count=$(wc -l < "$manifest_path")
-    [ "$manifest_count" -eq "$expected_roles" ] || die "Expected $expected_roles managed role hashes"
-    for role_path in "$roles_dir"/*.toml; do
-        [ -f "$role_path" ] || die "Missing managed role: $role_path"
-        role_name=$(basename "$role_path")
-        expected_hash=$(manifest_hash "$role_name" "$manifest_path") || die "Missing role hash: $role_name"
-        actual_hash=$(normalized_lf_sha256 "$role_path")
-        [ "$expected_hash" = "$actual_hash" ] || die "Role hash mismatch: $role_name"
-        field_matches=$(rg -o '^(name|model|model_reasoning_effort|sandbox_mode|description|developer_instructions)[[:space:]]*=' "$role_path" | awk '{ sub(/[[:space:]]*=.*/, ""); print }') || die "Role fields missing: $role_name"
-        printf '%s\n' "$field_matches" | awk 'BEGIN { wanted["name"]=1; wanted["model"]=1; wanted["model_reasoning_effort"]=1; wanted["sandbox_mode"]=1; wanted["description"]=1; wanted["developer_instructions"]=1 } { count[$0]++ } END { for (key in wanted) if (count[key] != 1) exit 1 }' || die "Role fields missing or repeated: $role_name"
-    done
-}
-
-assert_agents_md() {
-    agents_dir=${1:-$source_roles}
-    manifest_path=${2:-$source_manifest}
-    manifest_count=$(wc -l < "$manifest_path")
-    [ "$manifest_count" -eq "$expected_roles" ] || die "Expected $expected_roles managed agent hashes"
-    for agent_path in "$agents_dir"/*.md; do
-        [ -f "$agent_path" ] || die "Missing managed agent: $agent_path"
-        agent_name=$(basename "$agent_path")
-        expected_hash=$(manifest_hash "$agent_name" "$manifest_path") || die "Missing agent hash: $agent_name"
-        actual_hash=$(normalized_lf_sha256 "$agent_path")
-        [ "$expected_hash" = "$actual_hash" ] || die "Agent hash mismatch: $agent_name"
-        awk -v agent="${agent_name%.md}" '
-            { sub(/\r$/, "") }
-            NR == 1 { if ($0 != "---") { err = "frontmatter missing"; exit 1 } in_fm = 1; next }
-            in_fm && $0 == "---" { terminated = 1; exit 0 }
-            in_fm && /^(name|description|model|thoughtLevel)[[:space:]]*:/ {
-                key = $0
-                sub(/[[:space:]]*:.*$/, "", key)
-                seen[key]++
-                if (key == "name") {
-                    value = $0
-                    sub(/^[^:]*:[[:space:]]*/, "", value)
-                    gsub(/^"|"$/, "", value)
-                    fm_name = value
-                }
-            }
-            END {
-                bad = 0
-                if (err != "") { printf "Agent %s: %s\n", agent, err > "/dev/stderr"; bad = 1 }
-                else if (!terminated) { printf "Agent %s: frontmatter unterminated\n", agent > "/dev/stderr"; bad = 1 }
-                else {
-                    split("name description model thoughtLevel", required, " ")
-                    for (i = 1; i <= 4; i++) if (seen[required[i]] != 1) { printf "Agent %s: field missing or repeated: %s\n", agent, required[i] > "/dev/stderr"; bad = 1 }
-                    if (fm_name != agent) { printf "Agent %s: frontmatter name mismatch: %s\n", agent, fm_name > "/dev/stderr"; bad = 1 }
-                }
-                exit bad ? 1 : 0
-            }
-        ' "$agent_path" || die "Invalid agent profile: $agent_name"
-    done
-}
-
-assert_managed_roles() {
-    if [ "$role_kind" = toml ]; then
-        assert_roles_toml "$@"
-    else
-        assert_agents_md "$@"
-    fi
-}
-
-# 已安装状态的平铺校验：agents 根目录可能含用户自建文件，只按 manifest 逐文件核对。
-assert_installed_agents_flat() {
-    agents_dir=$1
-    for agent_name in $(agent_manifest_names); do
-        agent_path=$agents_dir/$agent_name
-        [ -f "$agent_path" ] || die "Managed agent file missing: $agent_path"
-        expected_hash=$(manifest_hash "$agent_name") || die "Missing agent hash: $agent_name"
-        [ "$expected_hash" = "$(normalized_lf_sha256 "$agent_path")" ] || die "Agent hash mismatch: $agent_name"
-    done
-}
-
-# legacy 子目录探测：用 return 而非 die，允许在 if 条件上下文安全失败。
-legacy_dir_matches_manifest() {
-    probe_dir=$1
-    [ "$(wc -l < "$source_manifest")" -eq "$expected_roles" ] || return 1
-    for probe_name in $(agent_manifest_names); do
-        probe_path=$probe_dir/$probe_name
-        [ -f "$probe_path" ] || return 1
-        probe_expected=$(manifest_hash "$probe_name") || return 1
-        [ "$probe_expected" = "$(normalized_lf_sha256 "$probe_path")" ] || return 1
-    done
-    return 0
-}
 
 assert_safe_toml_merge_input() {
     config_path=$1
@@ -517,20 +1160,39 @@ done
 if [ "$role_kind" = toml ]; then
     assert_target "$client_home/agents/ai-vibecode-superpower" directory || die "Unsafe install target: $client_home/agents/ai-vibecode-superpower"
 else
-    agent_manifest_names >/dev/null
-    for agent_name in $(agent_manifest_names); do
+    while IFS= read -r agent_name || [ -n "$agent_name" ]; do
+        [ -n "$agent_name" ] || continue
         assert_target "$client_home/agents/$agent_name" file || die "Unsafe install target: $client_home/agents/$agent_name"
-    done
+    done < "$render_dir/names.txt"
 fi
 legacy_agents_dir=$client_home/agents/ai-vibecode-superpower
 legacy_agents_managed=0
 if [ "$role_kind" = md ] && [ -d "$legacy_agents_dir" ]; then
-    if legacy_dir_matches_manifest "$legacy_agents_dir"; then
+    if legacy_dir_matches_render "$legacy_agents_dir"; then
         assert_target "$legacy_agents_dir" directory || die "Unsafe install target: $legacy_agents_dir"
         legacy_agents_managed=1
     else
-        printf '%s\n' "Warning: legacy managed agent directory does not match the manifest; left untouched: $legacy_agents_dir" >&2
+        printf '%s\n' "Warning: legacy managed agent directory does not match the preset; left untouched: $legacy_agents_dir" >&2
     fi
+fi
+managed_list=$client_home/agents/.ai-vibecode-superpower.managed
+stale_list=$render_dir/stale.txt
+: > "$stale_list"
+if [ "$role_kind" = md ] && [ -f "$managed_list" ]; then
+    while IFS= read -r managed_name || [ -n "$managed_name" ]; do
+        managed_name=$(trim_ws "$managed_name")
+        [ -n "$managed_name" ] || continue
+        printf '%s\n' "$managed_name" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*\.md$' || continue
+        path_exists "$client_home/agents/$managed_name" || continue
+        LC_ALL=C grep -Fqx -- "$managed_name" "$render_dir/names.txt" && continue
+        printf '%s\n' "$managed_name" >> "$stale_list"
+    done < "$managed_list"
+fi
+if [ "$role_kind" = md ]; then
+    while IFS= read -r stale_name || [ -n "$stale_name" ]; do
+        [ -n "$stale_name" ] || continue
+        assert_target "$client_home/agents/$stale_name" file || die "Unsafe install target: $client_home/agents/$stale_name"
+    done < "$stale_list"
 fi
 if [ "$has_config" -eq 1 ]; then
     assert_target "$client_home/config.toml" file || die "Unsafe install target: $client_home/config.toml"
@@ -541,7 +1203,6 @@ done
 for container_path in "$client_home/agents" "$client_home/skills" "$client_home/backups"; do
     assert_directory_container "$container_path" || die "Unsafe managed container: $container_path"
 done
-assert_managed_roles
 
 has_state() {
     state_name=$1
@@ -601,6 +1262,7 @@ cleanup() {
         rollback
     fi
     if [ -n "$stage_dir" ] && [ -d "$stage_dir" ]; then rm -rf -- "$stage_dir"; fi
+    if [ -n "$render_dir" ] && [ -d "$render_dir" ]; then rm -rf -- "$render_dir"; fi
     exit "$status"
 }
 trap cleanup EXIT HUP INT TERM
@@ -610,11 +1272,43 @@ cp "$source_instructions" "$stage_dir/AGENTS.md"
 cp -R "$source_docs" "$stage_dir/docs"
 cp -R "$source_system_docs" "$stage_dir/docs/system"
 if [ "$role_kind" = md ]; then
-    for agent_name in $(agent_manifest_names); do cp "$source_roles/$agent_name" "$stage_dir/agents/$agent_name"; done
+    while IFS= read -r rendered_name || [ -n "$rendered_name" ]; do
+        [ -n "$rendered_name" ] || continue
+        cp -- "$render_dir/files/$rendered_name" "$stage_dir/agents/$rendered_name"
+    done < "$render_dir/names.txt"
+    LC_ALL=C sort "$render_dir/names.txt" > "$stage_dir/agents/.ai-vibecode-superpower.managed"
 else
-    cp -R "$source_roles" "$stage_dir/agents/"
+    mkdir -p -- "$stage_dir/agents/ai-vibecode-superpower"
+    while IFS= read -r rendered_name || [ -n "$rendered_name" ]; do
+        [ -n "$rendered_name" ] || continue
+        cp -- "$render_dir/files/$rendered_name" "$stage_dir/agents/ai-vibecode-superpower/$rendered_name"
+    done < "$render_dir/names.txt"
 fi
 for skill_spec in $skill_specs; do cp -R "$(skill_source_dir "$skill_spec")" "$stage_dir/skills/"; done
+# SKILL.md 角色清单渲染：骨架保留 <!-- preset-roles --> 占位符，安装时替换为当前宿主小节的角色清单。
+skill_doc=$stage_dir/skills/orchestrate-model-workflow/SKILL.md
+if [ -f "$skill_doc" ] && LC_ALL=C grep -qF -- '<!-- preset-roles -->' "$skill_doc"; then
+    if ! LC_ALL=C awk -v route_file="$render_dir/route.txt" '
+        BEGIN {
+            route = ""
+            first = 1
+            while ((getline routeline < route_file) > 0) {
+                if (first) { route = routeline; first = 0 } else { route = route "\n" routeline }
+            }
+            close(route_file)
+        }
+        {
+            line = $0
+            while ((marker_pos = index(line, "<!-- preset-roles -->")) > 0) {
+                line = substr(line, 1, marker_pos - 1) route substr(line, marker_pos + 21)
+            }
+            print line
+        }
+    ' "$skill_doc" > "$skill_doc.rendered"; then
+        die 'Could not render the skill role route.'
+    fi
+    mv -- "$skill_doc.rendered" "$skill_doc"
+fi
 if [ "$has_config" -eq 1 ]; then
     config_input=$source_config
     if path_exists "$client_home/config.toml"; then cp "$client_home/config.toml" "$stage_dir/existing-config.toml"; config_input=$stage_dir/existing-config.toml; fi
@@ -627,9 +1321,9 @@ if [ "$has_config" -eq 1 ]; then
     assert_safe_toml_merge_input "$stage_dir/config.toml"
 fi
 if [ "$role_kind" = md ]; then
-    assert_managed_roles "$stage_dir/agents" "$source_manifest"
+    assert_agent_structure "$stage_dir/agents" "$role_count"
 else
-    assert_managed_roles "$stage_dir/agents/ai-vibecode-superpower" "$source_manifest"
+    assert_toml_structure "$stage_dir/agents/ai-vibecode-superpower" "$role_count"
 fi
 escaped_home=$(printf '%s' "$client_home" | sed 's/[\\&|]/\\&/g')
 file_list=$stage_dir/files.list
@@ -647,7 +1341,15 @@ printf 'AGENTS.md\t%s\t%s\tfile\treplace\n' "$client_home/AGENTS.md" "$stage_dir
 [ "$has_config" -eq 1 ] && printf 'config.toml\t%s\t%s\tfile\treplace\n' "$client_home/config.toml" "$stage_dir/config.toml" >> "$manifest"
 printf 'docs\t%s\t%s\tdirectory\treplace\n' "$client_home/docs" "$stage_dir/docs" >> "$manifest"
 if [ "$role_kind" = md ]; then
-    for agent_name in $(agent_manifest_names); do printf 'agents/%s\t%s\t%s\tfile\treplace\n' "$agent_name" "$client_home/agents/$agent_name" "$stage_dir/agents/$agent_name" >> "$manifest"; done
+    while IFS= read -r agent_name || [ -n "$agent_name" ]; do
+        [ -n "$agent_name" ] || continue
+        printf 'agents/%s\t%s\t%s\tfile\treplace\n' "$agent_name" "$client_home/agents/$agent_name" "$stage_dir/agents/$agent_name" >> "$manifest"
+    done < "$render_dir/names.txt"
+    while IFS= read -r stale_name || [ -n "$stale_name" ]; do
+        [ -n "$stale_name" ] || continue
+        printf 'agents/%s\t%s\t-\tfile\tbackup-remove\n' "$stale_name" "$client_home/agents/$stale_name" >> "$manifest"
+    done < "$stale_list"
+    printf 'agents/.ai-vibecode-superpower.managed\t%s\t%s\tfile\treplace\n' "$managed_list" "$stage_dir/agents/.ai-vibecode-superpower.managed" >> "$manifest"
     [ "$legacy_agents_managed" -eq 1 ] && printf 'agents/ai-vibecode-superpower\t%s\t-\tdirectory\tbackup-remove\n' "$legacy_agents_dir" >> "$manifest"
 else
     printf 'agents/ai-vibecode-superpower\t%s\t%s\tdirectory\treplace\n' "$client_home/agents/ai-vibecode-superpower" "$stage_dir/agents/ai-vibecode-superpower" >> "$manifest"
@@ -688,11 +1390,24 @@ while IFS="$(printf '\t')" read -r target_name target_path candidate_path target
     fi
 done < "$manifest"
 if [ "$role_kind" = md ]; then
-    assert_installed_agents_flat "$client_home/agents"
+    # 平铺目录含用户自建文件：只核对渲染名单内的文件存在且结构合法，不按目录计数。
+    while IFS= read -r installed_name || [ -n "$installed_name" ]; do
+        [ -n "$installed_name" ] || continue
+        if [ ! -f "$client_home/agents/$installed_name" ]; then
+            die "Managed agent file missing: $client_home/agents/$installed_name"
+        fi
+        assert_agent_file "$client_home/agents/$installed_name" || die "Invalid agent profile: $installed_name"
+    done < "$render_dir/names.txt"
 else
-    assert_managed_roles "$client_home/agents/ai-vibecode-superpower" "$source_manifest"
+    assert_toml_structure "$client_home/agents/ai-vibecode-superpower" "$role_count"
+fi
+if [ -s "$render_dir/ignored.txt" ]; then
+    while IFS= read -r ignored_note || [ -n "$ignored_note" ]; do
+        [ -n "$ignored_note" ] || continue
+        printf '%s\n' "Warning: Preset field not consumed: $ignored_note" >&2
+    done < "$render_dir/ignored.txt"
 fi
 completed=1
-printf '%s\n' "$client_label configuration installed in: $client_home" 'Standalone skills and managed agent roles installed.' "Restart $client_label to load the new configuration and skills."
+printf '%s\n' "$client_label configuration installed in: $client_home" "Preset '$preset_display_name' rendered $role_count roles." 'Standalone skills and managed agent roles installed.' "Restart $client_label to load the new configuration and skills."
 if [ "$client" = zcode ]; then printf '%s\n' 'Unmanaged ZCode state (cli/, v2/, plugins, other skills and agents) was not modified.'; fi
 if [ -n "$backup_dir" ]; then printf '%s\n' "Backup directory: $backup_dir"; fi

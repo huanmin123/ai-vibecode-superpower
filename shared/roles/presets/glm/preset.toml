@@ -1,0 +1,46 @@
+description = "GLM 预设：ZCode 5 角色绑定 GLM-5.3-Flash / GLM-5.3。"
+
+[zcode]
+model = "account:bigmodel-individual-coding-plan/GLM-5.3-Flash"
+
+[[zcode.role]]
+id = "flash_low"
+name = "glm_5.3_flash_low"
+description = "只读常规取证与实施后预审。"
+effort = "basic"
+readonly = true
+color = "cyan"
+
+[[zcode.role]]
+id = "flash_high"
+name = "glm_5.3_flash_high"
+description = "只读深度取证与复杂预审。"
+effort = "deep"
+readonly = true
+color = "cyan"
+
+[[zcode.role]]
+id = "flash_max"
+name = "glm_5.3_flash_max"
+description = "写代码主力：受控契约执行、受保护写入、共享状态处理与集成。"
+effort = "max"
+readonly = false
+color = "green"
+
+[[zcode.role]]
+id = "review_high"
+name = "glm_5.3_high"
+description = "只读有界技术定案与常规复审（审核主力）。"
+effort = "deep"
+readonly = true
+color = "purple"
+model = "account:bigmodel-individual-coding-plan/GLM-5.3"
+
+[[zcode.role]]
+id = "review_max"
+name = "glm_5.3_max"
+description = "只读最高强度独立复审与最终升级验收（终审）。"
+effort = "max"
+readonly = true
+color = "orange"
+model = "account:bigmodel-individual-coding-plan/GLM-5.3"

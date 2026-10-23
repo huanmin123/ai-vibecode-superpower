@@ -13,7 +13,7 @@
 
 `functions/` 保存长期有效的功能契约，`plans/` 保存阶段性的执行记录。涉及接口、数据或权限契约的功能先写或更新功能设计，计划引用设计并记录需求基线；小改动可直接使用简短计划，已有问题/重构记录能完整覆盖范围与验证时无需再建平行计划。稳定验收口径属于契约，本次任务、验证矩阵与实际结果属于执行记录，并通过需求的 `AC-*` 键追踪。
 
-跨会话共享且尚未关闭的阻塞、待确认、待办和观察项集中在 `docs/待办与阻塞事项.md` 单一清单；条目关闭即删除，需要长期保留的过程与证据仍归入 `plans/`、`bug/`、`refactors/` 档案，清单通过编号锚点和指针区链接这些档案。格式见 [todo-blockers-template.md](templates/todo-blockers-template.md)。
+跨会话共享且尚未关闭的阻塞、待确认、待办和观察项集中在 `docs/待办与阻塞事项.md` 单一清单；条目关闭即删除且删除提交与完成改动同提，需要长期保留的过程与证据仍归入 `plans/`、`bug/`、`refactors/` 档案，清单通过编号锚点和指针区链接这些档案。格式见 [todo-blockers-template.md](templates/todo-blockers-template.md)。
 
 压测、验收、审计和专项分析沉淀的人工报告保存在 `docs/reports/`，只记录测试范围、环境、数据、已证实结论和边界；原始机器产物（JSON、log、profile）放在 Git 忽略目录（例如 `.local/project-resources/`），报告以仓库相对路径引用，不混入 `docs/`。计划仍承载推进过程与本次验证矩阵；报告结论升级为长期规则时同步回对应设计文档。格式见 [report-template.md](templates/report-template.md)。
 
@@ -114,7 +114,7 @@ docs/
 | AI 交付流水线或命令映射变化 | `AGENTS.md`、`docs/develop/`、`docs/deploy/`；更新 `.local/project-resources/README.md` 和相关脚本 |
 | 重复或重要 Bug | `bug/README.md`、当次问题记录；仅格式变化时更新问题模板 |
 | 大型重构 | `refactors/README.md`、当次重构记录；仅格式变化时更新重构模板 |
-| 阻塞出现或解除、裁决完成、观察项升级 | `待办与阻塞事项.md` 对应分区（保留编号移动）；需长期保留证据时建立 plans/bug/refactors 档案并删除清单条目 |
+| 阻塞出现或解除、裁决完成、观察项升级或到期复核 | `待办与阻塞事项.md` 对应分区（保留编号移动）；需长期保留证据时建立 plans/bug/refactors 档案并删除清单条目 |
 | 压测、验收、审计或专项分析产出独立报告 | `reports/README.md` 文件索引、当次报告；计划/问题的验证矩阵链接报告而不复制数据；结论成为长期规则时同步回设计文档 |
 | 文档新增、合并、归档、废弃或删除 | 先读 [document-cleanup-guide.md](document-cleanup-guide.md)；更新受影响目录 `README.md`、入链、替代文档、关联计划/基线和清理记录；有长期证据的记录只归档不删除 |
 | 清理规则、保留期限或归档位置变化 | [document-cleanup-guide.md](document-cleanup-guide.md)、本矩阵及受影响目录 `README.md`；说明生效日期、迁移范围和恢复路径 |
