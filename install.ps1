@@ -601,6 +601,7 @@ $clientProfiles = [ordered]@{
             @{ Name = 'agent-toolchain'; Source = (Join-Path $root 'shared\skills\agent-toolchain') },
             @{ Name = 'project-doc-planner'; Source = (Join-Path $root 'shared\skills\project-doc-planner') },
             @{ Name = 'visual-aesthetics'; Source = (Join-Path $root 'shared\skills\visual-aesthetics') },
+            @{ Name = 'deep-dive-review'; Source = (Join-Path $root 'shared\skills\deep-dive-review') },
             @{ Name = 'orchestrate-model-workflow'; Source = (Join-Path $root 'codex-global-config\skills\orchestrate-model-workflow') }
         )
     }
@@ -612,6 +613,7 @@ $clientProfiles = [ordered]@{
             @{ Name = 'agent-toolchain'; Source = (Join-Path $root 'shared\skills\agent-toolchain') },
             @{ Name = 'project-doc-planner'; Source = (Join-Path $root 'shared\skills\project-doc-planner') },
             @{ Name = 'visual-aesthetics'; Source = (Join-Path $root 'shared\skills\visual-aesthetics') },
+            @{ Name = 'deep-dive-review'; Source = (Join-Path $root 'shared\skills\deep-dive-review') },
             @{ Name = 'orchestrate-model-workflow'; Source = (Join-Path $root 'zcode-global-config\skills\orchestrate-model-workflow') }
         )
     }

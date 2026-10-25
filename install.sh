@@ -195,7 +195,7 @@ case "$client" in
         source_config=$script_dir/codex-global-config/config.toml
         source_model_provider_settings=$script_dir/codex-global-config/model-provider-settings.toml
         client_skills=$script_dir/codex-global-config/skills
-        skill_specs='agent-toolchain:shared project-doc-planner:shared visual-aesthetics:shared orchestrate-model-workflow:codex'
+        skill_specs='agent-toolchain:shared project-doc-planner:shared visual-aesthetics:shared deep-dive-review:shared orchestrate-model-workflow:codex'
         has_config=1
         ;;
     zcode)
@@ -209,7 +209,7 @@ case "$client" in
         source_instructions=$script_dir/zcode-global-config/AGENTS.md
         source_docs=$script_dir/zcode-global-config/docs
         client_skills=$script_dir/zcode-global-config/skills
-        skill_specs='agent-toolchain:shared project-doc-planner:shared visual-aesthetics:shared orchestrate-model-workflow:zcode'
+        skill_specs='agent-toolchain:shared project-doc-planner:shared visual-aesthetics:shared deep-dive-review:shared orchestrate-model-workflow:zcode'
         ;;
 esac
 

@@ -70,7 +70,7 @@ function posixHome(codexHome) {
   return path.relative(repository, codexHome).split(path.sep).join('/');
 }
 
-const sharedSkillNames = ['agent-toolchain', 'project-doc-planner', 'visual-aesthetics'];
+const sharedSkillNames = ['agent-toolchain', 'project-doc-planner', 'visual-aesthetics', 'deep-dive-review'];
 
 async function assertSharedSkillsDeployed(skillsDir) {
   for (const name of sharedSkillNames) {
@@ -694,7 +694,7 @@ test('PowerShell zcode installer composes shared and zcode sources and leaves un
     await assertSharedSkillsDeployed(path.join(zcodeHome, 'skills'));
     const cliConfig = await readFile(path.join(zcodeHome, 'cli', 'config.json'), 'utf8');
     assert.match(cliConfig, /"keep": ?"me"/);
-    assert.equal(await readdir(path.join(zcodeHome, 'skills')).then((names) => names.length), 4);
+    assert.equal(await readdir(path.join(zcodeHome, 'skills')).then((names) => names.length), 5);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

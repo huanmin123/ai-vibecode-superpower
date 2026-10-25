@@ -139,6 +139,7 @@ sh ./install.sh zcode glm
 | 能力 | 何时使用 | 你会得到 |
 | --- | --- | --- |
 | [`agent-toolchain`](shared/skills/agent-toolchain/SKILL.md) | 首次接入、升级、修复、维护或审查 CodeGraph/RTK | 对目标项目进行受控接入与维护。 |
+| [`deep-dive-review`](shared/skills/deep-dive-review/SKILL.md) | 交付后/上线前对需求或模块做多轮深挖质量审查 | 覆盖矩阵穷举、对抗证伪、裁决过滤与扩散收敛的台账与终报。 |
 | [`orchestrate-model-workflow`](codex-global-config/skills/orchestrate-model-workflow/SKILL.md) | 跨文件实现、复杂取证或独立验收 | 按证据和风险选择 role，并保留可核对的验证闭环。 |
 | [`project-doc-planner`](shared/skills/project-doc-planner/SKILL.md) | 新项目或大型改造的文档规划 | 可维护的项目级文档结构。 |
 | [`visual-aesthetics`](shared/skills/visual-aesthetics/SKILL.md) | 视觉呈现是任务目标、改动对象或验收条件时 | 按需求与情境选用审美原理，依据实际呈现检查效果。 |
