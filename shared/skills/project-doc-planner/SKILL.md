@@ -1,6 +1,6 @@
 ---
 name: project-doc-planner
-description: 设计或更新项目文档架构、根目录 AGENTS.md、开发规范和可复用模板，以及适用时的私有环境资源与交付流程。用于文档规划或整理，不因普通开发、部署或修复任务自动重建文档体系。
+description: 设计或更新项目文档架构、根目录 AGENTS.md、开发规范和可复用模板，以及 `.local` 私有层、私有环境资源与交付流程。用于文档规划或整理，不因普通开发、部署或修复任务自动重建文档体系。
 ---
 
 # 项目文档规划器
@@ -16,7 +16,8 @@ description: 设计或更新项目文档架构、根目录 AGENTS.md、开发规
 
 ## 核心边界
 
-- `docs/` 保存可提交的稳定契约、规则、模板和脱敏的计划/问题/重构记录；私有环境事实、凭据、发布产物和原始运行记录放在 Git 忽略目录，例如 `.local/project-resources/`。
+- `docs/` 保存可提交的稳定契约、规则、模板和脱敏的计划/问题/重构记录；`.local/` 是整体 Git 忽略的私有层，存放凭据、私有环境事实、发布产物、原始运行记录和任务暂存：`tmp/` 必备，dev/test/prod 环境事实在 `project-resources/`，其余子目录按使用场景裁剪。
+- `external/`（与 `docs/`、`.local/` 平级的仓库根目录）保存面向外部使用者的交付资料（演示、外部对接文档、模板、工具等），由维护者手工维护：AI 日常开发中不读取、不检查、不主动更新，仅在用户明确要求维护对外资料时操作；目录以 `README.md` 作为唯一资源索引。
 - 每个保留的 `docs/` 目录都有 `README.md`；按需增加模板或专题文档，不单独维护示例文档。
 - 默认用简体中文编写项目文档。代码、命令、路径、配置键、协议字段和有契约意义的原文保持不变；项目明确采用其他语言时遵从项目约定。
 - 设计必须写明目标、非目标、可观察行为、关键取舍、重要风险和待解决问题。稳定行为契约保留在设计中；本次测试项、验收清单和实际证据记在计划或对应问题/重构/部署记录中，关联记录用链接复用证据。只有影响决策、风险、回滚或用户明确要求时才展开实现细节。
@@ -47,7 +48,7 @@ description: 设计或更新项目文档架构、根目录 AGENTS.md、开发规
 | 完整公开文档树、目录职责或文档大纲 | [doc-architecture.md](references/doc-architecture.md) |
 | 文档生命周期、归档、合并、废弃和清理 | [document-cleanup-guide.md](references/document-cleanup-guide.md) |
 | 开发规范、架构、前后端边界、安全或验证 | [development-standards.md](references/development-standards.md) |
-| dev/test/prod 上下文、私有资源、部署、发布、回滚或环境隔离 | [local-project-resources.md](references/local-project-resources.md) |
+| `.local` 私有层、dev/test/prod 上下文、tmp 暂存、部署、发布、回滚或环境隔离 | [local-project-resources.md](references/local-project-resources.md) |
 | 可复用的项目根目录指令文件 | [root-agents-template.md](references/root-agents-template.md) |
 | `docs/` 及子目录 `README.md` 格式 | [dir-readme-template.md](references/templates/dir-readme-template.md)；项目根 README 保留使用手册定位 |
 | 架构总览格式 | [architecture-overview-template.md](references/templates/architecture-overview-template.md) |
@@ -57,6 +58,8 @@ description: 设计或更新项目文档架构、根目录 AGENTS.md、开发规
 | 长期需求与行为契约格式 | [feature-design-template.md](references/templates/feature-design-template.md) |
 | 单次交付计划与证据格式 | [plan-template.md](references/templates/plan-template.md) |
 | 跨会话未完成事项清单（阻塞、待确认、待办、观察项）格式 | [todo-blockers-template.md](references/templates/todo-blockers-template.md) |
+| 未来优化与条件触发事项（当前不做、储备登记）格式 | [reserve-items-template.md](references/templates/reserve-items-template.md) |
+| 对外资料目录定位、资源索引与维护边界 | [external-docs-readme-template.md](references/templates/external-docs-readme-template.md) |
 | 问题（bug）记录格式 | [bug-template.md](references/templates/bug-template.md) |
 | 重构记录格式 | [refactor-template.md](references/templates/refactor-template.md) |
 | 部署记录格式 | [deploy-record-template.md](references/templates/deploy-record-template.md) |
@@ -68,11 +71,12 @@ description: 设计或更新项目文档架构、根目录 AGENTS.md、开发规
 ## 规划与产出
 
 1. 提出最小可用结构，并说明每个保留目录的必要性。
-2. 有多环境或运维需求时，创建或规划被 `.gitignore` 保护的私有资源层。
-3. 让根 `AGENTS.md` 链接项目读取顺序、交付流程、环境边界和验证预期；持久政策只保留一个权威位置。
-4. 使用相对 Markdown 链接创建或更新文件。模板保持通用、占位符清晰；复制后删去 skill 使用说明，改写指向 skill 的链接，只保留目标项目适用的内容。
-5. 清理或重组文档前，先按清理指导手册完成引用、职责、基线、证据和恢复性预检；删除、覆盖或移动前必须保留可恢复副本或 Git 记录。
-6. 验证目录入口、模板覆盖、链接目标、忽略规则，以及交付流程、脚本、环境规则和验证说明的一致性。Git 忽略须同时核对目标路径被忽略且未被跟踪；已跟踪的私有文件不能仅靠新增忽略规则宣称安全，不自动取消跟踪或改写历史。
+2. 默认创建或规划被 `.gitignore` 保护的 `.local/` 私有层：`tmp/` 与 `project-resources/` 是固定成员；dev/test/prod 分区仅在确有对应环境时建立。
+3. 用户要求对外资料时，在仓库根规划 `external/`（与 `docs/`、`.local/` 平级），只建立 `README.md` 索引骨架和必要的分组目录；内容由用户维护，AI 不填充演示、对接或工具细节，也不在后续任务中主动同步。
+4. 让根 `AGENTS.md` 链接项目读取顺序、交付流程、环境边界和验证预期；持久政策只保留一个权威位置。
+5. 使用相对 Markdown 链接创建或更新文件。模板保持通用、占位符清晰；复制后删去 skill 使用说明，改写指向 skill 的链接，只保留目标项目适用的内容。
+6. 清理或重组文档前，先按清理指导手册完成引用、职责、基线、证据和恢复性预检；删除、覆盖或移动前必须保留可恢复副本或 Git 记录。
+7. 验证目录入口、模板覆盖、链接目标、忽略规则，以及交付流程、脚本、环境规则和验证说明的一致性。Git 忽略须同时核对目标路径被忽略且未被跟踪；已跟踪的私有文件不能仅靠新增忽略规则宣称安全，不自动取消跟踪或改写历史。
 
 ## 必须交付
 
