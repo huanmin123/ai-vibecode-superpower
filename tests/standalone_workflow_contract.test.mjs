@@ -134,7 +134,8 @@ test('standalone workflow skill has the five behavior stages and no obsolete pro
 
 test('protected execution roles and Luna executors allow the direct handoff matrix', async () => {
   const executors = ['luna_high_executor', 'luna_xhigh_executor'];
-  for (const role of ['sol_high', 'sol_high_fallback']) {
+  const senders = ['sol_high', 'sol_high_fallback'];
+  for (const role of senders) {
     const text = await readFile(path.join(presetGptRoles, `${role}.md`), 'utf8');
     const delegation = text.match(/可直接委派的执行子节点仅限 ([^。]+)。/u);
     assert.ok(delegation, `${role} must list its permitted execution children`);
@@ -149,7 +150,9 @@ test('protected execution roles and Luna executors allow the direct handoff matr
     const text = await readFile(path.join(presetGptRoles, `${executor}.md`), 'utf8');
     const accepted = text.match(/只接受([^。]+)的直接委派/u);
     assert.ok(accepted, `${executor} must define its direct-delegation boundary`);
-    assert.match(accepted[1], /`\{\{role:sol_high\}\}`/);
+    const acceptedSenders = Array.from(accepted[1].matchAll(/\{\{role:([^}]+)\}\}/gu), (match) => match[1]).sort();
+    assert.deepEqual(acceptedSenders, [...senders].sort(), `${executor} must accept exactly the permitted senders`);
+    assert.match(accepted[1], /主代理/);
     assert.doesNotMatch(accepted[1], /terra/);
   }
 });
