@@ -133,7 +133,7 @@ sandbox_mode = "<readonly 推导或显式值>"
 ## 内置预设
 
 - `presets/glm/`：ZCode 5 角色（与既有 `glm_5.3_*` 行为等价），不含 `[codex]` 小节——在 Codex 使用 GLM 需要用户先在 Codex 配置对应 model provider，属用户环境配置，仓库不代设。
-- `presets/gpt/`：Codex 11 角色（与既有 `gpt_6*` 行为等价），不含 `[zcode]` 小节。
+- `presets/gpt/`：Codex 12 角色（luna / terra / sol / astra 四档分工），不含 `[zcode]` 小节。
 - `presets/ds/`：ZCode 3 角色绑定 `deepseek-v4.1-flash`（2 读 1 写；复审/终审由 `ds_4.1_flash_max` 兼任，复审派发必须是全新实例且不信任写入实例的自述）。`model` 是占位值，安装前必须改成用户 Picker 里的实际值。不含 `[codex]` 小节，理由同 glm。
 - 新增模型方案：新增 `presets/<name>/` 并运行 `-UpdateRoleManifest`，不改代码。
 

@@ -108,14 +108,14 @@ test('standalone workflow skill has the five behavior stages and no obsolete pro
   assert.match(text, /不应只交给单个 agent 串行执行/);
   assert.match(text, /无法安全拆分、拆分成本高于收益或当前工具受限时，才使用单 agent/);
   assert.match(text, /fallback 只对本次派发生效/);
-  assert.match(text, /职责等价的可用角色/);
+  assert.match(text, /能胜任同一职责的角色替代/);
   assert.match(text, /子代理只修改分配范围/);
   assert.match(text, /共享部分按必要顺序处理/);
   assert.match(text, /未决选择、权限、依赖或环境问题由主代理解决/);
   assert.match(text, /拒绝不等于角色或模型不可用，不触发 fallback/);
   assert.match(text, /不得把写入任务派给只读角色/);
   assert.match(text, /拒绝场景下，主代理仅在授权、权限、范围和责任边界均已满足时直接继续/);
-  assert.match(text, /角色或模型不可用时，先换职责等价的可用角色/);
+  assert.match(text, /角色或模型不可用时，按档位就近回退/);
   assert.match(text, /派发一个继承主模型的子代理/);
   assert.match(text, /承担原角色职责，其余流程不变/);
   assert.match(text, /主代理不得改为在当前会话内直接执行/);
@@ -126,37 +126,29 @@ test('standalone workflow skill has the five behavior stages and no obsolete pro
   assert.match(text, /可用角色以下方清单为准/);
   assert.match(text, /不假定清单之外的角色/);
   assert.match(text, /<!-- preset-roles -->/);
-  assert.doesNotMatch(text, /gpt_6_luna|gpt_6\.1_sol|gpt_6_astra|gpt_6_sol/);
+  assert.doesNotMatch(text, /gpt_6_luna|gpt_6\.1_sol|gpt_6\.1_terra|gpt_6_astra|gpt_6_sol/);
   assert.doesNotMatch(text, /gpt_5\.6|terra/);
   const interfaceText = await readFile(skillInterface, 'utf8');
   assert.match(interfaceText, /可拆任务优先多 agent 并行/);
 });
 
-test('protected execution roles and Luna executors allow the direct handoff matrix', async () => {
-  const executors = ['luna_high_executor', 'luna_xhigh_executor'];
-  for (const role of ['sol_high', 'sol_high_fallback']) {
-    const text = await readFile(path.join(presetGptRoles, `${role}.md`), 'utf8');
-    const delegation = text.match(/可直接委派的执行子节点仅限 ([^。]+)。/u);
-    assert.ok(delegation, `${role} must list its permitted execution children`);
-    for (const executor of executors) assert.ok(delegation[1].includes(`{{role:${executor}}}`), `${role} must permit ${executor}`);
-    assert.doesNotMatch(delegation[1], /5\.6|terra/);
+test('terra write tiers delegate simple writes to the luna_max leaf executor', async () => {
+  const terraMax = await readFile(path.join(presetGptRoles, 'terra_max.md'), 'utf8');
+  const delegation = terraMax.match(/可直接委派的执行子节点仅限 ([^；。]+)/u);
+  assert.ok(delegation, 'terra_max must list its permitted execution children');
+  assert.equal(delegation[1], '`{{role:luna_max}}`');
+  const lunaMax = await readFile(path.join(presetGptRoles, 'luna_max.md'), 'utf8');
+  const accepted = lunaMax.match(/只接受([^。]+)的直接委派/u);
+  assert.ok(accepted, 'luna_max must define its direct-delegation boundary');
+  for (const writer of ['terra_high', 'terra_xhigh', 'terra_max']) {
+    assert.ok(accepted[1].includes(`{{role:${writer}}}`), `luna_max must accept ${writer}`);
   }
-  for (const role of ['sol_high_fallback', 'sol_xhigh_fallback']) {
-    const text = await readFile(path.join(presetGptRoles, `${role}.md`), 'utf8');
-    assert.match(text, /仅在 `\{\{role:sol_(?:high|xhigh)\}\}` 角色或 gpt-6\.1-sol/u);
-  }
-  for (const executor of executors) {
-    const text = await readFile(path.join(presetGptRoles, `${executor}.md`), 'utf8');
-    const accepted = text.match(/只接受([^。]+)的直接委派/u);
-    assert.ok(accepted, `${executor} must define its direct-delegation boundary`);
-    assert.match(accepted[1], /`\{\{role:sol_high\}\}`/);
-    assert.doesNotMatch(accepted[1], /terra/);
-  }
+  assert.doesNotMatch(accepted[1], /sol/);
 });
 
 test('the preset manifest covers every source file of all built-in presets', async () => {
   const lines = (await readFile(presetManifest, 'utf8')).trim().split(/\r?\n/);
-  assert.equal(lines.length, 22);
+  assert.equal(lines.length, 23);
   const entries = new Map(lines.map((line) => {
     const match = line.trim().match(/^([0-9a-f]{64}) {2}([^\s]+)$/);
     assert.ok(match, `invalid preset manifest line: ${line}`);
@@ -173,31 +165,31 @@ test('the preset manifest covers every source file of all built-in presets', asy
   }
 });
 
-test('all eleven gpt preset roles carry model routing fields', async () => {
+test('all twelve gpt preset roles carry model routing fields', async () => {
   const expectedAllocation = {
+    luna_medium: { model: 'gpt-6-luna', nativeEffort: 'medium' },
     luna_high: { model: 'gpt-6-luna', effort: 'deep' },
     luna_xhigh: { model: 'gpt-6-luna', nativeEffort: 'xhigh' },
-    luna_high_executor: { model: 'gpt-6-luna', effort: 'deep', readonly: 'false' },
-    luna_xhigh_executor: { model: 'gpt-6-luna', nativeEffort: 'xhigh', readonly: 'false' },
-    sol_high: { model: 'gpt-6.1-sol', effort: 'deep', readonly: 'false' },
+    luna_max: { model: 'gpt-6-luna', effort: 'max', readonly: 'false' },
+    terra_high: { model: 'gpt-6.1-terra', effort: 'deep', readonly: 'false' },
+    terra_xhigh: { model: 'gpt-6.1-terra', nativeEffort: 'xhigh', readonly: 'false' },
+    terra_max: { model: 'gpt-6.1-terra', effort: 'max', readonly: 'false' },
+    sol_high: { model: 'gpt-6.1-sol', effort: 'deep' },
     sol_xhigh: { model: 'gpt-6.1-sol', nativeEffort: 'xhigh' },
     astra_high: { model: 'gpt-6-astra', effort: 'deep' },
     astra_xhigh: { model: 'gpt-6-astra', nativeEffort: 'xhigh' },
-    astra_max: { model: 'gpt-6-astra', effort: 'max' },
-    sol_high_fallback: { model: 'gpt-6-sol', effort: 'deep', readonly: 'false' },
-    sol_xhigh_fallback: { model: 'gpt-6-sol', nativeEffort: 'xhigh' }
+    astra_max: { model: 'gpt-6-astra', effort: 'max' }
   };
   const text = await readFile(path.join(presetsRoot, 'gpt', 'preset.toml'), 'utf8');
   const blocks = text.split(/\[\[codex\.role\]\]/).slice(1);
-  assert.equal(blocks.length, 11);
+  assert.equal(blocks.length, 12);
   const field = (block, key) => block.match(new RegExp(`^${key} = "([^"]*)"`, 'm'))?.[1];
   for (const [id, expected] of Object.entries(expectedAllocation)) {
     const block = blocks.find((candidate) => field(candidate, 'id') === id);
     assert.ok(block, `missing gpt preset role: ${id}`);
-    assert.equal(field(block, 'name'), `gpt_6${id.startsWith('sol_') && !id.includes('fallback') ? '.1_' : '_'}${id.replace('_fallback', '')}`, `name mismatch: ${id}`);
+    assert.equal(field(block, 'name'), `gpt_6${id.startsWith('sol_') || id.startsWith('terra_') ? '.1_' : '_'}${id}`, `name mismatch: ${id}`);
     assert.ok(field(block, 'description'), `description missing: ${id}`);
-    if (expected.model === null) assert.equal(field(block, 'model'), undefined, `model must be inherited from host default: ${id}`);
-    else assert.equal(field(block, 'model'), expected.model, `model mismatch: ${id}`);
+    assert.equal(field(block, 'model'), expected.model, `model mismatch: ${id}`);
     if (expected.nativeEffort) {
       assert.equal(field(block, 'model_reasoning_effort'), expected.nativeEffort, `native effort mismatch: ${id}`);
       assert.doesNotMatch(block, /^effort = /m, `effort must be absent when native effort is set: ${id}`);
@@ -224,7 +216,7 @@ test('zcode workflow skill variant keeps the stages and drops codex-only mechani
   assert.match(text, /默认并行优先/);
   assert.match(text, /fallback 只对本次派发生效/);
   assert.match(text, /不得把写入任务派给只读角色/);
-  assert.match(text, /角色或模型不可用时，先换职责等价的可用角色/);
+  assert.match(text, /角色或模型不可用时，按档位就近回退/);
   assert.match(text, /风险与回滚、验收、验证、停止条件/);
   assert.match(text, /派发一个继承当前会话模型的子代理/);
   assert.match(text, /承担原角色职责，其余流程不变/);
@@ -373,12 +365,12 @@ test('PowerShell installer deploys the standalone skill into an isolated nested 
     assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
     const installed = await readFile(path.join(codexHome, 'skills', 'orchestrate-model-workflow', 'SKILL.md'), 'utf8');
     assert.match(installed, /^---\r?\nname: orchestrate-model-workflow\r?\n/);
-    assert.match(installed, /- `gpt_6_luna_high`：只读 Luna\/high 取证与实施后预审角色。/);
+    assert.match(installed, /- `gpt_6\.1_terra_high`：Terra\/high 常规契约写入角色。/);
     assert.doesNotMatch(installed, /<!-- preset-roles -->/);
     const roleDir = path.join(codexHome, 'agents', 'ai-vibecode-superpower');
     const roleFiles = (await readdir(roleDir)).filter((name) => name.endsWith('.toml')).sort();
-    assert.equal(roleFiles.length, 11);
-    assert.match(await readFile(path.join(roleDir, 'gpt_6_luna_high.toml'), 'utf8'), /^name = "gpt_6_luna_high"$/m);
+    assert.equal(roleFiles.length, 12);
+    assert.match(await readFile(path.join(roleDir, 'gpt_6.1_terra_high.toml'), 'utf8'), /^name = "gpt_6\.1_terra_high"$/m);
     await assertSharedSkillsDeployed(path.join(codexHome, 'skills'));
     const agents = await readFile(path.join(codexHome, 'AGENTS.md'), 'utf8');
     assert.doesNotMatch(agents, /<CODEX_HOME>|\$CODEX_HOME/);

@@ -1,6 +1,14 @@
-description = "GPT 预设：Codex 11 角色绑定 gpt-6 / gpt-6.1 系列。"
+description = "GPT 预设：Codex 12 角色绑定 gpt-6 / gpt-6.1 系列。"
 
 [codex]
+
+[[codex.role]]
+id = "luna_medium"
+name = "gpt_6_luna_medium"
+description = "只读 Luna/medium 轻量扫描与快速定位角色。"
+model_reasoning_effort = "medium"
+readonly = true
+model = "gpt-6-luna"
 
 [[codex.role]]
 id = "luna_high"
@@ -19,27 +27,43 @@ readonly = true
 model = "gpt-6-luna"
 
 [[codex.role]]
-id = "luna_high_executor"
-name = "gpt_6_luna_high_executor"
-description = "由主代理或 Sol 直接委派的 Luna/high 默认契约执行叶节点。"
-effort = "deep"
+id = "luna_max"
+name = "gpt_6_luna_max"
+description = "Luna/max 受控简单写入叶节点。"
+effort = "max"
 readonly = false
 model = "gpt-6-luna"
 
 [[codex.role]]
-id = "luna_xhigh_executor"
-name = "gpt_6_luna_xhigh_executor"
-description = "由主代理或 Sol 直接委派的 Luna/xhigh 深入契约执行叶节点。"
+id = "terra_high"
+name = "gpt_6.1_terra_high"
+description = "Terra/high 常规契约写入角色。"
+effort = "deep"
+readonly = false
+model = "gpt-6.1-terra"
+
+[[codex.role]]
+id = "terra_xhigh"
+name = "gpt_6.1_terra_xhigh"
+description = "Terra/xhigh 高复杂度契约写入角色。"
 model_reasoning_effort = "xhigh"
 readonly = false
-model = "gpt-6-luna"
+model = "gpt-6.1-terra"
+
+[[codex.role]]
+id = "terra_max"
+name = "gpt_6.1_terra_max"
+description = "Terra/max 受保护写入、执行监管与集成负责人。"
+effort = "max"
+readonly = false
+model = "gpt-6.1-terra"
 
 [[codex.role]]
 id = "sol_high"
 name = "gpt_6.1_sol_high"
-description = "一级 Sol/high 契约完备、执行风险分流、监管、保护执行与集成负责人。"
+description = "只读 Sol/high 常规独立评审与复审角色。"
 effort = "deep"
-readonly = false
+readonly = true
 model = "gpt-6.1-sol"
 
 [[codex.role]]
@@ -73,19 +97,3 @@ description = "只读 Astra/max 最高强度复审与最终升级验收角色。
 effort = "max"
 readonly = true
 model = "gpt-6-astra"
-
-[[codex.role]]
-id = "sol_high_fallback"
-name = "gpt_6_sol_high"
-description = "仅替代不可用的 Sol/6.1 保护写入、执行监管、结果核验与集成角色。"
-effort = "deep"
-readonly = false
-model = "gpt-6-sol"
-
-[[codex.role]]
-id = "sol_xhigh_fallback"
-name = "gpt_6_sol_xhigh"
-description = "仅替代不可用的 Sol/6.1 只读有界技术定案与常规复审角色。"
-model_reasoning_effort = "xhigh"
-readonly = true
-model = "gpt-6-sol"
