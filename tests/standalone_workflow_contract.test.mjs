@@ -140,9 +140,9 @@ test('terra write tiers delegate simple writes to the luna_max leaf executor', a
   const lunaMax = await readFile(path.join(presetGptRoles, 'luna_max.md'), 'utf8');
   const accepted = lunaMax.match(/只接受([^。]+)的直接委派/u);
   assert.ok(accepted, 'luna_max must define its direct-delegation boundary');
-  for (const writer of ['terra_high', 'terra_xhigh', 'terra_max']) {
-    assert.ok(accepted[1].includes(`{{role:${writer}}}`), `luna_max must accept ${writer}`);
-  }
+  const acceptedWriters = Array.from(accepted[1].matchAll(/\{\{role:([^}]+)\}\}/gu), (match) => match[1]).sort();
+  assert.deepEqual(acceptedWriters, ['terra_high', 'terra_max', 'terra_xhigh'].sort(), 'luna_max must accept exactly the terra write tiers');
+  assert.match(accepted[1], /主代理/);
   assert.doesNotMatch(accepted[1], /sol/);
 });
 

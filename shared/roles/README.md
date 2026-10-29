@@ -60,7 +60,7 @@ readonly    = true                        # true = 只读角色
 - 宿主小节的 `model` 为该宿主角色默认值；角色块 `model` 覆盖之；两者都缺失时安装报错，不做静默回退。
 - `id` 必填，预设内唯一，格式 `^[A-Za-z0-9][A-Za-z0-9_-]*$`；`name` 必填，格式 `^[A-Za-z0-9][A-Za-z0-9._-]*$`（首字符必须字母或数字，防止路径歧义），在同一预设内也必须唯一。
 - `effort`（取值 `basic` | `deep` | `max`）与宿主原生档位字段（ZCode `thoughtLevel`、Codex `model_reasoning_effort`）必须提供其一；两者同时提供时报错，不允许歧义配置。
-- `readonly` 缺省视为 `true`（安全默认：未声明的角色不得写入），必须为标量布尔。
+- `readonly` 缺省视为 `true`，必须为标量布尔；它表达角色不得写入的职责约束，不证明宿主工具层已禁止写入。
 - `tools` 必须是数组形式（如 `[Read, Bash]`）；标量形式报错，`readonly = false` 的角色显式写 `tools` 也报错（写入角色继承宿主全工具）。
 - 命名公式 `模型_版本_类型_思考档`（如 `glm_5.3_flash_low`）是推荐约定，不是机制；翻译器不推导名字。
 
@@ -99,8 +99,8 @@ sandbox_mode = "<readonly 推导或显式值>"
 ```
 
 - `effort` 映射：`basic → low`，`deep → high`，`max → max`；角色块直接写 `thoughtLevel`（ZCode）或 `model_reasoning_effort`（Codex）时使用该原生值，跳过映射，且不得与 `effort` 并存。
-- `sandbox_mode` 缺省规则：`readonly = true` → `read-only`；`readonly = false` → `danger-full-access`。
-- `tools`、`color` 在 Codex 侧无对应字段，被忽略（Codex 的工具边界由 sandbox_mode 与正文约束表达，属软约束）。
+- `sandbox_mode` 缺省规则：`readonly = true` → `read-only`；`readonly = false` → `danger-full-access`。当前 Codex 的 custom agent 配置不会用该字段覆盖父会话的 `sandbox_mode` 或 `approval_policy`，因此生成此字段本身不能建立角色级只读沙箱；实际权限由宿主支持的权限边界决定。需要强制隔离时，应采用并验证当前宿主实际支持的权限设置，详见 [Codex 子代理权限说明](https://learn.chatgpt.com/docs/agent-configuration/subagents#custom-agent-file-schema)。
+- `tools`、`color` 在 Codex 侧无对应字段，被忽略。角色正文表达职责要求；这些文本要求不构成工具层的写入隔离。
 
 ### 互引解析
 
