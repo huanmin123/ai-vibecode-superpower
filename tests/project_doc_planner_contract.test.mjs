@@ -115,6 +115,211 @@ test('reserve promotion preserves the spec boundary and plan-only exception', as
   assert.doesNotMatch(template, /先建功能设计或计划再实施/);
 });
 
+test('decision records and conflict interception are part of the planner contract', async () => {
+  const skill = await read('SKILL.md');
+  const architecture = await read('references/doc-architecture.md');
+  const index = await read('references/templates/decisions-readme-template.md');
+  const record = await read('references/templates/decision-record-template.md');
+  const cleanup = await read('references/document-cleanup-guide.md');
+  const rootAgents = await read('references/root-agents-template.md');
+  const standards = await read('references/development-standards.md');
+
+  assert.match(skill, /docs\/decisions\//);
+  assert.match(skill, /decision-record-template\.md/);
+  assert.match(skill, /decisions-readme-template\.md/);
+  assert.match(skill, /用户当前明确指令优先/);
+  assert.match(skill, /不构成否决/);
+  assert.match(skill, /不复制契约正文/);
+  assert.match(skill, /无条目时保留空索引/);
+  assert.match(skill, /当前指令已覆盖目标、范围和副作用/);
+  assert.match(skill, /不再二次确认/);
+  assert.match(skill, /明确排除项/);
+  assert.doesNotMatch(skill, /决策记录优先于用户|冲突时以决策为准/);
+
+  assert.match(architecture, /## 决策记录 `decisions\/`/);
+  assert.match(architecture, /├── decisions\//);
+  assert.match(architecture, /`D-` \+ 三位递增序号/);
+  assert.match(architecture, /创建后不复用/);
+  assert.match(architecture, /索引仍是唯一入口/);
+  assert.match(architecture, /索引可以暂时为空/);
+  assert.match(architecture, /正式状态使用：.*已接受.*已实施.*已被 D-xxx 取代.*已废弃/);
+  assert.match(architecture, /草稿.*不能作为冲突检查依据/);
+  assert.match(architecture, /含草稿/);
+  assert.match(architecture, /用户当前明确指令优先/);
+  assert.match(architecture, /不构成否决权/);
+  assert.match(architecture, /只对 .*条目判定冲突/);
+  assert.match(architecture, /以当前契约为准/);
+  assert.match(architecture, /当前指令已覆盖目标、范围和副作用/);
+  assert.match(architecture, /当前指令覆盖目标、范围和副作用时按指令执行并同次记录取代/);
+  assert.match(architecture, /不再二次确认/);
+  assert.match(architecture, /明确排除项/);
+  assert.match(architecture, /decisions\/README\.md` 索引与冲突检查规则/);
+  assert.match(architecture, /单条决策记录/);
+  assert.match(architecture, /decisions\/` 除外/);
+  assert.match(architecture, /复核后维持/);
+  assert.match(architecture, /部分推翻/);
+  assert.match(architecture, /第 2 项由 D-005 取代/);
+  assert.match(architecture, /不得静默删除、改写旧条目或用新计划覆盖历史/);
+  assert.match(architecture, /不复制契约正文/);
+  assert.match(architecture, /reserves\//);
+  assert.match(architecture, /在写入前停止/);
+
+  assert.match(index, /决策索引/);
+  assert.match(index, /范围 \/ 关键词/);
+  assert.match(index, /冲突检查/);
+  assert.match(index, /在写入前停止/);
+  assert.match(index, /保留原决策/);
+  assert.match(index, /用户当前明确指令优先/);
+  assert.match(index, /不构成否决权/);
+  assert.match(index, /任何条目（含草稿）不删除/);
+  assert.match(index, /放弃的草稿标记/);
+  assert.match(index, /整条被推翻时/);
+  assert.match(index, /部分推翻/);
+  assert.match(index, /索引仍是唯一入口/);
+  assert.match(index, /#d-001/);
+  assert.match(index, /只对 .*条目判定冲突/);
+  assert.match(index, /以当前契约为准/);
+  assert.match(index, /正式状态只用：.*已接受.*已实施.*已被 D-xxx 取代.*已废弃/);
+  assert.match(index, /草稿.*不能作为冲突检查依据/);
+  assert.match(index, /创建后不复用/);
+  assert.match(index, /第 N 项由 D-xxx 取代/);
+  assert.match(index, /当前指令已覆盖目标、范围和副作用/);
+  assert.match(index, /不再二次确认/);
+  assert.doesNotMatch(index, /冲突时以决策为准/);
+
+  assert.match(record, /备选方案/);
+  assert.match(record, /决定/);
+  assert.match(record, /理由/);
+  assert.match(record, /后果/);
+  assert.match(record, /影响/);
+  assert.match(record, /复核条件/);
+  assert.match(record, /决策者 \/ 批准人/);
+  assert.match(record, /D-<三位序号>/);
+  assert.match(record, /第 2 项由 D-005 取代/);
+  assert.match(record, /转正或放弃后的去向/);
+  assert.match(record, /已被 D-xxx 取代/);
+  assert.match(record, /放弃的草稿改为/);
+
+  assert.match(cleanup, /决策条目（含草稿）默认长期保留/);
+  assert.match(cleanup, /不能删除或原地改写结论/);
+  assert.match(cleanup, /决策记录（含草稿）不适用上述合并、归档或删除动作/);
+  assert.match(cleanup, /docs\/decisions\/` 下的条目除外/);
+  assert.match(cleanup, /下的任何条目（含草稿）不适用/);
+  assert.match(cleanup, /决策草稿除外/);
+  assert.match(cleanup, /部分判断被推翻/);
+  assert.match(cleanup, /储备引用/);
+
+  assert.match(rootAgents, /docs\/decisions\/README\.md/);
+  assert.match(rootAgents, /用户当前明确指令优先/);
+  assert.match(rootAgents, /不构成否决/);
+  assert.match(rootAgents, /当前指令已覆盖目标、范围和副作用/);
+  assert.match(rootAgents, /不再二次确认/);
+  assert.match(rootAgents, /明确排除项/);
+  assert.match(rootAgents, /架构、模块、功能契约或架构方向变化/);
+  assert.match(rootAgents, /同一行包含多个入口时只删去不存在的链接/);
+
+  assert.match(standards, /启用 `docs\/decisions\/` 时/);
+  assert.match(standards, /用户当前明确指令优先/);
+  assert.match(standards, /不构成否决/);
+  assert.match(standards, /当前指令已覆盖目标、范围和副作用/);
+  assert.match(standards, /不再二次确认/);
+  assert.match(standards, /明确排除项/);
+  assert.match(standards, /决策记录解释历史和取舍/);
+  assert.match(standards, /不替代当前契约/);
+});
+
+test('decision extraction keeps specs, plans, reports and records on one boundary', async () => {
+  const skill = await read('SKILL.md');
+  const architecture = await read('references/doc-architecture.md');
+  const standards = await read('references/development-standards.md');
+  const cleanup = await read('references/document-cleanup-guide.md');
+  const rootAgents = await read('references/root-agents-template.md');
+  const design = await read('references/templates/feature-design-template.md');
+  const overview = await read('references/templates/architecture-overview-template.md');
+  const plan = await read('references/templates/plan-template.md');
+  const report = await read('references/templates/report-template.md');
+  const bug = await read('references/templates/bug-template.md');
+  const refactor = await read('references/templates/refactor-template.md');
+  const todo = await read('references/templates/todo-blockers-template.md');
+  const reserve = await read('references/templates/reserve-items-template.md');
+  const record = await read('references/templates/decision-record-template.md');
+  const index = await read('references/templates/decisions-readme-template.md');
+
+  assert.match(skill, /符合记录边界的长期判断也抽到这里/);
+  assert.match(architecture, /符合记录边界.*均指会约束后续工作/);
+  assert.match(architecture, /符合记录边界的方向判断/);
+  assert.match(architecture, /以下涉及 `decisions\/` 的规则仅在项目启用该目录时适用/);
+  assert.match(architecture, /涉及 `decisions\/` 的行仅在项目启用该目录时适用/);
+  assert.doesNotMatch(architecture, /会约束后续工作的方向判断按「决策记录」/);
+  assert.doesNotMatch(architecture, /会约束后续工作的方向判断先转入/);
+  assert.match(architecture, /计划、问题、重构、报告、储备条目和待办裁决/);
+  assert.match(architecture, /抽到 `decisions\/`/);
+  assert.match(architecture, /若同时改变稳定行为契约，先更新 `functions\/` 设计/);
+  assert.match(architecture, /`已接受` 表示方向成立但未必已实施/);
+  assert.match(architecture, /多条决策重叠时，不合并删除/);
+
+  assert.match(design, /关联决策/);
+  assert.match(design, /取舍结论/);
+  assert.match(design, /符合记录边界/);
+  assert.match(design, /定义见 `docs\/decisions\/README\.md` 规则 1/);
+  assert.match(design, /不建决策/);
+  assert.match(design, /生效前补 D-ID/);
+  assert.match(design, /未启用时，在本表保留最小采用理由和放弃方案/);
+  assert.doesNotMatch(design, /会约束后续工作且理由不能由当前契约完整表达/);
+
+  assert.match(overview, /关键选择与取舍/);
+  assert.match(overview, /符合记录边界/);
+  assert.match(overview, /定义见 `docs\/decisions\/README\.md` 规则 1/);
+  assert.match(overview, /对架构 \/ 契约的影响/);
+  assert.match(overview, /决策记录仅作历史依据链接/);
+  assert.match(overview, /未启用时，在本表保留最小采用理由和替代方案/);
+  assert.doesNotMatch(overview, /会约束后续工作且理由不能由当前契约完整表达/);
+
+  assert.match(plan, /关联决策/);
+  assert.match(plan, /符合记录边界的判断/);
+  assert.match(plan, /符合记录边界的长期方向判断/);
+  assert.match(plan, /执行决策/);
+  assert.match(plan, /未启用时，把长期判断回写 spec\/architecture/);
+
+  assert.match(report, /决策记录：/);
+  assert.match(report, /符合记录边界/);
+  assert.match(report, /必须已在 spec 或 decisions 落位/);
+  assert.match(report, /未启用时回写 spec\/architecture/);
+
+  assert.match(bug, /关联决策：D-xxx/);
+  assert.match(bug, /修复确立符合记录边界的判断/);
+  assert.match(bug, /创建或更新 `functions\/` 设计/);
+  assert.match(bug, /未启用时，把结论回写 spec\/architecture/);
+
+  assert.match(refactor, /关联决策：D-xxx/);
+  assert.match(refactor, /重构确立符合记录边界的判断/);
+  assert.match(refactor, /创建或更新 `functions\/` 设计/);
+  assert.match(refactor, /未启用时，把结论回写 spec\/architecture/);
+
+  assert.match(todo, /裁决符合记录边界时建立决策记录/);
+  assert.match(todo, /未启用时回写对应设计或保留在档案/);
+  assert.match(reserve, /规则 8/);
+  assert.match(reserve, /符合记录边界的判断/);
+  assert.match(reserve, /普通的优先级、资源或时效原因不建决策/);
+  assert.match(reserve, /未启用时，把长期理由回写对应设计/);
+
+  assert.match(standards, /符合记录边界.*方向判断和被否方案写入决策记录/);
+  assert.match(standards, /修复确立符合记录边界的判断/);
+  assert.match(standards, /重构确立符合记录边界的判断/);
+  assert.match(cleanup, /不适用上述草稿删除、已废弃归档\/删除和合并删除规则/);
+  assert.match(cleanup, /多条决策重叠时新增一条整合决策/);
+  assert.match(cleanup, /符合记录边界的裁决先转入 `decisions\/`/);
+  assert.match(cleanup, /符合记录边界的放弃理由先转入 `decisions\/`/);
+  assert.match(cleanup, /已实施决策与当前契约内容仍一致/);
+  assert.match(cleanup, /以下涉及 `docs\/decisions\/` 的规则仅在项目启用该目录时适用/);
+  assert.match(index, /符合记录边界/);
+  assert.match(index, /已实施决策与当前契约是否仍一致/);
+  assert.match(record, /已接受（方向成立，未必已实施）/);
+  assert.match(record, /已实施（已落地并与当前契约一致）/);
+  assert.match(record, /草稿` 仅候选，不作冲突检查依据/);
+  assert.match(rootAgents, /长期决策见 `docs\/decisions\/`/);
+});
+
 test('external-facing resources directory is part of the planner contract', async () => {
   const skill = await read('SKILL.md');
   const architecture = await read('references/doc-architecture.md');

@@ -13,15 +13,17 @@
 
 `functions/` 保存长期有效的功能契约，`plans/` 保存阶段性的执行记录，`reserves/` 保存尚未转正的储备方案草稿。涉及接口、数据或权限契约的功能先写或更新功能设计，计划引用设计并记录需求基线；小改动可直接使用简短计划，已有问题/重构记录能完整覆盖范围与验证时无需再建平行计划。稳定验收口径属于契约，本次任务、验证矩阵与实际结果属于执行记录，并通过需求的 `AC-*` 键追踪。
 
-跨会话共享且尚未关闭的阻塞、待确认、待办和观察项集中在 `docs/待办与阻塞事项.md` 单一清单；条目关闭即删除且删除提交与完成改动同提，需要长期保留的过程与证据仍归入 `plans/`、`bug/`、`refactors/` 档案，清单通过编号锚点和指针区链接这些档案。格式见 [todo-blockers-template.md](templates/todo-blockers-template.md)。
+`decisions/` 按需保存方向判断与取舍历史，补足 `functions/` 和 `architecture/` 只描述"现在是什么"所缺失的"为什么"和"被否方案"。它不是当前契约，也不替代本次执行记录或未来储备；启用条件、记录边界、冲突检查与取代规则见下文「决策记录」。以下涉及 `decisions/` 的规则仅在项目启用该目录时适用；未启用时不创建空目录，按各条给出的 spec/architecture 或原记录回写路径处理。
 
-当前不做、触发条件满足或主动决策后才启动的未来优化与工作储备登记在 `docs/储备与触发事项.md`：每条必须包含可判定的触发条件和写到可独立开工程度的技术方案，条目在转正或确认放弃时从清单移除，去向与理由随删除提交记录；转正时按 [reserve-items-template.md](templates/reserve-items-template.md) 的 spec/plan 边界实施：涉及稳定契约变化先更新 spec，其余仅满足 plan-only 条件时才可使用 plan。技术方案详略按复杂度抉择：几句话能写清的留在条目内；复杂方案放独立的 `docs/reserves/储备方案-<短标题>.md` 草稿文档并在条目登记链接，避免清单膨胀，也不混入 `plans/` 执行记录。该草稿头部标注草稿状态、被在用条目引用期间不得按未引用草稿清理，生命周期跟随条目：转正时升级进待办条目、功能设计或计划，放弃时同提交删除。与 `待办与阻塞事项.md` 的边界：已明确要做、只是未排期的工作进待办清单，本清单只承载"不做也成立、触发才启动"的储备项；必须随代码完成的义务仍用代码 TODO 表达。格式见 [reserve-items-template.md](templates/reserve-items-template.md)。
+跨会话共享且尚未关闭的阻塞、待确认、待办和观察项集中在 `docs/待办与阻塞事项.md` 单一清单；条目关闭即删除且删除提交与完成改动同提，需要长期保留的过程与证据仍归入 `plans/`、`bug/`、`refactors/` 档案；符合记录边界的长期裁决另建 `decisions/` 条目。清单通过编号锚点和指针区链接这些档案。格式见 [todo-blockers-template.md](templates/todo-blockers-template.md)。
 
-压测、验收、审计和专项分析沉淀的人工报告保存在 `docs/reports/`，只记录测试范围、环境、数据、已证实结论和边界；原始机器产物（JSON、log、profile）放在 `.local/` 私有层（与报告互证的放 `.local/test-reports/` 等场景目录，临时中间产物放 `.local/tmp/`），报告以仓库相对路径引用，不混入 `docs/`。计划仍承载推进过程与本次验证矩阵；报告结论升级为长期规则时同步回对应设计文档。格式见 [report-template.md](templates/report-template.md)。
+当前不做、触发条件满足或主动决策后才启动的未来优化与工作储备登记在 `docs/储备与触发事项.md`：每条必须包含可判定的触发条件和写到可独立开工程度的技术方案，条目在转正或确认放弃时从清单移除，去向与理由随删除提交记录，符合记录边界的方向判断按「决策记录」先转入 `decisions/`；转正时按 [reserve-items-template.md](templates/reserve-items-template.md) 的 spec/plan 边界实施：涉及稳定契约变化先更新 spec，其余仅满足 plan-only 条件时才可使用 plan。技术方案详略按复杂度抉择：几句话能写清的留在条目内；复杂方案放独立的 `docs/reserves/储备方案-<短标题>.md` 草稿文档并在条目登记链接，避免清单膨胀，也不混入 `plans/` 执行记录。该草稿头部标注草稿状态、被在用条目引用期间不得按未引用草稿清理，生命周期跟随条目：转正时升级进待办条目、功能设计或计划，放弃时同提交删除。与 `待办与阻塞事项.md` 的边界：已明确要做、只是未排期的工作进待办清单，本清单只承载"不做也成立、触发才启动"的储备项；必须随代码完成的义务仍用代码 TODO 表达。格式见 [reserve-items-template.md](templates/reserve-items-template.md)。
+
+压测、验收、审计和专项分析沉淀的人工报告保存在 `docs/reports/`，只记录测试范围、环境、数据、已证实结论和边界；原始机器产物（JSON、log、profile）放在 `.local/` 私有层（与报告互证的放 `.local/test-reports/` 等场景目录，临时中间产物放 `.local/tmp/`），报告以仓库相对路径引用，不混入 `docs/`。计划仍承载推进过程与本次验证矩阵；报告结论升级为长期规则时同步回对应设计文档，符合记录边界时补 `decisions/` 条目并链接。格式见 [report-template.md](templates/report-template.md)。
 
 采用文档架构的项目默认规划 Git 忽略的 `.local/` 私有层，`tmp/` 必备；dev/test/prod 分区仅在确有对应环境时建立，仅有本地开发或公开配置的项目不自动增加分区。交付流程只覆盖项目实际支持的开发、验证和运维能力，不能把建议脚本描述为已有工具。
 
-文档按“草稿 -> 生效 -> 已废弃/已归档 -> 删除”管理生命周期；状态变化必须保留原因、责任人、受影响链接和基线影响。`functions/` 的稳定契约、已产生证据的 `plans/`、`bug/`、`refactors/` 和 `reports/` 默认保留或归档，不因当前任务结束直接删除；`待办与阻塞事项.md` 的已关闭条目和 `储备与触发事项.md` 的已转正或放弃条目仍按清单规则移除，其关联的储备方案草稿随条目迁移或删除，不留孤儿草稿；需要长期保留的过程证据必须先转入对应档案。`external/` 的对外资料由维护者手工管理，不按内部"未引用草稿"规则清理，废弃或替换前须确认已分发副本的影响。清理、合并、废弃和删除前的证据、恢复性、链接和索引检查按 [document-cleanup-guide.md](document-cleanup-guide.md) 执行。
+文档按“草稿 -> 生效 -> 已废弃/已归档 -> 删除”管理生命周期；状态变化必须保留原因、责任人、受影响链接和基线影响。`functions/` 的稳定契约、已产生证据的 `plans/`、`bug/`、`refactors/` 和 `reports/` 默认保留或归档，不因当前任务结束直接删除；`待办与阻塞事项.md` 的已关闭条目和 `储备与触发事项.md` 的已转正或放弃条目仍按清单规则移除，符合记录边界的方向判断先转入 `decisions/`，其关联的储备方案草稿随条目迁移或删除，不留孤儿草稿；需要长期保留的过程证据必须先转入对应档案。`external/` 的对外资料由维护者手工管理，不按内部"未引用草稿"规则清理，废弃或替换前须确认已分发副本的影响。清理、合并、废弃和删除前的证据、恢复性、链接和索引检查按 [document-cleanup-guide.md](document-cleanup-guide.md) 执行。
 
 ## 候选文档树
 
@@ -51,6 +53,9 @@ docs/
 │   ├── 接口契约与权限矩阵.md
 │   ├── 数据存储说明.md
 │   └── 安全与日志策略.md
+├── decisions/
+│   ├── README.md
+│   └── D-001-<短标题>.md
 ├── plans/
 │   ├── README.md
 │   └── 计划模板.md
@@ -76,6 +81,75 @@ docs/
     ├── README.md
     └── 重构模板.md
 ```
+
+## 决策记录 `decisions/`
+
+`decisions/` 保存会约束后续工作的方向判断和取舍历史：当时面对什么问题、比较过哪些方案、为什么选当前方向、放弃了什么、什么条件下应重新评估。它补的是当前契约只描述"现在是什么"所缺失的"为什么"和"被否方案"，用于后续需求与既有决策冲突时先呈现原因，避免用户遗忘后无意改坏原决策。
+
+### 启用条件
+
+满足任一即可，不强制所有项目：
+
+- 项目有长期架构边界、稳定契约、技术选型或产品范围判断，后续多个会话或维护者会继续改动，且其中存在理由不能由当前契约完整表达的取舍；
+- 存在代码和契约本身看不出原因的取舍，或曾出现遗忘旧决策、重复讨论已否决方案的情况。
+
+小型配置包、一次性脚本、短周期原型，或全部判断都能由单一 spec 完整表达且不预期重访时，不建立 `decisions/`；不为凑目录创建空记录。启用后也不是每个实现细节都建条目，具体边界见下节。
+
+### 记录边界
+
+- 记录：架构边界与技术选型、稳定契约的形态选择、权限/存储/安全模型、产品形态与明确排除项、兼容策略、流程门禁，以及"放弃了一个看似可行的方案"且理由不能由当前契约完整表达的判断。
+- 不记录：局部实现细节、命名和格式偏好、可逆且低成本的普通选择、纯任务安排、普通 bug 修复；这些分别由代码、lint/测试、`plans/`、`bug/` 承载。
+- 一条记录表达一个连贯判断；相关判断写在同一条的编号项里，无关判断不合并。
+- 决策记录以理由和被否方案为重点，不复制契约正文；当前行为仍以 `functions/`、`architecture/` 为准。
+- 下文所称"符合记录边界"均指会约束后续工作、且理由不能由当前契约完整表达；目标项目以 `decisions/README.md` 规则 1 为准。
+
+### 与相邻文档的分工
+
+| 文档 | 回答的问题 | 权威性 |
+| --- | --- | --- |
+| `decisions/` | 为什么这样定、当时放弃了什么、何时重审 | 历史判断与冲突检查依据；不覆盖用户当前明确指令 |
+| `functions/`、`architecture/` | 现在必须是什么行为或结构 | 当前契约的权威来源 |
+| `plans/` | 这次怎么实施、验证和留证 | 本次执行记录，可引用决策 ID |
+| `reserves/` | 现在不做什么、满足什么触发条件再做 | 未生效储备，不是契约 |
+| `reports/` | 这次观察或验证到什么、边界在哪 | 证据记录；结论升级为规则时回写 spec，符合记录边界时补 decisions |
+| `bug/`、`refactors/` | 发生了什么、怎么修复或重构、验证结果 | 过程证据；符合记录边界的方向或取舍抽到 decisions，稳定行为回写 spec |
+| `待办与阻塞事项.md` | 当前还有哪些未关闭事项 | 在用清单，关闭即删除；符合记录边界的裁决先转 decisions |
+
+若判断是"暂不做、触发再做"，主体写 `reserves/`；若是对方向的最终取舍，主体写 `decisions/`，有延后部分再链接储备条目。一次变更产生或改变稳定契约时，spec 链接决策 ID 说明依据，决策的「影响」反向登记 spec 路径；储备条目转正或放弃后，把决策中的引用更新为最终载体或注明去向。
+
+启用 `decisions/` 时，计划、问题、重构、报告、储备条目和待办裁决中出现符合记录边界的判断，在交付、关闭、转正或放弃前抽到 `decisions/`，原文档只保留结论摘要和决策 ID 链接；未启用时，把判断回写 spec/architecture，或在原记录保留最小理由和放弃方案。若同时改变稳定行为契约，先更新 `functions/` 设计。普通执行选择、临时排期和一次性验证结果留在原文档，不建决策。spec 的「关键取舍」只保留影响实现和验收的结论：符合记录边界的取舍链接 D-ID，完整备选、理由和后果放在决策记录；理由可由本表完整表达的取舍保留最小理由和放弃方案，不建决策。
+
+### 条目与索引
+
+- 编号 `D-` + 三位递增序号（`D-001`），创建后不复用。默认一条决策一个文件：`D-001-<短标题>.md`；项目已有分段台账惯例时可保留分段文件，但 `decisions/README.md` 索引仍是唯一入口，每条保留稳定 ID 和锚点。索引可以暂时为空；没有符合记录边界的判断时不建条目。
+- 每条至少写：日期、状态、范围、决策者/批准人、背景与证据、备选方案及放弃原因、决定、理由、后果、影响文件、取代关系、复核条件（适用时）。格式见 [decision-record-template.md](templates/decision-record-template.md)。
+- 正式状态使用：`已接受`（方向成立，未必已实施）、`已实施`（已落地并与当前契约一致）、`已被 D-xxx 取代`、`已废弃`。`草稿` 只用于尚未确认的提议，不能作为冲突检查依据；放弃的草稿标记 `已废弃`，条目和索引行保留，编号不复用。被取代或废弃的条目正文只作历史，不再作为当前依据。
+- 一条记录包含多个编号判断时，若只推翻其中部分，在「取代关系」写 `D-001 第 2 项由 D-005 取代`，整条状态保持 `已接受`/`已实施`，并在被推翻项后标注；全部判断被推翻时才将整条标记 `已被 D-xxx 取代`。
+- 决策条目的 `草稿` 是尚未确认的决策候选，不是 `reserves/` 下的储备方案草稿；储备方案草稿的载体和生命周期按 `reserves/` 规则。
+- 索引至少包含：编号、标题、日期、状态、范围/关键词、文件。范围/关键词写模块、契约、技术或产品边界，供后续按关键词筛选。索引与实际条目不一致视为缺陷；新增或改状态必须在同一次交付更新索引。
+
+### 冲突检查与取代
+
+改动架构边界、稳定契约、权限/存储策略、产品范围或明确排除项前，先读 `decisions/README.md`，按范围/关键词筛选相关条目，只读命中项。只对 `已接受`/`已实施` 条目判定冲突；`草稿`、`已被 D-xxx 取代`、`已废弃` 只作历史，不作为当前依据；若新要求重新引入其方向，可引用历史理由作提示，但不构成冲突门禁。
+
+`已接受` 表示方向成立但未必已实施，当前契约未体现它是正常的，不得据此忽略；`已实施` 才核对当前契约是否仍一致。若已实施决策在当前契约中已经偏离（例如先改了契约但未补记录），以当前契约为准，不得据此回滚已生效行为；在同一次交付中按取代规则补记新决策或逐项标注旧条目，并在「变更记录」说明分叉，再向用户说明历史原因。
+
+用户当前明确指令优先：决策记录只用于提醒和留痕，不构成否决权。冲突时先呈现原决策和理由，再按下列规则处理；高影响操作仍按项目既有授权门槛核对目标、范围和副作用。
+
+1. 无冲突：继续，按既有决策实施；计划引用决策 ID，不重复写理由。
+2. 有冲突且当前指令已覆盖目标、范围和副作用：按指令执行，并在同一交付中新增/更新决策、记录取代，不再二次确认。
+3. 有冲突且指令含糊、目标/范围/副作用未覆盖或授权不清：在写入前停止，向用户呈现冲突条目的编号、日期、原决定、核心理由、当时放弃的方案，以及新要求会改变什么。
+4. 用户确认保留原决策：调整本次要求，不改决策记录。
+5. 用户确认取代：同一次交付新增 `D-xxx`，写清改变原因和旧理由为何不再成立；整条被推翻时旧条目标记 `已被 D-xxx 取代` 并互链，部分推翻按「条目与索引」逐项标注；更新索引和受影响契约。不得静默删除、改写旧条目或用新计划覆盖历史。
+
+复核条件命中、外部约束变化或旧理由已不成立时，主动提出重审；未命中时允许长期休眠。复核后维持的，在「变更记录」写复核日期、证据和新的复核条件，索引状态不变，同一条件不因未变化重复触发。已接受决策的实质内容不得原地重写，修正通过新决策或带日期的补充说明完成。
+
+### 维护
+
+- 决策记录（含草稿）默认长期保留，不按"未引用草稿"清理；已取代、已废弃的记录只改状态并保留正文和索引行，用于解释历史。
+- 多条决策重叠时，不合并删除；新增一条整合决策并标记旧条目被取代，保留原条目和索引行用于追溯。
+- 不批量回填所有历史选择；只为仍约束未来工作、且理由不能由当前契约完整表达的判断补录。
+- 定期审计索引一致性、取代互链、复核条件、受影响契约和储备引用是否仍有效；发现当前契约已偏离旧决策时按冲突检查的前置判定处理；失效决策标记 `已废弃`，不删除。
 
 ## 私有层 `.local/`
 
@@ -108,9 +182,11 @@ docs/
 | 产物 | 模板或内容依据 |
 | --- | --- |
 | 项目根 `README.md` | 保留项目使用手册惯例：用途、使用者、安装/使用入口与文档导航，不套用内部目录索引模板 |
-| `docs/` 及子目录 `README.md` | [dir-readme-template.md](templates/dir-readme-template.md) |
+| `docs/` 及子目录 `README.md`（`decisions/` 除外） | [dir-readme-template.md](templates/dir-readme-template.md) |
 | `architecture/架构总览.md` | [architecture-overview-template.md](templates/architecture-overview-template.md) |
 | `functions/` 中长期需求与行为契约 | [feature-design-template.md](templates/feature-design-template.md) |
+| `decisions/README.md` 索引与冲突检查规则 | [decisions-readme-template.md](templates/decisions-readme-template.md) |
+| 单条决策记录 | [decision-record-template.md](templates/decision-record-template.md) |
 | `develop/测试与验证说明.md` | [verification-guide-template.md](templates/verification-guide-template.md) |
 | 安装、运行、构建、部署指南和私有 runbook | [operation-guide-template.md](templates/operation-guide-template.md) |
 | 文档生命周期、清理、归档、合并与删除 | [document-cleanup-guide.md](document-cleanup-guide.md) |
@@ -125,12 +201,15 @@ docs/
 | --- | --- |
 | 文档结构变化 | `docs/README.md`、受影响目录的 `README.md` |
 | 架构边界变化 | `architecture/README.md`、`architecture/架构总览.md` |
+| 架构方向、技术选型或稳定契约形态变化（启用 `decisions/` 且符合记录边界时） | `decisions/README.md` 索引与新增/更新条目；受影响 `architecture/`、`functions/` 文档；理由可由当前契约完整表达时只更新契约文档，不建条目 |
+| 用户要求与已接受/已实施决策冲突 | 先按「决策记录」的冲突检查呈现原决策；当前指令覆盖目标、范围和副作用时按指令执行并同次记录取代，含糊、覆盖不全或授权不清时先确认；高影响按既有授权门槛核对；保留原决策时调整本次要求 |
+| 决策复核条件触发、被取代或废弃 | 复核后维持时更新条目的变更记录、证据和复核条件；被取代或废弃时更新新旧条目状态与互链、`decisions/README.md` 索引；受影响契约文档 |
 | 前端信息架构 | `architecture/frontend/README.md`、前端指导与规范文档 |
 | 前端列表、表格、响应式或可复用组件变化 | 按相关性更新 `architecture/frontend/样式规范.md`、`architecture/frontend/响应式列表规范.md`、`architecture/frontend/通用组件规范.md` |
 | 后端分层或 API 边界 | `architecture/backend/README.md`、后端规范、功能/API 文档 |
 | 后端 worker、队列、定时任务或批处理副作用 | `architecture/backend/后台任务使用说明.md`、后端规范；运行时变化时更新 develop/deploy 文档 |
-| 新功能或流程 | `functions/README.md` 与功能设计文档；有追踪记录时更新 `plans/*` |
-| API、权限或存储变化 | `functions/接口契约与权限矩阵.md`、`functions/数据存储说明.md`、验证文档 |
+| 新功能或流程 | `functions/README.md` 与功能设计文档；有追踪记录时更新 `plans/*`；符合记录边界时更新 `decisions/` |
+| API、权限或存储变化 | `functions/接口契约与权限矩阵.md`、`functions/数据存储说明.md`、验证文档；符合记录边界时更新 `decisions/` |
 | 当前 schema/API/UI 模型变化 | 存储/API/UI 文档，以及明确的既有兼容义务或用户指定例外 |
 | 开发命令变化 | `develop/README.md`、运行/测试文档 |
 | 构建或部署变化 | `deploy/README.md`、构建/部署指南 |
@@ -138,26 +217,27 @@ docs/
 | 测试环境复用 dev 或与 dev 分离 | `develop/测试与验证说明.md`；更新 `.local/project-resources/test/` 和环境加载脚本 |
 | 生产发布或回滚 | 流程变化时更新 `deploy/` 模板；更新 `.local/project-resources/prod/logs/`、`prod/releases/`、`current-release.txt` 和回滚记录 |
 | AI 交付流水线或命令映射变化 | `AGENTS.md`、`docs/develop/`、`docs/deploy/`；更新 `.local/project-resources/README.md` 和相关脚本 |
-| 重复或重要 Bug | `bug/README.md`、当次问题记录；仅格式变化时更新问题模板 |
-| 大型重构 | `refactors/README.md`、当次重构记录；仅格式变化时更新重构模板 |
-| 阻塞出现或解除、裁决完成、观察项升级或到期复核 | `待办与阻塞事项.md` 对应分区（保留编号移动）；需长期保留证据时建立 plans/bug/refactors 档案并删除清单条目 |
-| 登记新储备事项、触发条件满足转正或方案失效复核 | `储备与触发事项.md` 对应条目与 `reserves/` 索引；转正时按 [reserve-items-template.md](templates/reserve-items-template.md) 的 spec/plan 边界实施，方案细节或草稿随条目移入待办清单或对应功能设计/计划，并从本清单删除条目及孤儿草稿 |
+| 重复或重要 Bug | `bug/README.md`、当次问题记录；修复确立符合记录边界的判断时补 `decisions/`，改变稳定行为规则时更新 `functions/`；仅格式变化时更新问题模板 |
+| 大型重构 | `refactors/README.md`、当次重构记录；重构确立符合记录边界的判断时补 `decisions/`，改变稳定行为契约时更新 `functions/`；仅格式变化时更新重构模板 |
+| 阻塞出现或解除、裁决完成、观察项升级或到期复核 | `待办与阻塞事项.md` 对应分区（保留编号移动）；裁决符合记录边界时建立 `decisions/` 条目；需长期保留证据时建立 plans/bug/refactors 档案或 decisions 记录并删除清单条目 |
+| 登记新储备事项、触发条件满足转正或方案失效复核 | `储备与触发事项.md` 对应条目与 `reserves/` 索引；转正时按 [reserve-items-template.md](templates/reserve-items-template.md) 的 spec/plan 边界实施，方案细节或草稿随条目移入待办清单或对应功能设计/计划，并从本清单删除条目及孤儿草稿；放弃理由符合记录边界时按模板规则 8 转入 `decisions/` |
 | 对外演示、对接文档、模板或工具新增、更新或废弃 | `external/README.md` 索引与对应资源；仅用户明确要求时由 AI 协助，日常开发不读取、不主动同步 |
-| 压测、验收、审计或专项分析产出独立报告 | `reports/README.md` 文件索引、当次报告；计划/问题的验证矩阵链接报告而不复制数据；结论成为长期规则时同步回设计文档 |
-| 文档新增、合并、归档、废弃或删除 | 先读 [document-cleanup-guide.md](document-cleanup-guide.md)；更新受影响目录 `README.md`、入链、替代文档、关联计划/基线和清理记录；有长期证据的记录只归档不删除 |
+| 压测、验收、审计或专项分析产出独立报告 | `reports/README.md` 文件索引、当次报告；计划/问题的验证矩阵链接报告而不复制数据；结论成为长期规则时同步回设计文档，符合记录边界时补 `decisions/` |
+| 文档新增、合并、归档、废弃或删除 | 先读 [document-cleanup-guide.md](document-cleanup-guide.md)；更新受影响目录 `README.md`、入链、替代文档、关联计划/基线和清理记录；有长期证据的记录只归档不删除；决策条目按清理手册的专用例外不归档、不删除 |
 | 清理规则、保留期限或归档位置变化 | [document-cleanup-guide.md](document-cleanup-guide.md)、本矩阵及受影响目录 `README.md`；说明生效日期、迁移范围和恢复路径 |
 
-矩阵按实际影响和已保留目录应用，不因命中变更类型创建整套不存在的文件；既有权威文件已覆盖时直接更新并链接。
+矩阵按实际影响和已保留目录应用，不因命中变更类型创建整套不存在的文件；既有权威文件已覆盖时直接更新并链接。涉及 `decisions/` 的行仅在项目启用该目录时适用；未启用时不创建该目录，按受影响契约或记录处理。
 
 ## 编号记录模式
 
 - 新建记录类文档（plans/bug/refactors）默认使用 UTC 时间戳 ID，精确到秒，不用毫秒和顺序编号。ID 形如 `PLAN-YYYYMMDDTHHmmss`、`BUG-YYYYMMDDTHHmmss`、`REFACTOR-YYYYMMDDTHHmmss`，文件名对应为 `计划/问题/重构-YYYYMMDDTHHmmss-短标题.md`。秒级时间戳仍可能碰撞；创建时以排他方式保留目标文件名，冲突则在下一秒重新生成，不覆盖已有记录。已有项目编号惯例可保留。
 - ID 创建后不再修改。标题可以改名，但文件正文和链接中的 ID 必须稳定。
+- `docs/decisions/` 使用 `D-` + 三位递增序号（`D-001`），创建后不复用；默认一条决策一个文件 `D-001-<短标题>.md`，已有分段台账惯例可保留分段文件，但 `decisions/README.md` 索引是唯一入口，每条保留稳定 ID 和锚点；状态变化和取代关系同次更新索引与互链。
 - `docs/待办与阻塞事项.md` 是在用清单而非档案，条目使用文件内稳定短编号（`B`/`C`/`T`/`W`/`P` + 递增序号），状态变化跨分区移动并保留编号，关闭即删除且编号不复用；需要长期保留的过程记录仍按时间戳 ID 建档。
 - `docs/储备与触发事项.md` 与待办清单同属在用清单而非档案，条目使用 `R` + 递增序号的文件内稳定短编号，转正或放弃即删除且编号不复用；转正后的正式工作按待办清单编号或时间戳 ID 建档规则跟踪。其关联的储备方案草稿存放于 `reserves/`、按 `储备方案-<短标题>.md` 命名且不使用时间戳 ID，生命周期跟随条目。
 - `docs/reports/` 报告不使用编号 ID，文件名用 `<主题>报告-YYYY-MM-DD.md`，同一主题多轮以日期区分；新报告在目录 README 的文件索引登记后才算交付。
 
-记录与私有资源模板：[plan-template.md](templates/plan-template.md)、[todo-blockers-template.md](templates/todo-blockers-template.md)、[reserve-items-template.md](templates/reserve-items-template.md)、[bug-template.md](templates/bug-template.md)、[refactor-template.md](templates/refactor-template.md)、[report-template.md](templates/report-template.md)、[deploy-record-template.md](templates/deploy-record-template.md)、[release-materials-template.md](templates/release-materials-template.md)、[env-readme-template.md](templates/env-readme-template.md)。稳定文档模板见上方映射表。目标项目仅在需要项目专有格式时维护模板副本；副本成为项目格式的权威来源，不要求与 skill 长期机械同步。
+记录与私有资源模板：[decisions-readme-template.md](templates/decisions-readme-template.md)、[decision-record-template.md](templates/decision-record-template.md)、[plan-template.md](templates/plan-template.md)、[todo-blockers-template.md](templates/todo-blockers-template.md)、[reserve-items-template.md](templates/reserve-items-template.md)、[bug-template.md](templates/bug-template.md)、[refactor-template.md](templates/refactor-template.md)、[report-template.md](templates/report-template.md)、[deploy-record-template.md](templates/deploy-record-template.md)、[release-materials-template.md](templates/release-materials-template.md)、[env-readme-template.md](templates/env-readme-template.md)。稳定文档模板见上方映射表。目标项目仅在需要项目专有格式时维护模板副本；副本成为项目格式的权威来源，不要求与 skill 长期机械同步。
 
 ## 开发策略基线
 
@@ -176,6 +256,7 @@ dev 默认上下文、生产确认门禁、环境隔离与敏感信息脱敏等�
 - 不为凑齐目录树创建空目录；仅含 `README.md` 的目录可以保留，但入口本身须承担实际索引或规则职责。
 - 不得把设想中的功能写成既有事实。
 - 架构文档要稳定耐用，计划文档保持临时性。
+- 决策记录以理由和被否方案为重点，不复制契约正文；索引、状态与取代互链必须与实际条目一致。
 - 链接保持相对路径，以便仓库移动后仍可用。
 - 不要留下模糊的“兼容性策略”表述；明确项目是只遵循当前模型，还是有具体兼容例外。
 - 任何清理都必须先证明目标的生命周期状态、入链、索引、需求基线和恢复路径；不能以“内容看起来过时”作为删除依据。
