@@ -1,0 +1,6 @@
+interface:
+  display_name: "安全审计"
+  short_description: "Evidence-gated source audit with attack-surface recon, sink tracing, refutation, and a coverage ledger"
+  default_prompt: "使用 $security-audit 对目标项目做取证式安全审计：先测绘攻击面与授权模型，再按 sink 追踪数据流，逐条用代码证据证实或证伪，输出含覆盖台账的报告；不要输出没有代码证据的漏洞。"
+policy:
+  allow_implicit_invocation: true

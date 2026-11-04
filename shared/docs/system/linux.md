@@ -17,7 +17,7 @@ command -v apt-get || command -v dnf || command -v pacman || command -v apk || c
 - 二进制资产必须匹配 `uname -m` 返回的架构。
 - 沿用系统已有工具和项目入口；只有当前命令确实不可用且替代路径有证据时，才安装或切换工具。
 
-## 路径与 Shell
+## 配置解析
 
 - 结构化配置使用对应解析器。
 

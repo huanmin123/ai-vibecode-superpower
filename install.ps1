@@ -602,7 +602,9 @@ $clientProfiles = [ordered]@{
             @{ Name = 'project-doc-planner'; Source = (Join-Path $root 'shared\skills\project-doc-planner') },
             @{ Name = 'visual-aesthetics'; Source = (Join-Path $root 'shared\skills\visual-aesthetics') },
             @{ Name = 'deep-dive-review'; Source = (Join-Path $root 'shared\skills\deep-dive-review') },
-            @{ Name = 'orchestrate-model-workflow'; Source = (Join-Path $root 'shared\skills\orchestrate-model-workflow') }
+            @{ Name = 'orchestrate-model-workflow'; Source = (Join-Path $root 'shared\skills\orchestrate-model-workflow') },
+            @{ Name = 'test-strategy'; Source = (Join-Path $root 'shared\skills\test-strategy') },
+            @{ Name = 'security-audit'; Source = (Join-Path $root 'shared\skills\security-audit') }
         )
         SkillAssets = Join-Path $root 'codex-global-config\skill-assets'
     }
@@ -615,7 +617,9 @@ $clientProfiles = [ordered]@{
             @{ Name = 'project-doc-planner'; Source = (Join-Path $root 'shared\skills\project-doc-planner') },
             @{ Name = 'visual-aesthetics'; Source = (Join-Path $root 'shared\skills\visual-aesthetics') },
             @{ Name = 'deep-dive-review'; Source = (Join-Path $root 'shared\skills\deep-dive-review') },
-            @{ Name = 'orchestrate-model-workflow'; Source = (Join-Path $root 'shared\skills\orchestrate-model-workflow') }
+            @{ Name = 'orchestrate-model-workflow'; Source = (Join-Path $root 'shared\skills\orchestrate-model-workflow') },
+            @{ Name = 'test-strategy'; Source = (Join-Path $root 'shared\skills\test-strategy') },
+            @{ Name = 'security-audit'; Source = (Join-Path $root 'shared\skills\security-audit') }
         )
     }
 }
@@ -673,7 +677,9 @@ foreach ($path in @($presetsRoot, $profile.Docs, $sourceSystemDocs, $profile.Ins
 if ($profile.Contains('SkillAssets') -and -not (Test-Path -LiteralPath $profile.SkillAssets)) { throw "Missing source: $($profile.SkillAssets)" }
 if ($profile.Contains('SkillAssets') -and (Test-Path -LiteralPath $profile.SkillAssets -PathType Container)) {
     foreach ($asset in Get-ChildItem -LiteralPath $profile.SkillAssets -Directory) {
-        if (@(Get-ChildItem -LiteralPath $asset.FullName -Recurse -File).Count -eq 0) { throw "Empty skill asset: $($asset.FullName)" }
+        $agentDir = Join-Path $asset.FullName 'agents'
+        if (-not (Test-Path -LiteralPath $agentDir -PathType Container)) { throw "Skill asset must contain agents/: $($asset.FullName)" }
+        if (@(Get-ChildItem -LiteralPath $agentDir -Recurse -File).Count -eq 0) { throw "Empty skill asset: $($asset.FullName)" }
     }
 }
 if ($profile.Contains('ConfigTemplate')) { foreach ($path in @($profile.ConfigTemplate, $profile.ProviderSettings)) { if (-not (Test-Path -LiteralPath $path)) { throw "Missing source: $path" } } }
@@ -749,7 +755,7 @@ try {
         foreach ($asset in Get-ChildItem -LiteralPath $profile.SkillAssets -Directory) {
             $assetTarget = Join-Path $stage "skills\$($asset.Name)"
             New-Item -ItemType Directory -Path $assetTarget -Force | Out-Null
-            Copy-Item (Join-Path $asset.FullName '*') $assetTarget -Recurse -Force
+            Copy-Item (Join-Path $asset.FullName 'agents') $assetTarget -Recurse -Force
         }
     }
     $skillDoc = Join-Path (Join-Path $stage 'skills\orchestrate-model-workflow') 'SKILL.md'

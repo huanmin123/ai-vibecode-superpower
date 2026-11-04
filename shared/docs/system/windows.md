@@ -26,7 +26,7 @@ Get-Command pwsh.exe, rg.exe, git.exe -All -ErrorAction SilentlyContinue
 - 调用原生程序后检查 `$LASTEXITCODE`；产生输出不代表成功。
 - 需要同时处理原生输出和退出码时，先完整捕获 `$output = @(& $exe @args)` 并立即保存 `$exit = $LASTEXITCODE`，再对 `$output` 使用 `Select-Object` 或解析器；不要直接把原生命令管到 `Select-Object -First`，下游提前关闭可能让原程序返回管道错误。
 - `$env:NAME` 只修改当前 PowerShell 进程及其后启动的子进程；写入 User/Machine 的持久环境变量不会反向更新当前会话。命令需要立即读取新值时，同时更新当前进程。
-- PowerShell 变量名不区分大小写；不得给只读或常量自动变量赋值，例如 `$Host`、`$PID`、`$HOME`、`$Error`、`$PSVersionTable`、`$PSEdition`、`$PSHOME`、`$true`、`$false`。业务变量使用 `$hostName`、`$processId`、`$homePath`、`$errorList` 等明确名称；不确定时用 `Get-Variable` 检查 `Options` 中的 `ReadOnly` 或 `Constant`。
+- PowerShell 变量名不区分大小写；不要覆盖 PowerShell 自动变量，其中 `$Host`、`$PID`、`$PSHOME`、`$PSEdition`、`$true`、`$false` 为只读或常量。业务变量使用 `$hostName`、`$processId`、`$homePath`、`$errorList` 等明确名称；不确定时用 `Get-Variable` 检查 `Options` 中的 `ReadOnly` 或 `Constant`。
 - 命令对象和可执行路径字符串不得混用。`Get-Command` 结果命名为 `$rgCommand`、`$sshCommand`，从其读取一次 `.Source` 后保存为 `$rgPath`、`$sshPath`；路径字符串用 `& $rgPath` 直接调用，不再访问 `$rgPath.Source`。调用前不确定类型时检查 `$value.GetType().FullName`。
 
 ```powershell

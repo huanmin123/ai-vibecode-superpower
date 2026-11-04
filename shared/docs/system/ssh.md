@@ -1,4 +1,4 @@
-## SSH 连接与认证规则
+# SSH 连接与认证规则
 
 1. 用户明确给出地址、端口、账号、密码、密钥、代理、跳板机等参数时，组装为**单条可直接执行命令**，尽可能规避交互式密码输入，防止AI终端执行卡在密码等待交互。
    - 指定端口：ssh 用小写 `-p`，plink 用大写 `-P`，二者不可混淆。
@@ -18,7 +18,7 @@
       2. 未检测到 plink：**先询问用户是否同意安装 plink**（说明：plink 是 PuTTY 官方命令行工具，可通过包管理器安装 PuTTY 或单 exe 下载后全局使用，用于实现一行命令带密码非交互登录）。用户同意后执行安装；用户拒绝则输出原生 ssh 命令并追加备注【Windows原生OpenSSH无命令行传密码能力，当前命令运行后会阻塞等待人工输入密码，AI无法自动完成登录，强烈建议配置密钥登录】。
       3. plink 安装方式（用户同意后执行），按顺序只采用第一个可用分支：
          - 包管理器：检查 `winget`、`choco`、`scoop`，存在则用其安装 PuTTY（winget 包 ID 为 `PuTTY.PuTTY`）；安装后用 `Get-Command plink.exe -All` 确认解析路径，不在 `PATH` 时使用完整路径调用。
-         - 直接下载：没有包管理器时下载官方 `plink.exe`，核对官方发布页公布的 SHA-256 后再使用；未获得可核对摘要时记录残余风险。使用 `System.Net.WebClient`（兼容旧版 PowerShell，禁止用 Invoke-WebRequest/iwr），地址 `https://the.earth.li/~sgtatham/putty/latest/w64/plink.exe`，先保存到用户目录，用 `plink -V` 验证版本后复制到 `C:\Windows\System32\` 实现全局调用；复制失败则保留在用户目录并使用完整路径调用。
+         - 直接下载：没有包管理器时下载官方 `plink.exe`，核对官方发布页公布的 SHA-256 后再使用；未获得可核对摘要时记录残余风险。使用 `Invoke-WebRequest -OutFile`（PowerShell 7；Windows PowerShell 5.1 也可用）下载地址 `https://the.earth.li/~sgtatham/putty/latest/w64/plink.exe`，保存到 `$env:LOCALAPPDATA\Programs\PuTTY\` 并加入用户 `PATH`；用 `plink -V` 验证版本。只有用户明确要求系统级安装并确认管理员权限时，才复制到 `C:\Windows\System32\`。
       4. 用户提供密钥文件：输出 `ssh -i "密钥路径" -p 端口 user@host`，优先密钥免交互。
    - 跳板/代理：ssh 用 `-J user@jumphost:port`（ProxyJump）；plink 不支持 `-J`，需用 `-proxycmd "plink -W %host:%port user@jumphost"`。
    - 所有参数合并一条完整命令输出，禁止输出分步操作。

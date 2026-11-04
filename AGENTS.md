@@ -20,7 +20,7 @@
 
 ## 权威来源
 
-- 共享平台文档与工具无关 skills：`shared/`（`docs/system/`、`global-instructions.md`、`agent-toolchain`、`project-doc-planner`、`visual-aesthetics`、`deep-dive-review`、`roles`），由两个安装器共同安装或消费。
+- 共享平台文档与工具无关 skills：`shared/`（`docs/system/`、`global-instructions.md`、`agent-toolchain`、`project-doc-planner`、`visual-aesthetics`、`deep-dive-review`、`test-strategy`、`security-audit`、`roles`），由两个安装器共同安装或消费。
 - 全局行为规范唯一事实源：`shared/global-instructions.md`；安装器把其中的 `<GLOBAL_HOME>` 展开为目标 home 后写入 `AGENTS.md`。客户端目录不再保存规范副本，不要重新引入。
 - 工作流路由、交接与验收：`shared/skills/orchestrate-model-workflow/SKILL.md`（双宿主共享；安装时仅注入当前预设的角色清单）；Codex 专属技能资产在 `codex-global-config/skill-assets/`。
 - role 唯一事实源：`shared/roles/`——schema 与翻译规则在 `shared/roles/README.md`，预设数据在 `shared/roles/presets/`（`glm` 绑定 ZCode 5 角色，`gpt` 绑定 Codex 12 role：四档分工——luna（gpt-6-luna）承担读任务（简单读 medium/high、深度读 xhigh）与简单写（max），terra（gpt-6.1-terra）为主力写（high/xhigh/max），sol（gpt-6.1-sol）为主力评审，astra（gpt-6-astra）为深度评审（high/xhigh/max）；`ds` 绑定 ZCode 3 角色，单模型 deepseek-v4.1-flash 拆 3 档，2 读 1 写，复审/终审由 `ds_4.1_flash_max` 兼任，其 model 是占位值），源完整性由 `shared/roles/presets.sha256` 静态校验。仓库不维护任何宿主角色文件；`codex-global-config/agents/` 与 `zcode-global-config/agents/` 已删除，安装时由翻译器按预设生成。角色命名推荐 `模型_版本_类型_思考档`（如 `glm_5.3_flash_low`、`gpt_6_astra_max`、`ds_4.1_flash_low`），同模型同档位冲突时追加职责后缀。md agent 的 `model` 必须写 ZCode Picker 值 `providerId/modelId`（如 `"account:bigmodel-individual-coding-plan/GLM-5.3-Flash"`，provider 段随实际登录的 Coding Plan 账号走），`thoughtLevel` 单独成键；裸模型名会被 ZCode 静默忽略并回退到父会话模型。

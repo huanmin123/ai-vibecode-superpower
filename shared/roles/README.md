@@ -127,7 +127,6 @@ sandbox_mode = "<readonly 推导或显式值>"
 ### Manifest
 
 - `shared/roles/presets.sha256` 记录全部预设**源文件**（preset.toml 与 roles/*.md）的规范化 SHA-256，静态提交进仓库，安装前校验一次；翻译产物不再做 hash 校验（产物是本机生成的编译物），改为结构校验：ZCode 校验 frontmatter 完整性、必填键与 `name == 文件名`；Codex 校验 6 个必填键各恰好出现一次。
-- 翻译产物不再做 hash 校验（产物是本机生成的编译物），改为结构校验：ZCode 校验 frontmatter 完整性、必填键与 `name == 文件名`；Codex 校验 6 个必填键各恰好出现一次。
 - 维护命令：`install.ps1 -UpdateRoleManifest` / `install.sh --update-role-manifest`，扫描 presets 目录重写 `presets.sha256`，不执行安装。修改任何预设源文件后必须运行它。
 
 ## 内置预设

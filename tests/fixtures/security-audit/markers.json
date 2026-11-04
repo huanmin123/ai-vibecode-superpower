@@ -1,0 +1,158 @@
+[
+  {
+    "id": "N1",
+    "file": "node-app/routes/notes.js",
+    "marker": "WHERE id = ${req.params.id}",
+    "expect": "finding"
+  },
+  {
+    "id": "N2",
+    "file": "node-app/routes/notes.js",
+    "marker": "return res.json({ note });",
+    "expect": "finding"
+  },
+  {
+    "id": "N3",
+    "file": "node-app/routes/export.js",
+    "marker": "tar -czf ${archivePath} -C ${config.UPLOAD_DIR} ${fileName}",
+    "expect": "finding"
+  },
+  {
+    "id": "N4",
+    "file": "node-app/routes/integrations.js",
+    "marker": "const response = await axios.get(target, {",
+    "expect": "finding"
+  },
+  {
+    "id": "N5",
+    "file": "node-app/routes/files.js",
+    "marker": "const filePath = path.join(config.UPLOAD_DIR, file);",
+    "expect": "finding"
+  },
+  {
+    "id": "N6",
+    "file": "node-app/server.js",
+    "marker": "const user = db.getUserById(req.params.id);",
+    "expect": "finding"
+  },
+  {
+    "id": "N7",
+    "file": "node-app/config.js",
+    "marker": "const JWT_SECRET = process.env.JWT_SECRET || 'notes-dev-secret';",
+    "expect": "finding"
+  },
+  {
+    "id": "N8",
+    "file": "node-app/routes/integrations.js",
+    "marker": "const merged = _.merge({}, settings, body);",
+    "expect": "finding"
+  },
+  {
+    "id": "N9",
+    "file": "node-app/server.js",
+    "marker": "const entries = db.listAuditEntries(200);",
+    "expect": "finding"
+  },
+  {
+    "id": "P1",
+    "file": "python-app/views.py",
+    "marker": "template = \"<h1>Hello \" + name + \"!</h1>\"",
+    "expect": "finding"
+  },
+  {
+    "id": "P2",
+    "file": "python-app/views.py",
+    "marker": "data = pickle.loads(base64.b64decode(raw))",
+    "expect": "finding"
+  },
+  {
+    "id": "P3",
+    "file": "python-app/views.py",
+    "marker": "path = os.path.join(storage.BASE_DIR, filename)",
+    "expect": "finding"
+  },
+  {
+    "id": "P4",
+    "file": "python-app/views.py",
+    "marker": "order = storage.get_order(order_id)",
+    "expect": "finding"
+  },
+  {
+    "id": "P5",
+    "file": "python-app/views.py",
+    "marker": "sql = f\"SELECT id, title, body FROM notes WHERE title LIKE '%{query}%'\"",
+    "expect": "finding"
+  },
+  {
+    "id": "P6",
+    "file": "python-app/views.py",
+    "marker": "archive.extractall(storage.RESTORE_DIR)",
+    "expect": "finding"
+  },
+  {
+    "id": "P7",
+    "file": "python-app/app.py",
+    "marker": "app.config[\"SECRET_KEY\"] = os.environ.get(\"APP_SECRET_KEY\", \"change-me-in-production\")",
+    "expect": "finding"
+  },
+  {
+    "id": "T1",
+    "file": "node-app/routes/notes.js",
+    "marker": "WHERE owner_id = ?",
+    "expect": "trap"
+  },
+  {
+    "id": "T2",
+    "file": "node-app/routes/files.js",
+    "marker": "const safeName = path.basename(requested);",
+    "expect": "trap"
+  },
+  {
+    "id": "T3",
+    "file": "node-app/routes/files.js",
+    "marker": "execFile('file', ['-b', previewPath]",
+    "expect": "trap"
+  },
+  {
+    "id": "T4",
+    "file": "node-app/db.js",
+    "marker": "function findNotesByTitleFragment(fragment) {",
+    "expect": "trap"
+  },
+  {
+    "id": "T5",
+    "file": "node-app/routes/notes.js",
+    "marker": "if (typeof req.body.title === 'string') changes.title = req.body.title.trim();",
+    "expect": "trap"
+  },
+  {
+    "id": "T6",
+    "file": "python-app/views.py",
+    "marker": "WHERE title LIKE ?",
+    "expect": "trap"
+  },
+  {
+    "id": "T7",
+    "file": "python-app/views.py",
+    "marker": "subprocess.run(argv, shell=False, capture_output=True, text=True, timeout=10)",
+    "expect": "trap"
+  },
+  {
+    "id": "T8",
+    "file": "python-app/views.py",
+    "marker": "return render_template(\"hello.html\", name=name)",
+    "expect": "trap"
+  },
+  {
+    "id": "T9",
+    "file": "python-app/storage.py",
+    "marker": "def load_cached_preferences(blob):",
+    "expect": "trap"
+  },
+  {
+    "id": "T10",
+    "file": "python-app/views.py",
+    "marker": "yaml.safe_load(raw)",
+    "expect": "trap"
+  }
+]

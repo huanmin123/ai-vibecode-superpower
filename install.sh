@@ -195,7 +195,7 @@ case "$client" in
         source_config=$script_dir/codex-global-config/config.toml
         source_model_provider_settings=$script_dir/codex-global-config/model-provider-settings.toml
         skill_assets_dir=$script_dir/codex-global-config/skill-assets
-        skill_specs='agent-toolchain:shared project-doc-planner:shared visual-aesthetics:shared deep-dive-review:shared orchestrate-model-workflow:shared'
+        skill_specs='agent-toolchain:shared project-doc-planner:shared visual-aesthetics:shared deep-dive-review:shared orchestrate-model-workflow:shared test-strategy:shared security-audit:shared'
         has_config=1
         ;;
     zcode)
@@ -209,7 +209,7 @@ case "$client" in
         source_instructions=$script_dir/shared/global-instructions.md
         source_docs=$script_dir/zcode-global-config/docs
         skill_assets_dir=
-        skill_specs='agent-toolchain:shared project-doc-planner:shared visual-aesthetics:shared deep-dive-review:shared orchestrate-model-workflow:shared'
+        skill_specs='agent-toolchain:shared project-doc-planner:shared visual-aesthetics:shared deep-dive-review:shared orchestrate-model-workflow:shared test-strategy:shared security-audit:shared'
         ;;
 esac
 
@@ -905,6 +905,21 @@ case "$preset_dir" in
     "$presets_root"|"$presets_root"/*) is_managed_preset=1 ;;
     *) is_managed_preset=0 ;;
 esac
+
+# 先校验目标 home，再开始任何渲染或写入；拒绝路径时不得先创建目录。
+: "$HOME"
+raw_home=$HOME/$default_home
+if printenv "$home_env" >/dev/null 2>&1; then raw_home=$(printenv "$home_env"); fi
+case "$raw_home" in
+    ''|.) die "Refusing unsafe $client_label home: $raw_home" ;;
+    /*) ;;
+    *) raw_home=$(CDPATH= cd -- . && printf '%s/%s' "$PWD" "$raw_home") ;;
+esac
+assert_path_chain "$raw_home" || die "Unsafe $client_label home path: $raw_home"
+client_home=$(normalize_absolute_path "$raw_home") || die "Could not normalize $client_label home: $raw_home"
+case "$client_home" in /|.) die "Refusing unsafe $client_label home: $client_home" ;; esac
+assert_path_chain "$client_home" || die "Unsafe $client_label home path: $client_home"
+
 render_dir=$(mktemp -d "${TMPDIR:-/tmp}/install-preset-render.XXXXXX") || die 'Could not create preset render directory.'
 trap 'rm -rf -- "$render_dir"' EXIT HUP INT TERM
 if [ "$is_managed_preset" = 1 ]; then
@@ -937,23 +952,12 @@ done
 if [ -n "$skill_assets_dir" ]; then
     for asset_dir in "$skill_assets_dir"/*; do
         [ -d "$asset_dir" ] || continue
-        asset_file_count=$(find "$asset_dir" -type f | wc -l | tr -d ' ')
+        [ -d "$asset_dir/agents" ] || die "Skill asset must contain agents/: $asset_dir"
+        asset_file_count=$(find "$asset_dir/agents" -type f | wc -l | tr -d ' ')
         [ "$asset_file_count" -gt 0 ] || die "Empty skill asset: $asset_dir"
     done
 fi
 
-: "$HOME"
-raw_home=$HOME/$default_home
-if printenv "$home_env" >/dev/null 2>&1; then raw_home=$(printenv "$home_env"); fi
-case "$raw_home" in
-    ''|.) die "Refusing unsafe $client_label home: $raw_home" ;;
-    /*) ;;
-    *) raw_home=$(CDPATH= cd -- . && printf '%s/%s' "$PWD" "$raw_home") ;;
-esac
-assert_path_chain "$raw_home" || die "Unsafe $client_label home path: $raw_home"
-client_home=$(normalize_absolute_path "$raw_home") || die "Could not normalize $client_label home: $raw_home"
-case "$client_home" in /|.) die "Refusing unsafe $client_label home: $client_home" ;; esac
-assert_path_chain "$client_home" || die "Unsafe $client_label home path: $client_home"
 mkdir -p "$(dirname -- "$client_home")"
 assert_path_chain "$client_home" || die "Unsafe $client_label home path: $client_home"
 home_parent=$(CDPATH= cd -- "$(dirname -- "$client_home")" && pwd -P) || die "Could not resolve $client_label home parent: $client_home"
@@ -1297,7 +1301,7 @@ if [ -d "$skill_assets_dir" ]; then
     for asset_dir in "$skill_assets_dir"/*; do
         [ -d "$asset_dir" ] || continue
         mkdir -p -- "$stage_dir/skills/$(basename -- "$asset_dir")"
-        cp -R "$asset_dir/." "$stage_dir/skills/$(basename -- "$asset_dir")/"
+        cp -R "$asset_dir/agents" "$stage_dir/skills/$(basename -- "$asset_dir")/"
     done
 fi
 # SKILL.md 角色清单渲染：骨架保留 <!-- preset-roles --> 占位符，安装时替换为当前宿主小节的角色清单。

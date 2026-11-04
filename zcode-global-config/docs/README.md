@@ -6,6 +6,8 @@
 
 需要执行系统命令时，读取 [系统执行规范](system/README.md)，按当前命令涉及的平台、SSH 或工具场景选择补充文档。只读取会影响当前命令构造、执行或验证的内容，不因关键词匹配机械加载整棵目录，也不重复读取已经满足的前置条件。
 
+`system/` 由安装器从 `shared/docs/system/` 装配；在仓库内直接浏览时该链接目标不存在，安装后路径为 `<ZCODE_HOME>/docs/system/`。
+
 ZCode 终端在 Windows 上可能使用 Git Bash（POSIX）或 PowerShell；执行命令前按系统执行规范识别实际 Shell，再选择对应的平台文档。
 
 ## 文档职责与维护

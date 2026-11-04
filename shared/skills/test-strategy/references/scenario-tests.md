@@ -1,0 +1,75 @@
+# 场景测试（scenario）
+
+## 定义
+
+场景测试用真实依赖验证一条业务流程或用户场景，例如真实数据库、真实消息队列、真实外部 API、浏览器或部署后的服务。它提供功能基线无法提供的集成证据，但更慢、更脆、更需要环境控制。
+
+## 何时运行
+
+- 验收标准明确要求真实端到端行为。
+- 改动涉及跨服务契约、真实外部 API、数据库迁移、权限、文件上传、浏览器交互。
+- 功能基线无法表达该风险，且场景测试能给出额外证据。
+- 用户明确要求验证真实环境。
+
+不满足以上条件时不运行场景测试；不要因为“更放心”而默认执行。
+
+## 场景目录
+
+按 flow 维护，不按模块跑全部场景：
+
+```
+| flow id | tags | 入口 | 环境变量 | 数据 | 预算 |
+| --- | --- | --- | --- | --- | --- |
+| checkout | payment, order | tests/scenario/checkout | PAYMENT_BASE_URL | 自建订单 | <2min |
+| login | auth | tests/scenario/login | AUTH_BASE_URL | 自建账号 | <30s |
+```
+
+从 diff 映射到 flow id，只跑匹配项；无法映射时报告未覆盖风险并询问，不默认跑全部场景。
+
+## 默认排除
+
+默认命令必须排除场景测试，并验证收集到 0 个场景：
+
+- pytest：`addopts = -m "not scenario"`，场景用 `@pytest.mark.scenario`。
+- Vitest：配置 `exclude` 排除 `tests/scenario/**`，或使用独立 project。
+- Jest：`testPathIgnorePatterns` 排除 `tests/scenario`。
+- Node 内置 runner：默认只 glob `tests/baseline`。
+- Go：场景用 build tag 或 `testing.Short()`；默认 `-short` 时测试内部必须用 `testing.Short()` 跳过。
+- Rust：场景用 `#[ignore]` 或 feature `scenario`，显式 `cargo test --features scenario`；默认 `cargo test` 不跑。
+- Maven：场景用 Failsafe 或 `@Tag("scenario")` 的独立 profile；默认 surefire 排除。
+- Gradle：场景用独立 `scenarioTest` source set，默认 `test` 不包含。
+- .NET：场景用 `[Trait("Category","Scenario")]`，默认 `dotnet test --filter "Category!=Scenario"`。
+
+某生态无法隔离时，不得使用全量命令；先报告缺口并定义显式场景命令。
+
+运行场景时必须显式指定目录、标记或 project。
+
+## 隔离
+
+- 使用独立测试环境、账号和凭据；禁止连接生产或共享开发数据。
+- 配置从环境变量读取；缺失时明确 skip 并报告原因，不静默改用本地真实资源。
+- 测试数据使用合成数据或已脱敏数据；使用唯一命名空间（前缀、时间戳、随机后缀），避免并行冲突。
+- 测试自建数据、自清理；优先事务回滚、临时数据库、临时命名空间或容器。
+- 失败时也执行清理，并记录清理结果；不依赖上一次运行残留的数据。
+
+## 稳定性
+
+- 不用盲目重试掩盖 flaky；先定位是环境、数据、时序还是真实缺陷。
+- 无法立即修复的 flaky 用例隔离并记录原因、复现频率和负责人。
+- 为外部依赖设置明确超时和失败断言；超时是失败，不是跳过。
+- 记录每次运行的耗时；持续变慢的场景要拆分或降级为更小的契约测试。
+
+## 交付证据
+
+- 运行的 flow id 与命令。
+- 环境类型（本地容器、测试环境、沙箱），不记录敏感地址或凭据。
+- 结果摘要与耗时；失败时给出最小复现和原始错误。
+- 未运行的场景及原因。
+
+## 反模式
+
+- 把场景测试混进默认全量命令。
+- 连接共享开发库或生产数据。
+- 依赖固定端口、固定用户名、残留数据。
+- 用 `sleep` 等待异步完成，或用重试把真实缺陷变成偶发通过。
+- 为了“覆盖全”把单元逻辑重复写成端到端用例。

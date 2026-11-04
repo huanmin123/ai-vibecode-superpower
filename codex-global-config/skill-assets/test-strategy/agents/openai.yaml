@@ -1,0 +1,6 @@
+interface:
+  display_name: "测试策略"
+  short_description: "Mock-first baseline, on-demand scenario, and isolated performance tests"
+  default_prompt: "使用 $test-strategy 为本次改动选择最小充分测试：先跑受影响模块的功能基线，必要时再跑对应场景或性能测试，不要默认全量。"
+policy:
+  allow_implicit_invocation: true

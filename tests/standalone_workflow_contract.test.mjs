@@ -68,13 +68,58 @@ function posixHome(codexHome) {
   return path.relative(repository, codexHome).split(path.sep).join('/');
 }
 
-const sharedSkillNames = ['agent-toolchain', 'project-doc-planner', 'visual-aesthetics', 'deep-dive-review'];
+const sharedSkillNames = ['agent-toolchain', 'project-doc-planner', 'visual-aesthetics', 'deep-dive-review', 'test-strategy', 'security-audit'];
 
 async function assertSharedSkillsDeployed(skillsDir) {
   for (const name of sharedSkillNames) {
     assert.match(await readFile(path.join(skillsDir, name, 'SKILL.md'), 'utf8'), /^---/);
   }
+  const skillEntries = (await readdir(skillsDir)).filter((name) => !name.startsWith('.'));
+  assert.equal(skillEntries.length, sharedSkillNames.length + 1, 'managed skill count must include all shared skills and orchestrate-model-workflow');
   assert.match(await readFile(path.join(skillsDir, 'visual-aesthetics', 'references', 'design-principles.md'), 'utf8'), /^# /);
+  const strategySkill = await readFile(path.join(skillsDir, 'test-strategy', 'SKILL.md'), 'utf8');
+  const expectedRefs = (await readdir(path.join(repository, 'shared', 'skills', 'test-strategy', 'references')))
+    .filter((name) => name.endsWith('.md')).sort();
+  const installedRefs = (await readdir(path.join(skillsDir, 'test-strategy', 'references')))
+    .filter((name) => name.endsWith('.md')).sort();
+  assert.deepEqual(installedRefs, expectedRefs, 'test-strategy references must be installed exactly');
+  for (const ref of expectedRefs) {
+    assert.match(strategySkill, new RegExp(ref.replace('.', '\\.')), `test-strategy must link ${ref}`);
+    const content = await readFile(path.join(skillsDir, 'test-strategy', 'references', ref), 'utf8');
+    assert.match(content, /^# /, `reference must have a heading: ${ref}`);
+    assert.ok(content.length > 40, `reference must not be empty: ${ref}`);
+    assert.doesNotMatch(content, /Codex|ZCode|CODEX_HOME|ZCODE_HOME/, `reference must stay host-agnostic: ${ref}`);
+  }
+  const auditSkill = await readFile(path.join(skillsDir, 'security-audit', 'SKILL.md'), 'utf8');
+  const auditRefs = (await readdir(path.join(repository, 'shared', 'skills', 'security-audit', 'references')))
+    .filter((name) => name.endsWith('.md')).sort();
+  const installedAuditRefs = (await readdir(path.join(skillsDir, 'security-audit', 'references')))
+    .filter((name) => name.endsWith('.md')).sort();
+  assert.deepEqual(installedAuditRefs, auditRefs, 'security-audit references must be installed exactly');
+  for (const ref of auditRefs) {
+    assert.match(auditSkill, new RegExp(ref.replace('.', '\\.')), `security-audit must link ${ref}`);
+    const content = await readFile(path.join(skillsDir, 'security-audit', 'references', ref), 'utf8');
+    assert.match(content, /^# /, `reference must have a heading: ${ref}`);
+    assert.ok(content.length > 40, `reference must not be empty: ${ref}`);
+    assert.doesNotMatch(content, /Codex|ZCode|CODEX_HOME|ZCODE_HOME/, `reference must stay host-agnostic: ${ref}`);
+  }
+  const hasCodexAssets = await readFile(path.join(skillsDir, 'orchestrate-model-workflow', 'agents', 'openai.yaml')).then(() => true, () => false);
+  const hasStrategyAsset = await readFile(path.join(skillsDir, 'test-strategy', 'agents', 'openai.yaml')).then(() => true, () => false);
+  assert.equal(hasStrategyAsset, hasCodexAssets, 'client skill assets must be isolated consistently');
+  if (hasStrategyAsset) {
+    const asset = await readFile(path.join(skillsDir, 'test-strategy', 'agents', 'openai.yaml'), 'utf8');
+    assert.match(asset, /display_name:/);
+    assert.match(asset, /default_prompt:.*\$test-strategy/);
+    assert.match(asset, /allow_implicit_invocation:\s*true/);
+  }
+  const hasAuditAsset = await readFile(path.join(skillsDir, 'security-audit', 'agents', 'openai.yaml')).then(() => true, () => false);
+  assert.equal(hasAuditAsset, hasCodexAssets, 'client skill assets must be isolated consistently');
+  if (hasAuditAsset) {
+    const asset = await readFile(path.join(skillsDir, 'security-audit', 'agents', 'openai.yaml'), 'utf8');
+    assert.match(asset, /display_name:/);
+    assert.match(asset, /default_prompt:.*\$security-audit/);
+    assert.match(asset, /allow_implicit_invocation:\s*true/);
+  }
 }
 
 test('global behavior rules do not hard-code obsolete host tool protocols', async () => {
@@ -87,6 +132,9 @@ test('global behavior rules do not hard-code obsolete host tool protocols', asyn
   assert.match(text, /保持正常语义/);
   assert.match(text, /不静默降级或改变业务行为/);
   assert.match(text, /按影响范围验证/);
+  assert.match(text, /test-strategy/);
+  assert.match(text, /test double/);
+  assert.match(text, /project-doc-planner/);
 });
 
 test('standalone workflow skill has the five behavior stages and no obsolete protocol terms', async () => {
@@ -359,6 +407,96 @@ test('shared instruction and skill bases are host-agnostic', async () => {
   assert.match(skillText, /承担写入职责的角色/);
 });
 
+test('test strategy skill separates baseline, scenario, and performance tracks', async () => {
+  const skillDir = path.join(repository, 'shared', 'skills', 'test-strategy');
+  const text = await readFile(path.join(skillDir, 'SKILL.md'), 'utf8');
+  assert.match(text, /^---\r?\nname: test-strategy\r?\n/);
+  for (const phrase of ['功能基线', '场景测试', '性能测试', '微基准', '5 分钟', 'mock 优先', '按需', '200ms']) {
+    assert.match(text, new RegExp(phrase));
+  }
+  assert.match(text, /全量功能基线只允许/);
+  assert.match(text, /项目 `AGENTS\.md`、`TESTING\.md` 或 CI/);
+  assert.match(text, /slow-baseline/);
+  assert.doesNotMatch(text, /Codex|ZCode|CODEX_HOME|ZCODE_HOME/);
+  for (const ref of ['baseline-tests.md', 'scenario-tests.md', 'selection-and-commands.md', 'performance-tests.md']) {
+    assert.match(text, new RegExp(ref.replace('.', '\\.')), `SKILL.md must link ${ref}`);
+    const content = await readFile(path.join(skillDir, 'references', ref), 'utf8');
+    assert.ok(content.length > 0, `reference must not be empty: ${ref}`);
+  }
+  const posixText = await readFile(posixInstaller, 'utf8');
+  assert.equal((posixText.match(/test-strategy:shared/g) ?? []).length, 2, 'both install.sh client profiles must register test-strategy');
+  const powerText = await readFile(powerInstaller, 'utf8');
+  assert.equal((powerText.match(/Name = 'test-strategy'/g) ?? []).length, 2, 'both install.ps1 client profiles must register test-strategy');
+  const selection = await readFile(path.join(skillDir, 'references', 'selection-and-commands.md'), 'utf8');
+  assert.match(selection, /项目 `AGENTS\.md`、`TESTING\.md` 或 CI/);
+  assert.doesNotMatch(selection, /\| 测试基础设施 \| 全量功能基线/, 'test infrastructure changes must not default to a full baseline');
+  const performance = await readFile(path.join(skillDir, 'references', 'performance-tests.md'), 'utf8');
+  assert.match(performance, /## 触发前提/);
+  assert.match(performance, /共享 runner 只记录趋势/);
+});
+
+test('security audit skill is guidance-first, attacker-oriented, and evidence-gated', async () => {
+  const skillDir = path.join(repository, 'shared', 'skills', 'security-audit');
+  const text = await readFile(path.join(skillDir, 'SKILL.md'), 'utf8');
+  assert.match(text, /^---\r?\nname: security-audit\r?\n/);
+  for (const phrase of ['攻击者视角', '外部核实', '证据准入', '覆盖台账', '时效性', '攻击路径', 'not-covered', '不夸大', 'exhaustive', '覆盖空间', '覆盖审计']) {
+    assert.match(text, new RegExp(phrase));
+  }
+  assert.match(text, /不是漏洞清单/);
+  assert.match(text, /不凭记忆/);
+  assert.doesNotMatch(text, /Codex|ZCode|CODEX_HOME|ZCODE_HOME/);
+  for (const ref of [
+    'attacker-mindset.md', 'authz.md', 'external-research.md', 'layers.md', 'lenses.md',
+    'recon.md', 'report.md', 'review-loop.md', 'server-baseline.md', 'sources.md',
+    'stack-playbook.md', 'supply-chain.md', 'tooling.md', 'exhaustive-sweep.md'
+  ]) {
+    assert.match(text, new RegExp(ref.replace('.', '\\.')), `SKILL.md must link ${ref}`);
+    const content = await readFile(path.join(skillDir, 'references', ref), 'utf8');
+    assert.match(content, /^# /, `reference must have a heading: ${ref}`);
+    assert.ok(content.length > 40, `reference must not be empty: ${ref}`);
+  }
+  const research = await readFile(path.join(skillDir, 'references', 'external-research.md'), 'utf8');
+  assert.match(research, /不编造 CVE/);
+  assert.match(research, /检索日期/);
+  assert.match(research, /affected range/);
+  const attacker = await readFile(path.join(skillDir, 'references', 'attacker-mindset.md'), 'utf8');
+  assert.match(attacker, /已经拥有什么/);
+  assert.match(attacker, /攻击树/);
+  const sweep = await readFile(path.join(skillDir, 'references', 'exhaustive-sweep.md'), 'utf8');
+  assert.match(sweep, /覆盖空间/);
+  assert.match(sweep, /生成者/);
+  assert.match(sweep, /合并者/);
+  assert.match(sweep, /覆盖审计者/);
+  assert.match(sweep, /连续两轮/);
+  const posixText = await readFile(posixInstaller, 'utf8');
+  assert.equal((posixText.match(/security-audit:shared/g) ?? []).length, 2, 'both install.sh client profiles must register security-audit');
+  const powerText = await readFile(powerInstaller, 'utf8');
+  assert.equal((powerText.match(/Name = 'security-audit'/g) ?? []).length, 2, 'both install.ps1 client profiles must register security-audit');
+  const asset = await readFile(path.join(repository, 'codex-global-config', 'skill-assets', 'security-audit', 'agents', 'openai.yaml'), 'utf8');
+  assert.match(asset, /display_name:/);
+  assert.match(asset, /default_prompt:.*\$security-audit/);
+  assert.match(asset, /allow_implicit_invocation:\s*true/);
+});
+
+test('security audit fixture markers are unique, complete, and machine-checkable', async () => {
+  const fixture = path.join(repository, 'tests', 'fixtures', 'security-audit');
+  const markers = JSON.parse(await readFile(path.join(fixture, 'markers.json'), 'utf8'));
+  assert.ok(Array.isArray(markers) && markers.length >= 20, 'fixture must cover planted findings and traps');
+  const ids = new Set();
+  const answerKey = await readFile(path.join(fixture, 'answer-key.md'), 'utf8');
+  for (const item of markers) {
+    assert.match(item.id, /^[A-Z][0-9]+$/);
+    assert.ok(!ids.has(item.id), `duplicate marker id: ${item.id}`);
+    ids.add(item.id);
+    assert.ok(['finding', 'trap'].includes(item.expect), `invalid expectation: ${item.id}`);
+    const source = await readFile(path.join(fixture, item.file), 'utf8');
+    assert.equal(source.split(item.marker).length - 1, 1, `marker ${item.id} must occur exactly once in ${item.file}`);
+    assert.ok(answerKey.includes(`| ${item.id} |`), `answer key must document ${item.id}`);
+  }
+  assert.ok(markers.some((item) => item.expect === 'trap'), 'fixture must include false-positive traps');
+  assert.ok(markers.some((item) => item.expect === 'finding'), 'fixture must include planted findings');
+});
+
 test('PowerShell installer deploys the standalone skill into an isolated nested home', { skip: process.platform !== 'win32' }, async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'codex-powershell-contract-'));
   const codexHome = path.join(root, 'missing', 'nested', '.codex');
@@ -517,6 +655,10 @@ test('POSIX installer deploys a fresh standalone home without legacy prerequisit
     assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
     const installed = await readFile(path.join(codexHome, 'skills', 'orchestrate-model-workflow', 'SKILL.md'), 'utf8');
     assert.match(installed, /^---\nname: orchestrate-model-workflow\n/);
+    assert.ok(
+      await readFile(path.join(codexHome, 'skills', 'test-strategy', 'agents', 'openai.yaml')).then(() => true, () => false),
+      'codex must install the test-strategy skill interface'
+    );
     assert.doesNotMatch(installed, /<!-- @/);
     assert.doesNotMatch(installed, /\{\{/);
     assert.doesNotMatch(installed, /ZCODE_HOME/);
@@ -735,7 +877,7 @@ test('PowerShell zcode installer composes shared and zcode sources and leaves un
     await assertSharedSkillsDeployed(path.join(zcodeHome, 'skills'));
     const cliConfig = await readFile(path.join(zcodeHome, 'cli', 'config.json'), 'utf8');
     assert.match(cliConfig, /"keep": ?"me"/);
-    assert.equal(await readdir(path.join(zcodeHome, 'skills')).then((names) => names.length), 5);
+    assert.equal(await readdir(path.join(zcodeHome, 'skills')).then((names) => names.length), 7);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -782,6 +924,11 @@ test('POSIX zcode installer deploys a fresh home without codex configuration', a
     for (const expected of ['README.md', 'windows.md', 'rg.md', 'ssh.md', 'linux.md', 'macos.md', '跨系统操作示例.md']) {
       assert.ok(systemDocs.includes(expected), `missing shared system doc: ${expected}`);
     }
+    assert.equal(
+      await readFile(path.join(zcodeHome, 'skills', 'test-strategy', 'agents', 'openai.yaml')).then(() => true, () => false),
+      false,
+      'zcode install must not ship the codex test-strategy interface'
+    );
     assert.equal(await readFile(path.join(zcodeHome, 'config.toml'), 'utf8').then(() => true, () => false), false);
   } finally {
     await rm(root, { recursive: true, force: true });
