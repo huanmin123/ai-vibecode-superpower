@@ -44,6 +44,13 @@ function normalizedHash(buffer) {
   return crypto.createHash('sha256').update(buffer.toString('utf8').replaceAll('\r\n', '\n')).digest('hex');
 }
 
+function markdownSection(text, heading) {
+  const start = text.indexOf(`## ${heading}`);
+  assert.notEqual(start, -1, `missing section: ${heading}`);
+  const end = text.indexOf('\n## ', start + 3);
+  return text.slice(start, end === -1 ? undefined : end);
+}
+
 async function runResult(command, args, options) {
   try {
     const result = await run(command, args, { windowsHide: true, maxBuffer: 8 * 1024 * 1024, ...options });
@@ -75,6 +82,16 @@ async function assertSharedSkillsDeployed(skillsDir, client) {
     assert.match(await readFile(path.join(skillsDir, name, 'SKILL.md'), 'utf8'), /^---/);
   }
   assert.match(await readFile(path.join(skillsDir, 'visual-aesthetics', 'references', 'design-principles.md'), 'utf8'), /^# /);
+  const deepDiveDir = path.join(skillsDir, 'deep-dive-review');
+  const sourceDeepDiveDir = path.join(repository, 'shared', 'skills', 'deep-dive-review');
+  const deepDiveRefs = ['attack-matrix.md', 'attacker-brief.md', 'ledger-template.md', 'review-round.md', 'verifier-protocol.md'];
+  const deepDiveSkill = await readFile(path.join(deepDiveDir, 'SKILL.md'), 'utf8');
+  assert.equal(deepDiveSkill, await readFile(path.join(sourceDeepDiveDir, 'SKILL.md'), 'utf8'));
+  for (const ref of deepDiveRefs) {
+    assert.ok(deepDiveSkill.includes(`](references/${ref})`), `deep-dive-review must link references/${ref}`);
+    assert.equal(await readFile(path.join(deepDiveDir, 'references', ref), 'utf8'),
+      await readFile(path.join(sourceDeepDiveDir, 'references', ref), 'utf8'), `installed deep-dive reference: ${ref}`);
+  }
   const strategySkill = await readFile(path.join(skillsDir, 'test-strategy', 'SKILL.md'), 'utf8');
   const expectedRefs = (await readdir(path.join(repository, 'shared', 'skills', 'test-strategy', 'references')))
     .filter((name) => name.endsWith('.md')).sort();
@@ -486,6 +503,7 @@ test('security audit skill is guidance-first, attacker-oriented, and evidence-ga
   assert.match(sweep, /合并者/);
   assert.match(sweep, /覆盖审计者/);
   assert.match(sweep, /连续两轮/);
+  assert.match(sweep, /deep-dive-review[^\n]*只读、只出报告[^\n]*不沿用其自主修复语义/);
   const posixText = await readFile(posixInstaller, 'utf8');
   assert.equal((posixText.match(/security-audit:shared/g) ?? []).length, 2, 'both install.sh client profiles must register security-audit');
   const powerText = await readFile(powerInstaller, 'utf8');
@@ -1048,10 +1066,41 @@ test('deep dive review defaults to report-only and has executable convergence ru
   assert.match(matrix, /书面豁免/);
   const ledger = await readFile(path.join(skillDir, 'references', 'ledger-template.md'), 'utf8');
   assert.match(ledger, /授权模式/);
-  assert.match(ledger, /issues\.md/);
+  assert.match(ledger, /问题记录：<实际路径或正文锚点>/);
   assert.match(ledger, /收敛预算/);
   const round = await readFile(path.join(skillDir, 'references', 'review-round.md'), 'utf8');
-  assert.match(round, /回归确认轮不计入干净轮/);
+  const passing = markdownSection(round, '通过语义');
+  assert.match(passing, /fix 模式零 B 类确认且零回归可计入干净轮/);
+  assert.match(passing, /回归确认即重置计数/);
+  assert.match(passing, /report-only 模式当轮出现任何新的确认项均不能计入连续干净轮/);
+  assert.match(passing, /三轮不同视角与覆盖条件/);
   const verifier = await readFile(path.join(skillDir, 'references', 'verifier-protocol.md'), 'utf8');
   assert.match(verifier, /行号错误时以实际代码为准/);
+  const reproduction = markdownSection(verifier, '测试钉住优先');
+  assert.match(reproduction, /report-only 模式[^\n]*不得以验证为由写入目标项目/);
+  const attacker = await readFile(path.join(skillDir, 'references', 'attacker-brief.md'), 'utf8');
+  const quality = markdownSection(attacker, '质量要点（实战教训）');
+  assert.match(quality, /验证者须是未参与同项工作的全新实例，可使用同一角色档位/);
+  assert.doesNotMatch(quality, /验证者与攻击者不同角色档位/);
+  const admission = markdownSection(text, '准入前提（缺一不开工）');
+  assert.doesNotMatch(admission, /授权模式必须显式确认/);
+  assert.match(admission, /用户显式发起即采用 report-only/);
+  assert.match(admission, /只有用户明确同意 A 类即修权才进入 fix 模式/);
+  const authorization = markdownSection(text, '交互与授权模型（核心）');
+  const reportOnly = authorization.split('\n').find((line) => line.startsWith('**默认 report-only**'));
+  assert.ok(reportOnly);
+  assert.match(reportOnly, /不修改目标项目文件/);
+  for (const target of ['源码', '配置', '项目测试', '文档']) assert.ok(reportOnly.includes(target));
+  assert.match(reportOnly, /复现也不得写入这些对象/);
+  const discipline = markdownSection(text, '纪律');
+  assert.match(discipline, /未参与同项假设生成或写入的全新实例执行，可串行使用同一角色/);
+  assert.match(discipline, /未指定位置时，问题记录与台账同目录/);
+  assert.match(discipline, /正文交付时明确对应章节/);
+  const workflow = markdownSection(text, '流程');
+  const setup = workflow.slice(workflow.indexOf('**0 建档**'), workflow.indexOf('**1 假设穷举'));
+  assert.match(setup, /指定不落盘时只用会话正文/);
+  const termination = workflow.slice(workflow.indexOf('**6 终止**'));
+  assert.match(termination, /连续三轮视角互不相同/);
+  assert.match(termination, /fix 模式还要求连续 3 轮零 B 类确认、零回归/);
+  assert.match(termination, /report-only 模式要求连续 3 轮无新确认项，任何新确认均重置计数/);
 });
