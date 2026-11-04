@@ -5,7 +5,7 @@ description: 为目标项目受控接入、升级、修复或维护 CodeGraph �
 
 # 项目工具链接入与维护
 
-`$agent-toolchain` 是 CodeGraph/RTK 的项目接入和维护入口，不是日常开发分析 skill。`configure` 会在目标项目根 `AGENTS.md` 写入唯一的 `## CodeGraph 与 RTK` 受管标题，并写入 CodeGraph 的 MCP 配置。接入后，日常开发直接遵守目标项目 `AGENTS.md`，不要为普通查询或命令压缩触发本 skill。
+`agent-toolchain` skill 是 CodeGraph/RTK 的项目接入和维护入口，不是日常开发分析 skill。`configure` 会在目标项目根 `AGENTS.md` 写入唯一的 `## CodeGraph 与 RTK` 受管标题，并写入 CodeGraph 的 MCP 配置。接入后，日常开发直接遵守目标项目 `AGENTS.md`，不要为普通查询或命令压缩触发本 skill。
 
 仅在用户明确要求以下状态变更或维护时使用：项目接入、安装、升级到受支持版本、配置修复、索引初始化或修复、健康检查或回滚。不要因发现 CodeGraph/RTK 可用于当前开发任务而自行接入、升级或维护。
 
@@ -15,7 +15,7 @@ description: 为目标项目受控接入、升级、修复或维护 CodeGraph �
 2. 首次接入或修复配置时先执行 `configure`。它仅在没有冲突时写入 CodeGraph 的 MCP 配置（Codex 写入 `.codex/config.toml`，ZCode 写入 `.zcode/config.json` 的 `mcp.servers`）、`/.codegraph/` 与所接入客户端目录（Codex 为 `/.codex/`，ZCode 为 `/.zcode/`）的忽略规则和一个完整的 `## CodeGraph 与 RTK` 标题；已有配置或标题被改写、缺项或来自旧版 `## AI 工具` 注入时停止并报告，不覆盖项目规则。客户端按项目现有目录自动探测：有 `.codex/` 接入 Codex，有 `.zcode/` 接入 ZCode，两者都有则都接入。都未探测到时：交互终端由驱动询问用户选择（Codex/ZCode/Both）；非交互调用（会话代理经终端运行驱动时属于此类）必须显式传 `--client codex|zcode|both`，按当前会话宿主选择，不确定时先询问用户。
 3. 用户明确说“升级”时运行 `upgrade --project <目标项目> --dry-run`，核对后再运行 `upgrade --project <目标项目> --apply`。它只把旧受管安装升级到驱动内置 manifest 的当前受支持版本，不查询 GitHub/npm 最新版；CodeGraph 版本变化后会全量重建索引并运行完整 `doctor`。
 4. 首次安装或只修复缺失工具时，先运行 `bootstrap --dry-run`，确认预期下载和写入后才执行 `--apply`。固定版本、来源和 SHA-256 只能来自驱动内置 manifest；不自动升级。
-5. 接入完成后初始化或同步索引并运行完整 `doctor`：CodeGraph 用 `init-codegraph`。CodeGraph 的 MCP 配置通常需要新建会话或重启对应客户端（Codex/ZCode）才能加载。
+5. 接入完成后初始化或同步索引并运行完整 `doctor`：CodeGraph 用 `init-codegraph`。CodeGraph 的 MCP 配置通常需要新建会话或重启对应客户端才能加载。
 6. 只有明确的故障、健康检查、索引异常或回滚任务才运行诊断与维护命令；不要为普通开发定期检查或同步。
 
 ## 按需资料

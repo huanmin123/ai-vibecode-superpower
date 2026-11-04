@@ -1,6 +1,6 @@
 # 项目接入与安装
 
-仅在用户要求为项目接入 CodeGraph/RTK、首次安装、升级到受支持版本或修复缺失安装时读取本文件。接入完成后的日常使用规则由目标项目根 `AGENTS.md` 的 `## CodeGraph 与 RTK` 标题提供，不要为普通开发读取本文件或触发 `$agent-toolchain`。
+仅在用户要求为项目接入 CodeGraph/RTK、首次安装、升级到受支持版本或修复缺失安装时读取本文件。接入完成后的日常使用规则由目标项目根 `AGENTS.md` 的 `## CodeGraph 与 RTK` 标题提供，不要为普通开发读取本文件或触发 `agent-toolchain` skill。
 
 ## 先决条件与边界
 
@@ -12,7 +12,7 @@
 
 ## 接入顺序
 
-1. 运行 `configure`：仅在不存在冲突时写入 CodeGraph 的 MCP 配置（Codex 写入 `.codex/config.toml` 的 `[mcp_servers.codegraph]`，ZCode 写入 `.zcode/config.json` 的 `mcp.servers`）、`/.codegraph/` 与所接入客户端目录（Codex 为 `/.codex/`，ZCode 为 `/.zcode/`）的忽略规则及项目根 `AGENTS.md` 的唯一 `## CodeGraph 与 RTK` 受管标题。客户端按项目现有 `.codex/`、`.zcode/` 目录自动探测，两者都有则都接入；都未探测到时，交互终端由驱动询问用户，非交互调用必须传 `--client codex|zcode|both`（按当前会话宿主选择，不确定时先询问用户）。该标题内同时包含运行时工具规则和 `$agent-toolchain` 管理路由；旧版 `## AI 工具` 标题不会被覆盖。
+1. 运行 `configure`：仅在不存在冲突时写入 CodeGraph 的 MCP 配置（Codex 写入 `.codex/config.toml` 的 `[mcp_servers.codegraph]`，ZCode 写入 `.zcode/config.json` 的 `mcp.servers`）、`/.codegraph/` 与所接入客户端目录（Codex 为 `/.codex/`，ZCode 为 `/.zcode/`）的忽略规则及项目根 `AGENTS.md` 的唯一 `## CodeGraph 与 RTK` 受管标题。客户端按项目现有 `.codex/`、`.zcode/` 目录自动探测，两者都有则都接入；都未探测到时，交互终端由驱动询问用户，非交互调用必须传 `--client codex|zcode|both`（按当前会话宿主选择，不确定时先询问用户）。该标题内同时包含运行时工具规则和 `agent-toolchain` 管理路由；旧版 `## AI 工具` 标题不会被覆盖。
 2. 运行 `bootstrap --dry-run`，核对将安装的受管工具。
 3. 运行 `bootstrap --apply`：CodeGraph 使用官方固定 npm 包且禁用安装脚本；RTK 使用固定官方 release 归档，并校验摘要与二进制架构。
 4. 运行 `init-codegraph`：新建 CodeGraph 索引，或对已有索引执行一次增量同步。
@@ -26,7 +26,7 @@
 
 ## 调用驱动
 
-从当前已加载 skill 的绝对 `SKILL.md` 路径定位驱动：把末尾 `SKILL.md` 替换为 `scripts/agent-toolchain.ps1`（Windows）或 `scripts/agent-toolchain.sh`（macOS/Linux）。该绝对 skill 路径已由当前客户端（Codex 或 ZCode）在本会话的 Available skills 中提供。不得扫描 `plugins/cache`、按时间挑选版本、使用开发仓库路径，或自行展开 home 环境变量。
+从当前已加载 skill 的绝对 `SKILL.md` 路径定位驱动：把末尾 `SKILL.md` 替换为 `scripts/agent-toolchain.ps1`（Windows）或 `scripts/agent-toolchain.sh`（macOS/Linux）。该绝对 skill 路径由当前会话的 skill 清单提供。不得扫描 `plugins/cache`、按时间挑选版本、使用开发仓库路径，或自行展开 home 环境变量。
 
 按该确定路径执行用户所需动作。首次接入依次运行 `configure --project <目标项目>`（客户端无法自动探测时追加 `--client codex|zcode|both`，按当前会话宿主选择）、`bootstrap --project <目标项目> --dry-run`、`bootstrap --project <目标项目> --apply`、`init-codegraph --project <目标项目>` 和 `doctor --project <目标项目>`；明确升级则只运行 `upgrade --project <目标项目> --dry-run`、`upgrade --project <目标项目> --apply`。
 
@@ -34,5 +34,5 @@
 
 - 新接入项目的 CodeGraph 规则要求跨文件依赖分析及公共契约等相关任务先查询再复核，并允许单文件局部修复、文档及低风险整理跳过；具体边界以驱动生成的受管段落为准。已有旧模板仍按冲突停止，须人工核对迁移，不自动覆盖。
 - CodeGraph 项目配置与索引均不入库：`.codegraph/` 是本地索引缓存，`.codex/`、`.zcode/` 是本机客户端目录；`configure` 会把对应忽略规则写入项目 `.gitignore`。
-- CodeGraph 的 MCP 配置生效通常需要新建会话或重启对应客户端（Codex/ZCode）。
+- CodeGraph 的 MCP 配置生效通常需要新建会话或重启对应客户端。
 - `doctor` 通过只证明当前受管工具和索引可用；后续每次实际使用仍须以当前源文件、`rg`、未跟踪文件和刚修改文件复核结果。

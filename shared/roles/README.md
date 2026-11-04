@@ -114,7 +114,7 @@ sandbox_mode = "<readonly 推导或显式值>"
 
 ### SKILL.md 渲染
 
-`orchestrate-model-workflow` 的 SKILL.md（两宿主变体）是"骨架 + 角色清单占位符"：角色选择段含 `<!-- preset-roles -->` 标记，安装器在装配 stage 时把它替换为当前宿主小节的角色清单，每行格式 `- \`<name>\`：<skill_desc 或 description>`，随预设变化；骨架其余文案（阶段要求、错误与恢复）只描述职责措辞，不硬编码角色名。仓库中的 SKILL.md 保留标记原样，渲染只发生在安装产物中；预设删除某角色后，清单自动不再包含它，无需改 skill 文本。
+`orchestrate-model-workflow` 的 SKILL.md（双宿主共享骨架）是"骨架 + 角色清单占位符"：安装器只把角色选择段中的 `<!-- preset-roles -->` 标记替换为当前宿主小节的角色清单，每行格式 `- \`<name>\`：<skill_desc 或 description>`，随预设变化；骨架其余文案（阶段要求、错误与恢复）只描述职责措辞，不硬编码角色名。仓库中的共享 SKILL.md 保留标记原样，渲染只发生在安装产物中；预设删除某角色后，清单自动不再包含它，无需改 skill 文本。
 
 ## 安装器集成
 

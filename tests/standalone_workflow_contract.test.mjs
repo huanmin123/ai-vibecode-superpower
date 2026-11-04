@@ -9,18 +9,16 @@ import test from 'node:test';
 import { promisify } from 'node:util';
 
 const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const globalAgents = path.join(repository, 'codex-global-config', 'AGENTS.md');
-const skill = path.join(repository, 'codex-global-config', 'skills', 'orchestrate-model-workflow', 'SKILL.md');
-const skillInterface = path.join(repository, 'codex-global-config', 'skills', 'orchestrate-model-workflow', 'agents', 'openai.yaml');
+const baseAgents = path.join(repository, 'shared', 'global-instructions.md');
+const skillBase = path.join(repository, 'shared', 'skills', 'orchestrate-model-workflow', 'SKILL.md');
+const skillInterface = path.join(repository, 'codex-global-config', 'skill-assets', 'orchestrate-model-workflow', 'agents', 'openai.yaml');
 const presetsRoot = path.join(repository, 'shared', 'roles', 'presets');
 const presetManifest = path.join(repository, 'shared', 'roles', 'presets.sha256');
 const presetGptRoles = path.join(presetsRoot, 'gpt', 'roles');
 const posixInstaller = path.join(repository, 'install.sh');
 const powerInstaller = path.join(repository, 'install.ps1');
 const ripgrepDoc = path.join(repository, 'shared', 'docs', 'system', 'rg.md');
-const zcodeAgents = path.join(repository, 'zcode-global-config', 'AGENTS.md');
 const zcodeDocsReadme = path.join(repository, 'zcode-global-config', 'docs', 'README.md');
-const zcodeSkill = path.join(repository, 'zcode-global-config', 'skills', 'orchestrate-model-workflow', 'SKILL.md');
 const zcodePosixInstaller = path.join(repository, 'install.sh');
 const zcodeRoleNames = [
   'glm_5.3_flash_low', 'glm_5.3_flash_high', 'glm_5.3_flash_max', 'glm_5.3_high', 'glm_5.3_max'
@@ -80,7 +78,7 @@ async function assertSharedSkillsDeployed(skillsDir) {
 }
 
 test('global behavior rules do not hard-code obsolete host tool protocols', async () => {
-  const text = await readFile(globalAgents, 'utf8');
+  const text = await readFile(baseAgents, 'utf8');
   assert.doesNotMatch(text, /^## 工具调用契约$/m);
   for (const obsolete of [
     'functions.wait', 'functions.exec', 'collaboration.wait_agent',
@@ -92,7 +90,7 @@ test('global behavior rules do not hard-code obsolete host tool protocols', asyn
 });
 
 test('standalone workflow skill has the five behavior stages and no obsolete protocol terms', async () => {
-  const text = await readFile(skill, 'utf8');
+  const text = await readFile(skillBase, 'utf8');
   assert.match(text, /^---\r?\nname: orchestrate-model-workflow\r?\n/);
   for (const stage of ['Explore', 'Plan', 'Work', 'Critique', 'Promote']) assert.match(text, new RegExp(`\\b${stage}\\b`));
   for (const forbidden of [
@@ -105,8 +103,8 @@ test('standalone workflow skill has the five behavior stages and no obsolete pro
   assert.match(text, /默认优先选择成本最低且能胜任的取证角色/);
   assert.match(text, /风险与回滚、验收、验证、停止条件/);
   assert.match(text, /默认并行优先/);
-  assert.match(text, /不应只交给单个 agent 串行执行/);
-  assert.match(text, /无法安全拆分、拆分成本高于收益或当前工具受限时，才使用单 agent/);
+  assert.match(text, /不应只交给单个子代理串行执行/);
+  assert.match(text, /无法安全拆分、拆分成本高于收益或当前工具受限时，才使用单代理/);
   assert.match(text, /fallback 只对本次派发生效/);
   assert.match(text, /能胜任同一职责的角色替代/);
   assert.match(text, /子代理只修改分配范围/);
@@ -116,14 +114,14 @@ test('standalone workflow skill has the five behavior stages and no obsolete pro
   assert.match(text, /不得把写入任务派给只读角色/);
   assert.match(text, /拒绝场景下，主代理仅在授权、权限、范围和责任边界均已满足时直接继续/);
   assert.match(text, /角色或模型不可用时，按档位就近回退/);
-  assert.match(text, /派发一个继承主模型的子代理/);
+  assert.match(text, /派发一个继承当前会话模型的子代理/);
   assert.match(text, /承担原角色职责，其余流程不变/);
   assert.match(text, /主代理不得改为在当前会话内直接执行/);
   assert.match(text, /恢复后回到原角色/);
   assert.doesNotMatch(text, /spawn_agent|agent_type|subagent_type/);
   assert.doesNotMatch(text, /路径锁|并行写入安全|所有.*串行/);
-  assert.match(text, /角色定义的权威来源是 `<CODEX_HOME>\/agents\/ai-vibecode-superpower\/` 下的 toml role/);
-  assert.match(text, /可用角色以下方清单为准/);
+  assert.match(text, /角色定义的权威来源是当前宿主实际安装的角色清单/);
+  assert.match(text, /派发前以清单为准/);
   assert.match(text, /不假定清单之外的角色/);
   assert.match(text, /<!-- preset-roles -->/);
   assert.doesNotMatch(text, /gpt_6_luna|gpt_6\.1_sol|gpt_6\.1_terra|gpt_6_astra|gpt_6_sol/);
@@ -202,38 +200,34 @@ test('all twelve gpt preset roles carry model routing fields', async () => {
   }
 });
 
-test('zcode workflow skill variant keeps the stages and drops codex-only mechanics', async () => {
-  const text = await readFile(zcodeSkill, 'utf8');
+test('shared workflow skill stays free of host-specific sources', async () => {
+  const text = await readFile(skillBase, 'utf8');
   assert.match(text, /^---\r?\nname: orchestrate-model-workflow\r?\n/);
   for (const stage of ['Explore', 'Plan', 'Work', 'Critique', 'Promote']) assert.match(text, new RegExp(`\\b${stage}\\b`));
-  assert.match(text, /<!-- preset-roles -->/);
-  assert.match(text, /派发前以该目录实际存在的文件核对/);
-  assert.match(text, /不假定清单之外的角色/);
-  assert.match(text, /<ZCODE_HOME>/);
-  assert.match(text, /宿主只扫描该层，子目录不参与发现/);
-  for (const role of zcodeRoleNames) assert.doesNotMatch(text, new RegExp(role.replace(/\./g, '\\.')));
-  assert.doesNotMatch(text, /agents\/ai-vibecode-superpower/);
-  assert.match(text, /默认并行优先/);
-  assert.match(text, /fallback 只对本次派发生效/);
-  assert.match(text, /不得把写入任务派给只读角色/);
-  assert.match(text, /角色或模型不可用时，按档位就近回退/);
-  assert.match(text, /风险与回滚、验收、验证、停止条件/);
-  assert.match(text, /派发一个继承当前会话模型的子代理/);
-  assert.match(text, /承担原角色职责，其余流程不变/);
-  assert.match(text, /主代理不得改为在当前会话内直接执行/);
-  assert.match(text, /恢复后回到原角色/);
-  assert.doesNotMatch(text, /Agent 工具|subagent_type|general-purpose|spawn_agent/);
   for (const forbidden of [
-    'CODEX_HOME', 'coordinator_thread_id', 'gpt-5\\.6', 'sandbox_mode', 'avsp_'
-  ]) assert.doesNotMatch(text, new RegExp(forbidden));
+    'CODEX_HOME', 'ZCODE_HOME', 'agents/ai-vibecode-superpower', '顶层平铺', 'toml role', 'Agent 工具'
+  ]) {
+    assert.ok(!text.includes(forbidden), `host-specific source leaked into the shared skill: ${forbidden}`);
+  }
+  assert.doesNotMatch(text, /\{\{/);
+  assert.doesNotMatch(text, /<!-- @/);
+  for (const required of [
+    '宿主负责子代理',
+    '承担写入职责的角色',
+    '承担审核职责的角色',
+    '承担终审职责的角色',
+    '继承当前会话模型的子代理',
+    '<!-- preset-roles -->'
+  ]) {
+    assert.ok(text.includes(required), `shared skill must state: ${required}`);
+  }
 });
 
 test('skill skeletons require fresh-instance review when a role carries both duties', async () => {
-  for (const text of [await readFile(skill, 'utf8'), await readFile(zcodeSkill, 'utf8')]) {
-    assert.match(text, /复审复用承担写入职责的角色时必须派发全新实例，不得把写入实例的自述当作事实/);
-    assert.match(text, /由未参与本次写入的独立复审派发独立核对/);
-    assert.doesNotMatch(text, /由未参与写入的只读角色独立核对/);
-  }
+  const text = await readFile(skillBase, 'utf8');
+  assert.match(text, /复审复用承担写入职责的角色时必须派发全新实例，不得把写入实例的自述当作事实/);
+  assert.match(text, /由未参与本次写入的独立复审派发独立核对/);
+  assert.doesNotMatch(text, /由未参与写入的只读角色独立核对/);
 });
 
 test('glm preset keeps five roles with model routing and cross references', async () => {
@@ -296,8 +290,8 @@ test('ds preset keeps three roles on a single model with max carrying review dut
   assert.match(maxBody, /复审派发必须是全新实例，不得引用或信任写入实例的自述/);
 });
 
-test('zcode sources do not leak codex placeholders or model ids', async () => {
-  const glmFiles = [zcodeAgents, zcodeDocsReadme, zcodeSkill];
+test('shared base and zcode sources do not leak codex placeholders or model ids', async () => {
+  const glmFiles = [baseAgents, zcodeDocsReadme, skillBase];
   const glmDir = path.join(presetsRoot, 'glm');
   for (const file of (await readdir(glmDir, { recursive: true })).filter((name) => /\.(md|toml)$/.test(name))) {
     glmFiles.push(path.join(glmDir, file));
@@ -352,6 +346,19 @@ test('direct ripgrep release examples verify SHA-256 before extraction', async (
   assertBefore(linux, 'shasum', 'tar -xzf');
 });
 
+test('shared instruction and skill bases are host-agnostic', async () => {
+  const baseText = await readFile(baseAgents, 'utf8');
+  assert.doesNotMatch(baseText, /<!-- @section|<!-- @override|\{\{|CODEX_HOME|ZCODE_HOME|Codex|ZCode/);
+  assert.match(baseText, /<GLOBAL_HOME>/);
+  assert.match(baseText, /主代理按其规则调度角色/);
+  assert.match(baseText, /保持正常语义/);
+  const skillText = await readFile(skillBase, 'utf8');
+  assert.doesNotMatch(skillText, /<!-- @section|<!-- @override|\{\{|CODEX_HOME|ZCODE_HOME|Codex|ZCode/);
+  assert.match(skillText, /<!-- preset-roles -->/);
+  assert.match(skillText, /宿主负责子代理/);
+  assert.match(skillText, /承担写入职责的角色/);
+});
+
 test('PowerShell installer deploys the standalone skill into an isolated nested home', { skip: process.platform !== 'win32' }, async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'codex-powershell-contract-'));
   const codexHome = path.join(root, 'missing', 'nested', '.codex');
@@ -367,6 +374,15 @@ test('PowerShell installer deploys the standalone skill into an isolated nested 
     assert.match(installed, /^---\r?\nname: orchestrate-model-workflow\r?\n/);
     assert.match(installed, /- `gpt_6\.1_terra_high`：Terra\/high 常规契约写入角色。/);
     assert.doesNotMatch(installed, /<!-- preset-roles -->/);
+    assert.doesNotMatch(installed, /<!-- @/);
+    assert.doesNotMatch(installed, /\{\{/);
+    assert.doesNotMatch(installed, /ZCODE_HOME/);
+    assert.match(installed, /承担写入职责的角色/);
+    assert.match(installed, /承担审核职责的角色/);
+    assert.ok(
+      await readFile(path.join(codexHome, 'skills', 'orchestrate-model-workflow', 'agents', 'openai.yaml')).then(() => true, () => false),
+      'codex skill assets must be installed'
+    );
     const roleDir = path.join(codexHome, 'agents', 'ai-vibecode-superpower');
     const roleFiles = (await readdir(roleDir)).filter((name) => name.endsWith('.toml')).sort();
     assert.equal(roleFiles.length, 12);
@@ -374,6 +390,10 @@ test('PowerShell installer deploys the standalone skill into an isolated nested 
     await assertSharedSkillsDeployed(path.join(codexHome, 'skills'));
     const agents = await readFile(path.join(codexHome, 'AGENTS.md'), 'utf8');
     assert.doesNotMatch(agents, /<CODEX_HOME>|\$CODEX_HOME/);
+    assert.doesNotMatch(agents, /ZCODE_HOME/);
+    assert.doesNotMatch(agents, /GLOBAL_HOME/);
+    assert.doesNotMatch(agents, /\{\{|<!-- @/);
+    assert.match(agents, /orchestrate-model-workflow/);
     assert.match(agents, /codex-powershell-contract-/i);
     const config = await readFile(path.join(codexHome, 'config.toml'), 'utf8');
     assert.match(config, /keep_me = "untouched"/);
@@ -497,9 +517,23 @@ test('POSIX installer deploys a fresh standalone home without legacy prerequisit
     assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
     const installed = await readFile(path.join(codexHome, 'skills', 'orchestrate-model-workflow', 'SKILL.md'), 'utf8');
     assert.match(installed, /^---\nname: orchestrate-model-workflow\n/);
+    assert.doesNotMatch(installed, /<!-- @/);
+    assert.doesNotMatch(installed, /\{\{/);
+    assert.doesNotMatch(installed, /ZCODE_HOME/);
+    assert.match(installed, /承担写入职责的角色/);
+    assert.match(installed, /承担审核职责的角色/);
+    assert.doesNotMatch(installed, /<!-- preset-roles -->/);
+    assert.ok(
+      await readFile(path.join(codexHome, 'skills', 'orchestrate-model-workflow', 'agents', 'openai.yaml')).then(() => true, () => false),
+      'codex skill assets must be installed'
+    );
     await assertSharedSkillsDeployed(path.join(codexHome, 'skills'));
     const agents = await readFile(path.join(codexHome, 'AGENTS.md'), 'utf8');
     assert.doesNotMatch(agents, /<CODEX_HOME>|\$CODEX_HOME/);
+    assert.doesNotMatch(agents, /ZCODE_HOME/);
+    assert.doesNotMatch(agents, /GLOBAL_HOME/);
+    assert.doesNotMatch(agents, /\{\{|<!-- @/);
+    assert.match(agents, /orchestrate-model-workflow/);
     const config = await readFile(path.join(codexHome, 'config.toml'), 'utf8');
     assert.match(config, /^model = "gpt-6\.1-sol"/m);
     assert.match(config, /\[features\]\ngoals = true/);
@@ -668,12 +702,27 @@ test('PowerShell zcode installer composes shared and zcode sources and leaves un
     assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
     const agents = await readFile(path.join(zcodeHome, 'AGENTS.md'), 'utf8');
     assert.doesNotMatch(agents, /<ZCODE_HOME>|\$ZCODE_HOME/);
+    assert.doesNotMatch(agents, /CODEX_HOME/);
+    assert.doesNotMatch(agents, /GLOBAL_HOME/);
+    assert.doesNotMatch(agents, /\{\{|<!-- @/);
+    assert.match(agents, /orchestrate-model-workflow/);
     assert.match(agents, /zcode-powershell-contract-/i);
     const installedSkill = await readFile(path.join(zcodeHome, 'skills', 'orchestrate-model-workflow', 'SKILL.md'), 'utf8');
     assert.match(installedSkill, /^---\r?\nname: orchestrate-model-workflow\r?\n/);
     assert.match(installedSkill, /- `glm_5\.3_flash_low`：只读常规取证与实施后预审。/);
     assert.doesNotMatch(installedSkill, /<!-- preset-roles -->/);
     assert.doesNotMatch(installedSkill, /<ZCODE_HOME>/);
+    assert.doesNotMatch(installedSkill, /CODEX_HOME/);
+    assert.doesNotMatch(installedSkill, /<!-- @/);
+    assert.doesNotMatch(installedSkill, /\{\{/);
+    assert.match(installedSkill, /宿主负责子代理/);
+    assert.match(installedSkill, /承担写入职责的角色/);
+    assert.match(installedSkill, /承担审核职责的角色/);
+    assert.equal(
+      await readFile(path.join(zcodeHome, 'skills', 'orchestrate-model-workflow', 'agents', 'openai.yaml')).then(() => true, () => false),
+      false,
+      'zcode install must not ship codex skill assets'
+    );
     const agentFiles = (await readdir(path.join(zcodeHome, 'agents'))).filter((name) => name.endsWith('.md'));
     for (const role of zcodeRoleNames) assert.ok(agentFiles.includes(`${role}.md`), `missing flat agent: ${role}.md`);
     assert.equal(agentFiles.filter((name) => zcodeRoleNames.includes(name.slice(0, -3))).length, 5);
@@ -705,11 +754,26 @@ test('POSIX zcode installer deploys a fresh home without codex configuration', a
     assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
     const agents = await readFile(path.join(zcodeHome, 'AGENTS.md'), 'utf8');
     assert.doesNotMatch(agents, /<ZCODE_HOME>|\$ZCODE_HOME/);
+    assert.doesNotMatch(agents, /CODEX_HOME/);
+    assert.doesNotMatch(agents, /GLOBAL_HOME/);
+    assert.doesNotMatch(agents, /\{\{|<!-- @/);
+    assert.match(agents, /orchestrate-model-workflow/);
     const installedSkill = await readFile(path.join(zcodeHome, 'skills', 'orchestrate-model-workflow', 'SKILL.md'), 'utf8');
     assert.match(installedSkill, /^---\nname: orchestrate-model-workflow\n/);
     assert.match(installedSkill, /- `glm_5\.3_flash_low`：只读常规取证与实施后预审。/);
     assert.doesNotMatch(installedSkill, /<!-- preset-roles -->/);
     assert.doesNotMatch(installedSkill, /<ZCODE_HOME>/);
+    assert.doesNotMatch(installedSkill, /CODEX_HOME/);
+    assert.doesNotMatch(installedSkill, /<!-- @/);
+    assert.doesNotMatch(installedSkill, /\{\{/);
+    assert.match(installedSkill, /宿主负责子代理/);
+    assert.match(installedSkill, /承担写入职责的角色/);
+    assert.match(installedSkill, /承担审核职责的角色/);
+    assert.equal(
+      await readFile(path.join(zcodeHome, 'skills', 'orchestrate-model-workflow', 'agents', 'openai.yaml')).then(() => true, () => false),
+      false,
+      'zcode install must not ship codex skill assets'
+    );
     await assertSharedSkillsDeployed(path.join(zcodeHome, 'skills'));
     const agentFiles = (await readdir(path.join(zcodeHome, 'agents'))).filter((name) => name.endsWith('.md'));
     for (const role of zcodeRoleNames) assert.ok(agentFiles.includes(`${role}.md`), `missing flat agent: ${role}.md`);

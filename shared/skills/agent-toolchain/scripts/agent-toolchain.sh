@@ -295,7 +295,7 @@ configure_project() {
 - 单文件且不改公共契约的局部修复、文档/注释、格式化和低风险机械整理可以跳过 CodeGraph 查询。
 - 对只读且输出量大的命令，优先使用匹配的 `rtk` 子命令：`git`、`rg`、`log`、`diff`、`test`、`mvn`、`npm`、`pnpm`、`read`、`find`、`ls`、`tree`。未列出的只读命令先用 `rtk rewrite "<command>"` 或 `rtk --help` 核实；写操作和精确排障使用原生命令。
 - 只有工具注册表或 `--help` 未列出目标命令时，才能判定该命令不存在；其他工具错误保留原始输出，不得归因于能力缺失。
-- 安装、配置修复、初始化或修复索引、健康检查、升级审查和回滚使用全局 `$agent-toolchain`；不得在日常开发中自行安装、升级、重配或维护工具链。'
+- 安装、配置修复、初始化或修复索引、健康检查、升级审查和回滚使用全局 `agent-toolchain` skill；不得在日常开发中自行安装、升级、重配或维护工具链。'
 
   if [ "$wire_codex" -eq 1 ]; then
     if [ -f "$codex_config" ] && rg -q '^\[mcp_servers\.codegraph\][[:space:]]*$' "$codex_config"; then

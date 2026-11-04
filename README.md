@@ -2,7 +2,7 @@
 
 > 把 Codex 与 ZCode 从“单次对话工具”升级为一套面向复杂开发的工程协作系统：**更快推进、更强判断、更少浪费**。
 
-`ai-vibecode-superpower` 是可安装的 Codex / ZCode 配置包。它为复杂开发建立可追溯的取证、执行、验证与独立复查闭环；小任务仍然保持直接、轻量，不为工作流而工作流。两个宿主共享同一套平台文档和通用 skills；全局指令、agent 角色、工作流变体和安装行为的差异通过 `codex-global-config/` 与 `zcode-global-config/` 目录隔离。
+`ai-vibecode-superpower` 是可安装的 Codex / ZCode 配置包。它为复杂开发建立可追溯的取证、执行、验证与独立复查闭环；小任务仍然保持直接、轻量，不为工作流而工作流。两个宿主共享同一套平台文档和通用 skills；全局指令、agent 角色、工作流骨架与角色清单、安装行为通过 `codex-global-config/` 与 `zcode-global-config/` 目录及 `shared/` 的共享内容组合。
 
 ## 你真正得到的提升
 
@@ -68,7 +68,7 @@ flowchart LR
 
 ## 快速安装
 
-每个平台一个安装器：`install.ps1`（Windows）与 `install.sh`（macOS/Linux）。直接运行后按提示交互选择客户端（Codex / ZCode）和角色预设，或在命令中直接指定；共享内容由所选客户端的安装流程一并安装，宿主专属内容各装各的。新增客户端时在两个安装器的客户端注册表中加入一项即可。
+每个平台一个安装器：`install.ps1`（Windows）与 `install.sh`（macOS/Linux）。直接运行后按提示交互选择客户端（Codex / ZCode）和角色预设，或在命令中直接指定；共享内容由所选客户端的安装流程一并安装，宿主专属内容各装各的。新增客户端需要在两个安装器的客户端注册表中加入一项，并提供该客户端所需的 docs/config 与可选 `skill-assets/`；共享指令与工作流骨架不需要 per-client 副本。
 
 **角色预设**：agent 角色不是仓库里的固定文件，而是安装时从 `shared/roles/presets/` 下的预设（如 `glm`、`gpt`、`ds`）翻译生成的宿主配置。预设只绑定模型与职责，内置预设可直接用；只用其他模型或想混合模型（如 GPT 写码 + GLM 复审）时，复制一个预设目录、把各角色的 `model` 改成你宿主里实际可用的模型 ID 即可，详见 [`shared/roles/README.md`](shared/roles/README.md)。`ds` 预设的 `model` 是占位值，安装前必须改成你的实际 Picker 值。安装交互会列出可选预设并标注各客户端的默认值。
 
@@ -140,17 +140,15 @@ sh ./install.sh zcode glm
 | --- | --- | --- |
 | [`agent-toolchain`](shared/skills/agent-toolchain/SKILL.md) | 首次接入、升级、修复、维护或审查 CodeGraph/RTK | 对目标项目进行受控接入与维护。 |
 | [`deep-dive-review`](shared/skills/deep-dive-review/SKILL.md) | 交付后/上线前对需求或模块做多轮深挖质量审查 | 覆盖矩阵穷举、对抗证伪、裁决过滤与扩散收敛的台账与终报。 |
-| [`orchestrate-model-workflow`](codex-global-config/skills/orchestrate-model-workflow/SKILL.md) | 跨文件实现、复杂取证或独立验收 | 按证据和风险选择 role，并保留可核对的验证闭环。 |
+| [`orchestrate-model-workflow`](shared/skills/orchestrate-model-workflow/SKILL.md) | 跨文件实现、复杂取证或独立验收 | 按证据和风险选择 role，并保留可核对的验证闭环。 |
 | [`project-doc-planner`](shared/skills/project-doc-planner/SKILL.md) | 新项目或大型改造的文档规划 | 可维护的项目级文档结构。 |
 | [`visual-aesthetics`](shared/skills/visual-aesthetics/SKILL.md) | 视觉呈现是任务目标、改动对象或验收条件时 | 按需求与情境选用审美原理，依据实际呈现检查效果。 |
 
-`orchestrate-model-workflow` 是双变体 skill：Codex 版与 ZCode 版按宿主机制差异分离维护，ZCode 版见 [`zcode-global-config/skills/orchestrate-model-workflow/SKILL.md`](zcode-global-config/skills/orchestrate-model-workflow/SKILL.md)。
-
-例如：“使用 `$agent-toolchain` 给这个项目接入工具链”，或“使用 `$orchestrate-model-workflow` 组织这个复杂任务”。工具链接入完成后，普通开发不需要再次触发 `$agent-toolchain`。
+例如：“使用 `agent-toolchain` skill 给这个项目接入工具链”，或“使用 `orchestrate-model-workflow` skill 组织这个复杂任务”。工具链接入完成后，普通开发不需要再次触发 `agent-toolchain` skill。
 
 ## 进一步阅读
 
-- [`orchestrate-model-workflow`（Codex 版）](codex-global-config/skills/orchestrate-model-workflow/SKILL.md) / [（ZCode 版）](zcode-global-config/skills/orchestrate-model-workflow/SKILL.md)：工作流路由、交接与验收规范。
+- [`orchestrate-model-workflow`](shared/skills/orchestrate-model-workflow/SKILL.md)：工作流路由、交接与验收规范。
 - [角色预设与翻译器规范](shared/roles/README.md) / [内置预设](shared/roles/presets/)：角色 schema、翻译规则、内置预设与自定义方法。
 - [统一安装器：Windows](install.ps1) / [macOS/Linux](install.sh)（交互选择或指定 `codex` / `zcode` 客户端与预设）。
 

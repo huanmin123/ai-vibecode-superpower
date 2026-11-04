@@ -190,12 +190,12 @@ case "$client" in
         host_section=codex
         default_preset=gpt
         placeholder=CODEX_HOME
-        source_instructions=$script_dir/codex-global-config/AGENTS.md
+        source_instructions=$script_dir/shared/global-instructions.md
         source_docs=$script_dir/codex-global-config/docs
         source_config=$script_dir/codex-global-config/config.toml
         source_model_provider_settings=$script_dir/codex-global-config/model-provider-settings.toml
-        client_skills=$script_dir/codex-global-config/skills
-        skill_specs='agent-toolchain:shared project-doc-planner:shared visual-aesthetics:shared deep-dive-review:shared orchestrate-model-workflow:codex'
+        skill_assets_dir=$script_dir/codex-global-config/skill-assets
+        skill_specs='agent-toolchain:shared project-doc-planner:shared visual-aesthetics:shared deep-dive-review:shared orchestrate-model-workflow:shared'
         has_config=1
         ;;
     zcode)
@@ -206,18 +206,16 @@ case "$client" in
         host_section=zcode
         default_preset=glm
         placeholder=ZCODE_HOME
-        source_instructions=$script_dir/zcode-global-config/AGENTS.md
+        source_instructions=$script_dir/shared/global-instructions.md
         source_docs=$script_dir/zcode-global-config/docs
-        client_skills=$script_dir/zcode-global-config/skills
-        skill_specs='agent-toolchain:shared project-doc-planner:shared visual-aesthetics:shared deep-dive-review:shared orchestrate-model-workflow:zcode'
+        skill_assets_dir=
+        skill_specs='agent-toolchain:shared project-doc-planner:shared visual-aesthetics:shared deep-dive-review:shared orchestrate-model-workflow:shared'
         ;;
 esac
 
 skill_source_dir() {
     case "${1##*:}" in
         shared) printf '%s\n' "$shared_skills/${1%%:*}" ;;
-        codex) printf '%s\n' "$client_skills/${1%%:*}" ;;
-        zcode) printf '%s\n' "$client_skills/${1%%:*}" ;;
         *) return 1 ;;
     esac
 }
@@ -919,7 +917,8 @@ fi
 render_preset
 role_count=$ROLE_COUNT_OUT
 
-required_sources="$presets_root $source_docs $source_system_docs $source_instructions $shared_skills $client_skills"
+required_sources="$presets_root $source_docs $source_system_docs $source_instructions $shared_skills"
+[ -n "$skill_assets_dir" ] && required_sources="$required_sources $skill_assets_dir"
 [ "$has_config" -eq 1 ] && required_sources="$required_sources $source_config $source_model_provider_settings"
 for source_path in $required_sources; do
     [ -e "$source_path" ] || die "Missing source: $source_path"
@@ -934,6 +933,14 @@ assert_path_chain "$script_dir" || die "Unsafe installer source path: $script_di
 for source_path in $required_sources; do
     assert_no_symlink_tree "$source_path" || die "Source tree contains a symlink or unsafe entry: $source_path"
 done
+# 技能资产目录必须实际携带文件；空目录会让安装静默丢失客户端专属资产。
+if [ -n "$skill_assets_dir" ]; then
+    for asset_dir in "$skill_assets_dir"/*; do
+        [ -d "$asset_dir" ] || continue
+        asset_file_count=$(find "$asset_dir" -type f | wc -l | tr -d ' ')
+        [ "$asset_file_count" -gt 0 ] || die "Empty skill asset: $asset_dir"
+    done
+fi
 
 : "$HOME"
 raw_home=$HOME/$default_home
@@ -1285,29 +1292,42 @@ else
     done < "$render_dir/names.txt"
 fi
 for skill_spec in $skill_specs; do cp -R "$(skill_source_dir "$skill_spec")" "$stage_dir/skills/"; done
+# 客户端技能资产：把 <client>-global-config/skill-assets/<name>/ 的内容叠加到暂存技能目录。
+if [ -d "$skill_assets_dir" ]; then
+    for asset_dir in "$skill_assets_dir"/*; do
+        [ -d "$asset_dir" ] || continue
+        mkdir -p -- "$stage_dir/skills/$(basename -- "$asset_dir")"
+        cp -R "$asset_dir/." "$stage_dir/skills/$(basename -- "$asset_dir")/"
+    done
+fi
 # SKILL.md 角色清单渲染：骨架保留 <!-- preset-roles --> 占位符，安装时替换为当前宿主小节的角色清单。
 skill_doc=$stage_dir/skills/orchestrate-model-workflow/SKILL.md
-if [ -f "$skill_doc" ] && LC_ALL=C grep -qF -- '<!-- preset-roles -->' "$skill_doc"; then
-    if ! LC_ALL=C awk -v route_file="$render_dir/route.txt" '
-        BEGIN {
-            route = ""
-            first = 1
-            while ((getline routeline < route_file) > 0) {
-                if (first) { route = routeline; first = 0 } else { route = route "\n" routeline }
+if [ -f "$skill_doc" ]; then
+    role_marker_status=0
+    LC_ALL=C grep -qF -- '<!-- preset-roles -->' "$skill_doc" || role_marker_status=$?
+    [ "$role_marker_status" -le 1 ] || die "Could not inspect $skill_doc"
+    if [ "$role_marker_status" -eq 0 ]; then
+        if ! LC_ALL=C awk -v route_file="$render_dir/route.txt" '
+            BEGIN {
+                route = ""
+                first = 1
+                while ((getline routeline < route_file) > 0) {
+                    if (first) { route = routeline; first = 0 } else { route = route "\n" routeline }
+                }
+                close(route_file)
             }
-            close(route_file)
-        }
-        {
-            line = $0
-            while ((marker_pos = index(line, "<!-- preset-roles -->")) > 0) {
-                line = substr(line, 1, marker_pos - 1) route substr(line, marker_pos + 21)
+            {
+                line = $0
+                while ((marker_pos = index(line, "<!-- preset-roles -->")) > 0) {
+                    line = substr(line, 1, marker_pos - 1) route substr(line, marker_pos + 21)
+                }
+                print line
             }
-            print line
-        }
-    ' "$skill_doc" > "$skill_doc.rendered"; then
-        die 'Could not render the skill role route.'
+        ' "$skill_doc" > "$skill_doc.rendered"; then
+            die 'Could not render the skill role route.'
+        fi
+        mv -- "$skill_doc.rendered" "$skill_doc"
     fi
-    mv -- "$skill_doc.rendered" "$skill_doc"
 fi
 if [ "$has_config" -eq 1 ]; then
     config_input=$source_config
@@ -1331,10 +1351,18 @@ find "$stage_dir" -type f \( -name '*.md' -o -name '*.toml' -o -name '*.txt' \) 
 while IFS= read -r text_file || [ -n "$text_file" ]; do
     [ "$text_file" = "$file_list" ] && continue
     temporary_file=$text_file.tmp
-    sed "s|<${placeholder}>|$escaped_home|g; s|\$${placeholder}|$escaped_home|g" "$text_file" > "$temporary_file" || die "Could not expand placeholders in: $text_file"
+    sed "s|<${placeholder}>|$escaped_home|g; s|<GLOBAL_HOME>|$escaped_home|g; s|\$${placeholder}|$escaped_home|g" "$text_file" > "$temporary_file" || die "Could not expand placeholders in: $text_file"
     mv "$temporary_file" "$text_file"
 done < "$file_list"
 rm -f "$file_list"
+# 展开后不得残留任一宿主的 home 占位符或未解析 token，否则宿主会读到错误的文档路径。
+for guard_file in "$stage_dir/AGENTS.md" "$stage_dir"/skills/*/SKILL.md; do
+    [ -f "$guard_file" ] || continue
+    guard_status=0
+    LC_ALL=C grep -qE '(<(CODEX_HOME|ZCODE_HOME|GLOBAL_HOME)>|[$](CODEX_HOME|ZCODE_HOME)|[{][{])' "$guard_file" || guard_status=$?
+    [ "$guard_status" -le 1 ] || die "Could not inspect $guard_file"
+    [ "$guard_status" -eq 1 ] || die "Unresolved home placeholder in: $guard_file"
+done
 
 manifest=$stage_dir/targets.tsv
 printf 'AGENTS.md\t%s\t%s\tfile\treplace\n' "$client_home/AGENTS.md" "$stage_dir/AGENTS.md" > "$manifest"

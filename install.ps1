@@ -574,7 +574,7 @@ function Expand-Placeholders([string]$Directory, [string]$Token, [string]$Root) 
     foreach ($file in Get-ChildItem -LiteralPath $Directory -Recurse -File) {
         if ($file.Extension.ToLowerInvariant() -notin @('.md','.toml','.txt')) { continue }
         $text = [IO.File]::ReadAllText($file.FullName)
-        $expanded = $text.Replace(('<' + $Token + '>'), $Root).Replace(('$' + $Token), $Root)
+        $expanded = $text.Replace(('<' + $Token + '>'), $Root).Replace(('$' + $Token), $Root).Replace('<GLOBAL_HOME>', $Root)
         if ($expanded -ne $text) { [IO.File]::WriteAllText($file.FullName, $expanded, [Text.UTF8Encoding]::new($false)) }
     }
 }
@@ -593,7 +593,7 @@ $sourceSystemDocs = Join-Path $root 'shared\docs\system'
 $clientProfiles = [ordered]@{
     codex = @{
         Label = 'Codex'; HomeEnv = 'CODEX_HOME'; DefaultHome = '.codex'; RoleKind = 'toml'; HostSection = 'codex'; DefaultPreset = 'gpt'; Placeholder = 'CODEX_HOME'
-        Instructions = Join-Path $root 'codex-global-config\AGENTS.md'
+        Instructions = Join-Path $root 'shared\global-instructions.md'
         Docs = Join-Path $root 'codex-global-config\docs'
         ConfigTemplate = Join-Path $root 'codex-global-config\config.toml'
         ProviderSettings = Join-Path $root 'codex-global-config\model-provider-settings.toml'
@@ -602,19 +602,20 @@ $clientProfiles = [ordered]@{
             @{ Name = 'project-doc-planner'; Source = (Join-Path $root 'shared\skills\project-doc-planner') },
             @{ Name = 'visual-aesthetics'; Source = (Join-Path $root 'shared\skills\visual-aesthetics') },
             @{ Name = 'deep-dive-review'; Source = (Join-Path $root 'shared\skills\deep-dive-review') },
-            @{ Name = 'orchestrate-model-workflow'; Source = (Join-Path $root 'codex-global-config\skills\orchestrate-model-workflow') }
+            @{ Name = 'orchestrate-model-workflow'; Source = (Join-Path $root 'shared\skills\orchestrate-model-workflow') }
         )
+        SkillAssets = Join-Path $root 'codex-global-config\skill-assets'
     }
     zcode = @{
         Label = 'ZCode'; HomeEnv = 'ZCODE_HOME'; DefaultHome = '.zcode'; RoleKind = 'md'; HostSection = 'zcode'; DefaultPreset = 'glm'; Placeholder = 'ZCODE_HOME'
-        Instructions = Join-Path $root 'zcode-global-config\AGENTS.md'
+        Instructions = Join-Path $root 'shared\global-instructions.md'
         Docs = Join-Path $root 'zcode-global-config\docs'
         Skills = @(
             @{ Name = 'agent-toolchain'; Source = (Join-Path $root 'shared\skills\agent-toolchain') },
             @{ Name = 'project-doc-planner'; Source = (Join-Path $root 'shared\skills\project-doc-planner') },
             @{ Name = 'visual-aesthetics'; Source = (Join-Path $root 'shared\skills\visual-aesthetics') },
             @{ Name = 'deep-dive-review'; Source = (Join-Path $root 'shared\skills\deep-dive-review') },
-            @{ Name = 'orchestrate-model-workflow'; Source = (Join-Path $root 'zcode-global-config\skills\orchestrate-model-workflow') }
+            @{ Name = 'orchestrate-model-workflow'; Source = (Join-Path $root 'shared\skills\orchestrate-model-workflow') }
         )
     }
 }
@@ -669,6 +670,12 @@ $homePath = if ($homeEnvValue) { [IO.Path]::GetFullPath($homeEnvValue) } else { 
 if ([string]::IsNullOrWhiteSpace($homePath) -or [IO.Path]::GetPathRoot($homePath).TrimEnd('\') -eq $homePath.TrimEnd('\')) { throw "Refusing unsafe $label home: $homePath" }
 
 foreach ($path in @($presetsRoot, $profile.Docs, $sourceSystemDocs, $profile.Instructions)) { if (-not (Test-Path -LiteralPath $path)) { throw "Missing source: $path" } }
+if ($profile.Contains('SkillAssets') -and -not (Test-Path -LiteralPath $profile.SkillAssets)) { throw "Missing source: $($profile.SkillAssets)" }
+if ($profile.Contains('SkillAssets') -and (Test-Path -LiteralPath $profile.SkillAssets -PathType Container)) {
+    foreach ($asset in Get-ChildItem -LiteralPath $profile.SkillAssets -Directory) {
+        if (@(Get-ChildItem -LiteralPath $asset.FullName -Recurse -File).Count -eq 0) { throw "Empty skill asset: $($asset.FullName)" }
+    }
+}
 if ($profile.Contains('ConfigTemplate')) { foreach ($path in @($profile.ConfigTemplate, $profile.ProviderSettings)) { if (-not (Test-Path -LiteralPath $path)) { throw "Missing source: $path" } } }
 foreach ($skill in $profile.Skills) {
     if (-not (Test-Path -LiteralPath $skill.Source -PathType Container)) { throw "Missing skill: $($skill.Name)" }
@@ -738,6 +745,13 @@ try {
     foreach ($fileName in $rendered.Files.Keys) { [IO.File]::WriteAllText((Join-Path $stageAgents $fileName), $rendered.Files[$fileName], [Text.UTF8Encoding]::new($false)) }
     if ($profile.RoleKind -eq 'md') { [IO.File]::WriteAllText((Join-Path $stageAgents '.ai-vibecode-superpower.managed'), ((@($rendered.Files.Keys) | Sort-Object) -join "`n") + "`n", [Text.UTF8Encoding]::new($false)) }
     foreach ($skill in $profile.Skills) { Copy-Item $skill.Source (Join-Path $stage 'skills') -Recurse }
+    if ($profile.Contains('SkillAssets') -and (Test-Path -LiteralPath $profile.SkillAssets -PathType Container)) {
+        foreach ($asset in Get-ChildItem -LiteralPath $profile.SkillAssets -Directory) {
+            $assetTarget = Join-Path $stage "skills\$($asset.Name)"
+            New-Item -ItemType Directory -Path $assetTarget -Force | Out-Null
+            Copy-Item (Join-Path $asset.FullName '*') $assetTarget -Recurse -Force
+        }
+    }
     $skillDoc = Join-Path (Join-Path $stage 'skills\orchestrate-model-workflow') 'SKILL.md'
     if (Test-Path -LiteralPath $skillDoc -PathType Leaf) {
         $skillText = [IO.File]::ReadAllText($skillDoc)
@@ -749,6 +763,12 @@ try {
     }
     if ($null -ne $existingConfig) { Merge-Config $profile.ConfigTemplate $existingConfig $profile.ProviderSettings (Join-Path $stage 'config.toml') }
     Expand-Placeholders $stage $profile.Placeholder $homePath
+    # 展开后不得残留任一宿主的 home 占位符或未解析 token，否则宿主会读到错误的文档路径。
+    $guardFiles = @((Join-Path $stage 'AGENTS.md')) + @(Get-ChildItem -LiteralPath (Join-Path $stage 'skills') -Directory -ErrorAction SilentlyContinue | ForEach-Object { Join-Path $_.FullName 'SKILL.md' })
+    foreach ($guardFile in $guardFiles) {
+        if (-not (Test-Path -LiteralPath $guardFile -PathType Leaf)) { continue }
+        if ([IO.File]::ReadAllText($guardFile) -match '<(CODEX_HOME|ZCODE_HOME|GLOBAL_HOME)>|\$(CODEX_HOME|ZCODE_HOME)|\{\{') { throw "Unresolved home placeholder in: $guardFile" }
+    }
     Assert-RoleOutput $profile.RoleKind $stageAgents $expectedRoleCount
 
     $backupRoot = Join-Path $homePath 'backups'
