@@ -74,7 +74,7 @@ flowchart LR
 
 ### Codex
 
-前置条件：所有平台都需要 `rg`（ripgrep）；安装器会检查，缺失时按系统文档安装。
+运行时依赖：所有平台都需要 `rg`（ripgrep）；安装器不检查，缺失时按系统文档安装。
 
 安装器会解析当前用户的 Codex home，再把全局文档中的路径占位符替换为绝对路径；已安装的 `AGENTS.md` 和 `docs/` 不依赖模型展开环境变量。安装失败时会尝试从本次安装生成的备份恢复；名称不匹配、符号链接或 junction 内容不会删除。备份目录由安装器输出，清理策略由维护者另行管理。
 
@@ -139,7 +139,7 @@ sh ./install.sh zcode glm
 | 能力 | 何时使用 | 你会得到 |
 | --- | --- | --- |
 | [`agent-toolchain`](shared/skills/agent-toolchain/SKILL.md) | 首次接入、升级、修复、维护或审查 CodeGraph/RTK | 对目标项目进行受控接入与维护。 |
-| [`deep-dive-review`](shared/skills/deep-dive-review/SKILL.md) | 交付后/上线前对需求或模块做多轮深挖质量审查 | 覆盖矩阵穷举、对抗证伪、裁决过滤与扩散收敛的台账与终报。 |
+| [`deep-dive-review`](shared/skills/deep-dive-review/SKILL.md) | 交付后/上线前对需求或模块做多轮深挖质量审查 | 覆盖矩阵穷举、对抗证伪、裁决过滤与扩散收敛的台账与终报；默认只出报告，显式授权后修复。 |
 | [`orchestrate-model-workflow`](shared/skills/orchestrate-model-workflow/SKILL.md) | 跨文件实现、复杂取证或独立验收 | 按证据和风险选择 role，并保留可核对的验证闭环。 |
 | [`project-doc-planner`](shared/skills/project-doc-planner/SKILL.md) | 新项目或大型改造的文档规划 | 可维护的项目级文档结构。 |
 | [`test-strategy`](shared/skills/test-strategy/SKILL.md) | 小功能/修复需要选测试、避免全量或过度测试时 | 功能基线全项目 ≤5 分钟；场景/性能按需另计。 |

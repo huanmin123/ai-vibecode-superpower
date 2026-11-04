@@ -28,17 +28,17 @@
 
 ## 默认排除
 
-默认命令必须排除场景测试，并验证收集到 0 个场景：
+默认命令在加载测试模块前排除场景测试，验证收集到 0 个场景且未加载场景测试模块。仅发现文件名等元数据不等于加载模块；导入模块、初始化包或启动测试 target 可能产生副作用。运行时 skip 或测试名筛选不能单独证明加载前隔离。另须确认应运行的功能基线实际执行且通过：收集到 0 个测试或全部跳过时，该范围未验证。
 
-- pytest：`addopts = -m "not scenario"`，场景用 `@pytest.mark.scenario`。
-- Vitest：配置 `exclude` 排除 `tests/scenario/**`，或使用独立 project。
-- Jest：`testPathIgnorePatterns` 排除 `tests/scenario`。
-- Node 内置 runner：默认只 glob `tests/baseline`。
-- Go：场景用 build tag 或 `testing.Short()`；默认 `-short` 时测试内部必须用 `testing.Short()` 跳过。
-- Rust：场景用 `#[ignore]` 或 feature `scenario`，显式 `cargo test --features scenario`；默认 `cargo test` 不跑。
-- Maven：场景用 Failsafe 或 `@Tag("scenario")` 的独立 profile；默认 surefire 排除。
-- Gradle：场景用独立 `scenarioTest` source set，默认 `test` 不包含。
-- .NET：场景用 `[Trait("Category","Scenario")]`，默认 `dotnet test --filter "Category!=Scenario"`。
+- pytest：默认显式选择 baseline 目录或在收集前忽略场景路径；只用 `-m "not scenario"` 会先导入测试模块，不能证明隔离。场景用标记并显式选择场景路径。
+- Vitest：使用独立 baseline 和 scenario project，或为两者提供独立配置。全局 `exclude` 也会排除显式指定的场景路径，场景命令需使用不含该排除项的配置。
+- Jest：为 baseline 和 scenario 使用独立配置。全局 `testPathIgnorePatterns` 也会排除显式指定的场景路径，场景命令需使用不含该排除项的配置。
+- Node 内置 runner：默认显式传入 baseline 测试文件列表；使用 glob 前核实项目 Node 版本支持的展开方式。
+- Go：场景放在带 build tag 的独立文件，或独立场景包并从默认命令的包范围排除；默认构建不能加载场景文件或包。显式场景命令选择对应 tag 或包。`testing.Short()` 可额外防护，但 `-short` 不能防止包初始化或单独证明隔离。
+- Rust：场景放在独立 test target，配置非默认 `scenario` feature 控制该 target，或让默认命令只选择 baseline target；显式场景命令选择对应 target，必要时启用 feature。`#[ignore]` 可额外防护，但单独使用不能阻止测试 target 启动；启用场景时若使用 `#[ignore]`，还需 `-- --ignored`。
+- Maven：场景放独立测试目录或模块，由 Failsafe/profile 显式选择；默认 surefire 不加载场景类。单靠 `@Tag` 筛选须核实不会先加载场景类。
+- Gradle：场景用独立 `scenarioTest` source set，默认 `test` 不包含且不加载场景类。
+- .NET：场景放独立测试项目，默认命令只选择 baseline 项目；`[Trait("Category","Scenario")]` 可进一步筛选，但不能单独证明场景程序集未加载。
 
 某生态无法隔离时，不得使用全量命令；先报告缺口并定义显式场景命令。
 

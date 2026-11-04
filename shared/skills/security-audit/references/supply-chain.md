@@ -14,31 +14,31 @@
 
 ## 2 依赖清单
 
-先确定**实际锁定版本**，再看是否存在漏洞。常见对应关系如下（示例，不是完整清单；以目标仓库实际使用的包管理器为准）：
+先确定可证实的依赖版本，再看是否存在漏洞。常见对应关系如下（示例，不是完整清单；以目标仓库实际使用的包管理器为准）：
 
 | 生态 | 清单 | 锁文件 |
 | --- | --- | --- |
 | Node | `package.json` | `package-lock.json` / `pnpm-lock.yaml` / `yarn.lock` |
 | Python | `pyproject.toml` / `requirements*.txt` | `poetry.lock` / `uv.lock` / `Pipfile.lock` |
-| Go | `go.mod` | `go.sum` |
+| Go | `go.mod` / `go.work` | 无独立锁文件；`go.sum` / `go.work.sum` 记录校验和 |
 | JVM | `pom.xml` / `build.gradle` | `gradle.lockfile` / 依赖树 |
 | PHP | `composer.json` | `composer.lock` |
 | Ruby | `Gemfile` | `Gemfile.lock` |
 | .NET | `*.csproj` | `packages.lock.json` |
 | Rust | `Cargo.toml` | `Cargo.lock` |
 
-只有清单没有锁文件时，解析结果可能与生产不一致，必须在报告中标注"版本未锁定/可能漂移"。
+Go 的 build list 由模块依赖图和 MVS 解析，需结合 `go.mod`、适用的 `go.work` 和 `replace` 判断；`go.sum` 可能包含未选中的版本，不能当作 build list。解析结果也不等于实际部署产物，应分别核对构建上下文和产物，无法核实时记录缺口。其他生态只有清单没有锁文件时，解析结果可能与生产不一致，须标注版本可能漂移。
 
 ## 3 已知漏洞与可达性
 
-常用工具如下（示例；优先使用项目已有工具，缺工具时先确认是否已有等价能力）：
+常用工具如下（示例；执行前按 [工具边界](tooling.md) 核实构建、配置、网络和写入副作用；不满足时登记缺口）：
 
 | 工具 | 适用 | 要点 |
 | --- | --- | --- |
 | `osv-scanner scan source -r .` | 多生态 + 锁文件 | 优先锁文件；支持 `--call-analysis` 的语言可减少未调用告警 |
 | `trivy fs --scanners vuln,secret,misconfig .` | 文件系统/镜像/IaC | 缺省扫描 `vuln,secret`；用 `--severity` 过滤 |
 | `govulncheck ./...` | Go | 基于调用图，信噪比最好；无抑制机制 |
-| `npm audit` / `pnpm audit` / `yarn npm audit` | Node | 无锁文件不可靠；`--audit-level` 只改退出码，不过滤报告 |
+| `npm audit` / `pnpm audit` / `yarn npm audit` | Node | 无锁文件不可靠；`npm audit` 向配置的 registry 发送依赖数据，先确认接收方和数据授权；`--audit-level` 只改退出码，不过滤报告 |
 | `pip-audit -r requirements.txt` | Python | 解析环境或锁文件；注意解析漂移 |
 | `cargo audit` | Rust | 基于 `Cargo.lock` 与 RustSec |
 | `bundle audit` / `composer audit` | Ruby / PHP | 基于锁文件 |
@@ -46,7 +46,7 @@
 
 判定顺序：
 
-1. 漏洞是否影响**实际锁定版本**；
+1. 漏洞是否影响已核实的依赖版本；
 2. 受影响函数是否被本仓库调用（有调用图工具时优先）；
 3. 调用路径是否可从外部入口到达；
 4. 是否有可用修复版本；没有修复时是否有官方缓解措施；
@@ -86,7 +86,7 @@
 
 ## 7 仓库密钥
 
-1. 扫描当前文件与 git 历史（`gitleaks git`、`trufflehog git file://.`、`detect-secrets`）。
+1. 扫描授权范围内的当前文件；只有历史范围获准时才扫描对应 git 历史（例如 `gitleaks git`、`detect-secrets`；TruffleHog 的本地、无验证和无网络边界见 [工具选择](tooling.md)）。
 2. 确认凭据是否**有效、权限多大、是否已在生产使用**；不能确认有效性的，标为"疑似泄露"。
 3. 处理顺序：先轮换/吊销，再清理历史；只从工作区删除不算修复。
 4. 测试夹具、示例值、已吊销凭据记 clean 并注明依据。

@@ -2,6 +2,8 @@
 
 测绘的目标不是"看懂项目"，而是产出后续排查可直接使用的边界与清单：哪些输入能进入系统、经过哪些控制、落到哪些敏感操作、由谁授权。
 
+以下递归命令从授权 root 或授权子目录执行，并限定授权路径；历史命令限定授权 ref。不得因 `.` 或仓库级历史扩大范围。
+
 ## 1 技术栈与版本
 
 先确定**实际运行版本**，而不是清单里的声明版本：
@@ -36,7 +38,7 @@ rg --files -g 'Cargo.toml' -g 'Cargo.lock'
 | Server Action/边缘函数 | `"use server"`、`route.ts`、edge functions、lambda handler |
 | 文件系统/配置 | 扫描目录、监听文件、读取环境变量或挂载配置的路径 |
 
-入口必须能对应到具体函数与文件行。找不到注册点的 handler 记为"未接线"，不当作可达入口。
+代码入口必须能对应到具体函数与文件行。找不到注册点的 handler 记为"未接线"，不当作可达入口。非代码入口记录授权资源标识或只读命令、执行身份、采集时间和相关输出定位；不能核实的可达性标为未验证。
 
 入口类型不是穷举；专门找表外入口：插件、规则引擎、导入导出、消息订阅、模型/Agent 工具调用、批处理、管理脚本、设备/离线同步。发现表外入口时新增一行，并说明它为什么可达或为什么不可达。
 
@@ -89,17 +91,7 @@ rg --files -g 'Cargo.toml' -g 'Cargo.lock'
 
 ## 7 目标自身的已知问题
 
-在开始判断前，先收集项目自己留下的线索；它们既是审计入口，也是"是否已修/是否回填/是否只是已知限制"的证据：
-
-```bash
-rg --files -g 'SECURITY.md' -g 'CHANGELOG*' -g 'RELEASE*' -g 'docs/security*'
-rg -n 'TODO|FIXME|HACK|XXX|security|vuln|insecure|unsafe|bypass' \
-  --glob '!vendor' --glob '!node_modules' --glob '!dist' .
-rg -n 'skip|xfail|@Ignore|\.only\(|disabled' tests/ 2>/dev/null
-git log --all --oneline -i --grep='security' --grep='CVE-' --grep='vulnerab' --grep='auth bypass' --grep='SSRF' --grep='XSS' --grep='injection'
-git log --all -S'unsafe' --oneline -- path/to/area 2>/dev/null
-git tag --sort=-creatordate | head -20
-```
+在开始判断前，先收集项目自己留下的线索；它们既是审计入口，也是"是否已修/是否回填/是否只是已知限制"的证据。按 [external-research.md](external-research.md) 第 2 节在授权的 root、ref 和路径内检索，子目录范围不得因 `.` 或仓库级历史扩大。
 
 记录：已知披露与修复版本、被回滚或未回填的修复、跳过的安全测试、注释中的"暂时不校验"、仍开放的 issue/PR。检索与可信度规则见 [external-research.md](external-research.md) 第 2 节。
 
@@ -152,6 +144,6 @@ git tag --sort=-creatordate | head -20
 ## 测绘纪律
 
 - 先读路由注册与中间件装配，再读业务实现；顺序反了容易把不可达代码当成入口。
-- 以"实际运行版本"为准核实框架默认行为；声明版本与锁定版本不一致时，以锁文件为准并记录差异。
-- 入口、边界、授权矩阵都必须能落到 file:line；落不到的写成待确认项，不带入后续定性。
+- 分别记录声明版本、依赖解析结果及实际部署版本；锁文件不能单独证明实际部署，按 [supply-chain.md](supply-chain.md) 核对构建上下文与产物，无法核实时标明缺口。
+- 代码入口、边界、授权矩阵必须能落到 `file:line`；非代码项使用可复核的资源或命令输出定位，并记录身份和时间。缺少适用层证据的写成待确认项，不带入后续定性。
 - 测绘阶段不下漏洞结论；发现可疑 sink 只登记位置，留给分域排查。

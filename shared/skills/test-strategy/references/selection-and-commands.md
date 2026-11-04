@@ -41,7 +41,7 @@
 
 1. 读 workspace manifests、构建脚本和 CI 配置，列出模块与边界。
 2. 从项目 scripts/CI 取命令，用 `--list` / `--collect-only` / `--dry-run` 验证。
-3. 写入 `TESTING.md`；项目已有文档体系时放进其指定测试文档，不另建架构。
+3. 项目已有测试文档时写入其指定位置；没有 `TESTING.md` 时先征得用户同意再写，或只把映射放进交付证据，不另建架构。
 4. 记录来源、日期和负责人。
 
 ```
@@ -66,49 +66,49 @@
 
 ## co-located 测试
 
-如果功能基线与源码同目录，必须用 marker/project 选择，不能只按目录：
+如果功能基线与源码同目录，选择 baseline 测试文件或 project，并确认场景测试模块不会被加载；仅在导入后筛选的 marker 不足以隔离：
 
-- pytest：`pytest -m baseline`，并在配置中注册 `baseline` marker。
+- pytest：选择 baseline 文件列表或在收集前忽略场景路径；marker 可进一步筛选已选测试。
 - Vitest：独立 `baseline` project。
-- Jest：`--testPathPattern` 选择测试文件，同时排除 `tests/scenario`。
-- Node 内置 runner：默认只支持 `tests/baseline`；co-located 需要生成文件列表，不能假设 glob。
+- Jest：使用项目当前版本支持的路径筛选参数选择测试文件，同时排除 `tests/scenario`。
+- Node 内置 runner：传入选出的 baseline 测试文件列表；使用 glob 前核实项目 Node 版本支持的展开方式。
 - 全量命令同步使用 marker/project，不只写目录。
 
 ## 常见生态命令示例
 
-按项目实际脚本替换，不要假设包管理器或目录名。
+按项目实际脚本、runner 版本和测试布局替换，不要假设包管理器或目录名。Node 第三方 runner 使用项目已安装的本地可执行文件；不可用时报告缺失，不用可能自动下载的 `npx` 补装。以下文件路径、模块和测试名均为占位符。
 
 - Python / pytest：
   - `pytest tests/baseline/<module> -q`
-  - `pytest tests/baseline/<module> -m "not scenario"`
-  - `pytest --lf`（只跑上次失败）
-  - `pytest --durations=20`（找慢用例）
+  - `pytest tests/baseline/<module> -m "not scenario"`（该目录不包含场景测试模块）
+  - `pytest tests/baseline/<module> --lf --last-failed-no-failures none`（仅重跑该范围内缓存的上次失败；无缓存失败时不运行）
+  - `pytest tests/baseline/<module> --durations=20`（找该范围内慢用例）
 - Node / Vitest：
-  - `npx vitest run tests/baseline/<module>`
-  - `npx vitest run --changed`
-  - `npx vitest run --project baseline`
+  - `./node_modules/.bin/vitest run tests/baseline/<module>`
+  - `./node_modules/.bin/vitest run --project baseline`（仅项目策略允许全量时）
 - Node / Jest：
-  - `npx jest tests/baseline/<module>`
-  - `npx jest --onlyChanged`
+  - `./node_modules/.bin/jest tests/baseline/<module>`
 - Node 内置 test runner：
-  - `node --test tests/baseline/<module>`
+  - `node --test tests/baseline/<module>/<test-file>.test.js`（多文件时传入实际文件列表，不将目录当作测试文件）
 - Go：
-  - `go test -short ./<module>/...`
-  - `go test -short ./<module>/... -run TestName -count=1`
-  - `-short` 只是标志，测试内部必须用 `testing.Short()` 跳过慢用例和场景测试。
+  - `go test -short ./<baseline-package>`
+  - `go test -short ./<baseline-package> -run TestName -count=1`
+  - 包范围须排除独立场景包；同包场景文件须使用默认不启用的 build tag。`-short` 只是额外标志，不能防止场景包初始化。
 - Rust / Cargo：
-  - `cargo test -p <crate>`
-  - `cargo test -p <crate> <test_name>`
+  - `cargo test -p <crate> --test <baseline-target>`
+  - `cargo test -p <crate> --test <baseline-target> <test_name>`
 - Java / Maven：
   - `mvn -Dtest='<Class>#<method>' test`
 - Java / Gradle：
   - `./gradlew test --tests '<Class>.<method>'`
 - .NET：
-  - `dotnet test --filter "FullyQualifiedName~<Class>"`
+  - `dotnet test <baseline-project>.csproj --filter "FullyQualifiedName~<Class>"`
 
-场景测试命令必须显式带标记或目录，例如 `pytest -m scenario tests/scenario/<flow>`、`npm run test:scenario -- <flow>`；默认命令不得包含它们，并验证默认命令收集到 0 个场景。
+Vitest `--changed` 和 Jest `--onlyChanged` 依赖 Git 变更关系：先核实项目约定的被审基线、共同祖先及 runner 版本的比较行为，再确认选择结果包含受影响模块和新增测试；不能仅凭这些选项证明覆盖。选择到空集时按未验证报告。
 
-全量功能基线命令由项目提供，常见形式：`pytest tests/baseline`、`vitest run tests/baseline`、`go test ./... -short`、`cargo test --all`。只在“全量功能基线”允许的场景使用，并记录耗时。
+场景测试命令必须显式带标记、目录或 target，例如 `pytest -m scenario tests/scenario/<flow>`、项目配置好的 `npm run test:scenario -- <flow>`；默认命令须在加载场景测试模块前排除它们，并验证收集到 0 个场景且未加载场景测试模块。运行时跳过不能证明隔离。应有测试的范围若收集到 0 个测试或全部跳过，报告未验证；仅证明场景被排除不等于功能基线通过。
+
+全量功能基线命令由项目提供，且须确认选中的目录、包或 target 不加载场景测试模块。只在“全量功能基线”允许的场景使用，并记录耗时。
 
 ## 控制测试规模
 

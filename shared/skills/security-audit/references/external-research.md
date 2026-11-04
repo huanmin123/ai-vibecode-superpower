@@ -11,7 +11,7 @@
 | 问题 | 一手来源 | 交叉验证 |
 | --- | --- | --- |
 | 这个版本是否存在已知漏洞 | OSV、GitHub Advisory、厂商 PSIRT、发行版 tracker | NVD/CVE.org、包管理器 audit |
-| 这个漏洞是否影响本仓库 | 公告的 affected range + 锁文件版本 + 代码调用 | 发行版 backport 记录、修复提交 |
+| 这个漏洞是否影响本仓库 | 公告的 affected range + 已核实版本 + 代码调用 | 发行版 backport 记录、修复提交 |
 | 这个框架/库的默认行为 | 对应版本文档、源码 tag、changelog | 依赖源码、release notes |
 | 这个 API 是否危险 | 官方文档的安全章节、CWE/Cheat Sheet | 社区/研究文章（仅辅助） |
 | 是否存在在野利用 | CISA KEV、厂商通告、可信研究 | EPSS（概率，不是结论） |
@@ -22,16 +22,16 @@
 
 ## 2 目标自身的已有问题
 
-审计开始前先看项目自己留下了什么线索：
+审计开始前先看项目自己留下了什么线索。以下文件搜索从授权 root 或子目录执行，`.` 仅代表该授权目录，且工作区内容必须对应授权 ref；不对应时先以只读方式核实指定 ref 的内容。历史搜索仅在提交历史、ref 和路径都已获准时执行；变更集审计不因调查线索扩大历史或路径范围。
 
 ```bash
 rg --files -g 'SECURITY.md' -g 'CHANGELOG*' -g 'RELEASE*' -g 'docs/security*'
 rg -n 'TODO|FIXME|HACK|XXX|security|vuln|insecure|unsafe|bypass' \
   --glob '!vendor' --glob '!node_modules' --glob '!dist' .
-rg -n 'skip|xfail|@Ignore|\.only\(|disabled' tests/ 2>/dev/null
-git log --all --oneline -i --grep='security' --grep='CVE-' --grep='vulnerab' --grep='auth bypass' --grep='SSRF' --grep='XSS' --grep='injection'
-git log --all -S'unsafe' --oneline -- path/to/area 2>/dev/null
-git tag --sort=-creatordate | head -20
+rg -n 'skip|xfail|@Ignore|\.only\(|disabled' tests/
+# 将占位符替换为已授权的历史范围和相对于当前授权目录的路径
+git log '<已授权历史范围>' --oneline -i --grep='security' --grep='CVE-' --grep='vulnerab' --grep='auth bypass' --grep='SSRF' --grep='XSS' --grep='injection' -- '<已授权路径>'
+git log '<已授权历史范围>' -S'unsafe' --oneline -- '<已授权路径>'
 ```
 
 重点看：
@@ -59,7 +59,7 @@ git tag --sort=-creatordate | head -20
 
 ## 3 依赖漏洞的核实流程
 
-1. **确定实际版本**：从锁文件读取，不用清单里的范围号。
+1. **确定版本证据**：从适用的锁文件或依赖解析结果核对，并与部署产物区分；Go 特例见 [供应链审计](supply-chain.md#2-依赖清单)。
 2. **查公告**：OSV/GHSA/厂商 PSIRT/发行版 tracker；记录公告 ID、CVE、affected range、fixed version。
 3. **核对适用性**：
    - 版本是否落在 affected range；
@@ -71,19 +71,18 @@ git tag --sort=-creatordate | head -20
 6. **给修复**：升级到哪个版本、是否有 backport、无法升级时的缓解措施。
 
 ```bash
-osv-scanner scan source -r .
-# 只查询包名与版本，不上传代码
-curl -s https://api.osv.dev/v1/query \
+# 仅在包名和版本获准外发时查询，不上传代码
+curl -fsS https://api.osv.dev/v1/query \
   -H 'Content-Type: application/json' \
   -d '{"package":{"name":"<pkg>","ecosystem":"npm"},"version":"<version>"}'
 ```
 
-查询外部 API 属于只读网络请求，但仍要确认授权与数据边界：不要发送源码、内部 URL、凭据或客户数据。
+查询外部 API 属于只读网络请求，但仍要确认接收方与数据边界，包括包名和版本；不要发送源码、内部 URL、凭据或客户数据。使用扫描器查询时也须先核实其发送的数据和本地副作用，见 [工具选择](tooling.md)。
 
 ## 4 版本相关行为的核实
 
 1. 从包元数据/registry 找到官方文档，再切到**对应版本**（版本选择器或 tag），不是最新版。
-2. 文档含糊时读安装版本的源码：`node_modules`、`site-packages`、`go mod download` 的模块、jar sources、vendored 目录。
+2. 文档含糊时读取已存在的安装版本源码：`node_modules`、`site-packages`、本地 Go 模块缓存、jar sources、vendored 目录；缺少源码时登记缺口，另行下载须先确认授权和副作用。
 3. 查 changelog/release notes，确认安全默认值是否在版本间变化。
 4. 记录：版本、文档 URL、核实日期。
 5. 文档与源码冲突时，以安装版本的实际行为为准，并在报告中记录冲突。

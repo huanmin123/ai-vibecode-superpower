@@ -70,12 +70,10 @@ function posixHome(codexHome) {
 
 const sharedSkillNames = ['agent-toolchain', 'project-doc-planner', 'visual-aesthetics', 'deep-dive-review', 'test-strategy', 'security-audit'];
 
-async function assertSharedSkillsDeployed(skillsDir) {
-  for (const name of sharedSkillNames) {
+async function assertSharedSkillsDeployed(skillsDir, client) {
+  for (const name of [...sharedSkillNames, 'orchestrate-model-workflow']) {
     assert.match(await readFile(path.join(skillsDir, name, 'SKILL.md'), 'utf8'), /^---/);
   }
-  const skillEntries = (await readdir(skillsDir)).filter((name) => !name.startsWith('.'));
-  assert.equal(skillEntries.length, sharedSkillNames.length + 1, 'managed skill count must include all shared skills and orchestrate-model-workflow');
   assert.match(await readFile(path.join(skillsDir, 'visual-aesthetics', 'references', 'design-principles.md'), 'utf8'), /^# /);
   const strategySkill = await readFile(path.join(skillsDir, 'test-strategy', 'SKILL.md'), 'utf8');
   const expectedRefs = (await readdir(path.join(repository, 'shared', 'skills', 'test-strategy', 'references')))
@@ -103,23 +101,39 @@ async function assertSharedSkillsDeployed(skillsDir) {
     assert.ok(content.length > 40, `reference must not be empty: ${ref}`);
     assert.doesNotMatch(content, /Codex|ZCode|CODEX_HOME|ZCODE_HOME/, `reference must stay host-agnostic: ${ref}`);
   }
-  const hasCodexAssets = await readFile(path.join(skillsDir, 'orchestrate-model-workflow', 'agents', 'openai.yaml')).then(() => true, () => false);
-  const hasStrategyAsset = await readFile(path.join(skillsDir, 'test-strategy', 'agents', 'openai.yaml')).then(() => true, () => false);
-  assert.equal(hasStrategyAsset, hasCodexAssets, 'client skill assets must be isolated consistently');
-  if (hasStrategyAsset) {
-    const asset = await readFile(path.join(skillsDir, 'test-strategy', 'agents', 'openai.yaml'), 'utf8');
-    assert.match(asset, /display_name:/);
-    assert.match(asset, /default_prompt:.*\$test-strategy/);
-    assert.match(asset, /allow_implicit_invocation:\s*true/);
+  for (const name of ['test-strategy', 'security-audit']) {
+    const assetPath = path.join(skillsDir, name, 'agents', 'openai.yaml');
+    if (client === 'codex') {
+      const asset = await readFile(assetPath, 'utf8');
+      assert.match(asset, /display_name:/);
+      assert.match(asset, new RegExp(`default_prompt:.*\\$${name}`));
+      assert.match(asset, /allow_implicit_invocation:\s*true/);
+    } else {
+      await assert.rejects(readFile(assetPath), { code: 'ENOENT' });
+    }
   }
-  const hasAuditAsset = await readFile(path.join(skillsDir, 'security-audit', 'agents', 'openai.yaml')).then(() => true, () => false);
-  assert.equal(hasAuditAsset, hasCodexAssets, 'client skill assets must be isolated consistently');
-  if (hasAuditAsset) {
-    const asset = await readFile(path.join(skillsDir, 'security-audit', 'agents', 'openai.yaml'), 'utf8');
-    assert.match(asset, /display_name:/);
-    assert.match(asset, /default_prompt:.*\$security-audit/);
-    assert.match(asset, /allow_implicit_invocation:\s*true/);
+}
+
+async function seedZcodeSkills(zcodeHome) {
+  for (const [name, content] of [['test-strategy', 'old managed skill\n'], ['private-sentinel', 'private skill\n']]) {
+    const dir = path.join(zcodeHome, 'skills', name);
+    await mkdir(dir, { recursive: true });
+    await writeFile(path.join(dir, 'SKILL.md'), content);
   }
+}
+
+async function assertZcodeSkillsPreserved(zcodeHome) {
+  assert.equal(await readFile(path.join(zcodeHome, 'skills', 'private-sentinel', 'SKILL.md'), 'utf8'), 'private skill\n');
+  const backups = await readdir(path.join(zcodeHome, 'backups'));
+  const contents = await Promise.all(backups.map(async (backup) => {
+    try {
+      return await readFile(path.join(zcodeHome, 'backups', backup, 'skills', 'test-strategy', 'SKILL.md'), 'utf8');
+    } catch (error) {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    }
+  }));
+  assert.ok(contents.includes('old managed skill\n'), 'previous managed skill must be backed up');
 }
 
 test('global behavior rules do not hard-code obsolete host tool protocols', async () => {
@@ -411,12 +425,16 @@ test('test strategy skill separates baseline, scenario, and performance tracks',
   const skillDir = path.join(repository, 'shared', 'skills', 'test-strategy');
   const text = await readFile(path.join(skillDir, 'SKILL.md'), 'utf8');
   assert.match(text, /^---\r?\nname: test-strategy\r?\n/);
-  for (const phrase of ['功能基线', '场景测试', '性能测试', '微基准', '5 分钟', 'mock 优先', '按需', '200ms']) {
+  for (const phrase of ['功能基线', '场景测试', '性能测试', '微基准', '5 分钟', '按需', '200ms']) {
     assert.match(text, new RegExp(phrase));
   }
   assert.match(text, /全量功能基线只允许/);
   assert.match(text, /项目 `AGENTS\.md`、`TESTING\.md` 或 CI/);
   assert.match(text, /slow-baseline/);
+  assert.match(text, /外部依赖用 test double/);
+  const baseline = await readFile(path.join(skillDir, 'references', 'baseline-tests.md'), 'utf8');
+  assert.match(baseline, /\*\*stub\*\*：只需要固定返回值或错误/);
+  assert.match(baseline, /\*\*mock\/spy\*\*：只在交互本身是契约时验证/);
   assert.doesNotMatch(text, /Codex|ZCode|CODEX_HOME|ZCODE_HOME/);
   for (const ref of ['baseline-tests.md', 'scenario-tests.md', 'selection-and-commands.md', 'performance-tests.md']) {
     assert.match(text, new RegExp(ref.replace('.', '\\.')), `SKILL.md must link ${ref}`);
@@ -481,20 +499,33 @@ test('security audit skill is guidance-first, attacker-oriented, and evidence-ga
 test('security audit fixture markers are unique, complete, and machine-checkable', async () => {
   const fixture = path.join(repository, 'tests', 'fixtures', 'security-audit');
   const markers = JSON.parse(await readFile(path.join(fixture, 'markers.json'), 'utf8'));
-  assert.ok(Array.isArray(markers) && markers.length >= 20, 'fixture must cover planted findings and traps');
-  const ids = new Set();
   const answerKey = await readFile(path.join(fixture, 'answer-key.md'), 'utf8');
+  assert.ok(Array.isArray(markers) && markers.length >= 20, 'fixture must cover planted findings and traps');
+  const byId = new Map();
   for (const item of markers) {
     assert.match(item.id, /^[A-Z][0-9]+$/);
-    assert.ok(!ids.has(item.id), `duplicate marker id: ${item.id}`);
-    ids.add(item.id);
+    assert.ok(!byId.has(item.id), `duplicate marker id: ${item.id}`);
     assert.ok(['finding', 'trap'].includes(item.expect), `invalid expectation: ${item.id}`);
+    byId.set(item.id, item);
     const source = await readFile(path.join(fixture, item.file), 'utf8');
     assert.equal(source.split(item.marker).length - 1, 1, `marker ${item.id} must occur exactly once in ${item.file}`);
-    assert.ok(answerKey.includes(`| ${item.id} |`), `answer key must document ${item.id}`);
   }
-  assert.ok(markers.some((item) => item.expect === 'trap'), 'fixture must include false-positive traps');
   assert.ok(markers.some((item) => item.expect === 'finding'), 'fixture must include planted findings');
+  assert.ok(markers.some((item) => item.expect === 'trap'), 'fixture must include false-positive traps');
+  const seen = new Set();
+  let category;
+  for (const line of answerKey.split('\n')) {
+    if (line.startsWith('## ')) category = line === '## 预期发现' ? 'finding' : line === '## 误报陷阱' ? 'trap' : undefined;
+    const id = category && line.match(/^\| ([A-Z][0-9]+) \|/)?.[1];
+    if (!id) continue;
+    assert.ok(!seen.has(id), `duplicate answer key id: ${id}`);
+    seen.add(id);
+    const item = byId.get(id);
+    assert.ok(item, `answer key id missing from markers: ${id}`);
+    assert.equal(item.expect, category, `wrong category: ${id}`);
+    assert.ok(line.includes(`| \`${item.file}\` | \`${item.marker}\` |`), `wrong file or marker: ${id}`);
+  }
+  assert.deepEqual([...seen].sort(), [...byId.keys()].sort(), 'answer key must contain every marker');
 });
 
 test('PowerShell installer deploys the standalone skill into an isolated nested home', { skip: process.platform !== 'win32' }, async (t) => {
@@ -525,7 +556,7 @@ test('PowerShell installer deploys the standalone skill into an isolated nested 
     const roleFiles = (await readdir(roleDir)).filter((name) => name.endsWith('.toml')).sort();
     assert.equal(roleFiles.length, 12);
     assert.match(await readFile(path.join(roleDir, 'gpt_6.1_terra_high.toml'), 'utf8'), /^name = "gpt_6\.1_terra_high"$/m);
-    await assertSharedSkillsDeployed(path.join(codexHome, 'skills'));
+    await assertSharedSkillsDeployed(path.join(codexHome, 'skills'), 'codex');
     const agents = await readFile(path.join(codexHome, 'AGENTS.md'), 'utf8');
     assert.doesNotMatch(agents, /<CODEX_HOME>|\$CODEX_HOME/);
     assert.doesNotMatch(agents, /ZCODE_HOME/);
@@ -579,7 +610,10 @@ test('POSIX installer removes stale managed agents when switching presets', asyn
     const base = { cwd: repository, env: { ...process.env, ZCODE_HOME: posixHome(zcodeHome) } };
     assert.equal((await runResult(shell, ['install.sh', 'zcode', 'ds'], base)).code, 0);
     await writeFile(path.join(zcodeHome, 'agents', 'custom.md'), 'user custom agent\n');
+    await seedZcodeSkills(zcodeHome);
     assert.equal((await runResult(shell, ['install.sh', 'zcode', 'glm'], base)).code, 0);
+    await assertSharedSkillsDeployed(path.join(zcodeHome, 'skills'), 'zcode');
+    await assertZcodeSkillsPreserved(zcodeHome);
     const names = (await readdir(path.join(zcodeHome, 'agents'))).sort();
     assert.ok(!names.some((name) => name.startsWith('ds_4.1_flash_')), `stale ds agents must be removed: ${names}`);
     for (const role of zcodeRoleNames) assert.ok(names.includes(`${role}.md`), `missing glm agent: ${role}`);
@@ -669,7 +703,7 @@ test('POSIX installer deploys a fresh standalone home without legacy prerequisit
       await readFile(path.join(codexHome, 'skills', 'orchestrate-model-workflow', 'agents', 'openai.yaml')).then(() => true, () => false),
       'codex skill assets must be installed'
     );
-    await assertSharedSkillsDeployed(path.join(codexHome, 'skills'));
+    await assertSharedSkillsDeployed(path.join(codexHome, 'skills'), 'codex');
     const agents = await readFile(path.join(codexHome, 'AGENTS.md'), 'utf8');
     assert.doesNotMatch(agents, /<CODEX_HOME>|\$CODEX_HOME/);
     assert.doesNotMatch(agents, /ZCODE_HOME/);
@@ -838,6 +872,7 @@ test('PowerShell zcode installer composes shared and zcode sources and leaves un
     await mkdir(zcodeHome, { recursive: true });
     await mkdir(path.join(zcodeHome, 'cli'), { recursive: true });
     await writeFile(path.join(zcodeHome, 'cli', 'config.json'), '{"keep":"me"}\n');
+    await seedZcodeSkills(zcodeHome);
     const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'zcode', '-Preset', 'glm'], {
       env: { ...process.env, ZCODE_HOME: zcodeHome },
     });
@@ -874,10 +909,10 @@ test('PowerShell zcode installer composes shared and zcode sources and leaves un
     for (const expected of ['README.md', 'windows.md', 'rg.md', 'ssh.md', 'linux.md', 'macos.md', '跨系统操作示例.md']) {
       assert.ok(systemDocs.includes(expected), `missing shared system doc: ${expected}`);
     }
-    await assertSharedSkillsDeployed(path.join(zcodeHome, 'skills'));
+    await assertSharedSkillsDeployed(path.join(zcodeHome, 'skills'), 'zcode');
+    await assertZcodeSkillsPreserved(zcodeHome);
     const cliConfig = await readFile(path.join(zcodeHome, 'cli', 'config.json'), 'utf8');
     assert.match(cliConfig, /"keep": ?"me"/);
-    assert.equal(await readdir(path.join(zcodeHome, 'skills')).then((names) => names.length), 7);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -916,7 +951,7 @@ test('POSIX zcode installer deploys a fresh home without codex configuration', a
       false,
       'zcode install must not ship codex skill assets'
     );
-    await assertSharedSkillsDeployed(path.join(zcodeHome, 'skills'));
+    await assertSharedSkillsDeployed(path.join(zcodeHome, 'skills'), 'zcode');
     const agentFiles = (await readdir(path.join(zcodeHome, 'agents'))).filter((name) => name.endsWith('.md'));
     for (const role of zcodeRoleNames) assert.ok(agentFiles.includes(`${role}.md`), `missing flat agent: ${role}.md`);
     assert.equal(agentFiles.filter((name) => zcodeRoleNames.includes(name.slice(0, -3))).length, 5);
@@ -924,11 +959,6 @@ test('POSIX zcode installer deploys a fresh home without codex configuration', a
     for (const expected of ['README.md', 'windows.md', 'rg.md', 'ssh.md', 'linux.md', 'macos.md', '跨系统操作示例.md']) {
       assert.ok(systemDocs.includes(expected), `missing shared system doc: ${expected}`);
     }
-    assert.equal(
-      await readFile(path.join(zcodeHome, 'skills', 'test-strategy', 'agents', 'openai.yaml')).then(() => true, () => false),
-      false,
-      'zcode install must not ship the codex test-strategy interface'
-    );
     assert.equal(await readFile(path.join(zcodeHome, 'config.toml'), 'utf8').then(() => true, () => false), false);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -995,4 +1025,33 @@ test('merged PowerShell installer requires an explicit client when input is redi
   const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller], { cwd: repository });
   assert.notEqual(result.code, 0, result.stdout);
   assert.match(result.stdout + '\n' + result.stderr, /No client specified\. Usage: \.\\install\.ps1 -Client <codex\|zcode>/);
+});
+
+test('deep dive review defaults to report-only and has executable convergence rules', async () => {
+  const skillDir = path.join(repository, 'shared', 'skills', 'deep-dive-review');
+  const text = await readFile(path.join(skillDir, 'SKILL.md'), 'utf8');
+  assert.match(text, /^---\r?\nname: deep-dive-review\r?\n/);
+  assert.match(text, /默认 report-only/);
+  assert.match(text, /A 类即修权/);
+  assert.match(text, /单实例顺序执行/);
+  assert.match(text, /file:line \+ 该行原文片段/);
+  assert.match(text, /回归确认即重置连续干净轮计数/);
+  assert.doesNotMatch(text, /发起即一次授权/);
+  for (const ref of ['attack-matrix.md', 'attacker-brief.md', 'ledger-template.md', 'review-round.md', 'verifier-protocol.md']) {
+    assert.match(text, new RegExp(ref.replace('.', '\\.')), `SKILL.md must link ${ref}`);
+    const content = await readFile(path.join(skillDir, 'references', ref), 'utf8');
+    assert.ok(content.length > 40, `reference must not be empty: ${ref}`);
+  }
+  const matrix = await readFile(path.join(skillDir, 'references', 'attack-matrix.md'), 'utf8');
+  assert.match(matrix, /列的定义/);
+  assert.match(matrix, /n\/a \| 理由/);
+  assert.match(matrix, /书面豁免/);
+  const ledger = await readFile(path.join(skillDir, 'references', 'ledger-template.md'), 'utf8');
+  assert.match(ledger, /授权模式/);
+  assert.match(ledger, /issues\.md/);
+  assert.match(ledger, /收敛预算/);
+  const round = await readFile(path.join(skillDir, 'references', 'review-round.md'), 'utf8');
+  assert.match(round, /回归确认轮不计入干净轮/);
+  const verifier = await readFile(path.join(skillDir, 'references', 'verifier-protocol.md'), 'utf8');
+  assert.match(verifier, /行号错误时以实际代码为准/);
 });

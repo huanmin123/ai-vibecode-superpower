@@ -87,7 +87,7 @@
     "id": "P6",
     "file": "python-app/views.py",
     "marker": "archive.extractall(storage.RESTORE_DIR)",
-    "expect": "finding"
+    "expect": "trap"
   },
   {
     "id": "P7",

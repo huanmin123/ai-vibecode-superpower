@@ -88,7 +88,7 @@
 | Critical | 9.0–10.0 |
 
 - 评分变体：CVSS-B（Base）、CVSS-BE（Base+Environmental）、CVSS-BT（Base+Threat）、CVSS-BTE。
-- 只给 Base 会忽略威胁与环境，代码审计常缺 Threat/Environmental 证据；默认给 CVSS-BE 并写明假设。
+- 证据不足以确定环境指标时给 CVSS-B；环境证据可用时给 CVSS-BE。给分须附完整 vector 并写明假设。
 - https://www.first.org/cvss/v4-0/specification-document
 
 ## 3 修复参考
@@ -132,14 +132,14 @@
 
 ### 5.2 切到锁定版本
 
-- 用锁文件里的实际版本，不用清单里的范围号。
+- 按适用的锁文件或依赖解析结果核对版本，并区分部署产物；Go 的版本证据见 [供应链审计](supply-chain.md#2-依赖清单)。
 - 站点有版本选择器或 git tag，就切到该版本；没有就以安装包源码为准。
 - 记录 URL、版本、检索日期。
 - 文档与源码冲突时，以安装版本的实际行为为准，并记录冲突。
 
 ### 5.3 文档不够时
 
-- 读安装包源码：`node_modules`、`site-packages`、`go mod download`、jar sources、vendored 目录。
+- 读已存在的安装包源码：`node_modules`、`site-packages`、本地 Go 模块缓存、jar sources、vendored 目录；缺失时登记缺口，另行下载须先确认授权和副作用。
 - 读同一版本的 changelog/release notes，确认安全默认值是否变化。
 - 读上游修复提交与 advisory，确认补丁是否回填到目标分支。
 - 仍无法确认：写 `unverified`，不猜默认值。
@@ -150,7 +150,7 @@
 
 ### 5.5 公告与漏洞信息
 
-从包管理器的 audit 命令、OSV、registry 的 advisory、厂商 PSIRT 查；入口和命令随生态与版本变化，在目标环境核对。不要把任何"数据库清单"当作完整覆盖，也不要把"有公告"当作"本仓库可利用"。
+从包管理器的 audit 命令、OSV、registry 的 advisory、厂商 PSIRT 查；入口和命令随生态与版本变化，在目标环境核对。使用外部服务前确认接收方和发送数据的授权，参见 [工具选择](tooling.md) 与 [供应链审计](supply-chain.md)。不要把任何"数据库清单"当作完整覆盖，也不要把"有公告"当作"本仓库可利用"。
 
 ## 6 工具文档
 

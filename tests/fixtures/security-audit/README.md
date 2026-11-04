@@ -10,7 +10,7 @@
 
 - 审计范围应限定为 `node-app/` 与 `python-app/`；`answer-key.md` 和 `markers.json` 只供评分器使用，不应提供给被测实例。
 - 预期发现与误报陷阱的对照关系见 `answer-key.md`。
-- 契约测试可用 `markers.json` 做确定性 marker 校验；其中每一项的 `marker` 都应恰好命中一次。
+- 契约测试将 `markers.json` 与答案键的两张表逐项比对 ID、分类、文件和 marker；每个 marker 在对应文件中应恰好命中一次。
 
 ## 安全约束
 
@@ -37,7 +37,7 @@
 
 - Node 侧需要登录态的接口假定调用方持有由身份服务签发的 JWT；在默认 `JWT_SECRET` 未覆盖时，可按 N7 的默认密钥伪造。
 - Python 侧 `@login_required` 接口假定已有 Flask session；本地测试可用 Flask 测试客户端注入 session，或在默认 `SECRET_KEY` 未覆盖时按 P7 伪造。
-- P6 的 `zipfile.extractall` 在 POSIX 上会剥离 `..` 和绝对路径；其 Zip Slip 条件依赖 Windows 的尾随空格/点绕过，答案键将其标为 `needs-runtime`。
+- P6 是版本相关的误报陷阱：CPython 3.12.0 的 Windows 名称清理会删除尾随空格/点清理后为空的组件，不能据此认定 Zip Slip；其他版本的结论须有具体版本和机制依据（源码见答案键）。
 - `package.json` 只声明依赖和版本，不包含锁文件或 `node_modules`；`requirements.txt` 同样未安装。实际运行版本无法从仓库核实，评分时应按 `answer-key.md` 的 `needs-runtime` 口径处理相关条目。
 
 所有文件使用 LF 换行；代码注释使用英文，说明文档使用简体中文。
