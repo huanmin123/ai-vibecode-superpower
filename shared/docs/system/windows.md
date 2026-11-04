@@ -3,9 +3,8 @@
 ## 默认环境
 
 - 本机命令优先使用可用的 PowerShell 7 (`pwsh.exe`)；只有任务依赖位数时再核对 64 位。`powershell.exe` 表示 Windows PowerShell 5.1，仅在兼容性有明确依据时使用，不把两者静默视为等价替代。
-- 依赖仓库或目标文件的命令设置明确工作目录；纯版本查询、工具定位或系统诊断可沿用当前目录。不依赖 Profile、alias、虚拟环境激活或上一条命令的状态。
-- 命令的工作目录必须是已存在的绝对目录；仅在需要指定目录或工具返回目录无效时，用 `Test-Path -LiteralPath <目录> -PathType Container` 或 `Resolve-Path -LiteralPath <目录>` 核实。文件路径、文档路径和命令文本都不能作为工作目录。
-- 工具调用因目录无效而未开始执行（如退出码异常或报告“目录名称无效”）时，先重新核对调用时传入的工作目录；只有后续证据支持时，才能断言是文档路径、工具解析或远端系统的原因。
+- 不依赖 Profile、alias 或虚拟环境激活。
+- 命令的工作目录必须是已存在的绝对目录；工具报告目录名称无效（Windows 错误 267）或命令因目录问题未开始执行时，先核对调用时传入的工作目录，需要时用 `Test-Path -LiteralPath <目录> -PathType Container` 或 `Resolve-Path -LiteralPath <目录>` 核实，只有后续证据支持时才归因于文档路径、工具解析或远端系统。
 - 同名命令可能来自 PowerShell Alias、脚本、Windows 工具或多套第三方工具；`sort`、`where`、`tee`、`cat`、`rm` 等名称尤其容易遮蔽。行为或版本受来源影响时使用 `Get-Command <name> -All`，再调用确认后的完整路径、`.exe` 或 `.cmd`，不只按命令名猜测。
 
 任务确实受版本或工具来源影响时检查一次：
@@ -73,11 +72,11 @@ if (-not (Test-Path -LiteralPath $rgPath -PathType Leaf)) { throw "rg 路径不�
 if ($LASTEXITCODE -ne 0) { throw "rg 验证失败：$LASTEXITCODE" }
 ```
 
-确认缺失后按 [ripgrep 安装](rg.md#windows) 选择一个匹配流程，安装后重新验证；不要因为版本输出异常就静默覆盖现有安装。
+确认缺失后按 [ripgrep 安装](rg.md#windows) 安装并复验。
 
 ## 进程与端口
 
-端口占用先查 PID 和命令行；以下 `$port` 是当前任务的占位符。只停止本任务启动且已核对命令行的进程：
+端口占用先查 PID 和命令行；以下 `$port` 是当前任务的占位符：
 
 ```powershell
 $listeners = Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction Stop
@@ -87,13 +86,13 @@ $processes = foreach ($processId in @($listeners.OwningProcess | Sort-Object -Un
 $processes | Select-Object ProcessId, ExecutablePath, CommandLine
 ```
 
-查询无输出只代表当前权限下未发现，不代表全局不存在；权限错误或字段缺失必须保留为未知。后台服务保存 PID、完整启动命令和日志，并验证监听端口或健康检查。端口被其他任务占用时先报告占用者及证据；只有项目明确支持动态端口或用户明确允许时才更换端口，不批量结束同名进程。
+- 后台服务保存 PID、完整启动命令和日志，并验证监听端口或健康检查。
+- 端口被其他任务占用时先报告占用者及证据；只有项目明确支持动态端口或用户明确允许时才更换端口，不批量结束同名进程。
 
 ## 常用工具链
 
-- Git：需要检查仓库状态时运行 `git status --short`；用户已有修改不覆盖，不自动 reset/clean/restore/stash。
 - Node.js：按锁文件选择 npm/pnpm/Yarn/Bun；调用 Windows shim 时使用 `npm.cmd`、`npx.cmd`、`pnpm.cmd`、`yarn.cmd`。
 - Python：优先 `.venv\Scripts\python.exe`，否则使用项目指定入口或 `py.exe -3`；始终通过同一解释器运行 `-m pip`、`-m pytest`。
 - Java：优先 `gradlew.bat`、`mvnw.cmd`；需要 Docker 时再用 `docker version` 判断 daemon 是否可用。
 
-验证从最贴近的项目命令开始，再按风险扩大到格式、类型、测试和构建。其他 Shell 或 WSL 的成功不能替代 Windows 本地结果。
+其他 Shell 或 WSL 的成功不能替代 Windows 本地结果。

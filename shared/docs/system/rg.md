@@ -1,6 +1,6 @@
 # ripgrep 安装
 
-本文件按 Windows、macOS 和 Linux 分节。仅当当前平台已确认 `rg` 缺失或不可执行时读取对应章节：Windows 使用 `Get-Command rg.exe -CommandType Application` 确认可执行文件，macOS/Linux 使用 `command -v rg`。命令路径存在但版本或实际执行报错时，先保留原始错误并诊断，不直接安装另一个副本。安装完成后必须重新运行 `rg --version` 并确认实际解析到的路径。
+本文件按 Windows、macOS 和 Linux 分节，仅在当前平台已确认 `rg` 缺失或不可执行时读取对应章节（Windows 用 `Get-Command rg.exe -CommandType Application` 确认可执行文件，macOS/Linux 用 `command -v rg`）；命令路径存在但版本或实际执行报错时，先保留原始错误并诊断，不直接安装另一个副本；安装完成后必须重新运行 `rg --version` 并确认实际解析到的路径。
 
 优先使用当前系统已有的包管理器。直接下载 Release 时，核对目标架构；上游同时提供可用的可信摘要或签名时必须在解压前验证，未提供时记录 HTTPS 下载的残余完整性风险。不要从第三方镜像或未经核对的转发链接安装。
 
