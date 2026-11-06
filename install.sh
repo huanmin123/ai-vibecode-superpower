@@ -91,6 +91,7 @@ normalize_absolute_path() {
 }
 
 presets_root=$script_dir/shared/roles/presets
+external_presets_root=${HOME:+$HOME/.ai-vibecode-superpower/presets}
 preset_manifest=$script_dir/shared/roles/presets.sha256
 
 normalized_lf_sha256() {
@@ -152,9 +153,81 @@ if [ "${1:-}" = "--update-role-manifest" ]; then
     exit 0
 fi
 
+# ---- 参数解析：支持 --external；client/preset 仍为位置参数 ----
+
+external_presets=0
+external_presets_prepared=0
+positional_client=
+preset_input=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --external)
+            external_presets=1
+            shift
+            ;;
+        -h|--help)
+            printf '%s\n' 'Usage: sh install.sh [--external] <codex|zcode> [preset]'
+            exit 0
+            ;;
+        --)
+            shift
+            while [ "$#" -gt 0 ]; do
+                if [ -z "$positional_client" ]; then
+                    positional_client=$1
+                elif [ -z "$preset_input" ]; then
+                    preset_input=$1
+                else
+                    die "Unexpected argument: $1"
+                fi
+                shift
+            done
+            ;;
+        -*)
+            die "Unknown option: $1"
+            ;;
+        *)
+            if [ -z "$positional_client" ]; then
+                positional_client=$1
+            elif [ -z "$preset_input" ]; then
+                preset_input=$1
+            else
+                die "Unexpected argument: $1"
+            fi
+            shift
+            ;;
+    esac
+done
+
+# ---- 预设来源选择：交互模式且未指定预设时，先选内置/外置 ----
+
+if [ -z "$preset_input" ] && [ "$external_presets" = 0 ] && [ -t 0 ]; then
+    printf '%s\n' 'Select the preset source:' \
+        "  1) Built-in ($presets_root) [default]" \
+        "  2) External ($external_presets_root)"
+    printf 'Enter number or name (b/e, q to quit): '
+    read -r source_choice
+    case "$source_choice" in
+        [qQ]) exit 0 ;;
+        ''|1|[bB]|[bB]uiltin) external_presets=0 ;;
+        2|[eE]|[eE]xternal)
+            if [ -z "$external_presets_root" ]; then
+                die 'HOME is not set; cannot resolve external preset directory'
+            fi
+            external_presets=1
+            preset_search_root=$external_presets_root
+            if [ ! -d "$preset_search_root" ]; then
+                mkdir -p "$preset_search_root" || die "Could not create external preset directory: $preset_search_root"
+            fi
+            printf 'External preset directory: %s\n' "$preset_search_root"
+            external_presets_prepared=1
+            ;;
+        *) die "Invalid selection: $source_choice" ;;
+    esac
+fi
+
 # ---- 客户端选择：位置参数优先；无参数且为交互终端时进入菜单；否则报用法并退出 ----
 
-client=${1:-}
+client=$positional_client
 if [ -z "$client" ]; then
     if [ -t 0 ]; then
         printf '%s\n' 'Select the client to install:' '  1) Codex' '  2) ZCode'
@@ -167,7 +240,7 @@ if [ -z "$client" ]; then
             *) die "Invalid selection: $client_choice" ;;
         esac
     else
-        die 'No client specified. Usage: sh install.sh <codex|zcode>'
+        die 'No client specified. Usage: sh install.sh <codex|zcode> [preset] [--external]'
     fi
 fi
 case "$client" in
@@ -848,26 +921,53 @@ legacy_dir_matches_render() {
 
 # ---- 预设选择：位置参数优先；未指定且为非交互 stdin 时报错；否则进入菜单 ----
 
-preset_input=${2:-}
+preset_search_root=$presets_root
+if [ "$external_presets" = 1 ]; then
+    if [ -z "$external_presets_root" ]; then
+        die 'HOME is not set; cannot resolve external preset directory'
+    fi
+    preset_search_root=$external_presets_root
+    if [ "$external_presets_prepared" = 0 ]; then
+        if [ ! -d "$preset_search_root" ]; then
+            mkdir -p "$preset_search_root" || die "Could not create external preset directory: $preset_search_root"
+        fi
+        printf 'External preset directory: %s\n' "$preset_search_root"
+    fi
+fi
+
 if [ -z "$preset_input" ]; then
     if [ ! -t 0 ]; then
-        die "No preset specified. Usage: sh install.sh $client <$default_preset|name|path>"
+        if [ "$external_presets" = 1 ]; then
+            die "No preset specified. Usage: sh install.sh $client --external <name>"
+        fi
+        die "No preset specified. Usage: sh install.sh $client <$default_preset|name|path> [--external]"
     fi
     set --
-    for preset_entry_path in "$presets_root"/*/; do
+    for preset_entry_path in "$preset_search_root"/*/; do
         if [ -d "$preset_entry_path" ] && [ -f "${preset_entry_path}preset.toml" ]; then
-            set -- "$@" "$preset_entry_path"
+            if (PRESET_QUIET=1; export PRESET_QUIET; read_preset "${preset_entry_path}preset.toml"; [ "$(pget "P_HOST_${host_section}_SET")" = 1 ]); then
+                set -- "$@" "$preset_entry_path"
+            fi
         fi
     done
     if [ "$#" -eq 0 ]; then
-        die "No presets found under: $presets_root"
+        if [ "$external_presets" = 1 ]; then
+            printf 'No external presets support %s in: %s\n' "$client_label" "$preset_search_root"
+            printf 'Copy a built-in preset as a template, for example:\n'
+            printf "  cp -R '%s/%s' '%s/%s-local'\n" "$presets_root" "$default_preset" "$preset_search_root" "$default_preset"
+            printf "Then edit '%s/%s-local/preset.toml' and rerun with: sh install.sh %s --external %s-local\n" \
+                "$preset_search_root" "$default_preset" "$client" "$default_preset"
+            printf 'Use [%s] in the preset host section for %s.\n' "$host_section" "$client_label"
+            exit 1
+        fi
+        die "No presets support $client_label under: $presets_root"
     fi
-    printf '%s\n' 'Select the role preset to install:'
+    printf 'Select the %s role preset to install:\n' "$client_label"
     preset_index=1
     for preset_entry_path in "$@"; do
         preset_entry=$(basename -- "$preset_entry_path")
         preset_mark=
-        if [ "$preset_entry" = "$default_preset" ]; then preset_mark=' [default]'; fi
+        if [ "$external_presets" = 0 ] && [ "$preset_entry" = "$default_preset" ]; then preset_mark=' [default]'; fi
         preset_desc=$(PRESET_QUIET=1; export PRESET_QUIET; read_preset "${preset_entry_path}preset.toml"; printf '%s' "$P_DESC") || preset_desc='<unreadable preset>'
         printf '  %s) %s%s - %s\n' "$preset_index" "$preset_entry" "$preset_mark" "$preset_desc"
         preset_index=$((preset_index+1))
@@ -894,6 +994,8 @@ fi
 preset_display_name=$preset_input
 if [ -d "$preset_input" ]; then
     preset_dir=$(CDPATH= cd -- "$preset_input" && pwd -P) || die "Could not resolve preset directory: $preset_input"
+elif [ "$external_presets" = 1 ]; then
+    preset_dir=$external_presets_root/$preset_input
 else
     preset_dir=$presets_root/$preset_input
 fi

@@ -118,8 +118,9 @@ sandbox_mode = "<readonly 推导或显式值>"
 
 ## 安装器集成
 
-- 交互流程在选完客户端后新增预设选择：列出 `shared/roles/presets/` 下目录及其 `description`，默认推荐与客户端同源的预设（ZCode → `glm`，Codex → `gpt`），可输入其他预设名或自定义预设目录路径。
+- 交互流程先选预设来源（内置 `shared/roles/presets/` 或外部固定目录 `~/.ai-vibecode-superpower/presets/`），再选客户端，然后只列出包含对应宿主小节（`[zcode]` / `[codex]`）的预设及其 `description`；内置来源默认推荐与客户端同源的预设（ZCode → `glm`，Codex → `gpt`），也可输入预设名或自定义预设目录路径。列表按客户端过滤，不能安装到当前客户端的预设不会出现。
 - 位置参数：`install.ps1 -Client zcode -Preset glm`；`install.sh zcode glm`。`-Preset` 缺省时走交互选择。
+- 外部来源：`install.sh zcode --external zcode-ds`；`install.ps1 -Client zcode -Preset zcode-ds -External`。外部根目录不存在时安装器创建并打印路径；目录为空时输出复制内置预设的模板命令并退出。外部预设不做 `presets.sha256` 校验，但仍做宿主小节、角色名与 model 结构校验；显式目录路径继续支持。
 - 预设必须包含与目标客户端匹配的宿主小节，否则报错（如用 `glm` 预设装 Codex 会因缺少 `[codex]` 小节被拒绝）。
 - `RoleCount` 不再硬编码：按所选预设当前客户端小节的角色数动态校验。
 - 切换预设时的清理：安装器在宿主 home 维护受管角色清单（`agents/.ai-vibecode-superpower.managed`，md 宿主），记录上次安装的角色文件。再次安装时，清单内不在本次渲染名单中的文件先备份（`backups/`）再移除；用户自建的其他 agent 不在清单内，不受影响。Codex 宿主 role 装在独立子目录，整体替换天然覆盖。

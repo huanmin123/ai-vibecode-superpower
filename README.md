@@ -68,9 +68,9 @@ flowchart LR
 
 ## 快速安装
 
-每个平台一个安装器：`install.ps1`（Windows）与 `install.sh`（macOS/Linux）。直接运行后按提示交互选择客户端（Codex / ZCode）和角色预设，或在命令中直接指定；共享内容由所选客户端的安装流程一并安装，宿主专属内容各装各的。新增客户端需要在两个安装器的客户端注册表中加入一项，并提供该客户端所需的 docs/config 与可选 `skill-assets/`；共享指令与工作流骨架不需要 per-client 副本。
+每个平台一个安装器：`install.ps1`（Windows）与 `install.sh`（macOS/Linux）。直接运行后按提示交互选择预设来源（内置/外置）、客户端（Codex / ZCode）和角色预设，或在命令中直接指定；共享内容由所选客户端的安装流程一并安装，宿主专属内容各装各的。新增客户端需要在两个安装器的客户端注册表中加入一项，并提供该客户端所需的 docs/config 与可选 `skill-assets/`；共享指令与工作流骨架不需要 per-client 副本。
 
-**角色预设**：agent 角色不是仓库里的固定文件，而是安装时从 `shared/roles/presets/` 下的预设（如 `glm`、`gpt`、`ds`）翻译生成的宿主配置。预设只绑定模型与职责，内置预设可直接用；只用其他模型或想混合模型（如 GPT 写码 + GLM 复审）时，复制一个预设目录、把各角色的 `model` 改成你宿主里实际可用的模型 ID 即可，详见 [`shared/roles/README.md`](shared/roles/README.md)。`ds` 预设的 `model` 是占位值，安装前必须改成你的实际 Picker 值。安装交互会列出可选预设并标注各客户端的默认值。
+**角色预设**：agent 角色不是仓库里的固定文件，而是安装时从 `shared/roles/presets/` 下的预设（如 `glm`、`gpt`、`ds`）翻译生成的宿主配置。预设只绑定模型与职责，内置预设可直接用；只用其他模型或想混合模型（如 GPT 写码 + GLM 复审）时，复制一个预设目录、把各角色的 `model` 改成你宿主里实际可用的模型 ID 即可，详见 [`shared/roles/README.md`](shared/roles/README.md)。预设也可以放在仓库外：固定目录为 `~/.ai-vibecode-superpower/presets/`，安装时选择 External 来源或传 `--external` / `-External`，不会修改仓库。`ds` 预设的 `model` 是占位值，安装前必须改成你的实际 Picker 值（外部副本同样）。安装交互会先选内置/外置来源，再选客户端，然后只列出支持该客户端的预设并标注默认值。
 
 ### Codex
 
@@ -84,12 +84,14 @@ flowchart LR
 
 ```powershell
 & .\install.ps1 -Client codex
+& .\install.ps1 -Client codex -Preset codex-local -External   # 外部预设
 ```
 
 **macOS 或 Linux**：
 
 ```sh
 sh ./install.sh codex
+sh ./install.sh codex --external codex-local   # 外部预设
 ```
 
 可在 Codex 运行时安装，无需先退出应用；运行中的应用此后仍可能把配置覆盖回去。安装完成后完全重启 Codex Desktop 或 Codex CLI 进程，在新会话中使用 standalone skill，并按下方清单核对受管配置是否仍在。若使用 CC-Switch，请确认它没有覆盖安装脚本写入的 Codex 配置。
@@ -120,16 +122,18 @@ goals = true
 **Windows（PowerShell 7）**，在仓库根目录运行：
 
 ```powershell
-& .\install.ps1 -Client zcode            # 交互选择预设
+& .\install.ps1 -Client zcode            # 交互选择来源与预设
 & .\install.ps1 -Client zcode -Preset glm
-& .\install.ps1 -Client zcode -Preset D:\my-presets\deepseek   # 自定义预设目录
+& .\install.ps1 -Client zcode -Preset zcode-ds -External   # 外部预设
+& .\install.ps1 -Client zcode -Preset D:\my-presets\deepseek   # 任意自定义预设目录
 ```
 
 **macOS 或 Linux**：
 
 ```sh
-sh ./install.sh zcode          # 交互选择预设
+sh ./install.sh zcode          # 交互选择来源与预设
 sh ./install.sh zcode glm
+sh ./install.sh zcode --external zcode-ds   # 外部预设
 ```
 
 ## 使用方式与可选能力

@@ -238,15 +238,11 @@ function Configure-Project {
   $needsCodexConfig = $false; $needsZcodeConfig = $false; $needsAgents = $false
   $needsIgnoreCodegraph = $false; $needsIgnoreCodex = $false; $needsIgnoreZcode = $false
   $agentsHeading = '## CodeGraph 与 RTK'
-  $agentsBlock = @(
-    '## CodeGraph 与 RTK'
-    ''
-    '- 涉及跨模块/跨文件依赖，或公共函数、接口、类型、路由、存储、任务队列、依赖升级、删除重命名的开发、修复、重构或复审，必须先用 CodeGraph MCP 查询依赖、调用链或影响范围，再以当前源码、`rg`、未跟踪文件和刚修改文件复核。'
-    '- 单文件且不改公共契约的局部修复、文档/注释、格式化和低风险机械整理可以跳过 CodeGraph 查询。'
-    '- 对只读且输出量大的命令，优先使用匹配的 `rtk` 子命令：`git`、`rg`、`log`、`diff`、`test`、`mvn`、`npm`、`pnpm`、`read`、`find`、`ls`、`tree`。未列出的只读命令先用 `rtk rewrite "<command>"` 或 `rtk --help` 核实；写操作和精确排障使用原生命令。'
-    '- 只有工具注册表或 `--help` 未列出目标命令时，才能判定该命令不存在；其他工具错误保留原始输出，不得归因于能力缺失。'
-    '- 安装、配置修复、初始化或修复索引、健康检查、升级审查和回滚使用全局 `agent-toolchain` skill；不得在日常开发中自行安装、升级、重配或维护工具链。'
-  ) -join "`n"
+  $agentsBlockPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'references/managed-agents-block.md'
+  if (-not (Test-Path -LiteralPath $agentsBlockPath -PathType Leaf)) { Fail "缺少受管段落模板：$agentsBlockPath" }
+  $agentsBlock = (Get-Content -LiteralPath $agentsBlockPath -Raw).TrimEnd([char[]]"`r`n")
+  if ([string]::IsNullOrWhiteSpace($agentsBlock)) { Fail "受管段落模板为空：$agentsBlockPath" }
+  $managedMarker = '<!-- agent-toolchain-managed:v4 -->'
 
   if ($wireCodex) {
     $configText = if (Test-Path -LiteralPath $codexConfigPath) { Get-Content -LiteralPath $codexConfigPath -Raw } else { '' }
@@ -298,7 +294,9 @@ function Configure-Project {
   }
   $managedAgentsSection = Get-ManagedAgentsSection $agentsLines $agentsHeading
   if ($null -ne $managedAgentsSection) {
-    if ($managedAgentsSection -cne "$agentsBlock`n") { Fail 'AGENTS.md 的 CodeGraph 与 RTK 受管标题冲突' }
+    if (-not $managedAgentsSection.Contains($managedMarker)) {
+      Note "AGENTS.md 的受管段落没有 ${managedMarker}；请让 AI 读取 $agentsBlockPath 并重写该段，保留项目特定补充。"
+    }
   } else {
     $needsAgents = $true
   }
@@ -345,8 +343,8 @@ DO_NOT_TRACK = "1"
 
 function Load-TrustedManifest {
   $script:Manifest = [ordered]@{
-    CODEGRAPH_VERSION = '1.6.2'; CODEGRAPH_NPM_PACKAGE = '@colbymchenry/codegraph'; RTK_VERSION = '0.51.0'
-    RTK_WIN32_X64_ASSET = 'rtk-x86_64-pc-windows-msvc.zip'; RTK_WIN32_X64_SHA256 = '1623e9b45d28b15122d69e7314776e1123a804224885ce07e7182fb40080f05c'
+    CODEGRAPH_VERSION = '1.6.2'; CODEGRAPH_NPM_PACKAGE = '@colbymchenry/codegraph'; RTK_VERSION = '1.1.0'
+    RTK_WIN32_X64_ASSET = 'rtk-x86_64-pc-windows-msvc.zip'; RTK_WIN32_X64_SHA256 = 'c9a8f7a8bad471e64a343314168f38d2399a06fa327cdf5772fb0e645d99ea6f'
   }
 }
 
@@ -674,8 +672,12 @@ function Assert-Timeout([string]$Name, [string]$Value) {
 
 function Detect-Proxy {
   $script:DownloadProxy = $null; $script:DownloadProxySource = 'direct'
+  $explicitProxy = [Environment]::GetEnvironmentVariable('AGENT_TOOLCHAIN_PROXY', 'Process')
+  if (-not [string]::IsNullOrWhiteSpace($explicitProxy)) {
+    if ($explicitProxy -in @('direct', 'none')) { return }
+    $script:DownloadProxy = $explicitProxy; $script:DownloadProxySource = 'explicit'; return
+  }
   foreach ($candidate in @(
-    @{ Name = 'AGENT_TOOLCHAIN_PROXY'; Source = 'explicit' },
     @{ Name = 'HTTPS_PROXY'; Source = 'environment' },
     @{ Name = 'https_proxy'; Source = 'environment' },
     @{ Name = 'ALL_PROXY'; Source = 'environment' },
@@ -699,7 +701,7 @@ function Network-Preflight {
   Detect-Proxy
   if ($script:DownloadProxySource -eq 'direct') {
     Note "网络预检：直连 GitHub；未检测到代理。连接超时 $($script:ConnectTimeout)s，请求超时 $($script:RequestTimeout)s。"
-    Note '网络提示：若连接或下载缓慢，设置 AGENT_TOOLCHAIN_PROXY=<scheme://host:port> 后重试。'
+    Note '网络提示：若连接或下载缓慢，设置 AGENT_TOOLCHAIN_PROXY=<scheme://host:port> 后重试；系统代理不可用时设置 AGENT_TOOLCHAIN_PROXY=direct 强制直连。'
   } else {
     Note "网络预检：使用 $script:DownloadProxySource 代理；连接超时 $($script:ConnectTimeout)s，请求超时 $($script:RequestTimeout)s。"
   }
@@ -708,10 +710,14 @@ function Network-Preflight {
 function Invoke-Curl([string[]]$Arguments) {
   $curl = Get-Command curl.exe -ErrorAction Stop | Select-Object -First 1
   $curlArguments = @()
-  if ($script:DownloadProxy) { $curlArguments += @('--proxy', $script:DownloadProxy) }
+  if ($script:DownloadProxy) {
+    $curlArguments += @('--proxy', $script:DownloadProxy)
+  } else {
+    $curlArguments += @('--noproxy', '*')
+  }
   $curlArguments += $Arguments
   & $curl.Source @curlArguments
-  if ($LASTEXITCODE -ne 0) { Fail 'GitHub 下载失败或超时；请检查网络/代理后重试。可设置 AGENT_TOOLCHAIN_PROXY=<scheme://host:port>，不会写入项目配置。' }
+  if ($LASTEXITCODE -ne 0) { Fail 'GitHub 下载失败或超时；请检查网络/代理后重试。可设置 AGENT_TOOLCHAIN_PROXY=<scheme://host:port>，或设置 AGENT_TOOLCHAIN_PROXY=direct 强制直连；不会写入项目配置。' }
 }
 
 function Download-Archive([string]$Url, [string]$Archive, [string]$WorkDirectory, [string]$Label) {
@@ -719,7 +725,7 @@ function Download-Archive([string]$Url, [string]$Archive, [string]$WorkDirectory
   $segments = 0
   if (-not [int]::TryParse($segmentsText, [ref]$segments) -or $segments -lt 1 -or $segments -gt 8) { Fail 'AGENT_TOOLCHAIN_DOWNLOAD_WORKERS 必须是 1 到 8 的整数' }
   $headers = Join-Path $WorkDirectory 'range-headers'
-  Note "下载 $Label：获取受信任 release asset 信息"
+  Note "下载 ${Label}：获取受信任 release asset 信息"
   Invoke-Curl @('--fail', '--location', '--silent', '--show-error', '--http1.1', '--retry', '3', '--retry-delay', '2', '--connect-timeout', "$script:ConnectTimeout", '--max-time', "$script:RequestTimeout", '--proto', '=https', '--proto-redir', '=https', '--tlsv1.2', '--range', '0-0', '--dump-header', $headers, '--output', 'NUL', $Url)
   $headerText = Get-Content -LiteralPath $headers -Raw
   $rangeMatch = [regex]::Match($headerText, '(?im)^content-range:\s*bytes\s+\d+-\d+/(\d+)\s*$')
@@ -733,7 +739,7 @@ function Download-Archive([string]$Url, [string]$Archive, [string]$WorkDirectory
     $start = [int64]$index * $chunk
     if ($start -ge $total) { break }
     $end = [Math]::Min($total - 1, $start + $chunk - 1)
-    Note "下载 $Label：分段 $($index + 1)/$segments"
+    Note "下载 ${Label}：分段 $($index + 1)/$segments"
     Invoke-Curl @('--fail', '--location', '--silent', '--show-error', '--http1.1', '--retry', '3', '--retry-delay', '2', '--connect-timeout', "$script:ConnectTimeout", '--max-time', "$script:RequestTimeout", '--proto', '=https', '--proto-redir', '=https', '--tlsv1.2', '--range', "$start-$end", '--output', (Join-Path $WorkDirectory "part-$index"), $assetUrl)
   }
   $output = [System.IO.File]::Open($Archive, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)

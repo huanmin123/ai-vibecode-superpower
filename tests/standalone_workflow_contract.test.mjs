@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
@@ -978,6 +978,110 @@ test('POSIX zcode installer deploys a fresh home without codex configuration', a
       assert.ok(systemDocs.includes(expected), `missing shared system doc: ${expected}`);
     }
     assert.equal(await readFile(path.join(zcodeHome, 'config.toml'), 'utf8').then(() => true, () => false), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('POSIX zcode installer installs an external preset from the fixed root', async (t) => {
+  const shell = await findPosixShell();
+  if (!shell) return t.skip('POSIX shell is unavailable');
+  const root = await mkdtemp(path.join(repository, '.external-preset-zcode-'));
+  const home = path.join(root, 'home');
+  const externalRoot = path.join(home, '.ai-vibecode-superpower', 'presets');
+  const presetDir = path.join(externalRoot, 'zcode-ds');
+  const zcodeHome = path.join(root, '.zcode');
+  try {
+    await mkdir(externalRoot, { recursive: true });
+    await cp(path.join(presetsRoot, 'ds'), presetDir, { recursive: true });
+    const presetFile = path.join(presetDir, 'preset.toml');
+    const presetText = await readFile(presetFile, 'utf8');
+    await writeFile(presetFile, presetText.replace('account:deepseek-coding-plan/deepseek-v4.1-flash', 'new-provider-2/deepseek-flash'));
+    const result = await runResult(shell, ['install.sh', 'zcode', '--external', 'zcode-ds'], {
+      cwd: repository,
+      env: { ...process.env, HOME: home, ZCODE_HOME: posixHome(zcodeHome) },
+    });
+    assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.stdout, /External preset directory:/);
+    for (const role of ['ds_4.1_flash_low', 'ds_4.1_flash_high', 'ds_4.1_flash_max']) {
+      const text = await readFile(path.join(zcodeHome, 'agents', `${role}.md`), 'utf8');
+      assert.match(text, /^model: "new-provider-2\/deepseek-flash"$/m, `external model missing: ${role}`);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('POSIX codex installer installs an external preset from the fixed root', async (t) => {
+  const shell = await findPosixShell();
+  if (!shell) return t.skip('POSIX shell is unavailable');
+  const root = await mkdtemp(path.join(repository, '.external-preset-codex-'));
+  const home = path.join(root, 'home');
+  const externalRoot = path.join(home, '.ai-vibecode-superpower', 'presets');
+  const presetDir = path.join(externalRoot, 'codex-local');
+  const codexHome = path.join(root, '.codex');
+  try {
+    await mkdir(externalRoot, { recursive: true });
+    await cp(path.join(presetsRoot, 'gpt'), presetDir, { recursive: true });
+    const result = await runResult(shell, ['install.sh', 'codex', '--external', 'codex-local'], {
+      cwd: repository,
+      env: { ...process.env, HOME: home, CODEX_HOME: posixHome(codexHome) },
+    });
+    assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.stdout, /External preset directory:/);
+    const roleDir = path.join(codexHome, 'agents', 'ai-vibecode-superpower');
+    const roleFiles = (await readdir(roleDir)).filter((name) => name.endsWith('.toml'));
+    assert.equal(roleFiles.length, 12);
+    const firstRole = await readFile(path.join(roleDir, 'gpt_6_luna_high.toml'), 'utf8');
+    assert.match(firstRole, /^model = "gpt-6-luna"$/m);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('POSIX installer creates the external preset root and reports a missing preset', async (t) => {
+  const shell = await findPosixShell();
+  if (!shell) return t.skip('POSIX shell is unavailable');
+  const root = await mkdtemp(path.join(repository, '.external-preset-missing-'));
+  const home = path.join(root, 'home');
+  const externalRoot = path.join(home, '.ai-vibecode-superpower', 'presets');
+  const zcodeHome = path.join(root, '.zcode');
+  try {
+    const result = await runResult(shell, ['install.sh', 'zcode', '--external', 'missing'], {
+      cwd: repository,
+      env: { ...process.env, HOME: home, ZCODE_HOME: posixHome(zcodeHome) },
+    });
+    assert.notEqual(result.code, 0);
+    const output = result.stdout + '\n' + result.stderr;
+    assert.match(output, /External preset directory:/);
+    assert.match(output, /Preset not found: missing/);
+    assert.equal(await readdir(externalRoot).then(() => true, () => false), true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('PowerShell zcode installer installs an external preset from the fixed root', { skip: process.platform !== 'win32' }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'external-preset-powershell-'));
+  const home = path.join(root, 'home');
+  const externalRoot = path.join(home, '.ai-vibecode-superpower', 'presets');
+  const presetDir = path.join(externalRoot, 'zcode-ds');
+  const zcodeHome = path.join(root, '.zcode');
+  try {
+    await mkdir(externalRoot, { recursive: true });
+    await cp(path.join(presetsRoot, 'ds'), presetDir, { recursive: true });
+    const presetFile = path.join(presetDir, 'preset.toml');
+    const presetText = await readFile(presetFile, 'utf8');
+    await writeFile(presetFile, presetText.replace('account:deepseek-coding-plan/deepseek-v4.1-flash', 'new-provider-2/deepseek-flash'));
+    const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'zcode', '-Preset', 'zcode-ds', '-External'], {
+      env: { ...process.env, USERPROFILE: home, ZCODE_HOME: zcodeHome },
+    });
+    assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.stdout, /External preset directory:/);
+    for (const role of ['ds_4.1_flash_low', 'ds_4.1_flash_high', 'ds_4.1_flash_max']) {
+      const text = await readFile(path.join(zcodeHome, 'agents', `${role}.md`), 'utf8');
+      assert.match(text, /^model: "new-provider-2\/deepseek-flash"$/m, `external model missing: ${role}`);
+    }
   } finally {
     await rm(root, { recursive: true, force: true });
   }

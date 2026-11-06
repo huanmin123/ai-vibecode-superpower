@@ -120,6 +120,13 @@ test('posix driver stays syntactically valid and keeps the client wiring branche
   assert.match(text, /mcp\.servers/);
   assert.match(text, /\[ -t 0 \]/);
   assert.match(text, /Enter number or name \(q to quit\)/);
+  assert.doesNotMatch(text, /--migrate-managed/);
+  assert.match(text, /agent-toolchain-managed:v4/);
+  assert.match(text, /managed-agents-block\.md/);
+  assert.match(text, /paste -sd:/);
+  assert.doesNotMatch(text, /\$[A-Za-z_][A-Za-z0-9_]*[：，。；、]/, 'variables must be braced before CJK punctuation');
+  assert.match(text, /AGENT_TOOLCHAIN_PROXY=direct/);
+  assert.match(text, /--noproxy '\*'/);
   assert.doesNotMatch(text, /aoci/i);
 });
 
@@ -129,6 +136,12 @@ test('powerShell driver keeps the interactive client prompt behind a tty guard',
   assert.match(text, /Enter number or name \(q to quit\)/);
   assert.match(text, /'  3\) Both'/);
   assert.match(text, /Cancelled: no client selected; nothing was written\./);
+  assert.doesNotMatch(text, /--migrate-managed/);
+  assert.match(text, /agent-toolchain-managed:v4/);
+  assert.match(text, /managed-agents-block\.md/);
+  assert.match(text, /AGENT_TOOLCHAIN_PROXY=direct/);
+  assert.match(text, /@\('--noproxy', '\*'\)/);
+  assert.doesNotMatch(text, /\$[A-Za-z_][A-Za-z0-9_]*[：，。；、]/, 'variables must be braced before CJK punctuation');
   assert.doesNotMatch(text, /aoci/i);
 });
 
@@ -151,6 +164,100 @@ test('configure wires both clients (POSIX)', { skip: process.platform === 'win32
     assert.match(gitignore, /^\/\.codegraph\/$/m);
     assert.match(gitignore, /^\/\.codex\/$/m);
     assert.match(gitignore, /^\/\.zcode\/$/m);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+const managedTemplatePath = path.join(repository, 'shared', 'skills', 'agent-toolchain', 'references', 'managed-agents-block.md');
+
+test('configure appends the canonical managed block for a new project (POSIX)', { skip: process.platform === 'win32' }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'agent-toolchain-new-'));
+  const project = path.join(root, 'target-project');
+  try {
+    await mkdir(path.join(project, '.zcode'), { recursive: true });
+    const result = await runResult('sh', [posixDriver, 'configure', '--project', project], { cwd: repository });
+    assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+    const agents = await readFile(path.join(project, 'AGENTS.md'), 'utf8');
+    const template = await readFile(managedTemplatePath, 'utf8');
+    assert.ok(agents.includes(template.trim()), 'AGENTS.md should include the canonical template');
+    assert.match(agents, /^## CodeGraph 与 RTK$/m);
+    assert.match(agents, /<!-- agent-toolchain-managed:v4 -->/);
+    assert.match(agents, /代码结构探索或全链路关系/);
+    assert.match(agents, /采用白名单/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('configure accepts an AI-rewritten v4 block without rewriting it (POSIX)', { skip: process.platform === 'win32' }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'agent-toolchain-ai-rewrite-'));
+  const project = path.join(root, 'target-project');
+  try {
+    await mkdir(path.join(project, '.zcode'), { recursive: true });
+    const agentsPath = path.join(project, 'AGENTS.md');
+    const aiBlock = [
+      '## CodeGraph 与 RTK',
+      '',
+      '<!-- agent-toolchain-managed:v4 -->',
+      '- 项目特定：先读 docs/architecture 下的 ADR，再决定是否调用 CodeGraph。',
+      '- 只在需要代码结构探索或全链路关系且 `rg` 容易漏时使用 CodeGraph。',
+      '- RTK 只作为大日志安全阀，采用白名单；`git diff` 用原生。',
+      '- 保留项目自定义的发布检查。'
+    ].join('\n');
+    const original = `# Project\n\n${aiBlock}\n\n## Other\n\nkeep\n`;
+    await writeFile(agentsPath, original);
+    const result = await runResult('sh', [posixDriver, 'configure', '--project', project], { cwd: repository });
+    assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+    assert.equal(await readFile(agentsPath, 'utf8'), original, 'configure must not rewrite an AI-managed block');
+    assert.doesNotMatch(result.stdout + '\n' + result.stderr, /没有.*v4/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('configure warns but proceeds when the managed block lacks the v4 marker (POSIX)', { skip: process.platform === 'win32' }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'agent-toolchain-old-block-'));
+  const project = path.join(root, 'target-project');
+  try {
+    await mkdir(path.join(project, '.zcode'), { recursive: true });
+    const agentsPath = path.join(project, 'AGENTS.md');
+    const original = '# Project\n\n## CodeGraph 与 RTK\n\n- 旧规则：所有查询先用 CodeGraph。\n\n## Other\n\nkeep\n';
+    await writeFile(agentsPath, original);
+    const result = await runResult('sh', [posixDriver, 'configure', '--project', project], { cwd: repository });
+    assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+    assert.equal(await readFile(agentsPath, 'utf8'), original, 'configure must not rewrite the old block');
+    assert.match(result.stdout + '\n' + result.stderr, /managed-agents-block\.md/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('configure still refuses the legacy AI 工具 heading (POSIX)', { skip: process.platform === 'win32' }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'agent-toolchain-ai-tools-'));
+  const project = path.join(root, 'target-project');
+  try {
+    await mkdir(path.join(project, '.zcode'), { recursive: true });
+    const agentsPath = path.join(project, 'AGENTS.md');
+    const original = '# Project\n\n## AI 工具\n\n- old rule\n';
+    await writeFile(agentsPath, original);
+    const result = await runResult('sh', [posixDriver, 'configure', '--project', project], { cwd: repository });
+    assert.notEqual(result.code, 0, result.stdout);
+    assert.match(result.stdout + '\n' + result.stderr, /AI 工具/);
+    assert.equal(await readFile(agentsPath, 'utf8'), original);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('configure rejects the removed --migrate-managed flag (POSIX)', { skip: process.platform === 'win32' }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'agent-toolchain-no-flag-'));
+  const project = path.join(root, 'target-project');
+  try {
+    await mkdir(path.join(project, '.zcode'), { recursive: true });
+    const result = await runResult('sh', [posixDriver, 'configure', '--project', project, '--migrate-managed'], { cwd: repository });
+    assert.notEqual(result.code, 0, result.stdout);
+    assert.match(result.stdout + '\n' + result.stderr, /未知参数/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

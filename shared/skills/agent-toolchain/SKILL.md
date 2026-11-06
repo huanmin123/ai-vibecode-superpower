@@ -12,7 +12,7 @@ description: 为目标项目受控接入、升级、修复或维护 CodeGraph �
 ## 接入与维护边界
 
 1. 先读取目标项目根 `AGENTS.md`，确认用户授权当前写入或维护操作。只用本 skill 的平台驱动；不要运行项目内同名脚本、供应商 installer、`codegraph install`、`rtk init` 或 npm 上同名 `rtk` 包（宿主 MCP 配置由驱动统一写入）。
-2. 首次接入或修复配置时先执行 `configure`。它仅在没有冲突时写入 CodeGraph 的 MCP 配置（Codex 写入 `.codex/config.toml`，ZCode 写入 `.zcode/config.json` 的 `mcp.servers`）、`/.codegraph/` 与所接入客户端目录（Codex 为 `/.codex/`，ZCode 为 `/.zcode/`）的忽略规则和一个完整的 `## CodeGraph 与 RTK` 标题；已有配置或标题被改写、缺项或来自旧版 `## AI 工具` 注入时停止并报告，不覆盖项目规则。客户端按项目现有目录自动探测：有 `.codex/` 接入 Codex，有 `.zcode/` 接入 ZCode，两者都有则都接入。都未探测到时：交互终端由驱动询问用户选择（Codex/ZCode/Both）；非交互调用（会话代理经终端运行驱动时属于此类）必须显式传 `--client codex|zcode|both`，按当前会话宿主选择，不确定时先询问用户。
+2. 首次接入或修复配置时先执行 `configure`。它仅在没有冲突时写入 CodeGraph 的 MCP 配置（Codex 写入 `.codex/config.toml`，ZCode 写入 `.zcode/config.json` 的 `mcp.servers`）、`/.codegraph/` 与所接入客户端目录（Codex 为 `/.codex/`，ZCode 为 `/.zcode/`）的忽略规则和一个完整的 `## CodeGraph 与 RTK` 标题；已有 MCP 配置或标题被改写、缺项或来自旧版 `## AI 工具` 注入时停止并报告，不覆盖项目规则。已有 `## CodeGraph 与 RTK` 段落不被逐字覆盖；段落不是当前版本时，让 AI 读取 `references/managed-agents-block.md`，先备份 `AGENTS.md`，再直接用编辑工具重写该段（保留项目特定补充和 `<!-- agent-toolchain-managed:v4 -->` 标记），然后重新运行 `configure`；不要用脚本替换受管段落。客户端按项目现有目录自动探测：有 `.codex/` 接入 Codex，有 `.zcode/` 接入 ZCode，两者都有则都接入。都未探测到时：交互终端由驱动询问用户选择（Codex/ZCode/Both）；非交互调用（会话代理经终端运行驱动时属于此类）必须显式传 `--client codex|zcode|both`，按当前会话宿主选择，不确定时先询问用户。
 3. 用户明确说“升级”时运行 `upgrade --project <目标项目> --dry-run`，核对后再运行 `upgrade --project <目标项目> --apply`。它只把旧受管安装升级到驱动内置 manifest 的当前受支持版本，不查询 GitHub/npm 最新版；CodeGraph 版本变化后会全量重建索引并运行完整 `doctor`。
 4. 首次安装或只修复缺失工具时，先运行 `bootstrap --dry-run`，确认预期下载和写入后才执行 `--apply`。固定版本、来源和 SHA-256 只能来自驱动内置 manifest；不自动升级。
 5. 接入完成后初始化或同步索引并运行完整 `doctor`：CodeGraph 用 `init-codegraph`。CodeGraph 的 MCP 配置通常需要新建会话或重启对应客户端才能加载。

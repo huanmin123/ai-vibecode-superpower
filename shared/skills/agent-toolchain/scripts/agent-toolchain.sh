@@ -1,6 +1,7 @@
 #!/bin/sh
 set -eu
 
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 readonly TOOLCHAIN_HOME="${AGENT_TOOLCHAIN_HOME:-$HOME/.local/share/agent-toolchain}"
 readonly TOOLCHAIN_BIN="${AGENT_TOOLCHAIN_BIN:-$HOME/.local/bin}"
 
@@ -232,6 +233,15 @@ managed_agents_section() {
   ' "$file"
 }
 
+managed_agents_block() {
+  template="$SCRIPT_DIR/../references/managed-agents-block.md"
+  [ -f "$template" ] || die "缺少受管段落模板：$template"
+  [ ! -L "$template" ] || die "受管段落模板不能是 symlink：$template"
+  block=$(cat "$template") || die "无法读取受管段落模板：$template"
+  [ -n "$block" ] || die "受管段落模板为空：$template"
+  printf '%s\n' "$block"
+}
+
 configure_project() {
   codex_dir="$PROJECT/.codex"
   codex_config="$codex_dir/config.toml"
@@ -289,13 +299,8 @@ configure_project() {
   ignore_needs_codex=0
   ignore_needs_zcode=0
   agents_heading='## CodeGraph 与 RTK'
-  agents_block='## CodeGraph 与 RTK
-
-- 涉及跨模块/跨文件依赖，或公共函数、接口、类型、路由、存储、任务队列、依赖升级、删除重命名的开发、修复、重构或复审，必须先用 CodeGraph MCP 查询依赖、调用链或影响范围，再以当前源码、`rg`、未跟踪文件和刚修改文件复核。
-- 单文件且不改公共契约的局部修复、文档/注释、格式化和低风险机械整理可以跳过 CodeGraph 查询。
-- 对只读且输出量大的命令，优先使用匹配的 `rtk` 子命令：`git`、`rg`、`log`、`diff`、`test`、`mvn`、`npm`、`pnpm`、`read`、`find`、`ls`、`tree`。未列出的只读命令先用 `rtk rewrite "<command>"` 或 `rtk --help` 核实；写操作和精确排障使用原生命令。
-- 只有工具注册表或 `--help` 未列出目标命令时，才能判定该命令不存在；其他工具错误保留原始输出，不得归因于能力缺失。
-- 安装、配置修复、初始化或修复索引、健康检查、升级审查和回滚使用全局 `agent-toolchain` skill；不得在日常开发中自行安装、升级、重配或维护工具链。'
+  managed_marker='<!-- agent-toolchain-managed:v4 -->'
+  agents_block=$(managed_agents_block) || die '无法读取受管段落模板'
 
   if [ "$wire_codex" -eq 1 ]; then
     if [ -f "$codex_config" ] && rg -q '^\[mcp_servers\.codegraph\][[:space:]]*$' "$codex_config"; then
@@ -375,9 +380,9 @@ PYEOF
       *__agent_toolchain_section_end__) managed_section=${managed_section%__agent_toolchain_section_end__} ;;
       *) die 'AGENTS.md 的 CodeGraph 与 RTK 受管标题冲突' ;;
     esac
-    expected_section=$(printf '%s\n__agent_toolchain_section_end__' "$agents_block")
-    expected_section=${expected_section%__agent_toolchain_section_end__}
-    [ "$managed_section" = "$expected_section" ] || die 'AGENTS.md 的 CodeGraph 与 RTK 受管标题冲突'
+    if ! printf '%s\n' "$managed_section" | rg -qF -- "$managed_marker"; then
+      note "AGENTS.md 的受管段落没有 ${managed_marker}；请让 AI 读取 $SCRIPT_DIR/../references/managed-agents-block.md 并重写该段，保留项目特定补充。"
+    fi
   else
     agents_needs_write=1
   fi
@@ -458,15 +463,15 @@ DO_NOT_TRACK = "1"'
 load_trusted_manifest() {
   CODEGRAPH_VERSION=1.6.2
   CODEGRAPH_NPM_PACKAGE='@colbymchenry/codegraph'
-  RTK_VERSION=0.51.0
+  RTK_VERSION=1.1.0
   RTK_DARWIN_ARM64_ASSET=rtk-aarch64-apple-darwin.tar.gz
-  RTK_DARWIN_ARM64_SHA256=8817d8b71afc02ac8bf06eb24bcc41c306592ab735b68e8fee9db1ba0de7cb59
+  RTK_DARWIN_ARM64_SHA256=8da773b0954cf90b115ec95c4e4eb420f04c39de233c5db102246a6caf073ba7
   RTK_DARWIN_X64_ASSET=rtk-x86_64-apple-darwin.tar.gz
-  RTK_DARWIN_X64_SHA256=bd39c8153f4147358360c7dc51665a8131cc9ee16f81f69a9402ffa500be3cc2
+  RTK_DARWIN_X64_SHA256=1e23e8b9542b58428e6409c49b1c3fb92c4c0d5125da72e80f002a46086a6c20
   RTK_LINUX_ARM64_ASSET=rtk-aarch64-unknown-linux-gnu.tar.gz
-  RTK_LINUX_ARM64_SHA256=8d6d1aad9e69b42481eda7039507d1f7ee93698f87713cecd873d287c1931632
+  RTK_LINUX_ARM64_SHA256=a5c00c3ab0129884bcb757d348afc1a650efa0f4f0769da97c341f28f89719ed
   RTK_LINUX_X64_ASSET=rtk-x86_64-unknown-linux-musl.tar.gz
-  RTK_LINUX_X64_SHA256=5028d3b19a8f0990d30fec9fbb07e32782bc5698e618fb1861aad8a9ccba4eb5
+  RTK_LINUX_X64_SHA256=9454ad1b9489daa57ab0a9f4ebe2faaf4dc82b8a0f26c9e5135151abd7c9378d
   select_platform_assets
 }
 
@@ -806,10 +811,12 @@ positive_timeout() {
 detect_proxy() {
   DOWNLOAD_PROXY=
   DOWNLOAD_PROXY_SOURCE=direct
-  if [ -n "${AGENT_TOOLCHAIN_PROXY:-}" ]; then
-    DOWNLOAD_PROXY=$AGENT_TOOLCHAIN_PROXY
-    DOWNLOAD_PROXY_SOURCE=explicit
-  elif [ -n "${HTTPS_PROXY:-}" ]; then
+  case "${AGENT_TOOLCHAIN_PROXY:-}" in
+    direct|none) return 0 ;;
+    '') ;;
+    *) DOWNLOAD_PROXY=$AGENT_TOOLCHAIN_PROXY; DOWNLOAD_PROXY_SOURCE=explicit; return 0 ;;
+  esac
+  if [ -n "${HTTPS_PROXY:-}" ]; then
     DOWNLOAD_PROXY=$HTTPS_PROXY
     DOWNLOAD_PROXY_SOURCE=environment
   elif [ -n "${https_proxy:-}" ]; then
@@ -849,7 +856,7 @@ network_preflight() {
   case "$DOWNLOAD_PROXY_SOURCE" in
     direct)
       note "网络预检：直连 GitHub；未检测到代理。连接超时 ${CONNECT_TIMEOUT}s，请求超时 ${REQUEST_TIMEOUT}s。"
-      note "网络提示：若连接或下载缓慢，设置 AGENT_TOOLCHAIN_PROXY=<scheme://host:port> 后重试。"
+      note "网络提示：若连接或下载缓慢，设置 AGENT_TOOLCHAIN_PROXY=<scheme://host:port> 后重试；系统代理不可用时设置 AGENT_TOOLCHAIN_PROXY=direct 强制直连。"
       ;;
     *) note "网络预检：使用 ${DOWNLOAD_PROXY_SOURCE} 代理；连接超时 ${CONNECT_TIMEOUT}s，请求超时 ${REQUEST_TIMEOUT}s。" ;;
   esac
@@ -859,13 +866,13 @@ curl_fetch() {
   if [ -n "$DOWNLOAD_PROXY" ]; then
     curl --proxy "$DOWNLOAD_PROXY" "$@"
   else
-    curl "$@"
+    curl --noproxy '*' "$@"
   fi
 }
 
 fetch_or_die() {
   if ! curl_fetch "$@"; then
-    die "GitHub 下载失败或超时；请检查网络/代理后重试。可设置 AGENT_TOOLCHAIN_PROXY=<scheme://host:port>，不会写入项目配置。"
+    die "GitHub 下载失败或超时；请检查网络/代理后重试。可设置 AGENT_TOOLCHAIN_PROXY=<scheme://host:port>，或设置 AGENT_TOOLCHAIN_PROXY=direct 强制直连；不会写入项目配置。"
   fi
 }
 
@@ -880,7 +887,7 @@ download_archive() {
     *) die "AGENT_TOOLCHAIN_DOWNLOAD_WORKERS 必须是 1 到 8 的整数" ;;
   esac
   headers="$work/range-headers"
-  note "下载 $label：获取受信任 release asset 信息"
+  note "下载 ${label}：获取受信任 release asset 信息"
   fetch_or_die --fail --location --silent --show-error --http1.1 --retry 3 --retry-delay 2 --connect-timeout "$CONNECT_TIMEOUT" --max-time "$REQUEST_TIMEOUT" --proto '=https' --proto-redir '=https' --tlsv1.2 --range 0-0 --dump-header "$headers" --output /dev/null "$url"
   total=$(awk -F/ 'tolower($1) ~ /^content-range:/ { gsub(/\r/, "", $2); print $2 }' "$headers" | tail -n 1)
   asset_url=$(awk 'tolower($1) == "location:" { gsub(/\r/, "", $2); print $2 }' "$headers" | tail -n 1)
@@ -900,7 +907,7 @@ download_archive() {
     [ "$start" -lt "$total" ] || break
     end=$(( start + chunk - 1 ))
     [ "$end" -lt "$total" ] || end=$(( total - 1 ))
-    note "下载 $label：分段 $((index + 1))/$workers"
+    note "下载 ${label}：分段 $((index + 1))/$workers"
     fetch_or_die --fail --location --silent --show-error --http1.1 --retry 3 --retry-delay 2 --connect-timeout "$CONNECT_TIMEOUT" --max-time "$REQUEST_TIMEOUT" --proto '=https' --proto-redir '=https' --tlsv1.2 --range "$start-$end" --output "$work/part-$index" "$asset_url"
     index=$(( index + 1 ))
   done
@@ -1117,7 +1124,10 @@ ensure_posix_command_path() {
   if [ "$PLATFORM_OS" = darwin ] && command -v launchctl >/dev/null 2>&1; then
     gui_path=$(launchctl getenv PATH 2>/dev/null || true)
     [ -n "$gui_path" ] || gui_path='/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin'
-    launchctl setenv PATH "$TOOLCHAIN_BIN:$node_bin:$gui_path" || note "无法更新 macOS 图形会话 PATH；新开的终端仍会生效。"
+    gui_path=$(printf '%s' "$gui_path" | awk -v RS=: '$0 != "" && !seen[$0]++' | paste -sd: -)
+    case ":$gui_path:" in *":$node_bin:"*) ;; *) gui_path="$node_bin:$gui_path" ;; esac
+    case ":$gui_path:" in *":$TOOLCHAIN_BIN:"*) ;; *) gui_path="$TOOLCHAIN_BIN:$gui_path" ;; esac
+    launchctl setenv PATH "$gui_path" || note "无法更新 macOS 图形会话 PATH；新开的终端仍会生效。"
   elif [ "$PLATFORM_OS" = linux ]; then
     environment_dir="$HOME/.config/environment.d"
     environment_file="$environment_dir/90-agent-toolchain.conf"

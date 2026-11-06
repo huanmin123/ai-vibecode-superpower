@@ -1,5 +1,5 @@
 ﻿[CmdletBinding()]
-param([string]$Client, [string]$Preset, [switch]$UpdateRoleManifest)
+param([string]$Client, [string]$Preset, [switch]$External, [switch]$UpdateRoleManifest)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -581,6 +581,9 @@ function Expand-Placeholders([string]$Directory, [string]$Token, [string]$Root) 
 
 $root = Split-Path -Parent $PSCommandPath
 $presetsRoot = Join-Path $root 'shared\roles\presets'
+$externalHome = if ($env:USERPROFILE) { $env:USERPROFILE } else { [Environment]::GetFolderPath('UserProfile') }
+$externalPresetsRoot = Join-Path $externalHome '.ai-vibecode-superpower\presets'
+$externalPresetsPrepared = $false
 $presetManifest = Join-Path $root 'shared\roles\presets.sha256'
 if ($UpdateRoleManifest) {
     if (-not (Test-Path -LiteralPath $presetsRoot -PathType Container)) { throw "Missing presets root: $presetsRoot" }
@@ -624,8 +627,28 @@ $clientProfiles = [ordered]@{
     }
 }
 
+if ([string]::IsNullOrWhiteSpace($Preset) -and -not $External -and -not [Console]::IsInputRedirected) {
+    Write-Host 'Select the preset source:'
+    Write-Host "  1) Built-in ($presetsRoot) [default]"
+    Write-Host "  2) External ($externalPresetsRoot)"
+    $sourceChoice = Read-Host 'Enter number or name (b/e, q to quit)'
+    if ($sourceChoice -match '^[qQ]$') { return }
+    if ($sourceChoice -match '^(2|e|external)$') {
+        $External = $true
+        if (-not (Test-Path -LiteralPath $externalPresetsRoot -PathType Container)) {
+            New-Item -ItemType Directory -Force -Path $externalPresetsRoot | Out-Null
+        }
+        Write-Host "External preset directory: $externalPresetsRoot"
+        $externalPresetsPrepared = $true
+    } elseif ($sourceChoice -match '^(1|b|builtin|)$') {
+        $External = $false
+    } else {
+        throw "Invalid selection: $sourceChoice"
+    }
+}
+
 if ([string]::IsNullOrWhiteSpace($Client)) {
-    if ([Console]::IsInputRedirected) { throw "No client specified. Usage: .\install.ps1 -Client <$($clientProfiles.Keys -join '|')>" }
+    if ([Console]::IsInputRedirected) { throw "No client specified. Usage: .\install.ps1 -Client <$($clientProfiles.Keys -join '|')> [-Preset <name|path>] [-External]" }
     Write-Host 'Select the client to install:'
     $index = 1
     foreach ($name in $clientProfiles.Keys) { Write-Host ("  {0}) {1}" -f $index, $clientProfiles[$name].Label); $index++ }
@@ -643,13 +666,38 @@ $profile = $clientProfiles[$Client]
 $label = $profile.Label
 
 $presetName = $Preset
+$presetSearchRoot = $presetsRoot
+if ($External) {
+    $presetSearchRoot = $externalPresetsRoot
+    if (-not $externalPresetsPrepared) {
+        if (-not (Test-Path -LiteralPath $presetSearchRoot -PathType Container)) {
+            New-Item -ItemType Directory -Force -Path $presetSearchRoot | Out-Null
+        }
+        Write-Host "External preset directory: $presetSearchRoot"
+    }
+}
 if ([string]::IsNullOrWhiteSpace($presetName)) {
-    if ([Console]::IsInputRedirected) { throw "No preset specified. Usage: .\install.ps1 -Client $Client -Preset <$($profile.DefaultPreset)|name|path>" }
-    $available = @(Get-ChildItem -LiteralPath $presetsRoot -Directory | Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'preset.toml') -PathType Leaf } | Sort-Object Name)
-    if ($available.Count -eq 0) { throw "No presets found under: $presetsRoot" }
-    Write-Host 'Select the role preset to install:'
+    if ([Console]::IsInputRedirected) {
+        if ($External) { throw "No preset specified. Usage: .\install.ps1 -Client $Client -Preset <name> -External" }
+        throw "No preset specified. Usage: .\install.ps1 -Client $Client -Preset <$($profile.DefaultPreset)|name|path> [-External]"
+    }
+    $available = @(Get-ChildItem -LiteralPath $presetSearchRoot -Directory | Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'preset.toml') -PathType Leaf } | Where-Object {
+        try { (Read-Preset (Join-Path $_.FullName 'preset.toml')).sections.Contains($profile.HostSection) } catch { $false }
+    } | Sort-Object Name)
+    if ($available.Count -eq 0) {
+        if ($External) {
+            Write-Host "No external presets support $Client in: $presetSearchRoot"
+            Write-Host 'Copy a built-in preset as a template, for example:'
+            Write-Host "  Copy-Item -Recurse '$presetsRoot\$($profile.DefaultPreset)' '$presetSearchRoot\$($profile.DefaultPreset)-local'"
+            Write-Host "Then edit '$presetSearchRoot\$($profile.DefaultPreset)-local\preset.toml' and rerun with: .\install.ps1 -Client $Client -Preset $($profile.DefaultPreset)-local -External"
+            Write-Host "Use [$($profile.HostSection)] in the preset host section for $label."
+            throw "No external presets support $Client in: $presetSearchRoot"
+        }
+        throw "No presets support $Client under: $presetsRoot"
+    }
+    Write-Host "Select the $label role preset to install:"
     for ($i = 0; $i -lt $available.Count; $i++) {
-        $mark = if ($available[$i].Name -eq $profile.DefaultPreset) { ' [default]' } else { '' }
+        $mark = if (-not $External -and $available[$i].Name -eq $profile.DefaultPreset) { ' [default]' } else { '' }
         $desc = try { [string](Read-Preset (Join-Path $available[$i].FullName 'preset.toml')).description } catch { '<unreadable preset>' }
         Write-Host ('  {0}) {1}{2} - {3}' -f ($i + 1), $available[$i].Name, $mark, $desc)
     }
@@ -658,7 +706,13 @@ if ([string]::IsNullOrWhiteSpace($presetName)) {
     if ($choice -match '^\d+$' -and [int]$choice -ge 1 -and [int]$choice -le $available.Count) { $presetName = $available[[int]$choice - 1].Name }
     else { $presetName = $choice }
 }
-$presetDir = if (Test-Path -LiteralPath $presetName -PathType Container) { [IO.Path]::GetFullPath($presetName) } else { Join-Path $presetsRoot $presetName }
+$presetDir = if (Test-Path -LiteralPath $presetName -PathType Container) {
+    [IO.Path]::GetFullPath($presetName)
+} elseif ($External) {
+    Join-Path $externalPresetsRoot $presetName
+} else {
+    Join-Path $presetsRoot $presetName
+}
 $presetFile = Join-Path $presetDir 'preset.toml'
 if (-not (Test-Path -LiteralPath $presetFile -PathType Leaf)) { throw "Preset not found: $presetName (expected $presetFile)" }
 $isManagedPreset = $presetDir.TrimEnd('\').StartsWith($presetsRoot.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase) -or $presetDir.TrimEnd('\').Equals($presetsRoot.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)
