@@ -18,7 +18,11 @@
 2. 不要运行 `npm install`、`pip install` 或任何包管理器安装命令；`node_modules/`、虚拟环境和锁文件都不在夹具内。
 3. 不要运行 `node server.js`、`flask run`、`python app.py`，不要启动容器或反向代理。
 4. 不要把任何服务或端口暴露到本机网络之外；不要向夹具中的接口发送真实请求。
-5. 如需语法检查，只使用 `node --check <file>` 和 `python3 -m py_compile <file>`；不要用应用入口做启动检查。
+5. 如需语法检查，只使用 `node --check <file>`，或对 Python 源文件做不执行代码的内存编译；不要用应用入口做启动检查，也不要用 `py_compile` 生成 `__pycache__`：
+   ```sh
+   python3 -I -B -c 'import pathlib, sys; path = pathlib.Path(sys.argv[1]); compile(path.read_bytes(), str(path), "exec")' path/to/module.py
+   ```
+   `compile` 按 Python 源码的 BOM/编码声明解码，并以 module（`exec`）语法编译；语法或编码错误会导致非零退出，不运行代码。`-I` 隔离当前目录和用户环境，`-B` 禁止写入 `.pyc`。
 
 ## 目录
 

@@ -164,10 +164,6 @@ function Test-AgentsH2At([string[]]$Lines, [int]$Index) {
   return $Index + 1 -lt $Lines.Count -and $Lines[$Index] -match '^[ ]{0,3}\S.*$' -and $Lines[$Index + 1] -match '^[ ]{0,3}-+[ \t]*$'
 }
 
-function Test-AgentsSectionBoundary([string]$Line) {
-  return $Line -match '^[ ]{0,3}##[ \t]+'
-}
-
 function Get-ManagedAgentsSection([string[]]$Lines, [string]$Heading) {
   $headingCandidates = @(Get-AgentsHeadingCandidates $Lines $Heading)
   if ($headingCandidates.Count -ne 1) {
@@ -178,7 +174,7 @@ function Get-ManagedAgentsSection([string[]]$Lines, [string]$Heading) {
   if ($candidate.Kind -ne 'atx' -or $Lines[$candidate.Index] -cne $Heading) { Fail 'AGENTS.md 的 CodeGraph 与 RTK 受管标题冲突' }
   $sectionLines = [System.Collections.Generic.List[string]]::new()
   for ($index = $candidate.Index; $index -lt $Lines.Count; $index += 1) {
-    if ($index -gt $candidate.Index -and (Test-AgentsSectionBoundary $Lines[$index])) { break }
+    if ($index -gt $candidate.Index -and (Test-AgentsH2At $Lines $index)) { break }
     [void]$sectionLines.Add($Lines[$index])
   }
   while ($sectionLines.Count -gt 0 -and [string]::IsNullOrEmpty($sectionLines[$sectionLines.Count - 1])) {

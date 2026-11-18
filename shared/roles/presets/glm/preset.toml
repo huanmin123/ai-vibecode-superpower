@@ -1,7 +1,10 @@
+# GLM 预设：ZCode 5 角色绑定 GLM-5.3-Flash / GLM-5.3。
+# ZCode 的 providerId/modelId 随账号与套餐变化，预设只写 local:<key>；
+# 安装时从 ~/.ai-vibecode-superpower/model-bindings.toml 的 [zcode] 小节解析实际值。
 description = "GLM 预设：ZCode 5 角色绑定 GLM-5.3-Flash / GLM-5.3。"
 
 [zcode]
-model = "account:bigmodel-individual-coding-plan/GLM-5.3-Flash"
+model = "local:glm_flash"
 
 [[zcode.role]]
 id = "flash_low"
@@ -34,7 +37,7 @@ description = "只读有界技术定案与常规复审（审核主力）。"
 effort = "deep"
 readonly = true
 color = "purple"
-model = "account:bigmodel-individual-coding-plan/GLM-5.3"
+model = "local:glm_main"
 
 [[zcode.role]]
 id = "review_max"
@@ -43,4 +46,4 @@ description = "只读最高强度独立复审与最终升级验收（终审）�
 effort = "max"
 readonly = true
 color = "orange"
-model = "account:bigmodel-individual-coding-plan/GLM-5.3"
+model = "local:glm_main"

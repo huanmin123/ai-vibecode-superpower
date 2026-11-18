@@ -1,4 +1,4 @@
-description = "GPT 预设：Codex 12 角色绑定 gpt-6 / gpt-6.1 系列。"
+description = "GPT 预设：Codex 12 角色绑定 gpt-6 / gpt-6.1 / gpt-6.2 系列。"
 
 [codex]
 
@@ -60,40 +60,40 @@ model = "gpt-6.1-terra"
 
 [[codex.role]]
 id = "sol_high"
-name = "gpt_6.1_sol_high"
+name = "gpt_6.2_sol_high"
 description = "只读 Sol/high 常规独立评审与复审角色。"
 effort = "deep"
 readonly = true
-model = "gpt-6.1-sol"
+model = "gpt-6.2-sol"
 
 [[codex.role]]
 id = "sol_xhigh"
-name = "gpt_6.1_sol_xhigh"
+name = "gpt_6.2_sol_xhigh"
 description = "只读 Sol/xhigh 有界技术定案与常规复审角色。"
 model_reasoning_effort = "xhigh"
 readonly = true
-model = "gpt-6.1-sol"
+model = "gpt-6.2-sol"
 
 [[codex.role]]
 id = "astra_high"
-name = "gpt_6_astra_high"
+name = "gpt_6.2_astra_high"
 description = "只读 Astra/high 高难技术定案与复杂复审角色。"
 effort = "deep"
 readonly = true
-model = "gpt-6-astra"
+model = "gpt-6.2-astra"
 
 [[codex.role]]
 id = "astra_xhigh"
-name = "gpt_6_astra_xhigh"
+name = "gpt_6.2_astra_xhigh"
 description = "只读 Astra/xhigh 未解根因与升级调查角色。"
 model_reasoning_effort = "xhigh"
 readonly = true
-model = "gpt-6-astra"
+model = "gpt-6.2-astra"
 
 [[codex.role]]
 id = "astra_max"
-name = "gpt_6_astra_max"
+name = "gpt_6.2_astra_max"
 description = "只读 Astra/max 最高强度复审与最终升级验收角色。"
 effort = "max"
 readonly = true
-model = "gpt-6-astra"
+model = "gpt-6.2-astra"

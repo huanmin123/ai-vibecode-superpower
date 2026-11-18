@@ -1,0 +1,29 @@
+[
+  {
+    "id": "text-contract-and-presentation",
+    "prompt": "请依据 test-strategy 为以下两次独立改动选择验证，不执行命令。项目已有 Node 内置测试，无映射表或 marker。第一处修改 prompts/review.md 的代理行为规则，tests/prompt-contract.test.mjs 用 readFile 读取该文件并验证指令契约，没有任何 JS import 指向它，命令是 node --test tests/prompt-contract.test.mjs。第二处仅修正使用者手册中一段纯展示文字，无程序或自动化消费者，项目有 npm run docs:check 检查文档链接和格式。分别说明应运行什么，以及是否需要新增测试基础设施。",
+    "expected": [
+      "行为规则改动运行 node --test tests/prompt-contract.test.mjs，识别 readFile 消费关系。",
+      "纯展示文字运行已有 npm run docs:check，无需为了文件扩展名运行无关功能测试。",
+      "两处均无需为选测新增映射表、marker 或目录。"
+    ]
+  },
+  {
+    "id": "small-full-suite-shared-config",
+    "prompt": "请依据 test-strategy 选择验证，不执行命令。项目改动了多个模块共享的初始化配置，无法可靠确定受影响的局部集合。现有 npm run test:baseline 会在隔离环境运行全部功能基线，耗时约 25 秒，收集前排除需要账号和网络的外部场景测试。项目和用户均未指定额外门禁。说明应运行哪些测试、是否询问用户，以及是否需要新增测试基础设施。",
+    "expected": [
+      "自主运行 npm run test:baseline，使用成本可接受且隔离的全量功能基线覆盖不明确的影响面。",
+      "无需为这次全量功能基线询问用户，不默认运行外部场景。",
+      "无需新增映射表、marker 或目录。"
+    ]
+  },
+  {
+    "id": "slow-regression-and-local-cli",
+    "prompt": "请依据 test-strategy 选择验证，不执行命令。一次配置器修复影响解析器和落盘行为。已有 npm test -- config 运行受影响模块，包含一个稳定且高价值的解析器回归用例，耗时 800ms，以及一个运行本地 CLI 的测试，使用独立临时目录并在结束后清理，验证配置实际落盘，整套约 3 秒。没有网络或共享状态。说明选测、这两个用例的去留，以及是否需要为这次验证新增标记或测试架构。",
+    "expected": [
+      "运行 npm test -- config，保留并执行解析器回归用例和隔离的本地 CLI 落盘测试。",
+      "不会因单例超过 200ms 将回归用例移出日常测试，整体耗时可以接受。",
+      "无需新增 slow-baseline 标记、登记表或测试架构。"
+    ]
+  }
+]

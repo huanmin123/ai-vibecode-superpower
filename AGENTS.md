@@ -16,18 +16,17 @@
 
 1. `README.md` 是使用者手册：只说明用途、适用场景、简明工作流、安装入口和可选能力。
 2. 不在 README 重复 role 路由、模型选择、消息字段、权限边界、并发限制、配置合并或安装器实现细节。
-3. 技术规则只在其权威来源维护：项目文档边界在本文件，工作流在 `shared/skills/orchestrate-model-workflow/SKILL.md`，role schema、翻译规则与预设边界在 `shared/roles/README.md`，安装行为在安装脚本。README 仅在确有必要时链接这些来源。
+3. 首次安装所需的步骤和示例保留在 README。扩展说明链接到下列权威来源。
 
 ## 权威来源
 
-- 共享平台文档与工具无关 skills：`shared/`（`docs/system/`、`global-instructions.md`、`agent-toolchain`、`project-doc-planner`、`visual-aesthetics`、`deep-dive-review`、`test-strategy`、`security-audit`、`roles`），由两个安装器共同安装或消费。
-- 全局行为规范唯一事实源：`shared/global-instructions.md`；安装器把其中的 `<GLOBAL_HOME>` 展开为目标 home 后写入 `AGENTS.md`。客户端目录不再保存规范副本，不要重新引入。
-- 工作流路由、交接与验收：`shared/skills/orchestrate-model-workflow/SKILL.md`（双宿主共享；安装时仅注入当前预设的角色清单）；Codex 专属技能资产在 `codex-global-config/skill-assets/`。
-- role 唯一事实源：`shared/roles/`——schema 与翻译规则在 `shared/roles/README.md`，预设数据在 `shared/roles/presets/`（`glm` 绑定 ZCode 5 角色，`gpt` 绑定 Codex 12 role：四档分工——luna（gpt-6-luna）承担读任务（简单读 medium/high、深度读 xhigh）与简单写（max），terra（gpt-6.1-terra）为主力写（high/xhigh/max），sol（gpt-6.1-sol）为主力评审，astra（gpt-6-astra）为深度评审（high/xhigh/max）；`ds` 绑定 ZCode 3 角色，单模型 deepseek-v4.1-flash 拆 3 档，2 读 1 写，复审/终审由 `ds_4.1_flash_max` 兼任，其 model 是占位值），源完整性由 `shared/roles/presets.sha256` 静态校验。仓库不维护任何宿主角色文件；`codex-global-config/agents/` 与 `zcode-global-config/agents/` 已删除，安装时由翻译器按预设生成。角色命名推荐 `模型_版本_类型_思考档`（如 `glm_5.3_flash_low`、`gpt_6_astra_max`、`ds_4.1_flash_low`），同模型同档位冲突时追加职责后缀。md agent 的 `model` 必须写 ZCode Picker 值 `providerId/modelId`（如 `"account:bigmodel-individual-coding-plan/GLM-5.3-Flash"`，provider 段随实际登录的 Coding Plan 账号走），`thoughtLevel` 单独成键；裸模型名会被 ZCode 静默忽略并回退到父会话模型。
-- 安装与合并逻辑：`install.ps1`、`install.sh`（每平台一个安装器，交互选择预设来源（内置/外置）、客户端与预设（预设列表按宿主小节过滤），或以 `-Client`/`-Preset`、位置参数指定；`-External` / `--external` 使用固定外部预设根 `~/.ai-vibecode-superpower/presets/`；`-UpdateRoleManifest` / `--update-role-manifest` 重写预设 manifest）；不要直接编辑已安装的全局副本作为最终修改。ZCode 的 md agent 按预设渲染名单平铺安装到 `~/.zcode/agents/` 顶层（新版宿主只扫描顶层，子目录不参与发现），产物只做结构校验不做 hash 比对；旧版安装的 `agents/ai-vibecode-superpower/` 子目录仅在结构与角色名单和渲染产物完全一致时随安装备份移除。
+- 两个宿主共用[全局行为规范](shared/global-instructions.md)、[平台文档](shared/docs/system/README.md)和 [skills](shared/skills/)。安装器将全局规范中的 `<GLOBAL_HOME>` 展开为目标 home。
+- 工作流路由、交接与验收见[工作流 skill](shared/skills/orchestrate-model-workflow/SKILL.md)。Codex 专属技能资产在 [skill-assets/](codex-global-config/skill-assets/)。
+- 角色数据在[预设目录](shared/roles/presets/)中维护。schema、模型绑定与宿主翻译见[角色规范](shared/roles/README.md)。宿主角色文件由安装器生成。
+- 安装参数与合并行为以 [Windows 安装器](install.ps1)和 [macOS/Linux 安装器](install.sh)为准。
 
 ## 修改与验证
 
-1. 修改全局行为、skill 或预设时，先改本仓库中的权威来源；预设源文件（preset.toml、roles/*.md）变更后必须运行 `-UpdateRoleManifest` / `--update-role-manifest` 更新 `shared/roles/presets.sha256`；新增模型方案只新增预设目录，不改翻译器。
+1. 修改仓库中的权威来源，安装产物由安装器生成。内置预设的 `preset.toml` 或角色正文变更后，运行 `-UpdateRoleManifest` / `--update-role-manifest` 更新 [presets.sha256](shared/roles/presets.sha256)。新增模型方案只需增加预设并更新 manifest。本机模型绑定保存在仓库外。
 2. 只有用户要求部署时，运行对应平台的 `install` 脚本并选择目标客户端与预设，核对已安装文件与渲染产物一致。
 3. 保留实际错误和未验证项；不得用未证明兼容的 fallback 隐藏问题。

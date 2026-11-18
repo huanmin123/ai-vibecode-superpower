@@ -92,6 +92,7 @@ normalize_absolute_path() {
 
 presets_root=$script_dir/shared/roles/presets
 external_presets_root=${HOME:+$HOME/.ai-vibecode-superpower/presets}
+model_bindings_file=${HOME:+$HOME/.ai-vibecode-superpower/model-bindings.toml}
 preset_manifest=$script_dir/shared/roles/presets.sha256
 
 normalized_lf_sha256() {
@@ -523,6 +524,207 @@ read_preset() {
     if [ "$P_SECTION_COUNT" = 0 ]; then preset_fail "Preset has no host section: $rp_file"; fi
 }
 
+# ---- 本地模型绑定：~/.ai-vibecode-superpower/model-bindings.toml（只读，不属于安装产物） ----
+
+# 绑定值校验：两个宿主都拒绝空值、local: 前缀和控制字符；ZCode 另要求无空白的 providerId/modelId，Codex 只要求非空。
+validate_model_binding_value() {
+    vmbv_host=$1
+    vmbv_value=$2
+    vmbv_ctx=$3
+    case "$vmbv_value" in
+        local:*) die "Invalid model binding in $vmbv_ctx: value must not start with local:" ;;
+    esac
+    if [ -z "$vmbv_value" ]; then
+        die "Invalid model binding in $vmbv_ctx: value must not be empty"
+    fi
+    case "$vmbv_value" in
+        *[[:cntrl:]]*) die "Invalid model binding in $vmbv_ctx: value must not contain control characters" ;;
+    esac
+    if [ "$vmbv_host" = zcode ]; then
+        case "$vmbv_value" in
+            *[[:space:]]*) die "Invalid model binding in $vmbv_ctx: value must not contain whitespace" ;;
+        esac
+        case "$vmbv_value" in
+            */*) ;;
+            *) die "Invalid model binding in $vmbv_ctx: value must be providerId/modelId" ;;
+        esac
+        vmbv_provider=${vmbv_value%%/*}
+        vmbv_model=${vmbv_value#*/}
+        if [ -z "$vmbv_provider" ] || [ -z "$vmbv_model" ]; then
+            die "Invalid model binding in $vmbv_ctx: providerId and modelId must be non-empty"
+        fi
+    fi
+}
+
+# 按行解析绑定文件；只保存当前宿主小节的 key/value/行号，另一小节仅做结构校验。
+# key 允许 '-'，不能直接拼进 shell 变量名，故按序号保存并以 mb_find_binding 查询。
+mb_find_binding() {
+    MB_FOUND=0
+    MB_FOUND_VALUE=
+    MB_FOUND_LINE=
+    mbf_idx=1
+    while [ "$mbf_idx" -le "${MB_COUNT:-0}" ]; do
+        if [ "$(pget "MB_KEY_${mbf_idx}")" = "$1" ]; then
+            MB_FOUND=1
+            MB_FOUND_VALUE=$(pget "MB_VAL_${mbf_idx}"; printf X)
+            MB_FOUND_VALUE=${MB_FOUND_VALUE%X}
+            MB_FOUND_LINE=$(pget "MB_LINE_${mbf_idx}")
+            return 0
+        fi
+        mbf_idx=$((mbf_idx+1))
+    done
+    return 1
+}
+
+read_model_bindings() {
+    mb_file=$1
+    mb_target_host=$2
+    MB_COUNT=0
+    MB_SEEN_KEYS_zcode=
+    MB_SEEN_KEYS_codex=
+    mb_seen_table_zcode=0
+    mb_seen_table_codex=0
+    mb_section=
+    mb_lineno=0
+    mb_bom=$(printf '\357\273\277')
+    mb_first=1
+    while IFS= read -r mb_line || [ -n "$mb_line" ]; do
+        mb_lineno=$((mb_lineno+1))
+        if [ "$mb_first" = 1 ]; then
+            mb_first=0
+            mb_line=${mb_line#"$mb_bom"}
+        fi
+        mb_trim=$(trim_ws "$mb_line")
+        if [ -z "$mb_trim" ]; then continue; fi
+        case "$mb_trim" in '#'*) continue ;; esac
+        case "$mb_trim" in
+            '['*)
+                case "$mb_trim" in
+                    '[zcode]')
+                        if [ "$mb_seen_table_zcode" = 1 ]; then
+                            die "Repeated model binding table in $mb_file:$mb_lineno: $mb_trim"
+                        fi
+                        mb_seen_table_zcode=1
+                        mb_section=zcode
+                        ;;
+                    '[codex]')
+                        if [ "$mb_seen_table_codex" = 1 ]; then
+                            die "Repeated model binding table in $mb_file:$mb_lineno: $mb_trim"
+                        fi
+                        mb_seen_table_codex=1
+                        mb_section=codex
+                        ;;
+                    *) die "Unsupported model binding table in $mb_file:$mb_lineno: $mb_trim" ;;
+                esac
+                continue
+                ;;
+        esac
+        if [ -z "$mb_section" ]; then
+            die "Unsupported model binding line in $mb_file:$mb_lineno: $mb_trim (expected [zcode] or [codex] section first)"
+        fi
+        case "$mb_trim" in
+            *=*) mb_key=$(trim_ws "${mb_trim%%=*}"); mb_value_raw=${mb_trim#*=} ;;
+            *) die "Unsupported model binding line in $mb_file:$mb_lineno: $mb_trim" ;;
+        esac
+        if ! printf '%s' "$mb_key" | LC_ALL=C grep -Eq '^[A-Za-z][A-Za-z0-9_-]*$'; then
+            die "Unsupported model binding key in $mb_file:$mb_lineno: $mb_key"
+        fi
+        mb_seen=$(pget "MB_SEEN_KEYS_${mb_section}")
+        case " $mb_seen " in
+            *" $mb_key "*) die "Repeated model binding key in $mb_file:$mb_lineno: $mb_section/$mb_key" ;;
+        esac
+        pset "MB_SEEN_KEYS_${mb_section}" "${mb_seen:+$mb_seen }$mb_key"
+        mb_value_trim=$(trim_ws "$mb_value_raw")
+        case "$mb_value_trim" in
+            '"'*'"') ;;
+            *) die "Model binding value must be a double-quoted string in $mb_file:$mb_lineno: $mb_section/$mb_key" ;;
+        esac
+        PRESET_QUIET=0
+        parse_preset_scalar "$mb_value_raw" "$mb_file:$mb_lineno ($mb_section/$mb_key)"
+        if [ "$mb_section" = "$mb_target_host" ]; then
+            MB_COUNT=$((MB_COUNT+1))
+            pset "MB_KEY_${MB_COUNT}" "$mb_key"
+            pset "MB_VAL_${MB_COUNT}" "$PSV"
+            pset "MB_LINE_${MB_COUNT}" "$mb_lineno"
+        fi
+    done < "$mb_file"
+}
+
+# 遍历当前宿主角色收集 local:<key>，解析绑定并回写角色 model；缺失或非法一律报错，不回退。
+resolve_model_bindings() {
+    rmb_host=$host_section
+    rmb_file=$model_bindings_file
+    rmb_required=
+    rmb_role=1
+    while [ "$rmb_role" -le "$P_ROLES" ]; do
+        if [ "$(pget "P_R${rmb_role}_HOST")" = "$rmb_host" ]; then
+            rmb_effective=
+            if [ "$(pget "P_R${rmb_role}_SET_model")" = 1 ]; then
+                rmb_effective=$(pget "P_R${rmb_role}_model")
+            elif [ "$(pget "P_HOST_${rmb_host}_MODEL_SET")" = 1 ]; then
+                rmb_effective=$(pget "P_HOST_${rmb_host}_MODEL")
+            fi
+            case "$rmb_effective" in
+                local:*)
+                    rmb_key=${rmb_effective#local:}
+                    if ! printf '%s' "$rmb_key" | LC_ALL=C grep -Eq '^[A-Za-z][A-Za-z0-9_-]*$'; then
+                        die "Invalid local model reference in $preset_file: $rmb_effective (expected local:<key>)"
+                    fi
+                    case " $rmb_required " in
+                        *" $rmb_key "*) ;;
+                        *) rmb_required="${rmb_required:+$rmb_required }$rmb_key" ;;
+                    esac
+                    ;;
+            esac
+        fi
+        rmb_role=$((rmb_role+1))
+    done
+    [ -n "$rmb_required" ] || return 0
+    rmb_key_list=
+    for rmb_key in $rmb_required; do
+        rmb_key_list="${rmb_key_list:+$rmb_key_list, }$rmb_key"
+    done
+    if [ -z "$rmb_file" ]; then
+        die "Cannot resolve model bindings file: HOME is not set (required keys in [$rmb_host]: $rmb_key_list)"
+    fi
+    if [ ! -f "$rmb_file" ]; then
+        die "Model bindings file not found: $rmb_file (required keys in [$rmb_host]: $rmb_key_list)"
+    fi
+    read_model_bindings "$rmb_file" "$rmb_host"
+    rmb_missing=
+    for rmb_key in $rmb_required; do
+        if ! mb_find_binding "$rmb_key"; then
+            rmb_missing="${rmb_missing:+$rmb_missing, }$rmb_key"
+        fi
+    done
+    if [ -n "$rmb_missing" ]; then
+        die "Missing model binding keys in $rmb_file [$rmb_host]: $rmb_missing"
+    fi
+    rmb_role=1
+    while [ "$rmb_role" -le "$P_ROLES" ]; do
+        if [ "$(pget "P_R${rmb_role}_HOST")" = "$rmb_host" ]; then
+            rmb_effective=
+            if [ "$(pget "P_R${rmb_role}_SET_model")" = 1 ]; then
+                rmb_effective=$(pget "P_R${rmb_role}_model")
+            elif [ "$(pget "P_HOST_${rmb_host}_MODEL_SET")" = 1 ]; then
+                rmb_effective=$(pget "P_HOST_${rmb_host}_MODEL")
+            fi
+            case "$rmb_effective" in
+                local:*)
+                    rmb_key=${rmb_effective#local:}
+                    if ! mb_find_binding "$rmb_key"; then
+                        die "Missing model binding key in $rmb_file [$rmb_host]: $rmb_key"
+                    fi
+                    validate_model_binding_value "$rmb_host" "$MB_FOUND_VALUE" "$rmb_file:$MB_FOUND_LINE ($rmb_host/$rmb_key)"
+                    pset "P_R${rmb_role}_model" "$MB_FOUND_VALUE"
+                    pset "P_R${rmb_role}_SET_model" 1
+                    ;;
+            esac
+        fi
+        rmb_role=$((rmb_role+1))
+    done
+}
+
 # YAML/双引号安全转义：\ → \\、" → \"；结尾哨兵 X 由调用方剥掉，防止命令替换吞掉结尾换行。
 escape_quoted_apply() {
     printf '%sX' "$1" | LC_ALL=C sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
@@ -935,6 +1137,7 @@ if [ "$external_presets" = 1 ]; then
     fi
 fi
 
+preset_selected_dir=
 if [ -z "$preset_input" ]; then
     if [ ! -t 0 ]; then
         if [ "$external_presets" = 1 ]; then
@@ -977,22 +1180,35 @@ if [ -z "$preset_input" ]; then
     case "$preset_choice" in
         [qQ]) exit 0 ;;
     esac
+    preset_input=$preset_choice
+    preset_number=
     case "$preset_choice" in
-        ''|*[!0-9]*) preset_input=$preset_choice ;;
+        ''|*[!0-9]*) ;;
         *)
-            if [ "$preset_choice" -ge 1 ] && [ "$preset_choice" -le "$#" ]; then
-                eval "preset_input=\$(basename -- \"\${$preset_choice}\")"
-            else
-                preset_input=$preset_choice
-            fi
+            preset_number=$preset_choice
+            while [ "${preset_number#0}" != "$preset_number" ]; do preset_number=${preset_number#0}; done
             ;;
     esac
+    preset_index=1
+    preset_name_dir=
+    for preset_entry_path in "$@"; do
+        preset_entry=$(basename -- "$preset_entry_path")
+        if [ "$preset_entry" = "$preset_choice" ]; then preset_name_dir=$preset_entry_path; fi
+        if [ "$preset_index" = "$preset_number" ]; then
+            preset_selected_dir=$preset_entry_path
+            preset_input=$preset_entry
+        fi
+        preset_index=$((preset_index+1))
+    done
+    if [ -z "$preset_selected_dir" ]; then preset_selected_dir=$preset_name_dir; fi
 fi
 
 # ---- 预设解析、manifest 校验与渲染（先于路径安全检查与 stage 装配）----
 
 preset_display_name=$preset_input
-if [ -d "$preset_input" ]; then
+if [ -n "$preset_selected_dir" ]; then
+    preset_dir=${preset_selected_dir%/}
+elif [ -d "$preset_input" ]; then
     preset_dir=$(CDPATH= cd -- "$preset_input" && pwd -P) || die "Could not resolve preset directory: $preset_input"
 elif [ "$external_presets" = 1 ]; then
     preset_dir=$external_presets_root/$preset_input
@@ -1009,7 +1225,9 @@ case "$preset_dir" in
 esac
 
 # 先校验目标 home，再开始任何渲染或写入；拒绝路径时不得先创建目录。
-: "$HOME"
+if [ -z "${HOME:-}" ]; then
+    die "HOME is not set"
+fi
 raw_home=$HOME/$default_home
 if printenv "$home_env" >/dev/null 2>&1; then raw_home=$(printenv "$home_env"); fi
 case "$raw_home" in
@@ -1031,6 +1249,7 @@ read_preset "$preset_file"
 if [ "$(pget "P_HOST_${host_section}_SET")" != 1 ]; then
     die "Preset '$preset_display_name' has no [$host_section] section and cannot be installed for $client_label"
 fi
+resolve_model_bindings
 render_preset
 role_count=$ROLE_COUNT_OUT
 

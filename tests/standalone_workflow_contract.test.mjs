@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
-import { cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
@@ -51,6 +51,15 @@ function markdownSection(text, heading) {
   return text.slice(start, end === -1 ? undefined : end);
 }
 
+function workflowStage(text, heading) {
+  const stages = markdownSection(text, '阶段要求');
+  const marker = `### ${heading}`;
+  const start = stages.indexOf(marker);
+  assert.notEqual(start, -1, `missing workflow stage: ${heading}`);
+  const end = stages.indexOf('\n### ', start + marker.length);
+  return stages.slice(start, end === -1 ? undefined : end);
+}
+
 async function runResult(command, args, options) {
   try {
     const result = await run(command, args, { windowsHide: true, maxBuffer: 8 * 1024 * 1024, ...options });
@@ -75,6 +84,21 @@ function posixHome(codexHome) {
   return path.relative(repository, codexHome).split(path.sep).join('/');
 }
 
+const testModelBindings = {
+  glm_flash: 'test-glm/GLM-5.3-Flash',
+  glm_main: 'test-glm/GLM-5.3',
+  ds_flash: 'test-deepseek/deepseek-v4.1-flash',
+};
+
+async function seedModelBindings(home, overrides = {}) {
+  const dir = path.join(home, '.ai-vibecode-superpower');
+  await mkdir(dir, { recursive: true });
+  const values = { ...testModelBindings, ...overrides };
+  const lines = ['[zcode]'];
+  for (const [key, value] of Object.entries(values)) lines.push(`${key} = "${value}"`);
+  await writeFile(path.join(dir, 'model-bindings.toml'), lines.join('\n') + '\n');
+}
+
 const sharedSkillNames = ['agent-toolchain', 'project-doc-planner', 'visual-aesthetics', 'deep-dive-review', 'test-strategy', 'security-audit'];
 
 async function assertSharedSkillsDeployed(skillsDir, client) {
@@ -93,18 +117,18 @@ async function assertSharedSkillsDeployed(skillsDir, client) {
       await readFile(path.join(sourceDeepDiveDir, 'references', ref), 'utf8'), `installed deep-dive reference: ${ref}`);
   }
   const strategySkill = await readFile(path.join(skillsDir, 'test-strategy', 'SKILL.md'), 'utf8');
-  const expectedRefs = (await readdir(path.join(repository, 'shared', 'skills', 'test-strategy', 'references')))
+  const sourceStrategyDir = path.join(repository, 'shared', 'skills', 'test-strategy');
+  assert.equal(strategySkill, await readFile(path.join(sourceStrategyDir, 'SKILL.md'), 'utf8'));
+  const expectedRefs = (await readdir(path.join(sourceStrategyDir, 'references')))
     .filter((name) => name.endsWith('.md')).sort();
   const installedRefs = (await readdir(path.join(skillsDir, 'test-strategy', 'references')))
     .filter((name) => name.endsWith('.md')).sort();
   assert.deepEqual(installedRefs, expectedRefs, 'test-strategy references must be installed exactly');
   for (const ref of expectedRefs) {
-    assert.match(strategySkill, new RegExp(ref.replace('.', '\\.')), `test-strategy must link ${ref}`);
     const content = await readFile(path.join(skillsDir, 'test-strategy', 'references', ref), 'utf8');
-    assert.match(content, /^# /, `reference must have a heading: ${ref}`);
-    assert.ok(content.length > 40, `reference must not be empty: ${ref}`);
-    assert.doesNotMatch(content, /Codex|ZCode|CODEX_HOME|ZCODE_HOME/, `reference must stay host-agnostic: ${ref}`);
+    assert.equal(content, await readFile(path.join(sourceStrategyDir, 'references', ref), 'utf8'), `installed test-strategy reference: ${ref}`);
   }
+
   const auditSkill = await readFile(path.join(skillsDir, 'security-audit', 'SKILL.md'), 'utf8');
   const auditRefs = (await readdir(path.join(repository, 'shared', 'skills', 'security-audit', 'references')))
     .filter((name) => name.endsWith('.md')).sort();
@@ -171,7 +195,9 @@ test('global behavior rules do not hard-code obsolete host tool protocols', asyn
 test('standalone workflow skill has the five behavior stages and no obsolete protocol terms', async () => {
   const text = await readFile(skillBase, 'utf8');
   assert.match(text, /^---\r?\nname: orchestrate-model-workflow\r?\n/);
-  for (const stage of ['Explore', 'Plan', 'Work', 'Critique', 'Promote']) assert.match(text, new RegExp(`\\b${stage}\\b`));
+  const stageSection = markdownSection(text, '阶段要求');
+  const stages = Array.from(stageSection.matchAll(/^### (.+?)\s*$/gm), (match) => match[1]);
+  assert.deepEqual(stages, ['Explore', 'Plan', 'Work', 'Critique', 'Promote']);
   for (const forbidden of [
     'workflow_controller', 'workflow_', 'claim_id', 'routing_schema_version',
     'coordinator_task_path', 'review_history_digest', 'controller', 'plugin',
@@ -194,8 +220,7 @@ test('standalone workflow skill has the five behavior stages and no obsolete pro
   assert.match(text, /拒绝场景下，主代理仅在授权、权限、范围和责任边界均已满足时直接继续/);
   assert.match(text, /角色或模型不可用时，按档位就近回退/);
   assert.match(text, /派发一个继承当前会话模型的子代理/);
-  assert.match(text, /承担原角色职责，其余流程不变/);
-  assert.match(text, /主代理不得改为在当前会话内直接执行/);
+  assert.match(text, /继承当前会话模型的子代理[^。]*承担原角色职责/);
   assert.match(text, /恢复后回到原角色/);
   assert.doesNotMatch(text, /spawn_agent|agent_type|subagent_type/);
   assert.doesNotMatch(text, /路径锁|并行写入安全|所有.*串行/);
@@ -203,7 +228,7 @@ test('standalone workflow skill has the five behavior stages and no obsolete pro
   assert.match(text, /派发前以清单为准/);
   assert.match(text, /不假定清单之外的角色/);
   assert.match(text, /<!-- preset-roles -->/);
-  assert.doesNotMatch(text, /gpt_6_luna|gpt_6\.1_sol|gpt_6\.1_terra|gpt_6_astra|gpt_6_sol/);
+  assert.doesNotMatch(text, /\bgpt_\d+(?:\.\d+)?_[a-z]+/);
   assert.doesNotMatch(text, /gpt_5\.6|terra/);
   const interfaceText = await readFile(skillInterface, 'utf8');
   assert.match(interfaceText, /可拆任务优先多 agent 并行/);
@@ -251,11 +276,11 @@ test('all twelve gpt preset roles carry model routing fields', async () => {
     terra_high: { model: 'gpt-6.1-terra', effort: 'deep', readonly: 'false' },
     terra_xhigh: { model: 'gpt-6.1-terra', nativeEffort: 'xhigh', readonly: 'false' },
     terra_max: { model: 'gpt-6.1-terra', effort: 'max', readonly: 'false' },
-    sol_high: { model: 'gpt-6.1-sol', effort: 'deep' },
-    sol_xhigh: { model: 'gpt-6.1-sol', nativeEffort: 'xhigh' },
-    astra_high: { model: 'gpt-6-astra', effort: 'deep' },
-    astra_xhigh: { model: 'gpt-6-astra', nativeEffort: 'xhigh' },
-    astra_max: { model: 'gpt-6-astra', effort: 'max' }
+    sol_high: { model: 'gpt-6.2-sol', effort: 'deep' },
+    sol_xhigh: { model: 'gpt-6.2-sol', nativeEffort: 'xhigh' },
+    astra_high: { model: 'gpt-6.2-astra', effort: 'deep' },
+    astra_xhigh: { model: 'gpt-6.2-astra', nativeEffort: 'xhigh' },
+    astra_max: { model: 'gpt-6.2-astra', effort: 'max' }
   };
   const text = await readFile(path.join(presetsRoot, 'gpt', 'preset.toml'), 'utf8');
   const blocks = text.split(/\[\[codex\.role\]\]/).slice(1);
@@ -264,7 +289,9 @@ test('all twelve gpt preset roles carry model routing fields', async () => {
   for (const [id, expected] of Object.entries(expectedAllocation)) {
     const block = blocks.find((candidate) => field(candidate, 'id') === id);
     assert.ok(block, `missing gpt preset role: ${id}`);
-    assert.equal(field(block, 'name'), `gpt_6${id.startsWith('sol_') || id.startsWith('terra_') ? '.1_' : '_'}${id}`, `name mismatch: ${id}`);
+    const tier = id.slice(id.lastIndexOf('_') + 1);
+    const expectedName = `${expected.model.replaceAll('-', '_')}_${tier}`;
+    assert.equal(field(block, 'name'), expectedName, `name mismatch: ${id}`);
     assert.ok(field(block, 'description'), `description missing: ${id}`);
     assert.equal(field(block, 'model'), expected.model, `model mismatch: ${id}`);
     if (expected.nativeEffort) {
@@ -304,20 +331,70 @@ test('shared workflow skill stays free of host-specific sources', async () => {
 
 test('skill skeletons require fresh-instance review when a role carries both duties', async () => {
   const text = await readFile(skillBase, 'utf8');
-  assert.match(text, /复审复用承担写入职责的角色时必须派发全新实例，不得把写入实例的自述当作事实/);
-  assert.match(text, /由未参与本次写入的独立复审派发独立核对/);
-  assert.doesNotMatch(text, /由未参与写入的只读角色独立核对/);
+  const critique = workflowStage(text, 'Critique');
+  assert.match(critique, /未参与本次写入的独立复审者/);
+  assert.match(critique, /同一角色兼任写入和复审时[^。]*全新实例[^。]*独立判断/);
+  assert.match(critique, /实施任务遇到 blocker 时[^。]*已授权范围内[^。]*修复[^。]*新的独立复审者/);
+});
+
+test('workflow distinguishes report-only review from implementation delivery', async () => {
+  const text = await readFile(skillBase, 'utf8');
+  const critique = workflowStage(text, 'Critique');
+  const promote = workflowStage(text, 'Promote');
+  const work = workflowStage(text, 'Work');
+  assert.match(work, /仅评审时[^。]*被审对象原样/);
+  assert.match(critique, /仅评审任务[^。]*blocker[^。]*证据[^。]*报告/);
+  assert.match(promote, /实施任务[^。]*验收条件满足[^。]*交付/);
+  assert.match(promote, /正常派发时[^。]*独立复审无 blocker/);
+  assert.match(promote, /单代理自查[^。]*错误与恢复[^。]*交付状态/);
+  assert.match(promote, /仅评审任务[^。]*交付报告[^。]*结论、证据和未验证项/);
+  assert.match(promote, /被审对象[^。]*blocker[^。]*未通过/);
+});
+
+test('workflow routes review, investigation and final acceptance by responsibility', async () => {
+  const text = await readFile(skillBase, 'utf8');
+  const critique = workflowStage(text, 'Critique');
+  assert.match(critique, /常规定案或复审[^。]*承担审核职责的角色/);
+  assert.match(critique, /证据充分[^。]*权衡多项约束[^。]*承担复杂定案或深度复审职责的角色/);
+  assert.match(critique, /证据冲突或根因未明[^；。]*承担升级调查职责的角色/);
+  assert.match(critique, /最终升级验收[^；。]*承担终审职责的角色/);
+  assert.doesNotMatch(critique, /复杂、高不确定性或最终升级验收[^；。]*承担终审职责的角色/);
+});
+
+test('workflow preserves safe work and discloses missing review when no subagent can be created', async () => {
+  const text = await readFile(skillBase, 'utf8');
+  const recovery = markdownSection(text, '错误与恢复');
+  const critique = workflowStage(text, 'Critique');
+  assert.match(recovery, /没有合适替代且宿主能创建子代理时[^。]*派发[^。]*继承当前会话模型的子代理[^。]*承担原角色职责/);
+  assert.match(recovery, /确认宿主无法创建任何子代理时[^。]*原授权、权限和能安全接手的范围内继续工作/);
+  assert.match(critique, /宿主无法创建任何子代理时[^。]*错误与恢复[^。]*交付/);
+  assert.match(recovery, /只能自查[^。]*独立复审缺失/);
+  assert.match(recovery, /独立验收是必需项时[^。]*未满足[^。]*只交付当前进展/);
+  assert.match(recovery, /独立验收未列为必需项[^。]*其余验收条件均满足[^。]*自查证据[^。]*限制[^。]*交付结果/);
+});
+
+test('workflow checks authorization before selecting protected execution', async () => {
+  const text = await readFile(skillBase, 'utf8');
+  const work = workflowStage(text, 'Work');
+  const highImpact = work.slice(work.indexOf('涉及不可逆变更')).split('。')[0];
+  const orderedSteps = ['不可逆变更', '先核对已有用户授权', '补齐缺失的授权、回滚和验收条件', '再决定', '保护执行职责的角色'];
+  let previous = -1;
+  for (const step of orderedSteps) {
+    const position = highImpact.indexOf(step);
+    assert.ok(position > previous, `missing or out-of-order authorization step: ${step}`);
+    previous = position;
+  }
 });
 
 test('glm preset keeps five roles with model routing and cross references', async () => {
   const presetText = await readFile(path.join(presetsRoot, 'glm', 'preset.toml'), 'utf8');
-  assert.match(presetText, /\[zcode\]\nmodel = "account:bigmodel-individual-coding-plan\/GLM-5\.3-Flash"/);
+  assert.match(presetText, /\[zcode\]\nmodel = "local:glm_flash"/);
   const expectedAllocation = {
     flash_low: { name: 'glm_5.3_flash_low', model: null, effort: 'basic', readonly: true },
     flash_high: { name: 'glm_5.3_flash_high', model: null, effort: 'deep', readonly: true },
     flash_max: { name: 'glm_5.3_flash_max', model: null, effort: 'max', readonly: false },
-    review_high: { name: 'glm_5.3_high', model: 'account:bigmodel-individual-coding-plan/GLM-5.3', effort: 'deep', readonly: true },
-    review_max: { name: 'glm_5.3_max', model: 'account:bigmodel-individual-coding-plan/GLM-5.3', effort: 'max', readonly: true }
+    review_high: { name: 'glm_5.3_high', model: 'local:glm_main', effort: 'deep', readonly: true },
+    review_max: { name: 'glm_5.3_max', model: 'local:glm_main', effort: 'max', readonly: true }
   };
   const blocks = presetText.split(/\[\[zcode\.role\]\]/).slice(1);
   assert.equal(blocks.length, 5);
@@ -341,7 +418,7 @@ test('glm preset keeps five roles with model routing and cross references', asyn
 
 test('ds preset keeps three roles on a single model with max carrying review duty', async () => {
   const presetText = await readFile(path.join(presetsRoot, 'ds', 'preset.toml'), 'utf8');
-  assert.match(presetText, /\[zcode\]\nmodel = "account:deepseek-coding-plan\/deepseek-v4\.1-flash"/);
+  assert.match(presetText, /\[zcode\]\nmodel = "local:ds_flash"/);
   const expectedAllocation = {
     flash_low: { name: 'ds_4.1_flash_low', effort: 'basic', readonly: true },
     flash_high: { name: 'ds_4.1_flash_high', effort: 'deep', readonly: true },
@@ -438,36 +515,29 @@ test('shared instruction and skill bases are host-agnostic', async () => {
   assert.match(skillText, /承担写入职责的角色/);
 });
 
-test('test strategy skill separates baseline, scenario, and performance tracks', async () => {
+// 独立代理只读取 behavior-cases.json 中的 prompt，用 expected 人工核对选测结果。
+test('test strategy skill references resolve and installers register it', async () => {
   const skillDir = path.join(repository, 'shared', 'skills', 'test-strategy');
   const text = await readFile(path.join(skillDir, 'SKILL.md'), 'utf8');
   assert.match(text, /^---\r?\nname: test-strategy\r?\n/);
-  for (const phrase of ['功能基线', '场景测试', '性能测试', '微基准', '5 分钟', '按需', '200ms']) {
-    assert.match(text, new RegExp(phrase));
-  }
-  assert.match(text, /全量功能基线只允许/);
-  assert.match(text, /项目 `AGENTS\.md`、`TESTING\.md` 或 CI/);
-  assert.match(text, /slow-baseline/);
-  assert.match(text, /外部依赖用 test double/);
-  const baseline = await readFile(path.join(skillDir, 'references', 'baseline-tests.md'), 'utf8');
-  assert.match(baseline, /\*\*stub\*\*：只需要固定返回值或错误/);
-  assert.match(baseline, /\*\*mock\/spy\*\*：只在交互本身是契约时验证/);
   assert.doesNotMatch(text, /Codex|ZCode|CODEX_HOME|ZCODE_HOME/);
-  for (const ref of ['baseline-tests.md', 'scenario-tests.md', 'selection-and-commands.md', 'performance-tests.md']) {
-    assert.match(text, new RegExp(ref.replace('.', '\\.')), `SKILL.md must link ${ref}`);
+  const prose = text.replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/^\s*(```|~~~)[^\n]*\n[\s\S]*?^\s*\1[^\n]*$/gm, '')
+    .replace(/`[^`\n]*`/g, '');
+  const references = [...prose.matchAll(/\[[^\]\n]+\]\(references\/([\w-]+\.md)\)/g)]
+    .map((match) => match[1]);
+  const referenceFiles = (await readdir(path.join(skillDir, 'references')))
+    .filter((name) => name.endsWith('.md')).sort();
+  assert.deepEqual([...new Set(references)].sort(), referenceFiles, 'every reference must be linked and resolve');
+  for (const ref of referenceFiles) {
     const content = await readFile(path.join(skillDir, 'references', ref), 'utf8');
-    assert.ok(content.length > 0, `reference must not be empty: ${ref}`);
+    assert.match(content, /^# /, `reference must have a heading: ${ref}`);
+    assert.doesNotMatch(content, /Codex|ZCode|CODEX_HOME|ZCODE_HOME/, `reference must stay host-agnostic: ${ref}`);
   }
   const posixText = await readFile(posixInstaller, 'utf8');
   assert.equal((posixText.match(/test-strategy:shared/g) ?? []).length, 2, 'both install.sh client profiles must register test-strategy');
   const powerText = await readFile(powerInstaller, 'utf8');
   assert.equal((powerText.match(/Name = 'test-strategy'/g) ?? []).length, 2, 'both install.ps1 client profiles must register test-strategy');
-  const selection = await readFile(path.join(skillDir, 'references', 'selection-and-commands.md'), 'utf8');
-  assert.match(selection, /项目 `AGENTS\.md`、`TESTING\.md` 或 CI/);
-  assert.doesNotMatch(selection, /\| 测试基础设施 \| 全量功能基线/, 'test infrastructure changes must not default to a full baseline');
-  const performance = await readFile(path.join(skillDir, 'references', 'performance-tests.md'), 'utf8');
-  assert.match(performance, /## 触发前提/);
-  assert.match(performance, /共享 runner 只记录趋势/);
 });
 
 test('security audit skill is guidance-first, attacker-oriented, and evidence-gated', async () => {
@@ -600,8 +670,10 @@ test('PowerShell installer deploys the standalone skill into an isolated nested 
 test('PowerShell installer removes stale managed agents when switching presets', { skip: process.platform !== 'win32' }, async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'preset-switch-'));
   const zcodeHome = path.join(root, 'home');
+  const profileHome = path.join(root, 'profile');
   try {
-    const env = { ...process.env, ZCODE_HOME: zcodeHome };
+    await seedModelBindings(profileHome);
+    const env = { ...process.env, USERPROFILE: profileHome, ZCODE_HOME: zcodeHome };
     assert.equal((await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'zcode', '-Preset', 'ds'], { env })).code, 0);
     await writeFile(path.join(zcodeHome, 'agents', 'custom.md'), 'user custom agent\n');
     assert.equal((await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'zcode', '-Preset', 'glm'], { env })).code, 0);
@@ -624,8 +696,10 @@ test('POSIX installer removes stale managed agents when switching presets', asyn
   if (!shell) return t.skip('POSIX shell is unavailable');
   const root = await mkdtemp(path.join(repository, '.zcode-posix-switch-'));
   const zcodeHome = path.join(root, 'home');
+  const profileHome = path.join(root, 'profile');
   try {
-    const base = { cwd: repository, env: { ...process.env, ZCODE_HOME: posixHome(zcodeHome) } };
+    await seedModelBindings(profileHome);
+    const base = { cwd: repository, env: { ...process.env, HOME: profileHome, ZCODE_HOME: posixHome(zcodeHome) } };
     assert.equal((await runResult(shell, ['install.sh', 'zcode', 'ds'], base)).code, 0);
     await writeFile(path.join(zcodeHome, 'agents', 'custom.md'), 'user custom agent\n');
     await seedZcodeSkills(zcodeHome);
@@ -729,7 +803,7 @@ test('POSIX installer deploys a fresh standalone home without legacy prerequisit
     assert.doesNotMatch(agents, /\{\{|<!-- @/);
     assert.match(agents, /orchestrate-model-workflow/);
     const config = await readFile(path.join(codexHome, 'config.toml'), 'utf8');
-    assert.match(config, /^model = "gpt-6\.1-sol"/m);
+    assert.match(config, /^model = "gpt-6\.2-sol"/m);
     assert.match(config, /\[features\]\ngoals = true/);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -754,7 +828,7 @@ test('POSIX installer preserves safe quoted TOML keys', async (t) => {
     assert.match(config, /"\/Users\/example\/project" = "cursor"/);
     assert.match(config, /"part=key" = "equals"/);
     assert.match(config, /"gpt-5\.5" = true/);
-    assert.match(config, /^model = "gpt-6\.1-sol"/m);
+    assert.match(config, /^model = "gpt-6\.2-sol"/m);
     assert.match(config, /\[hooks\.state\."browser@openai-bundled:plugin\.json#hooks\[0\]:stop:0:0"\]\nenabled = true/);
     assert.match(config, /\[\[skills\."configured\[0\]#example"\]\]\npath = "local"/);
     assert.match(config, /\[model_providers\."local\[0\]#example"\][\s\S]*request_max_retries = 120[\s\S]*websocket_connect_timeout_ms = 15000/);
@@ -886,13 +960,15 @@ test('installer sources statically enforce target boundaries and transactional s
 test('PowerShell zcode installer composes shared and zcode sources and leaves unmanaged state untouched', { skip: process.platform !== 'win32' }, async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'zcode-powershell-contract-'));
   const zcodeHome = path.join(root, 'missing', 'nested', '.zcode');
+  const profileHome = path.join(root, 'profile');
   try {
+    await seedModelBindings(profileHome);
     await mkdir(zcodeHome, { recursive: true });
     await mkdir(path.join(zcodeHome, 'cli'), { recursive: true });
     await writeFile(path.join(zcodeHome, 'cli', 'config.json'), '{"keep":"me"}\n');
     await seedZcodeSkills(zcodeHome);
     const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'zcode', '-Preset', 'glm'], {
-      env: { ...process.env, ZCODE_HOME: zcodeHome },
+      env: { ...process.env, USERPROFILE: profileHome, ZCODE_HOME: zcodeHome },
     });
     assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
     const agents = await readFile(path.join(zcodeHome, 'AGENTS.md'), 'utf8');
@@ -921,6 +997,17 @@ test('PowerShell zcode installer composes shared and zcode sources and leaves un
     const agentFiles = (await readdir(path.join(zcodeHome, 'agents'))).filter((name) => name.endsWith('.md'));
     for (const role of zcodeRoleNames) assert.ok(agentFiles.includes(`${role}.md`), `missing flat agent: ${role}.md`);
     assert.equal(agentFiles.filter((name) => zcodeRoleNames.includes(name.slice(0, -3))).length, 5);
+    const glmModels = {
+      'glm_5.3_flash_low': testModelBindings.glm_flash,
+      'glm_5.3_flash_high': testModelBindings.glm_flash,
+      'glm_5.3_flash_max': testModelBindings.glm_flash,
+      'glm_5.3_high': testModelBindings.glm_main,
+      'glm_5.3_max': testModelBindings.glm_main,
+    };
+    for (const [role, expected] of Object.entries(glmModels)) {
+      const text = await readFile(path.join(zcodeHome, 'agents', `${role}.md`), 'utf8');
+      assert.ok(text.includes(`model: "${expected}"`), `resolved model mismatch: ${role}`);
+    }
     const docsReadme = await readFile(path.join(zcodeHome, 'docs', 'README.md'), 'utf8');
     assert.match(docsReadme, /ZCode 全局参考文档/);
     const systemDocs = await readdir(path.join(zcodeHome, 'docs', 'system'));
@@ -941,10 +1028,12 @@ test('POSIX zcode installer deploys a fresh home without codex configuration', a
   if (!shell) return t.skip('POSIX shell is unavailable');
   const root = await mkdtemp(path.join(repository, '.zcode-posix-contract-'));
   const zcodeHome = path.join(root, 'missing', 'nested', '.zcode');
+  const profileHome = path.join(root, 'profile');
   try {
+    await seedModelBindings(profileHome);
     const result = await runResult(shell, ['install.sh', 'zcode', 'glm'], {
       cwd: repository,
-      env: { ...process.env, ZCODE_HOME: posixHome(zcodeHome) },
+      env: { ...process.env, HOME: profileHome, ZCODE_HOME: posixHome(zcodeHome) },
     });
     assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
     const agents = await readFile(path.join(zcodeHome, 'AGENTS.md'), 'utf8');
@@ -973,11 +1062,452 @@ test('POSIX zcode installer deploys a fresh home without codex configuration', a
     const agentFiles = (await readdir(path.join(zcodeHome, 'agents'))).filter((name) => name.endsWith('.md'));
     for (const role of zcodeRoleNames) assert.ok(agentFiles.includes(`${role}.md`), `missing flat agent: ${role}.md`);
     assert.equal(agentFiles.filter((name) => zcodeRoleNames.includes(name.slice(0, -3))).length, 5);
+    const glmModels = {
+      'glm_5.3_flash_low': testModelBindings.glm_flash,
+      'glm_5.3_flash_high': testModelBindings.glm_flash,
+      'glm_5.3_flash_max': testModelBindings.glm_flash,
+      'glm_5.3_high': testModelBindings.glm_main,
+      'glm_5.3_max': testModelBindings.glm_main,
+    };
+    for (const [role, expected] of Object.entries(glmModels)) {
+      const text = await readFile(path.join(zcodeHome, 'agents', `${role}.md`), 'utf8');
+      assert.ok(text.includes(`model: "${expected}"`), `resolved model mismatch: ${role}`);
+    }
     const systemDocs = await readdir(path.join(zcodeHome, 'docs', 'system'));
     for (const expected of ['README.md', 'windows.md', 'rg.md', 'ssh.md', 'linux.md', 'macos.md', '跨系统操作示例.md']) {
       assert.ok(systemDocs.includes(expected), `missing shared system doc: ${expected}`);
     }
     assert.equal(await readFile(path.join(zcodeHome, 'config.toml'), 'utf8').then(() => true, () => false), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+for (const platform of ['POSIX', 'PowerShell']) {
+  const isPowerShell = platform === 'PowerShell';
+  const skip = isPowerShell && process.platform !== 'win32';
+
+  async function runLocalPreset(shell, presetDir, home, zcodeHome, env = {}) {
+    if (isPowerShell) {
+      return runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'zcode', '-Preset', presetDir], {
+        cwd: repository,
+        env: { ...process.env, ...env, USERPROFILE: home, ZCODE_HOME: zcodeHome },
+      });
+    }
+    return runResult(shell, ['install.sh', 'zcode', posixHome(presetDir)], {
+      cwd: repository,
+      env: { ...process.env, ...env, HOME: posixHome(home), ZCODE_HOME: posixHome(zcodeHome) },
+    });
+  }
+
+  test(`${platform} installer rejects newlines in local model references`, { skip }, async (t) => {
+    const shell = isPowerShell ? null : await findPosixShell();
+    if (!isPowerShell && !shell) return t.skip('POSIX shell is unavailable');
+    const root = await mkdtemp(path.join(repository, '.binding-reference-'));
+    const home = path.join(root, 'home');
+    const presetDir = path.join(root, 'preset');
+    const zcodeHome = path.join(root, 'target');
+    try {
+      await mkdir(path.join(presetDir, 'roles'), { recursive: true });
+      await writeFile(path.join(presetDir, 'roles', 'worker.md'), 'worker body\n');
+      await seedModelBindings(home, { key: 'provider/model' });
+      for (const [where, reference] of [
+        ['host', 'local:key\\n'], ['host', 'local:ke\\ny'],
+        ['role', 'local:key\\n'], ['role', 'local:ke\\ny'],
+      ]) {
+        const hostModel = where === 'host' ? reference : 'local:key';
+        const roleModel = where === 'role' ? `model = "${reference}"\n` : '';
+        const preset = `description = "test"\n[zcode]\nmodel = "${hostModel}"\n[[zcode.role]]\nid = "worker"\nname = "worker"\ndescription = "worker"\neffort = "basic"\n${roleModel}`;
+        await writeFile(path.join(presetDir, 'preset.toml'), preset);
+        const result = await runLocalPreset(shell, presetDir, home, zcodeHome);
+        assert.notEqual(result.code, 0, `${where} ${reference}: ${result.stdout}`);
+        assert.match(result.stdout + '\n' + result.stderr, /Invalid local model reference/);
+        await assert.rejects(readdir(zcodeHome), { code: 'ENOENT' });
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test(`${platform} installer validates Unicode whitespace in zcode bindings`, { skip }, async (t) => {
+    const shell = isPowerShell ? null : await findPosixShell();
+    if (!isPowerShell && !shell) return t.skip('POSIX shell is unavailable');
+    const root = await mkdtemp(path.join(repository, '.binding-whitespace-'));
+    const home = path.join(root, 'home');
+    const presetDir = path.join(root, 'preset');
+    const zcodeHome = path.join(root, 'target');
+    try {
+      await mkdir(path.join(presetDir, 'roles'), { recursive: true });
+      await writeFile(path.join(presetDir, 'roles', 'worker.md'), 'worker body\n');
+      await writeFile(path.join(presetDir, 'preset.toml'), 'description = "test"\n[zcode]\nmodel = "local:key"\n[[zcode.role]]\nid = "worker"\nname = "worker"\ndescription = "worker"\neffort = "basic"\n');
+      for (const value of ['provider/mo\u00a0del', 'provider/\u3000model']) {
+        await seedModelBindings(home, { key: value });
+        const result = await runLocalPreset(shell, presetDir, home, zcodeHome, { LC_ALL: 'C' });
+        assert.notEqual(result.code, 0, `${JSON.stringify(value)}: ${result.stdout}`);
+        assert.match(result.stdout + '\n' + result.stderr, /whitespace/);
+        await assert.rejects(readdir(zcodeHome), { code: 'ENOENT' });
+      }
+      await seedModelBindings(home, { key: 'provider/模型' });
+      const result = await runLocalPreset(shell, presetDir, home, zcodeHome, { LC_ALL: 'C' });
+      assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+      assert.match(await readFile(path.join(zcodeHome, 'agents', 'worker.md'), 'utf8'), /^model: "provider\/模型"$/m);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test(`${platform} installer accepts the documented preset schema example`, { skip }, async (t) => {
+    const shell = isPowerShell ? null : await findPosixShell();
+    if (!isPowerShell && !shell) return t.skip('POSIX shell is unavailable');
+    const root = await mkdtemp(path.join(repository, '.preset-schema-example-'));
+    const home = path.join(root, 'home');
+    const presetDir = path.join(root, 'preset');
+    const zcodeHome = path.join(root, 'target');
+    try {
+      const rolesReadme = await readFile(path.join(repository, 'shared', 'roles', 'README.md'), 'utf8');
+      const schemaSection = markdownSection(rolesReadme, 'preset.toml schema');
+      const example = schemaSection.match(/```toml\r?\n([\s\S]*?)```/);
+      assert.ok(example, 'preset schema example missing');
+      await mkdir(path.join(presetDir, 'roles'), { recursive: true });
+      await writeFile(path.join(presetDir, 'preset.toml'), example[1]);
+      await writeFile(path.join(presetDir, 'roles', 'flash_low.md'), 'worker body\n');
+      await seedModelBindings(home, { glm_flash: 'provider/model' });
+      const result = await runLocalPreset(shell, presetDir, home, zcodeHome);
+      assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+      assert.match(await readFile(path.join(zcodeHome, 'agents', 'glm_5.3_flash_low.md'), 'utf8'), /^model: "provider\/model"$/m);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+}
+
+test('POSIX zcode installer resolves ds local model bindings', async (t) => {
+  const shell = await findPosixShell();
+  if (!shell) return t.skip('POSIX shell is unavailable');
+  const root = await mkdtemp(path.join(repository, '.model-binding-ds-'));
+  const home = path.join(root, 'home');
+  const zcodeHome = path.join(root, '.zcode');
+  try {
+    await seedModelBindings(home, { ds_flash: 'test-provider/deepseek-v4.1-flash' });
+    const result = await runResult(shell, ['install.sh', 'zcode', 'ds'], {
+      cwd: repository,
+      env: { ...process.env, HOME: home, ZCODE_HOME: posixHome(zcodeHome) },
+    });
+    assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+    for (const role of ['ds_4.1_flash_low', 'ds_4.1_flash_high', 'ds_4.1_flash_max']) {
+      const text = await readFile(path.join(zcodeHome, 'agents', `${role}.md`), 'utf8');
+      assert.match(text, /^model: "test-provider\/deepseek-v4\.1-flash"$/m, `resolved model missing: ${role}`);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('POSIX zcode installer resolves glm local bindings including role overrides', async (t) => {
+  const shell = await findPosixShell();
+  if (!shell) return t.skip('POSIX shell is unavailable');
+  const root = await mkdtemp(path.join(repository, '.model-binding-glm-'));
+  const home = path.join(root, 'home');
+  const zcodeHome = path.join(root, '.zcode');
+  try {
+    await seedModelBindings(home);
+    const result = await runResult(shell, ['install.sh', 'zcode', 'glm'], {
+      cwd: repository,
+      env: { ...process.env, HOME: home, ZCODE_HOME: posixHome(zcodeHome) },
+    });
+    assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+    const expectedModels = {
+      'glm_5.3_flash_low': testModelBindings.glm_flash,
+      'glm_5.3_flash_high': testModelBindings.glm_flash,
+      'glm_5.3_flash_max': testModelBindings.glm_flash,
+      'glm_5.3_high': testModelBindings.glm_main,
+      'glm_5.3_max': testModelBindings.glm_main,
+    };
+    for (const [role, expected] of Object.entries(expectedModels)) {
+      const text = await readFile(path.join(zcodeHome, 'agents', `${role}.md`), 'utf8');
+      assert.ok(text.includes(`model: "${expected}"`), `resolved model mismatch: ${role}`);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('POSIX zcode installer fails when local model bindings are missing', async (t) => {
+  const shell = await findPosixShell();
+  if (!shell) return t.skip('POSIX shell is unavailable');
+  const root = await mkdtemp(path.join(repository, '.model-binding-missing-'));
+  const home = path.join(root, 'home');
+  const zcodeHome = path.join(root, '.zcode');
+  try {
+    await mkdir(home, { recursive: true });
+    const result = await runResult(shell, ['install.sh', 'zcode', 'ds'], {
+      cwd: repository,
+      env: { ...process.env, HOME: home, ZCODE_HOME: posixHome(zcodeHome) },
+    });
+    assert.notEqual(result.code, 0, result.stdout);
+    const output = result.stdout + '\n' + result.stderr;
+    assert.match(output, /ds_flash/);
+    assert.match(output, /model-bindings\.toml/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('POSIX zcode installer rejects malformed local model bindings', async (t) => {
+  const shell = await findPosixShell();
+  if (!shell) return t.skip('POSIX shell is unavailable');
+  const root = await mkdtemp(path.join(repository, '.model-binding-malformed-'));
+  const home = path.join(root, 'home');
+  const zcodeHome = path.join(root, '.zcode');
+  try {
+    await seedModelBindings(home, { ds_flash: 'bare-model' });
+    const result = await runResult(shell, ['install.sh', 'zcode', 'ds'], {
+      cwd: repository,
+      env: { ...process.env, HOME: home, ZCODE_HOME: posixHome(zcodeHome) },
+    });
+    assert.notEqual(result.code, 0, result.stdout);
+    assert.match(result.stdout + '\n' + result.stderr, /providerId\/modelId/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('POSIX zcode installer rejects duplicate local model binding keys', async (t) => {
+  const shell = await findPosixShell();
+  if (!shell) return t.skip('POSIX shell is unavailable');
+  const root = await mkdtemp(path.join(repository, '.model-binding-duplicate-'));
+  const home = path.join(root, 'home');
+  const zcodeHome = path.join(root, '.zcode');
+  try {
+    const bindingDir = path.join(home, '.ai-vibecode-superpower');
+    await mkdir(bindingDir, { recursive: true });
+    await writeFile(path.join(bindingDir, 'model-bindings.toml'), '[zcode]\nds_flash = "a/b"\nds_flash = "c/d"\n');
+    const result = await runResult(shell, ['install.sh', 'zcode', 'ds'], {
+      cwd: repository,
+      env: { ...process.env, HOME: home, ZCODE_HOME: posixHome(zcodeHome) },
+    });
+    assert.notEqual(result.code, 0, result.stdout);
+    assert.match(result.stdout + '\n' + result.stderr, /Repeated model binding key/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('PowerShell zcode installer resolves ds local model bindings', { skip: process.platform !== 'win32' }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'model-binding-powershell-'));
+  const home = path.join(root, 'profile');
+  const zcodeHome = path.join(root, '.zcode');
+  try {
+    await seedModelBindings(home, { ds_flash: 'test-provider/deepseek-v4.1-flash' });
+    const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'zcode', '-Preset', 'ds'], {
+      env: { ...process.env, USERPROFILE: home, ZCODE_HOME: zcodeHome },
+    });
+    assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+    for (const role of ['ds_4.1_flash_low', 'ds_4.1_flash_high', 'ds_4.1_flash_max']) {
+      const text = await readFile(path.join(zcodeHome, 'agents', `${role}.md`), 'utf8');
+      assert.ok(text.includes('model: "test-provider/deepseek-v4.1-flash"'), `resolved model missing: ${role}`);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('PowerShell zcode installer fails when local model bindings are missing', { skip: process.platform !== 'win32' }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'model-binding-powershell-missing-'));
+  const home = path.join(root, 'profile');
+  const zcodeHome = path.join(root, '.zcode');
+  try {
+    await mkdir(home, { recursive: true });
+    const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'zcode', '-Preset', 'ds'], {
+      env: { ...process.env, USERPROFILE: home, ZCODE_HOME: zcodeHome },
+    });
+    assert.notEqual(result.code, 0, result.stdout);
+    const output = result.stdout + '\n' + result.stderr;
+    assert.match(output, /ds_flash/);
+    assert.match(output, /model-bindings\.toml/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('PowerShell zcode installer rejects malformed local model bindings', { skip: process.platform !== 'win32' }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'model-binding-powershell-malformed-'));
+  const home = path.join(root, 'profile');
+  const zcodeHome = path.join(root, '.zcode');
+  try {
+    await seedModelBindings(home, { ds_flash: 'bare-model' });
+    const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'zcode', '-Preset', 'ds'], {
+      env: { ...process.env, USERPROFILE: home, ZCODE_HOME: zcodeHome },
+    });
+    assert.notEqual(result.code, 0, result.stdout);
+    assert.match(result.stdout + '\n' + result.stderr, /providerId\/modelId/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('POSIX zcode installer rejects duplicate local model binding tables', async (t) => {
+  const shell = await findPosixShell();
+  if (!shell) return t.skip('POSIX shell is unavailable');
+  const root = await mkdtemp(path.join(repository, '.model-binding-duplicate-table-'));
+  const home = path.join(root, 'home');
+  const zcodeHome = path.join(root, '.zcode');
+  try {
+    const bindingDir = path.join(home, '.ai-vibecode-superpower');
+    await mkdir(bindingDir, { recursive: true });
+    await writeFile(path.join(bindingDir, 'model-bindings.toml'), '[zcode]\nds_flash = "a/b"\n[zcode]\nds_flash = "c/d"\n');
+    const result = await runResult(shell, ['install.sh', 'zcode', 'ds'], {
+      cwd: repository,
+      env: { ...process.env, HOME: home, ZCODE_HOME: posixHome(zcodeHome) },
+    });
+    assert.notEqual(result.code, 0, result.stdout);
+    assert.match(result.stdout + '\n' + result.stderr, /Repeated model binding table/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('POSIX codex installer rejects control characters in local model bindings', async (t) => {
+  const shell = await findPosixShell();
+  if (!shell) return t.skip('POSIX shell is unavailable');
+  const root = await mkdtemp(path.join(repository, '.model-binding-codex-control-'));
+  const home = path.join(root, 'home');
+  const presetDir = path.join(root, 'codex-local');
+  const codexHome = path.join(root, '.codex');
+  try {
+    await mkdir(path.join(presetDir, 'roles'), { recursive: true });
+    await writeFile(path.join(presetDir, 'preset.toml'), 'description = "codex local binding"\n\n[codex]\nmodel = "local:codex_model"\n\n[[codex.role]]\nid = "worker"\nname = "my_worker"\ndescription = "worker"\neffort = "max"\nreadonly = false\n');
+    await writeFile(path.join(presetDir, 'roles', 'worker.md'), 'worker body\n');
+    const bindingDir = path.join(home, '.ai-vibecode-superpower');
+    await mkdir(bindingDir, { recursive: true });
+    for (const value of ['a\\nb', 'a\\n']) {
+      await writeFile(path.join(bindingDir, 'model-bindings.toml'), `[codex]\ncodex_model = "${value}"\n`);
+      const result = await runResult(shell, ['install.sh', 'codex', posixHome(presetDir)], {
+        cwd: repository,
+        env: { ...process.env, HOME: posixHome(home), CODEX_HOME: posixHome(codexHome) },
+      });
+      assert.notEqual(result.code, 0, `${value}: ${result.stdout}`);
+      assert.match(result.stdout + '\n' + result.stderr, /control characters/);
+      await assert.rejects(readdir(codexHome), { code: 'ENOENT' }, 'invalid binding must not be installed');
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('PowerShell zcode installer rejects duplicate local model binding tables', { skip: process.platform !== 'win32' }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'model-binding-powershell-duplicate-table-'));
+  const home = path.join(root, 'profile');
+  const zcodeHome = path.join(root, '.zcode');
+  try {
+    const bindingDir = path.join(home, '.ai-vibecode-superpower');
+    await mkdir(bindingDir, { recursive: true });
+    await writeFile(path.join(bindingDir, 'model-bindings.toml'), '[zcode]\nds_flash = "a/b"\n[zcode]\nds_flash = "c/d"\n');
+    const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'zcode', '-Preset', 'ds'], {
+      env: { ...process.env, USERPROFILE: home, ZCODE_HOME: zcodeHome },
+    });
+    assert.notEqual(result.code, 0, result.stdout);
+    assert.match(result.stdout + '\n' + result.stderr, /Repeated model binding table/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('PowerShell codex installer rejects control characters in local model bindings', { skip: process.platform !== 'win32' }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'model-binding-powershell-codex-control-'));
+  const home = path.join(root, 'profile');
+  const presetDir = path.join(root, 'codex-local');
+  const codexHome = path.join(root, '.codex');
+  try {
+    await mkdir(path.join(presetDir, 'roles'), { recursive: true });
+    await writeFile(path.join(presetDir, 'preset.toml'), 'description = "codex local binding"\n\n[codex]\nmodel = "local:codex_model"\n\n[[codex.role]]\nid = "worker"\nname = "my_worker"\ndescription = "worker"\neffort = "max"\nreadonly = false\n');
+    await writeFile(path.join(presetDir, 'roles', 'worker.md'), 'worker body\n');
+    const bindingDir = path.join(home, '.ai-vibecode-superpower');
+    await mkdir(bindingDir, { recursive: true });
+    for (const value of ['a\\nb', 'a\\n']) {
+      await writeFile(path.join(bindingDir, 'model-bindings.toml'), `[codex]\ncodex_model = "${value}"\n`);
+      const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'codex', '-Preset', presetDir], {
+        env: { ...process.env, USERPROFILE: home, CODEX_HOME: codexHome },
+      });
+      assert.notEqual(result.code, 0, `${value}: ${result.stdout}`);
+      assert.match(result.stdout + '\n' + result.stderr, /control characters/);
+      await assert.rejects(readdir(codexHome), { code: 'ENOENT' }, 'invalid binding must not be installed');
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('POSIX zcode installer resolves local bindings in an external preset', async (t) => {
+  const shell = await findPosixShell();
+  if (!shell) return t.skip('POSIX shell is unavailable');
+  const root = await mkdtemp(path.join(repository, '.external-binding-zcode-'));
+  const home = path.join(root, 'home');
+  const externalRoot = path.join(home, '.ai-vibecode-superpower', 'presets');
+  const presetDir = path.join(externalRoot, 'zcode-ds');
+  const zcodeHome = path.join(root, '.zcode');
+  try {
+    await mkdir(externalRoot, { recursive: true });
+    await cp(path.join(presetsRoot, 'ds'), presetDir, { recursive: true });
+    await seedModelBindings(home, { ds_flash: 'test-provider/deepseek-v4.1-flash' });
+    const result = await runResult(shell, ['install.sh', 'zcode', '--external', 'zcode-ds'], {
+      cwd: repository,
+      env: { ...process.env, HOME: home, ZCODE_HOME: posixHome(zcodeHome) },
+    });
+    assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+    for (const role of ['ds_4.1_flash_low', 'ds_4.1_flash_high', 'ds_4.1_flash_max']) {
+      const text = await readFile(path.join(zcodeHome, 'agents', `${role}.md`), 'utf8');
+      assert.match(text, /^model: "test-provider\/deepseek-v4\.1-flash"$/m, `external binding model missing: ${role}`);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('POSIX external preset menu selects the displayed preset despite a same-named cwd directory', { skip: process.platform === 'win32' }, async (t) => {
+  const shell = await findPosixShell();
+  if (!shell) return t.skip('POSIX shell is unavailable');
+  if ((await runResult('python3', ['-c', 'import pty'], {})).code !== 0) return t.skip('Python 3 pty is unavailable');
+  const root = await mkdtemp(path.join(await realpath(os.tmpdir()), 'external-menu-'));
+  const home = path.join(root, 'home');
+  const external = path.join(home, '.ai-vibecode-superpower', 'presets', 'same-name');
+  const cwdPreset = path.join(root, 'same-name');
+  const ptyRunner = [
+    'import errno, os, pty, sys',
+    'pid, fd = pty.fork()',
+    'if pid == 0:',
+    '    os.execvp(sys.argv[1], sys.argv[1:])',
+    'os.write(fd, (os.environ["MENU_CHOICE"] + "\\n").encode())',
+    'while True:',
+    '    try: data = os.read(fd, 65536)',
+    '    except OSError as e:',
+    '        if e.errno == errno.EIO: break',
+    '        raise',
+    '    if not data: break',
+    '    sys.stdout.buffer.write(data)',
+    '    sys.stdout.buffer.flush()',
+    '_, status = os.waitpid(pid, 0)',
+    'sys.exit(os.waitstatus_to_exitcode(status))',
+  ].join('\n');
+  try {
+    await mkdir(path.dirname(external), { recursive: true });
+    await cp(path.join(presetsRoot, 'ds'), external, { recursive: true });
+    const preset = await readFile(path.join(external, 'preset.toml'), 'utf8');
+    await writeFile(path.join(external, 'preset.toml'), preset.replace('local:ds_flash', 'external/model'));
+    await cp(external, cwdPreset, { recursive: true });
+    await writeFile(path.join(cwdPreset, 'preset.toml'), preset.replace('local:ds_flash', 'cwd/model'));
+    const choices = [['1', 'external/model'], ['same-name', 'external/model'], ['./same-name', 'cwd/model']];
+    for (const [index, [choice, expectedModel]] of choices.entries()) {
+      const zcodeHome = path.join(root, `zcode-${index}`);
+      const result = await runResult('python3', ['-c', ptyRunner, shell, posixInstaller, 'zcode', '--external'], {
+        cwd: root, timeout: 30000,
+        env: { ...process.env, HOME: home, ZCODE_HOME: zcodeHome, MENU_CHOICE: choice },
+      });
+      assert.equal(result.code, 0, result.stdout + '\n' + result.stderr);
+      assert.match(result.stdout, /1\) same-name/);
+      const installed = await readFile(path.join(zcodeHome, 'agents', 'ds_4.1_flash_low.md'), 'utf8');
+      assert.equal(installed.split(/\r?\n/).find((line) => line.startsWith('model:')), `model: "${expectedModel}"`, choice);
+    }
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -996,7 +1526,7 @@ test('POSIX zcode installer installs an external preset from the fixed root', as
     await cp(path.join(presetsRoot, 'ds'), presetDir, { recursive: true });
     const presetFile = path.join(presetDir, 'preset.toml');
     const presetText = await readFile(presetFile, 'utf8');
-    await writeFile(presetFile, presetText.replace('account:deepseek-coding-plan/deepseek-v4.1-flash', 'new-provider-2/deepseek-flash'));
+    await writeFile(presetFile, presetText.replace('local:ds_flash', 'example-provider/example-model'));
     const result = await runResult(shell, ['install.sh', 'zcode', '--external', 'zcode-ds'], {
       cwd: repository,
       env: { ...process.env, HOME: home, ZCODE_HOME: posixHome(zcodeHome) },
@@ -1005,7 +1535,7 @@ test('POSIX zcode installer installs an external preset from the fixed root', as
     assert.match(result.stdout, /External preset directory:/);
     for (const role of ['ds_4.1_flash_low', 'ds_4.1_flash_high', 'ds_4.1_flash_max']) {
       const text = await readFile(path.join(zcodeHome, 'agents', `${role}.md`), 'utf8');
-      assert.match(text, /^model: "new-provider-2\/deepseek-flash"$/m, `external model missing: ${role}`);
+      assert.match(text, /^model: "example-provider\/example-model"$/m, `external model missing: ${role}`);
     }
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -1072,7 +1602,7 @@ test('PowerShell zcode installer installs an external preset from the fixed root
     await cp(path.join(presetsRoot, 'ds'), presetDir, { recursive: true });
     const presetFile = path.join(presetDir, 'preset.toml');
     const presetText = await readFile(presetFile, 'utf8');
-    await writeFile(presetFile, presetText.replace('account:deepseek-coding-plan/deepseek-v4.1-flash', 'new-provider-2/deepseek-flash'));
+    await writeFile(presetFile, presetText.replace('local:ds_flash', 'example-provider/example-model'));
     const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'zcode', '-Preset', 'zcode-ds', '-External'], {
       env: { ...process.env, USERPROFILE: home, ZCODE_HOME: zcodeHome },
     });
@@ -1080,7 +1610,7 @@ test('PowerShell zcode installer installs an external preset from the fixed root
     assert.match(result.stdout, /External preset directory:/);
     for (const role of ['ds_4.1_flash_low', 'ds_4.1_flash_high', 'ds_4.1_flash_max']) {
       const text = await readFile(path.join(zcodeHome, 'agents', `${role}.md`), 'utf8');
-      assert.match(text, /^model: "new-provider-2\/deepseek-flash"$/m, `external model missing: ${role}`);
+      assert.match(text, /^model: "example-provider\/example-model"$/m, `external model missing: ${role}`);
     }
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -1191,6 +1721,9 @@ test('deep dive review defaults to report-only and has executable convergence ru
   assert.match(admission, /用户显式发起即采用 report-only/);
   assert.match(admission, /只有用户明确同意 A 类即修权才进入 fix 模式/);
   const authorization = markdownSection(text, '交互与授权模型（核心）');
+  assert.match(authorization, /无感知[^。\n]*A 类[^。\n]*可观察[^。\n]*B 类/);
+  assert.match(authorization, /证据不足[^。\n]*undetermined/);
+  assert.match(verifier, /\[SKILL\.md\]\(\.\.\/SKILL\.md\)/);
   const reportOnly = authorization.split('\n').find((line) => line.startsWith('**默认 report-only**'));
   assert.ok(reportOnly);
   assert.match(reportOnly, /不修改目标项目文件/);
@@ -1201,6 +1734,9 @@ test('deep dive review defaults to report-only and has executable convergence ru
   assert.match(discipline, /未指定位置时，问题记录与台账同目录/);
   assert.match(discipline, /正文交付时明确对应章节/);
   const workflow = markdownSection(text, '流程');
+  const classification = workflow.slice(workflow.indexOf('**3 裁决对齐**'), workflow.indexOf('**4 修复'));
+  assert.doesNotMatch(classification, /找不到契约依据的按 B/);
+  assert.doesNotMatch(verifier, /拿不准时按 B/);
   const setup = workflow.slice(workflow.indexOf('**0 建档**'), workflow.indexOf('**1 假设穷举'));
   assert.match(setup, /指定不落盘时只用会话正文/);
   const termination = workflow.slice(workflow.indexOf('**6 终止**'));

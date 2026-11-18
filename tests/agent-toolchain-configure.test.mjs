@@ -123,7 +123,6 @@ test('posix driver stays syntactically valid and keeps the client wiring branche
   assert.doesNotMatch(text, /--migrate-managed/);
   assert.match(text, /agent-toolchain-managed:v4/);
   assert.match(text, /managed-agents-block\.md/);
-  assert.match(text, /paste -sd:/);
   assert.doesNotMatch(text, /\$[A-Za-z_][A-Za-z0-9_]*[：，。；、]/, 'variables must be braced before CJK punctuation');
   assert.match(text, /AGENT_TOOLCHAIN_PROXY=direct/);
   assert.match(text, /--noproxy '\*'/);
@@ -258,6 +257,65 @@ test('configure rejects the removed --migrate-managed flag (POSIX)', { skip: pro
     const result = await runResult('sh', [posixDriver, 'configure', '--project', project, '--migrate-managed'], { cwd: repository });
     assert.notEqual(result.code, 0, result.stdout);
     assert.match(result.stdout + '\n' + result.stderr, /未知参数/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('macOS GUI PATH prioritizes managed and node bins and removes duplicate or empty entries', { skip: process.platform === 'win32' }, async () => {
+  const source = await readFile(posixDriver, 'utf8');
+  const withoutMain = source.replace(/\nmain "\$@"\s*$/, '');
+  assert.notEqual(withoutMain, source);
+  const nodeResult = await runResult('sh', ['-c', 'command -v node']);
+  assert.equal(nodeResult.code, 0, nodeResult.stderr);
+  const nodeBin = path.dirname(nodeResult.stdout.trim());
+  // Keep the prefix free of spaces so a regression can only touch the test root.
+  const root = await mkdtemp('/tmp/agent-toolchain-gui-path-');
+  const home = path.join(root, 'home with spaces');
+  const sentinel = path.join(root, 'home');
+  try {
+    await mkdir(home);
+    await writeFile(sentinel, 'untouched\n');
+    const script = withoutMain + `
+write_codegraph_launcher() { :; }
+note() { :; }
+atomic_replace() { mv "$1" "$2"; }
+launchctl() { if [ "$1" = getenv ]; then printf '%s' "$GUI_INPUT"; else printf '%s' "$3"; fi; }
+PLATFORM_OS=darwin
+ensure_posix_command_path
+`;
+    for (const [shell, profiles] of [
+      ['/bin/sh', ['.profile']],
+      ['/bin/zsh', ['.zprofile', '.zshrc']],
+      ['/bin/bash', ['.bash_profile', '.bashrc']],
+    ]) {
+      const managed = shell === '/bin/bash' ? nodeBin : '/managed/bin';
+      const input = `/first::${nodeBin}:${managed}:/first:/last:${nodeBin}:`;
+      const expected = [...new Set([managed, nodeBin, '/first', '/last'])].join(':');
+      const result = await runResult('sh', ['-c', script], { cwd: root, env: { ...process.env, HOME: home, SHELL: shell, AGENT_TOOLCHAIN_BIN: managed, GUI_INPUT: input } });
+      assert.equal(result.code, 0, result.stderr);
+      assert.equal(result.stdout, expected);
+      assert.equal(await readFile(sentinel, 'utf8'), 'untouched\n');
+      for (const profile of profiles) {
+        const content = await readFile(path.join(home, profile), 'utf8');
+        assert.ok(content.includes(`export PATH="${managed}:$PATH"`));
+      }
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('configure does not read the managed marker past a Setext H2 (PowerShell)', { skip: process.platform !== 'win32' }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'agent-toolchain-setext-'));
+  try {
+    await mkdir(path.join(root, '.zcode'), { recursive: true });
+    const original = '# Project\n\n## CodeGraph 与 RTK\n\nold rules\n\nOther section\n-------------\n\n<!-- agent-toolchain-managed:v4 -->\n';
+    await writeFile(path.join(root, 'AGENTS.md'), original);
+    const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerShellDriver, 'configure', '--project', root]);
+    assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.stdout + '\n' + result.stderr, /managed-agents-block\.md/);
+    assert.equal(await readFile(path.join(root, 'AGENTS.md'), 'utf8'), original);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

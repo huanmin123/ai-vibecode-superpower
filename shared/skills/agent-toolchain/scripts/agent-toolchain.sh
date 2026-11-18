@@ -1098,11 +1098,11 @@ ensure_posix_command_path() {
   write_codegraph_launcher
   export PATH="$TOOLCHAIN_BIN:$PATH"
   case "${SHELL:-}" in
-    */zsh) shell_profiles="$HOME/.zprofile $HOME/.zshrc" ;;
-    */bash) shell_profiles="$HOME/.bash_profile $HOME/.bashrc" ;;
-    *) shell_profiles="$HOME/.profile" ;;
+    */zsh) set -- "$HOME/.zprofile" "$HOME/.zshrc" ;;
+    */bash) set -- "$HOME/.bash_profile" "$HOME/.bashrc" ;;
+    *) set -- "$HOME/.profile" ;;
   esac
-  for profile in $shell_profiles; do
+  for profile do
     assert_plain_file_or_absent "$profile"
     temporary="${profile}.agent-toolchain-$$"
     if [ -f "$profile" ]; then
@@ -1124,9 +1124,7 @@ ensure_posix_command_path() {
   if [ "$PLATFORM_OS" = darwin ] && command -v launchctl >/dev/null 2>&1; then
     gui_path=$(launchctl getenv PATH 2>/dev/null || true)
     [ -n "$gui_path" ] || gui_path='/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin'
-    gui_path=$(printf '%s' "$gui_path" | awk -v RS=: '$0 != "" && !seen[$0]++' | paste -sd: -)
-    case ":$gui_path:" in *":$node_bin:"*) ;; *) gui_path="$node_bin:$gui_path" ;; esac
-    case ":$gui_path:" in *":$TOOLCHAIN_BIN:"*) ;; *) gui_path="$TOOLCHAIN_BIN:$gui_path" ;; esac
+    gui_path=$(printf '%s' "$TOOLCHAIN_BIN:$node_bin:$gui_path" | awk -v RS=: '$0 != "" && !seen[$0]++' | paste -sd: -)
     launchctl setenv PATH "$gui_path" || note "无法更新 macOS 图形会话 PATH；新开的终端仍会生效。"
   elif [ "$PLATFORM_OS" = linux ]; then
     environment_dir="$HOME/.config/environment.d"

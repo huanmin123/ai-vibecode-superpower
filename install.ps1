@@ -137,6 +137,91 @@ function Read-Preset([string]$PresetFile) {
     return $preset
 }
 
+function Assert-ModelBindingValue([string]$HostSection, [string]$Value, [string]$Context) {
+    if ($Value.StartsWith('local:')) { throw "Invalid model binding in ${Context}: value must not start with local:" }
+    if ($Value.Length -eq 0) { throw "Invalid model binding in ${Context}: value must not be empty" }
+    if ($Value -match '[\x00-\x1F\x7F]') { throw "Invalid model binding in ${Context}: value must not contain control characters" }
+    if ($HostSection -ceq 'zcode') {
+        if ($Value -match '\s') { throw "Invalid model binding in ${Context}: value must not contain whitespace" }
+        $slash = $Value.IndexOf('/')
+        if ($slash -lt 0) { throw "Invalid model binding in ${Context}: value must be providerId/modelId" }
+        if ($slash -eq 0 -or $slash -eq ($Value.Length - 1)) { throw "Invalid model binding in ${Context}: providerId and modelId must be non-empty" }
+    }
+}
+
+function Read-ModelBindings([string]$Path, [string]$HostSection) {
+    # 顶层 key -> 绑定值记录；Value 为解析后的字符串，Line 供 resolve 报错定位。
+    $bindings = [hashtable]::new([StringComparer]::Ordinal)
+    $seen = @{ zcode = [hashtable]::new([StringComparer]::Ordinal); codex = [hashtable]::new([StringComparer]::Ordinal) }
+    $seenTables = [hashtable]::new([StringComparer]::Ordinal)
+    $section = $null
+    $lineNumber = 0
+    foreach ($line in Get-Content -LiteralPath $Path -Encoding UTF8) {
+        $lineNumber += 1
+        if ($lineNumber -eq 1) { $line = $line.TrimStart([char[]]@([char]0xFEFF)) }
+        $trimmed = $line.Trim()
+        if ([string]::IsNullOrWhiteSpace($trimmed) -or $trimmed.StartsWith('#')) { continue }
+        if ($trimmed.StartsWith('[')) {
+            if ($trimmed -cne '[zcode]' -and $trimmed -cne '[codex]') { throw "Unsupported model binding table in ${Path}:${lineNumber}: $trimmed" }
+            if ($seenTables.ContainsKey($trimmed)) { throw "Repeated model binding table in ${Path}:${lineNumber}: $trimmed" }
+            $seenTables[$trimmed] = $true
+            $section = $trimmed.Substring(1, $trimmed.Length - 2)
+            continue
+        }
+        if ($null -eq $section) { throw "Unsupported model binding line in ${Path}:${lineNumber}: $trimmed (expected [zcode] or [codex] section first)" }
+        $separator = $trimmed.IndexOf('=')
+        if ($separator -lt 1) { throw "Unsupported model binding line in ${Path}:${lineNumber}: $trimmed" }
+        $key = $trimmed.Substring(0, $separator).Trim()
+        if ($key -notmatch '^[A-Za-z][A-Za-z0-9_-]*$') { throw "Unsupported model binding key in ${Path}:${lineNumber}: $key" }
+        if ($seen[$section].ContainsKey($key)) { throw "Repeated model binding key in ${Path}:${lineNumber}: $($section)/$key" }
+        $seen[$section][$key] = $true
+        $rawValue = $trimmed.Substring($separator + 1).Trim()
+        if ($rawValue.Length -lt 2 -or -not $rawValue.StartsWith('"') -or -not $rawValue.EndsWith('"')) {
+            throw "Model binding value must be a double-quoted string in ${Path}:${lineNumber}: $($section)/$key"
+        }
+        $value = [string](ConvertFrom-PresetScalar $rawValue "${Path}:${lineNumber} ($($section)/$key)")
+        if ($section -ceq $HostSection) { $bindings[$key] = @{ Value = $value; Line = $lineNumber } }
+    }
+    return $bindings
+}
+
+function Resolve-ModelBindings([hashtable]$Preset, [string]$HostSection, [string]$BindingsFile) {
+    $hostTable = $Preset.sections[$HostSection]
+    $required = [Collections.Generic.List[string]]::new()
+    foreach ($role in $hostTable.roles) {
+        $effective = $null
+        if ($role.Contains('model')) { $effective = [string]$role.model }
+        elseif ($hostTable.Contains('model')) { $effective = [string]$hostTable.model }
+        if ($null -ne $effective -and $effective.StartsWith('local:')) {
+            $key = $effective.Substring(6)
+            if ($key -notmatch '^[A-Za-z][A-Za-z0-9_-]*$') { throw "Invalid local model reference in [$HostSection]: $effective (expected local:<key>)" }
+            if (-not $required.Contains($key)) { $required.Add($key) }
+        }
+    }
+    if ($required.Count -eq 0) { return }
+    $requiredDisplay = $required -join ', '
+    if ([string]::IsNullOrWhiteSpace($BindingsFile)) {
+        throw "Cannot resolve model bindings file: USERPROFILE is not set (required keys in [$HostSection]: $requiredDisplay)"
+    }
+    if (-not (Test-Path -LiteralPath $BindingsFile -PathType Leaf)) {
+        throw "Model bindings file not found: $BindingsFile (required keys in [$HostSection]: $requiredDisplay)"
+    }
+    $bindings = Read-ModelBindings $BindingsFile $HostSection
+    $missing = @($required | Where-Object { -not $bindings.ContainsKey($_) })
+    if ($missing.Count -gt 0) { throw "Missing model binding keys in ${BindingsFile} [$HostSection]: $($missing -join ', ')" }
+    foreach ($role in $hostTable.roles) {
+        $effective = $null
+        if ($role.Contains('model')) { $effective = [string]$role.model }
+        elseif ($hostTable.Contains('model')) { $effective = [string]$hostTable.model }
+        if ($null -ne $effective -and $effective.StartsWith('local:')) {
+            $key = $effective.Substring(6)
+            $binding = $bindings[$key]
+            Assert-ModelBindingValue $HostSection ([string]$binding.Value) "${BindingsFile}:$($binding.Line) ($HostSection/$key)"
+            $role['model'] = [string]$binding.Value
+        }
+    }
+}
+
 function ConvertTo-SafeQuoted([string]$Value) {
     return $Value.Replace('\', '\\').Replace('"', '\"')
 }
@@ -582,7 +667,6 @@ function Expand-Placeholders([string]$Directory, [string]$Token, [string]$Root) 
 $root = Split-Path -Parent $PSCommandPath
 $presetsRoot = Join-Path $root 'shared\roles\presets'
 $externalHome = if ($env:USERPROFILE) { $env:USERPROFILE } else { [Environment]::GetFolderPath('UserProfile') }
-$externalPresetsRoot = Join-Path $externalHome '.ai-vibecode-superpower\presets'
 $externalPresetsPrepared = $false
 $presetManifest = Join-Path $root 'shared\roles\presets.sha256'
 if ($UpdateRoleManifest) {
@@ -591,6 +675,9 @@ if ($UpdateRoleManifest) {
     Write-Host "Preset manifest updated: $presetManifest"
     return
 }
+if ([string]::IsNullOrWhiteSpace($externalHome)) { throw 'USERPROFILE is not set' }
+$externalPresetsRoot = Join-Path $externalHome '.ai-vibecode-superpower\presets'
+$modelBindingsFile = Join-Path $externalHome '.ai-vibecode-superpower\model-bindings.toml'
 
 $sourceSystemDocs = Join-Path $root 'shared\docs\system'
 $clientProfiles = [ordered]@{
@@ -666,6 +753,7 @@ $profile = $clientProfiles[$Client]
 $label = $profile.Label
 
 $presetName = $Preset
+$presetSelectedDir = $null
 $presetSearchRoot = $presetsRoot
 if ($External) {
     $presetSearchRoot = $externalPresetsRoot
@@ -703,10 +791,20 @@ if ([string]::IsNullOrWhiteSpace($presetName)) {
     }
     $choice = Read-Host 'Enter number or name (q to quit)'
     if ($choice -match '^[qQ]$') { return }
-    if ($choice -match '^\d+$' -and [int]$choice -ge 1 -and [int]$choice -le $available.Count) { $presetName = $available[[int]$choice - 1].Name }
-    else { $presetName = $choice }
+    $choiceNumber = 0
+    if ($choice -match '^\d+$' -and [int]::TryParse($choice, [ref]$choiceNumber) -and $choiceNumber -ge 1 -and $choiceNumber -le $available.Count) {
+        $selected = $available[$choiceNumber - 1]
+        $presetName = $selected.Name
+        $presetSelectedDir = $selected.FullName
+    } else {
+        $presetName = $choice
+        $selected = $available | Where-Object { $_.Name -ceq $choice } | Select-Object -First 1
+        if ($null -ne $selected) { $presetSelectedDir = $selected.FullName }
+    }
 }
-$presetDir = if (Test-Path -LiteralPath $presetName -PathType Container) {
+$presetDir = if ($null -ne $presetSelectedDir) {
+    $presetSelectedDir
+} elseif (Test-Path -LiteralPath $presetName -PathType Container) {
     [IO.Path]::GetFullPath($presetName)
 } elseif ($External) {
     Join-Path $externalPresetsRoot $presetName
@@ -719,6 +817,7 @@ $isManagedPreset = $presetDir.TrimEnd('\').StartsWith($presetsRoot.TrimEnd('\') 
 if ($isManagedPreset) { Assert-PresetSources $presetsRoot ([IO.Path]::GetFileName($presetDir.TrimEnd('\'))) $presetManifest }
 $presetData = Read-Preset $presetFile
 if (-not $presetData.sections.Contains($profile.HostSection)) { throw "Preset '$presetName' has no [$($profile.HostSection)] section and cannot be installed for $label" }
+Resolve-ModelBindings $presetData $profile.HostSection $modelBindingsFile
 $rendered = Convert-PresetToHostFiles $presetData $profile.HostSection $profile.RoleKind $presetDir
 $expectedRoleCount = $rendered.Count
 

@@ -36,9 +36,9 @@ flowchart LR
     end
 
     VERIFY --> CRITIQUE{"Critique · 独立末端质量门<br/>验收、范围、验证与风险是否闭环？"}
-    CRITIQUE -->|"独立复审与验收通过"| PROMOTE["Promote · 可信交付<br/>速度 × 智力 × 成本效率"]
+    CRITIQUE -->|"实施验收通过，或已完成约定评审"| PROMOTE["Promote · 交付实施结果或评审报告"]
     PROMOTE --> DELIVERY(["可信交付完成"])
-    CRITIQUE -->|"发现问题"| REPAIR["精确修复<br/>重新验证，并按需要提高审查强度"]
+    CRITIQUE -->|"实施任务有授权范围内的阻断问题"| REPAIR["精确修复<br/>重新验证，并按需要提高审查强度"]
     REPAIR --> WORK
 
     classDef start fill:#0b1220,stroke:#38bdf8,color:#f8fafc,stroke-width:2px;
@@ -51,7 +51,7 @@ flowchart LR
     class PROMOTE,DELIVERY,DIRECT_DELIVERY result;
 ```
 
-复杂任务用 `Explore → Plan → Work → Critique → Promote` 表达主线：`Explore` 是取证，`Plan` 是定案与契约，`Work` 包含实施和集成验证，`Critique` 是独立复审，`Promote` 仅表示在验收通过后允许可信交付，不授权额外发布或部署。简单问答、只读查询或单文件且边界清晰低风险的直接任务不进入该闭环；有改动时运行贴近改动、再按影响扩大的验证后交付。
+复杂任务按 `Explore → Plan → Work → Critique → Promote` 推进，依次取证、定案、执行、复审和交付。实施任务在验收通过后交付改动。仅评审时，交付物是有证据的报告，即使被审对象未通过也可以完成评审。发布或部署需要相应授权。简单问答、只读查询或边界清晰的单文件低风险整理可直接完成，有改动时按影响范围验证。
 
 这不是“多开几个 agent”。它是一套明确分工的工程闭环：低成本工作尽量并行和复用，高强度判断只在证据不足、风险上升或需要独立复查时介入；每次交付都要经过与任务风险相称的验证。
 
@@ -70,7 +70,16 @@ flowchart LR
 
 每个平台一个安装器：`install.ps1`（Windows）与 `install.sh`（macOS/Linux）。直接运行后按提示交互选择预设来源（内置/外置）、客户端（Codex / ZCode）和角色预设，或在命令中直接指定；共享内容由所选客户端的安装流程一并安装，宿主专属内容各装各的。新增客户端需要在两个安装器的客户端注册表中加入一项，并提供该客户端所需的 docs/config 与可选 `skill-assets/`；共享指令与工作流骨架不需要 per-client 副本。
 
-**角色预设**：agent 角色不是仓库里的固定文件，而是安装时从 `shared/roles/presets/` 下的预设（如 `glm`、`gpt`、`ds`）翻译生成的宿主配置。预设只绑定模型与职责，内置预设可直接用；只用其他模型或想混合模型（如 GPT 写码 + GLM 复审）时，复制一个预设目录、把各角色的 `model` 改成你宿主里实际可用的模型 ID 即可，详见 [`shared/roles/README.md`](shared/roles/README.md)。预设也可以放在仓库外：固定目录为 `~/.ai-vibecode-superpower/presets/`，安装时选择 External 来源或传 `--external` / `-External`，不会修改仓库。`ds` 预设的 `model` 是占位值，安装前必须改成你的实际 Picker 值（外部副本同样）。安装交互会先选内置/外置来源，再选客户端，然后只列出支持该客户端的预设并标注默认值。
+**角色预设**：agent 角色不是仓库里的固定文件，而是安装时从 `shared/roles/presets/` 下的预设（如 `glm`、`gpt`、`ds`）翻译生成的宿主配置。`gpt`（Codex）可直接使用；ZCode 的 `glm` / `ds` 使用 `local:` 键，需要一次性创建 `~/.ai-vibecode-superpower/model-bindings.toml`（Windows 为 `%USERPROFILE%\.ai-vibecode-superpower\model-bindings.toml`），填入当前 ZCode Picker 中的实际 `providerId/modelId`：
+
+```toml
+[zcode]
+glm_flash = "<your-glm-plan>/GLM-5.3-Flash"
+glm_main  = "<your-glm-plan>/GLM-5.3"
+ds_flash  = "<your-deepseek-provider>/<your-deepseek-model>"
+```
+
+只需提供所选预设引用的键，缺失时安装会直接报错。外部预设写具体 `provider/model` 时仍兼容、不需要绑定文件；写 `local:` 时同样走绑定层。要用其他模型或混合模型（如 GPT 写码 + GLM 复审）时，复制一个预设目录并修改角色 `model` 即可，详见 [`shared/roles/README.md`](shared/roles/README.md)。预设也可以放在仓库外：固定目录为 `~/.ai-vibecode-superpower/presets/`，安装时选择 External 来源或传 `--external` / `-External`，不会修改仓库。安装交互会先选内置/外置来源，再选客户端，然后只列出支持该客户端的预设并标注默认值。
 
 ### Codex
 
@@ -99,7 +108,7 @@ sh ./install.sh codex --external codex-local   # 外部预设
 如果配置看起来没有生效（包括在 Codex 运行期间安装的情况），可核对以下配置是否仍存在：
 
 ```toml
-model = "gpt-6.1-sol"
+model = "gpt-6.2-sol"
 model_reasoning_effort = "high"
 sandbox_mode = "danger-full-access"
 approval_policy = "on-request"
@@ -117,6 +126,7 @@ goals = true
 
 - 可在 ZCode 会话运行时安装；安装成功后重启 ZCode，使 `~/.zcode/agents` 的角色和 `~/.zcode/skills` 生效。
 - 角色由所选预设（默认 `glm`，5 个角色）翻译生成；命名公式与各角色职责见 [`shared/roles/README.md`](shared/roles/README.md) 与预设文件。换个预设，同一套安装流程生成不同的角色集合。
+- 内置 `glm` / `ds` 的 `model` 为 `local:` 键；先按“角色预设”创建绑定文件，再运行安装器。缺失绑定会安装失败；外部预设写具体 `provider/model` 时不需要绑定文件。
 - 安装器只管理 `AGENTS.md`、`docs/`、按所选预设渲染后平铺安装到 `~/.zcode/agents/` 顶层的 md agent（新版 ZCode 宿主只扫描该目录顶层，子目录不参与发现）和受管的 skills；不修改 ZCode 的 `cli/`、`v2/`、插件缓存或用户自建的其它 skills/agents。已有的 `AGENTS.md` 会先备份再替换。
 
 **Windows（PowerShell 7）**，在仓库根目录运行：
@@ -146,7 +156,7 @@ sh ./install.sh zcode --external zcode-ds   # 外部预设
 | [`deep-dive-review`](shared/skills/deep-dive-review/SKILL.md) | 交付后/上线前对需求或模块做多轮深挖质量审查 | 覆盖矩阵穷举、对抗证伪、裁决过滤与扩散收敛的台账与终报；默认只出报告，显式授权后修复。 |
 | [`orchestrate-model-workflow`](shared/skills/orchestrate-model-workflow/SKILL.md) | 跨文件实现、复杂取证或独立验收 | 按证据和风险选择 role，并保留可核对的验证闭环。 |
 | [`project-doc-planner`](shared/skills/project-doc-planner/SKILL.md) | 新项目或大型改造的文档规划 | 可维护的项目级文档结构。 |
-| [`test-strategy`](shared/skills/test-strategy/SKILL.md) | 小功能/修复需要选测试、避免全量或过度测试时 | 功能基线全项目 ≤5 分钟；场景/性能按需另计。 |
+| [`test-strategy`](shared/skills/test-strategy/SKILL.md) | 需要判断改动影响哪些可观察行为、该运行哪些测试时 | 复用现有测试入口，按影响与验证成本选择测试范围。 |
 | [`security-audit`](shared/skills/security-audit/SKILL.md) | 源码/配置/供应链及授权范围内的部署、主机与云安全审计；上线前体检、PR 安全审查 | 攻击者视角、外部核实、证据链与覆盖台账；`exhaustive` 模式做多视角穷举。 |
 | [`visual-aesthetics`](shared/skills/visual-aesthetics/SKILL.md) | 视觉呈现是任务目标、改动对象或验收条件时 | 按需求与情境选用审美原理，依据实际呈现检查效果。 |
 

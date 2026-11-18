@@ -79,7 +79,7 @@ jq -s '{version:"2.1.0",
   runs:[.[].runs[]]}' '<获准目录>/a.sarif' '<获准目录>/b.sarif' > '<获准目录>/merged.sarif'
 ```
 
-每个结果至少保留：`ruleId`、`level`、`message.text`、`locations[].physicalLocation`（URI + 行列，1-based）、`partialFingerprints`。修复/抑制使用 `suppressions`（`kind`、`status`、`justification`），存量用 `baselineState` 区分新增与既有。
+合并时保留工具给出的 `ruleId`、`level`、`message.text`、位置与 `partialFingerprints`。文件位置使用实际 URI 与行列（1-based）；资源类证据保留原始资源定位。最终发现的导出规则见 [报告](report.md#9-sarif-输出可选)。修复/抑制使用 `suppressions`（`kind`、`status`、`justification`），存量用 `baselineState` 区分新增与既有。
 
 如果目标平台支持代码扫描上传，注意：仅接受 SARIF 2.1.0；单文件有大小上限；同一工具 + 同一 category 的新上传会替换旧结果。上传前确认平台与权限，不把内部代码扫描结果发到未授权服务。
 
@@ -89,7 +89,7 @@ jq -s '{version:"2.1.0",
 - 优先用规则级/路径级抑制，不用全局关闭规则。
 - 抑制后代码变更时重新评估；指纹变化意味着需要重看。
 - 统计抑制率：持续升高说明规则或代码模式需要调整，而不是继续加抑制。
-- 不把"工具没报"当作 clean；clean 必须有相应层的判定证据，代码层须核查代码链。
+- 工具零告警仅描述本次扫描结果。将具体候选记为 `clean` 时，须给出适用层面足以排除疑点的证据。
 
 ## 9 工具选择速查
 
