@@ -19,7 +19,6 @@
   - `pytest tests/baseline/<module> --durations=20`（找该范围内慢用例）
 - Node / Vitest：
   - `./node_modules/.bin/vitest run tests/baseline/<module>`
-  - `./node_modules/.bin/vitest run --project baseline`（按入口规则选择全量时）
 - Node / Jest：
   - `./node_modules/.bin/jest tests/baseline/<module>`
 - Node 内置 test runner：
