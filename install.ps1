@@ -140,7 +140,7 @@ function Read-Preset([string]$PresetFile) {
 function Assert-ModelBindingValue([string]$HostSection, [string]$Value, [string]$Context) {
     if ($Value.StartsWith('local:')) { throw "Invalid model binding in ${Context}: value must not start with local:" }
     if ($Value.Length -eq 0) { throw "Invalid model binding in ${Context}: value must not be empty" }
-    if ($Value -match '[\x00-\x1F\x7F]') { throw "Invalid model binding in ${Context}: value must not contain control characters" }
+    if ($Value -match '[\x00-\x1F\x7F-\x9F]') { throw "Invalid model binding in ${Context}: value must not contain control characters" }
     if ($HostSection -ceq 'zcode') {
         if ($Value -match '\s') { throw "Invalid model binding in ${Context}: value must not contain whitespace" }
         $slash = $Value.IndexOf('/')
@@ -194,7 +194,7 @@ function Resolve-ModelBindings([hashtable]$Preset, [string]$HostSection, [string
         elseif ($hostTable.Contains('model')) { $effective = [string]$hostTable.model }
         if ($null -ne $effective -and $effective.StartsWith('local:')) {
             $key = $effective.Substring(6)
-            if ($key -notmatch '^[A-Za-z][A-Za-z0-9_-]*$') { throw "Invalid local model reference in [$HostSection]: $effective (expected local:<key>)" }
+            if ($key -cnotmatch '\A[A-Za-z][A-Za-z0-9_-]*\z') { throw "Invalid local model reference in [$HostSection]: $effective (expected local:<key>)" }
             if (-not $required.Contains($key)) { $required.Add($key) }
         }
     }

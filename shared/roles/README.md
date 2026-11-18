@@ -35,7 +35,7 @@ shared/roles/presets/<preset-name>/
 ## preset.toml schema
 
 ```toml
-description = "GLM 预设：ZCode 5 角色绑定 GLM-5.3 / GLM-5.3-Flash。"
+description = "ZCode 单角色示例，绑定 GLM-5.3-Flash。"
 
 [zcode]
 # 宿主角色默认 model；local:<key> 在安装时解析。
@@ -52,8 +52,6 @@ description = "只读常规取证与实施后预审。"
 effort = "basic"
 # ZCode 原生档位字段示例，使用时注释或删除上面的 effort。
 # thoughtLevel = "low"
-# Codex 原生档位字段示例，使用时注释或删除上面的 effort。
-# model_reasoning_effort = "low"
 # true 表示只读角色。
 readonly = true
 # 可选：覆盖宿主默认 model。
@@ -63,7 +61,7 @@ readonly = true
 # 可选：仅 ZCode 消费，缺省按翻译规则推导。
 # color = "cyan"
 # 可选：仅 ZCode 消费，须保持 readonly = true。
-# tools = [Read, Bash]
+# tools = ["Read", "Bash"]
 # 可选：仅 Codex 消费。
 # sandbox_mode = "read-only"
 # 可选：写入 SKILL.md 角色清单的描述，缺省使用 description。

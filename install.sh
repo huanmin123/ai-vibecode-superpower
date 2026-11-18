@@ -537,13 +537,21 @@ validate_model_binding_value() {
     if [ -z "$vmbv_value" ]; then
         die "Invalid model binding in $vmbv_ctx: value must not be empty"
     fi
-    case "$vmbv_value" in
-        *[[:cntrl:]]*) die "Invalid model binding in $vmbv_ctx: value must not contain control characters" ;;
-    esac
+    # 固定 C locale 按 UTF-8 字节识别 Unicode Cc 和 White_Space，ENVIRON 保留原始反斜杠和换行。
+    if ! vmbv_invalid=$(MODEL_BINDING_VALUE="$vmbv_value" MODEL_BINDING_HOST="$vmbv_host" LC_ALL=C awk '
+        BEGIN {
+            value = ENVIRON["MODEL_BINDING_VALUE"]
+            if (value ~ /[[:cntrl:]]/ || value ~ /\302[\200-\237]/) print "control characters"
+            else if (ENVIRON["MODEL_BINDING_HOST"] == "zcode" &&
+                     value ~ / |\302\240|\341\232\200|\342\200[\200-\212]|\342\200\250|\342\200\251|\342\200\257|\342\201\237|\343\200\200/) print "whitespace"
+        }
+    '); then
+        die "Could not validate model binding in $vmbv_ctx"
+    fi
+    if [ -n "$vmbv_invalid" ]; then
+        die "Invalid model binding in $vmbv_ctx: value must not contain $vmbv_invalid"
+    fi
     if [ "$vmbv_host" = zcode ]; then
-        case "$vmbv_value" in
-            *[[:space:]]*) die "Invalid model binding in $vmbv_ctx: value must not contain whitespace" ;;
-        esac
         case "$vmbv_value" in
             */*) ;;
             *) die "Invalid model binding in $vmbv_ctx: value must be providerId/modelId" ;;
@@ -650,6 +658,19 @@ read_model_bindings() {
     done < "$mb_file"
 }
 
+# 选择角色覆盖值或宿主默认值；哨兵保留命令替换末尾的换行供校验。
+get_binding_effective_model() {
+    RMB_EFFECTIVE=
+    if [ "$(pget "P_R${1}_SET_model")" = 1 ]; then
+        RMB_EFFECTIVE=$(pget "P_R${1}_model"; printf X)
+    elif [ "$(pget "P_HOST_${2}_MODEL_SET")" = 1 ]; then
+        RMB_EFFECTIVE=$(pget "P_HOST_${2}_MODEL"; printf X)
+    else
+        return 0
+    fi
+    RMB_EFFECTIVE=${RMB_EFFECTIVE%X}
+}
+
 # 遍历当前宿主角色收集 local:<key>，解析绑定并回写角色 model；缺失或非法一律报错，不回退。
 resolve_model_bindings() {
     rmb_host=$host_section
@@ -658,18 +679,14 @@ resolve_model_bindings() {
     rmb_role=1
     while [ "$rmb_role" -le "$P_ROLES" ]; do
         if [ "$(pget "P_R${rmb_role}_HOST")" = "$rmb_host" ]; then
-            rmb_effective=
-            if [ "$(pget "P_R${rmb_role}_SET_model")" = 1 ]; then
-                rmb_effective=$(pget "P_R${rmb_role}_model")
-            elif [ "$(pget "P_HOST_${rmb_host}_MODEL_SET")" = 1 ]; then
-                rmb_effective=$(pget "P_HOST_${rmb_host}_MODEL")
-            fi
-            case "$rmb_effective" in
+            get_binding_effective_model "$rmb_role" "$rmb_host"
+            case "$RMB_EFFECTIVE" in
                 local:*)
-                    rmb_key=${rmb_effective#local:}
-                    if ! printf '%s' "$rmb_key" | LC_ALL=C grep -Eq '^[A-Za-z][A-Za-z0-9_-]*$'; then
-                        die "Invalid local model reference in $preset_file: $rmb_effective (expected local:<key>)"
-                    fi
+                    rmb_key=${RMB_EFFECTIVE#local:}
+                    case "$rmb_key" in
+                        ''|[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz]*|*[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-]*)
+                            die "Invalid local model reference in $preset_file: $RMB_EFFECTIVE (expected local:<key>)" ;;
+                    esac
                     case " $rmb_required " in
                         *" $rmb_key "*) ;;
                         *) rmb_required="${rmb_required:+$rmb_required }$rmb_key" ;;
@@ -703,15 +720,10 @@ resolve_model_bindings() {
     rmb_role=1
     while [ "$rmb_role" -le "$P_ROLES" ]; do
         if [ "$(pget "P_R${rmb_role}_HOST")" = "$rmb_host" ]; then
-            rmb_effective=
-            if [ "$(pget "P_R${rmb_role}_SET_model")" = 1 ]; then
-                rmb_effective=$(pget "P_R${rmb_role}_model")
-            elif [ "$(pget "P_HOST_${rmb_host}_MODEL_SET")" = 1 ]; then
-                rmb_effective=$(pget "P_HOST_${rmb_host}_MODEL")
-            fi
-            case "$rmb_effective" in
+            get_binding_effective_model "$rmb_role" "$rmb_host"
+            case "$RMB_EFFECTIVE" in
                 local:*)
-                    rmb_key=${rmb_effective#local:}
+                    rmb_key=${RMB_EFFECTIVE#local:}
                     if ! mb_find_binding "$rmb_key"; then
                         die "Missing model binding key in $rmb_file [$rmb_host]: $rmb_key"
                     fi

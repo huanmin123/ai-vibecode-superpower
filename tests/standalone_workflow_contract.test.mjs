@@ -1147,10 +1147,29 @@ for (const platform of ['POSIX', 'PowerShell']) {
         assert.match(result.stdout + '\n' + result.stderr, /whitespace/);
         await assert.rejects(readdir(zcodeHome), { code: 'ENOENT' });
       }
+      for (const value of ['provider/mo\u0080del', 'provider/mo\u009fdel']) {
+        await seedModelBindings(home, { key: value });
+        const result = await runLocalPreset(shell, presetDir, home, zcodeHome, { LC_ALL: 'C' });
+        assert.notEqual(result.code, 0, `${JSON.stringify(value)}: ${result.stdout}`);
+        assert.match(result.stdout + '\n' + result.stderr, /control characters/);
+        await assert.rejects(readdir(zcodeHome), { code: 'ENOENT' });
+      }
       await seedModelBindings(home, { key: 'provider/模型' });
       const result = await runLocalPreset(shell, presetDir, home, zcodeHome, { LC_ALL: 'C' });
       assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
       assert.match(await readFile(path.join(zcodeHome, 'agents', 'worker.md'), 'utf8'), /^model: "provider\/模型"$/m);
+      if (!isPowerShell) {
+        const locales = await runResult('locale', ['-a']);
+        const utf8Locale = locales.stdout.split(/\r?\n/).find((locale) => /^(C\.utf-?8|en_US\.utf-?8)$/i.test(locale));
+        if (utf8Locale) {
+          await seedModelBindings(home, { key: 'provider/模\u200b\u200c型' });
+          const utf8Result = await runLocalPreset(shell, presetDir, home, zcodeHome, { LC_ALL: utf8Locale });
+          assert.equal(utf8Result.code, 0, `${utf8Result.stdout}\n${utf8Result.stderr}`);
+          assert.match(await readFile(path.join(zcodeHome, 'agents', 'worker.md'), 'utf8'), /^model: "provider\/模\u200b\u200c型"$/m);
+        } else {
+          t.diagnostic('UTF-8 locale unavailable; Unicode format character check not run');
+        }
+      }
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -1380,7 +1399,7 @@ test('POSIX codex installer rejects control characters in local model bindings',
     await writeFile(path.join(presetDir, 'roles', 'worker.md'), 'worker body\n');
     const bindingDir = path.join(home, '.ai-vibecode-superpower');
     await mkdir(bindingDir, { recursive: true });
-    for (const value of ['a\\nb', 'a\\n']) {
+    for (const value of ['a\\nb', 'a\\n', 'a\u0080b', 'a\u009fb']) {
       await writeFile(path.join(bindingDir, 'model-bindings.toml'), `[codex]\ncodex_model = "${value}"\n`);
       const result = await runResult(shell, ['install.sh', 'codex', posixHome(presetDir)], {
         cwd: repository,
@@ -1390,6 +1409,13 @@ test('POSIX codex installer rejects control characters in local model bindings',
       assert.match(result.stdout + '\n' + result.stderr, /control characters/);
       await assert.rejects(readdir(codexHome), { code: 'ENOENT' }, 'invalid binding must not be installed');
     }
+    await writeFile(path.join(bindingDir, 'model-bindings.toml'), '[codex]\ncodex_model = "model with spaces"\n');
+    const result = await runResult(shell, ['install.sh', 'codex', posixHome(presetDir)], {
+      cwd: repository,
+      env: { ...process.env, HOME: posixHome(home), CODEX_HOME: posixHome(codexHome) },
+    });
+    assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+    assert.match(await readFile(path.join(codexHome, 'agents', 'ai-vibecode-superpower', 'my_worker.toml'), 'utf8'), /^model = "model with spaces"$/m);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1424,7 +1450,7 @@ test('PowerShell codex installer rejects control characters in local model bindi
     await writeFile(path.join(presetDir, 'roles', 'worker.md'), 'worker body\n');
     const bindingDir = path.join(home, '.ai-vibecode-superpower');
     await mkdir(bindingDir, { recursive: true });
-    for (const value of ['a\\nb', 'a\\n']) {
+    for (const value of ['a\\nb', 'a\\n', 'a\u0080b', 'a\u009fb']) {
       await writeFile(path.join(bindingDir, 'model-bindings.toml'), `[codex]\ncodex_model = "${value}"\n`);
       const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'codex', '-Preset', presetDir], {
         env: { ...process.env, USERPROFILE: home, CODEX_HOME: codexHome },
@@ -1433,6 +1459,12 @@ test('PowerShell codex installer rejects control characters in local model bindi
       assert.match(result.stdout + '\n' + result.stderr, /control characters/);
       await assert.rejects(readdir(codexHome), { code: 'ENOENT' }, 'invalid binding must not be installed');
     }
+    await writeFile(path.join(bindingDir, 'model-bindings.toml'), '[codex]\ncodex_model = "model with spaces"\n');
+    const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'codex', '-Preset', presetDir], {
+      env: { ...process.env, USERPROFILE: home, CODEX_HOME: codexHome },
+    });
+    assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+    assert.match(await readFile(path.join(codexHome, 'agents', 'ai-vibecode-superpower', 'my_worker.toml'), 'utf8'), /^model = "model with spaces"$/m);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1631,6 +1663,27 @@ test('merged POSIX installer rejects unknown clients', async (t) => {
   const result = await runResult(shell, ['install.sh', 'unknown-client'], { cwd: repository });
   assert.notEqual(result.code, 0, result.stdout);
   assert.match(result.stdout + '\n' + result.stderr, /Unknown client: unknown-client/);
+});
+
+test('POSIX installer reports a preset role without any model binding', async (t) => {
+  const shell = await findPosixShell();
+  if (!shell) return t.skip('POSIX shell is unavailable');
+  const root = await mkdtemp(path.join(repository, '.preset-bad-model-'));
+  const presetDir = path.join(root, 'preset');
+  try {
+    await mkdir(path.join(presetDir, 'roles'), { recursive: true });
+    await writeFile(path.join(presetDir, 'preset.toml'), 'description = "broken preset"\n\n[zcode]\n\n[[zcode.role]]\nid = "worker"\nname = "my_worker"\ndescription = "worker"\neffort = "max"\nreadonly = false\n');
+    await writeFile(path.join(presetDir, 'roles', 'worker.md'), 'worker body\n');
+    const result = await runResult(shell, ['install.sh', 'zcode', posixHome(presetDir)], {
+      cwd: repository,
+      env: { ...process.env, HOME: posixHome(root), ZCODE_HOME: posixHome(path.join(root, 'target')) },
+    });
+    assert.notEqual(result.code, 0, result.stdout);
+    assert.match(result.stdout + '\n' + result.stderr, /has no model/i);
+    await assert.rejects(readdir(path.join(root, 'target')), { code: 'ENOENT' });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test('PowerShell installer rejects a preset role without any model binding', { skip: process.platform !== 'win32' }, async () => {
