@@ -97,7 +97,7 @@ ZCode 的 `model` 是本机 Picker 值 `providerId/modelId`；providerId 随登�
 [zcode]
 ds_flash  = "<your-provider>/<your-deepseek-model>"
 glm_flash = "<your-glm-plan>/GLM-5.3-Flash"
-glm_main  = "<your-glm-plan>/GLM-5.3"
+glm_main  = "<your-glm-plan>/GLM-5.4"
 ```
 
 - 只需提供所选预设实际引用的 key；未引用的 key 可省略，也不做 `providerId/modelId` 语义校验，但其 TOML 子集语法仍会被解析。缺失 key 一次性汇总报错；被引用 key 的值格式非法，或解析出的 ZCode 绑定值不符合 `providerId/modelId` 格式时同样安装失败。不静默回退，也不自动探测本机 provider。
@@ -176,7 +176,7 @@ sandbox_mode = "<readonly 推导或显式值>"
 
 ## 内置预设
 
-- `presets/glm/`：ZCode 5 角色（与既有 `glm_5.3_*` 行为等价），`model = local:glm_flash`，`review_high` / `review_max` 使用 `local:glm_main`；需在绑定文件 `[zcode]` 提供 `glm_flash` 与 `glm_main`。不含 `[codex]` 小节——在 Codex 使用 GLM 需要用户先在 Codex 配置对应 model provider，属用户环境配置，仓库不代设。
+- `presets/glm/`：ZCode 5 角色（与既有 `glm_5.3_flash_*` / `glm_5.4_*` 行为等价），`model = local:glm_flash`，`review_high` / `review_max` 使用 `local:glm_main`；需在绑定文件 `[zcode]` 提供 `glm_flash` 与 `glm_main`。不含 `[codex]` 小节——在 Codex 使用 GLM 需要用户先在 Codex 配置对应 model provider，属用户环境配置，仓库不代设。
 - `presets/gpt/`：Codex 12 角色（luna / terra / sol / astra 四档分工），不含 `[zcode]` 小节。
 - `presets/ds/`：ZCode 3 角色，`model = local:ds_flash`（2 读 1 写；复审/终审由 `ds_4.1_flash_max` 兼任，复审派发必须是全新实例且不信任写入实例的自述）；需在绑定文件 `[zcode]` 提供 `ds_flash`。不含 `[codex]` 小节，理由同 glm。
 - 新增模型方案：新增 `presets/<name>/` 并运行 `-UpdateRoleManifest`，不改代码；使用 `local:` 时在预设描述中注明所需 key。

@@ -21,7 +21,7 @@ const ripgrepDoc = path.join(repository, 'shared', 'docs', 'system', 'rg.md');
 const zcodeDocsReadme = path.join(repository, 'zcode-global-config', 'docs', 'README.md');
 const zcodePosixInstaller = path.join(repository, 'install.sh');
 const zcodeRoleNames = [
-  'glm_5.3_flash_low', 'glm_5.3_flash_high', 'glm_5.3_flash_max', 'glm_5.3_high', 'glm_5.3_max'
+  'glm_5.3_flash_low', 'glm_5.3_flash_high', 'glm_5.3_flash_max', 'glm_5.4_high', 'glm_5.4_max'
 ];
 const bracketedTables = [
   '[hooks.state."browser@openai-bundled:plugin.json#hooks[0]:stop:0:0"]',
@@ -86,7 +86,7 @@ function posixHome(codexHome) {
 
 const testModelBindings = {
   glm_flash: 'test-glm/GLM-5.3-Flash',
-  glm_main: 'test-glm/GLM-5.3',
+  glm_main: 'test-glm/GLM-5.4',
   ds_flash: 'test-deepseek/deepseek-v4.1-flash',
 };
 
@@ -393,8 +393,8 @@ test('glm preset keeps five roles with model routing and cross references', asyn
     flash_low: { name: 'glm_5.3_flash_low', model: null, effort: 'basic', readonly: true },
     flash_high: { name: 'glm_5.3_flash_high', model: null, effort: 'deep', readonly: true },
     flash_max: { name: 'glm_5.3_flash_max', model: null, effort: 'max', readonly: false },
-    review_high: { name: 'glm_5.3_high', model: 'local:glm_main', effort: 'deep', readonly: true },
-    review_max: { name: 'glm_5.3_max', model: 'local:glm_main', effort: 'max', readonly: true }
+    review_high: { name: 'glm_5.4_high', model: 'local:glm_main', effort: 'deep', readonly: true },
+    review_max: { name: 'glm_5.4_max', model: 'local:glm_main', effort: 'max', readonly: true }
   };
   const blocks = presetText.split(/\[\[zcode\.role\]\]/).slice(1);
   assert.equal(blocks.length, 5);
@@ -1001,8 +1001,8 @@ test('PowerShell zcode installer composes shared and zcode sources and leaves un
       'glm_5.3_flash_low': testModelBindings.glm_flash,
       'glm_5.3_flash_high': testModelBindings.glm_flash,
       'glm_5.3_flash_max': testModelBindings.glm_flash,
-      'glm_5.3_high': testModelBindings.glm_main,
-      'glm_5.3_max': testModelBindings.glm_main,
+      'glm_5.4_high': testModelBindings.glm_main,
+      'glm_5.4_max': testModelBindings.glm_main,
     };
     for (const [role, expected] of Object.entries(glmModels)) {
       const text = await readFile(path.join(zcodeHome, 'agents', `${role}.md`), 'utf8');
@@ -1066,8 +1066,8 @@ test('POSIX zcode installer deploys a fresh home without codex configuration', a
       'glm_5.3_flash_low': testModelBindings.glm_flash,
       'glm_5.3_flash_high': testModelBindings.glm_flash,
       'glm_5.3_flash_max': testModelBindings.glm_flash,
-      'glm_5.3_high': testModelBindings.glm_main,
-      'glm_5.3_max': testModelBindings.glm_main,
+      'glm_5.4_high': testModelBindings.glm_main,
+      'glm_5.4_max': testModelBindings.glm_main,
     };
     for (const [role, expected] of Object.entries(glmModels)) {
       const text = await readFile(path.join(zcodeHome, 'agents', `${role}.md`), 'utf8');
@@ -1239,8 +1239,8 @@ test('POSIX zcode installer resolves glm local bindings including role overrides
       'glm_5.3_flash_low': testModelBindings.glm_flash,
       'glm_5.3_flash_high': testModelBindings.glm_flash,
       'glm_5.3_flash_max': testModelBindings.glm_flash,
-      'glm_5.3_high': testModelBindings.glm_main,
-      'glm_5.3_max': testModelBindings.glm_main,
+      'glm_5.4_high': testModelBindings.glm_main,
+      'glm_5.4_max': testModelBindings.glm_main,
     };
     for (const [role, expected] of Object.entries(expectedModels)) {
       const text = await readFile(path.join(zcodeHome, 'agents', `${role}.md`), 'utf8');

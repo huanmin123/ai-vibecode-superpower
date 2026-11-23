@@ -75,7 +75,7 @@ flowchart LR
 ```toml
 [zcode]
 glm_flash = "<your-glm-plan>/GLM-5.3-Flash"
-glm_main  = "<your-glm-plan>/GLM-5.3"
+glm_main  = "<your-glm-plan>/GLM-5.4"
 ds_flash  = "<your-deepseek-provider>/<your-deepseek-model>"
 ```
 
