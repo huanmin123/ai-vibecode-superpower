@@ -386,6 +386,44 @@ test('workflow checks authorization before selecting protected execution', async
   }
 });
 
+test('workflow review checks restraint, impact, proportion and companion changes', async () => {
+  const text = await readFile(skillBase, 'utf8');
+  const plan = workflowStage(text, 'Plan');
+  const critique = workflowStage(text, 'Critique');
+  assert.match(plan, /变更边界[^。]*不得改变的行为[^。]*既有实现[^。]*调用方/);
+  assert.match(critique, /派发时随任务附上清单和 Plan 的变更边界/);
+  for (const required of [
+    '只做该做的',
+    '没伤到其他',
+    '做法相称',
+    '配套已同步',
+    '修复类任务另答',
+    '需求未要求改变的既有行为默认有存在理由',
+    '经过被改代码的既有功能有验证证据'
+  ]) {
+    assert.ok(critique.includes(required), `review checklist must state: ${required}`);
+  }
+  assert.match(critique, /仅凭"可以写得更好"不构成发现[^。]*不得借复审要求需求未要的设计、抽象或防御/);
+  assert.match(critique, /判定为 blocker[^。]*越界改动改变了既有行为[^。]*跳过既有测试[^。]*没有验证证据[^。]*配套文档或契约[^。]*带入回归/);
+  assert.match(critique, /越界但未改变既有行为的改动[^。]*不阻塞交付[^。]*裁决项[^。]*不自行放行或打回/);
+});
+
+test('every review role answers the checklist attached to the dispatch', async () => {
+  const reviewRoles = [
+    ['glm', 'review_high'],
+    ['glm', 'review_max'],
+    ['gpt', 'sol_high'],
+    ['gpt', 'sol_xhigh'],
+    ['gpt', 'astra_high'],
+    ['gpt', 'astra_max'],
+    ['ds', 'flash_max']
+  ];
+  for (const [preset, id] of reviewRoles) {
+    const body = await readFile(path.join(presetsRoot, preset, 'roles', `${id}.md`), 'utf8');
+    assert.match(body, /复审时逐项回答派发任务附带的审查清单[^。]*清单未附时先请求补充/, `${preset}/${id} must answer the dispatched checklist`);
+  }
+});
+
 test('glm preset keeps five roles with model routing and cross references', async () => {
   const presetText = await readFile(path.join(presetsRoot, 'glm', 'preset.toml'), 'utf8');
   assert.match(presetText, /\[zcode\]\nmodel = "local:glm_flash"/);
