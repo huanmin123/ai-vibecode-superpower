@@ -14,13 +14,12 @@
 非目标：
 
 - 不提供运行时动态增删角色的能力；角色集合在安装时确定。
-- 不在预设层做跨角色、跨宿主的继承或引用；预设的角色定义是自包含数据，重复表达优于隐式耦合。本机模型绑定是安装输入，不属于预设继承。
 - 不验证模型是否真实存在或可用；但使用 `local:<key>` 时必须显式提供绑定，且 ZCode 绑定解析结果必须通过 `providerId/modelId` 格式校验。后缀变体只从绑定文件的显式键枚举，不推断模型语义。
 - 不自动探测本机 provider 集合或模型列表；绑定由用户显式维护。安装器只枚举绑定文件中已写出的后缀键。
 
 ## 预设目录结构
 
-一个预设 = 一个目录：
+每个预设目录都包含安装所需的角色正文，可以单独复制到外部预设目录修改。本机模型绑定由安装环境提供。
 
 ```
 shared/roles/presets/<preset-name>/
@@ -31,6 +30,8 @@ shared/roles/presets/<preset-name>/
 - `roles/<id>.md` 是纯正文（无 frontmatter），可包含 `{{role:<id>}}` 互引用。
 - 同一 `id` 在一个预设内唯一；两个宿主小节引用同一 `id` 即共享同一正文。
 - 正文文件缺省为 `roles/<id>.md`，可用角色块 `body` 字段指向其他文件。
+
+内置预设中需要保持一致的正文只在 [bodies/](bodies/) 编辑。[targets.txt](bodies/targets.txt) 每行列出一个相对 `presets/` 的目标路径，源文件是 `bodies/` 下的同名 Markdown 文件。运行下文的 manifest 更新命令会用源文件覆盖这些目标，再更新校验值。外部预设可以直接编辑自己目录中的正文。
 
 ## preset.toml schema
 
@@ -190,7 +191,7 @@ sandbox_mode = "<readonly 推导或显式值>"
 
 - `shared/roles/presets.sha256` 记录全部预设**源文件**（preset.toml 与 roles/*.md）的规范化 SHA-256，静态提交进仓库，安装前校验一次；翻译产物不再做 hash 校验（产物是本机生成的编译物），改为结构校验：ZCode 校验 frontmatter 完整性、必填键与 `name == 文件名`；Codex 校验 6 个必填键各恰好出现一次。provider 变体是翻译产物，不进入 manifest。
 - 绑定文件 `~/.ai-vibecode-superpower/model-bindings.toml` 位于仓库外，不属于预设源文件，不参与 manifest 校验和；也不是安装器的受管 target。
-- 维护命令：`install.ps1 -UpdateRoleManifest` / `install.sh --update-role-manifest`，扫描 presets 目录重写 `presets.sha256`，不执行安装。修改任何预设源文件后必须运行它。
+- 维护命令：`install.ps1 -UpdateRoleManifest` / `install.sh --update-role-manifest`。修改共享正文、同步目标或预设文件后运行一次，将更新后的预设正文和 `presets.sha256` 一起提交。
 
 ## 内置预设
 
@@ -201,7 +202,7 @@ sandbox_mode = "<readonly 推导或显式值>"
 
 ### 界面设计角色
 
-三个内置预设都含界面设计角色 `design_high`，正文相同。它在界面实现前给出设计定案（本屏意图、取舍、组件映射、主任务脚本），实现后按“冷看 → 任务走查 → 清单走查”的顺序以实际截图复审；只报告问题和修改方向，不修改界面和项目代码，修改由主代理安排写入角色完成。它设为 `readonly = false` 以继承宿主全工具，可以自行编写走查脚本、截图并使用宿主提供的浏览器控制；不写项目代码是正文约束的职责边界，不是工具隔离；Codex 侧对应生成 `sandbox_mode = "danger-full-access"`，该字段不覆盖父会话设置（见上文 Codex toml role 的 `sandbox_mode` 缺省规则）。走查在本地或已授权的测试环境里不受操作限制，可以增删改测试数据；走查脚本和截图这类取证产物放在临时目录，不进源码或测试目录。项目成文规范优先于角色自带的缺陷清单，`visual-aesthetics` 提供方法与评审维度。glm 绑定 `local:glm_main`，ds 继承 `local:ds_flash`，gpt 绑定 `gpt-6.2-sol`。工作流在 Plan 与 Critique 阶段按职责措辞路由，不写角色名。
+三个内置预设共用[界面设计角色正文](bodies/design_high.md)。角色设为 `readonly = false`，以便使用宿主工具走查界面和截图。具体模型由各预设的 `design_high` 角色块指定。
 
 ## 运行时路由约定
 

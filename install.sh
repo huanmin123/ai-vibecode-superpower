@@ -128,10 +128,44 @@ preset_fail() {
 
 if [ "${1:-}" = "--update-role-manifest" ]; then
     [ -d "$presets_root" ] || die "Missing presets root: $presets_root"
+    um_bodies_root=$script_dir/shared/roles/bodies
+    um_targets_file=$um_bodies_root/targets.txt
     um_tmp_manifest=$preset_manifest.tmp
     um_tmp_list=$(mktemp) || die 'Could not create temporary file.'
     um_tmp_files=$(mktemp) || { rm -f -- "$um_tmp_list"; die 'Could not create temporary file.'; }
-    trap 'rm -f -- "$um_tmp_list" "$um_tmp_files" "$um_tmp_manifest"' EXIT HUP INT TERM
+    um_tmp_targets=$(mktemp) || { rm -f -- "$um_tmp_list" "$um_tmp_files"; die 'Could not create temporary file.'; }
+    trap 'rm -f -- "$um_tmp_list" "$um_tmp_files" "$um_tmp_targets" "$um_tmp_manifest"' EXIT HUP INT TERM
+    assert_target "$um_targets_file" file || die "Invalid shared role targets: $um_targets_file"
+    [ -f "$um_targets_file" ] || die "Missing shared role targets: $um_targets_file"
+    um_cr=$(printf '\r')
+    sed "s/${um_cr}\$//" "$um_targets_file" > "$um_tmp_targets"
+    [ -s "$um_tmp_targets" ] || die "Empty shared role targets: $um_targets_file"
+    while IFS= read -r um_target || [ -n "$um_target" ]; do
+        um_preset=${um_target%%/*}
+        um_filename=${um_target##*/}
+        um_id=${um_filename%.md}
+        case "$um_preset" in
+            ''|[!A-Za-z0-9]*|*[!A-Za-z0-9_-]*) die "Invalid shared role target: $um_target" ;;
+        esac
+        case "$um_id" in
+            ''|[!A-Za-z0-9]*|*[!A-Za-z0-9_-]*) die "Invalid shared role target: $um_target" ;;
+        esac
+        [ "$um_target" = "$um_preset/roles/$um_id.md" ] || die "Invalid shared role target: $um_target"
+        um_source=$um_bodies_root/$um_filename
+        um_destination=$presets_root/$um_target
+        assert_directory_container "$presets_root/$um_preset/roles" || die "Invalid preset roles directory: $um_preset"
+        [ -d "$presets_root/$um_preset/roles" ] && [ -f "$presets_root/$um_preset/preset.toml" ] || die "Missing preset or roles directory: $um_preset"
+        assert_target "$um_source" file || die "Invalid shared role body: $um_source"
+        [ -f "$um_source" ] || die "Missing shared role body: $um_source"
+        assert_target "$um_destination" file || die "Invalid shared role target: $um_destination"
+    done < "$um_tmp_targets"
+    while IFS= read -r um_target || [ -n "$um_target" ]; do
+        um_source=$um_bodies_root/${um_target##*/}
+        um_destination=$presets_root/$um_target
+        if ! cmp -s "$um_source" "$um_destination"; then
+            cp "$um_source" "$um_destination" || die "Could not synchronize shared role body: $um_target"
+        fi
+    done < "$um_tmp_targets"
     : > "$um_tmp_manifest"
     find "$presets_root" -mindepth 1 -maxdepth 1 -type d | LC_ALL=C sort > "$um_tmp_list"
     um_sources=0

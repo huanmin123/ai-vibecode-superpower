@@ -20,21 +20,20 @@
 
 ## 权威来源
 
-- 两个宿主共用[全局行为规范](shared/global-instructions.md)、`shared/docs/system/` 平台文档和 [skills](shared/skills/)。安装器将全局规范中的 `<GLOBAL_HOME>` 展开为目标 home。
+- 两个宿主共用[全局行为规范](shared/global-instructions.md)、[系统命令索引](shared/docs/system/README.md)和 [skills](shared/skills/)。安装器将全局规范中的 `<GLOBAL_HOME>` 展开为目标 home。
 - 工作流路由、交接与验收见[工作流 skill](shared/skills/orchestrate-model-workflow/SKILL.md)。Codex 专属技能资产在 [skill-assets/](codex-global-config/skill-assets/)。
-- 角色数据在[预设目录](shared/roles/presets/)中维护。schema、模型绑定（含 `local:<key>_<label>` 多 provider 变体）与宿主翻译见[角色规范](shared/roles/README.md)。宿主角色文件由安装器生成。
+- 各预设的模型绑定和专有正文在[预设目录](shared/roles/presets/)，跨预设共用的正文在[共享角色正文](shared/roles/bodies/)。schema、同步方式与宿主翻译见[角色规范](shared/roles/README.md)。
 - 安装参数与合并行为以 [Windows 安装器](install.ps1)和 [macOS/Linux 安装器](install.sh)为准。
 
 ## 文档维护
 
-- `AGENTS.md` 只放跨项目、每次任务都有效的行为与授权边界；`shared/docs/system/` 只放平台语法、命令、工具安装和排障。
-- 每条规则只在权威入口完整说明一次。平台文档只补充本平台特有、其他平台不生效的内容，不重复通用约定。
+- `shared/global-instructions.md` 维护跨项目的行为与授权边界。通用命令约定归共享索引，平台文档补充各平台的语法、工具安装和排障。
 - 新增或修改命令文档时，写清适用条件、预检、可核对的成功证据和失败边界；按风险保留必要的平台差异，不用抽象措辞替代可执行说明。
-- 新增平台或工具文档时，同步更新两个客户端 `docs/README.md` 索引的“命中才读”条件；未命中条件的文档不进入常规读取路径。
+- 新增平台或工具文档时，在共享索引登记适用条件。
 - 不在公开规范中保存主机地址、账号、密钥、令牌、生产连接信息或其他敏感事实。
 
 ## 修改与验证
 
-1. 修改仓库中的权威来源，安装产物由安装器生成。内置预设的 `preset.toml` 或角色正文变更后，运行 `-UpdateRoleManifest` / `--update-role-manifest` 更新 [presets.sha256](shared/roles/presets.sha256)。新增模型方案只需增加预设并更新 manifest；为使用 `local:` 的已有预设增加同一逻辑模型的第二个 ZCode provider，只需在仓库外的绑定文件加后缀键并重跑安装，不修改预设或 manifest。本机模型绑定保存在仓库外。
+1. 内置预设或共享正文变更后，运行 `-UpdateRoleManifest` / `--update-role-manifest` 同步正文并更新 [presets.sha256](shared/roles/presets.sha256)。新增模型方案只需增加预设并更新 manifest；为使用 `local:` 的已有预设增加同一逻辑模型的第二个 ZCode provider，只需在仓库外的绑定文件加后缀键并重跑安装，不修改预设或 manifest。本机模型绑定保存在仓库外。
 2. 只有用户要求部署时，运行对应平台的 `install` 脚本并选择目标客户端与预设，核对已安装文件与渲染产物一致。
 3. 保留实际错误和未验证项；不得用未证明兼容的 fallback 隐藏问题。

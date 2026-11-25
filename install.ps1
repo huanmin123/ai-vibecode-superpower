@@ -519,6 +519,41 @@ function Assert-PresetSources([string]$PresetsRoot, [string]$PresetName, [string
     if ($matched.Count -eq 0) { throw "Preset not covered by manifest: $PresetName" }
 }
 
+function Sync-RoleBodies([string]$PresetsRoot, [string]$BodiesRoot) {
+    $targetsFile = Join-Path $BodiesRoot 'targets.txt'
+    Assert-NoReparseChain $targetsFile
+    if (-not (Test-Path -LiteralPath $targetsFile -PathType Leaf)) { throw "Missing role body targets: $targetsFile" }
+
+    $copies = [Collections.Generic.List[object]]::new()
+    foreach ($target in (Get-Content -LiteralPath $targetsFile -Encoding UTF8)) {
+        if ($target -cnotmatch '^([A-Za-z0-9][A-Za-z0-9_-]*)/roles/([A-Za-z0-9][A-Za-z0-9_-]*\.md)$') {
+            throw "Invalid role body target: $target"
+        }
+        $presetDir = Join-Path $PresetsRoot $Matches[1]
+        $rolesDir = Join-Path $presetDir 'roles'
+        $source = Join-Path $BodiesRoot $Matches[2]
+        $destination = Join-Path $rolesDir $Matches[2]
+        Assert-NoReparseChain $source
+        Assert-InstallContainer $rolesDir
+        Assert-InstallTarget $destination 'File'
+        if (-not (Test-Path -LiteralPath (Join-Path $presetDir 'preset.toml') -PathType Leaf) -or
+            -not (Test-Path -LiteralPath $rolesDir -PathType Container)) {
+            throw "Role body target is not an existing preset roles directory: $rolesDir"
+        }
+        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Role body source missing: $source" }
+        $copies.Add([pscustomobject]@{ Destination = $destination; Bytes = [IO.File]::ReadAllBytes($source) })
+    }
+    if ($copies.Count -eq 0) { throw "No role body targets: $targetsFile" }
+
+    foreach ($copy in $copies) {
+        if ((Test-Path -LiteralPath $copy.Destination -PathType Leaf) -and
+            [Convert]::ToBase64String([IO.File]::ReadAllBytes($copy.Destination)) -ceq [Convert]::ToBase64String($copy.Bytes)) {
+            continue
+        }
+        [IO.File]::WriteAllBytes($copy.Destination, $copy.Bytes)
+    }
+}
+
 function Update-RoleManifest([string]$PresetsRoot, [string]$ManifestPath) {
     $lines = [Collections.Generic.List[string]]::new()
     foreach ($preset in (Get-ChildItem -LiteralPath $PresetsRoot -Directory | Sort-Object Name)) {
@@ -779,6 +814,7 @@ $externalPresetsPrepared = $false
 $presetManifest = Join-Path $root 'shared\roles\presets.sha256'
 if ($UpdateRoleManifest) {
     if (-not (Test-Path -LiteralPath $presetsRoot -PathType Container)) { throw "Missing presets root: $presetsRoot" }
+    Sync-RoleBodies $presetsRoot (Join-Path $root 'shared\roles\bodies')
     Update-RoleManifest $presetsRoot $presetManifest
     Write-Host "Preset manifest updated: $presetManifest"
     return

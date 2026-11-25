@@ -13,6 +13,7 @@ const baseAgents = path.join(repository, 'shared', 'global-instructions.md');
 const skillBase = path.join(repository, 'shared', 'skills', 'orchestrate-model-workflow', 'SKILL.md');
 const skillInterface = path.join(repository, 'codex-global-config', 'skill-assets', 'orchestrate-model-workflow', 'agents', 'openai.yaml');
 const presetsRoot = path.join(repository, 'shared', 'roles', 'presets');
+const sharedBodiesRoot = path.join(repository, 'shared', 'roles', 'bodies');
 const presetManifest = path.join(repository, 'shared', 'roles', 'presets.sha256');
 const presetGptRoles = path.join(presetsRoot, 'gpt', 'roles');
 const posixInstaller = path.join(repository, 'install.sh');
@@ -267,6 +268,76 @@ test('the preset manifest covers every source file of all built-in presets', asy
   }
 });
 
+test('shared role bodies match every generated preset copy', async () => {
+  const targetText = (await readFile(path.join(sharedBodiesRoot, 'targets.txt'), 'utf8')).trim();
+  assert.ok(targetText, 'shared body targets must not be empty');
+  const targets = targetText.split(/\r?\n/);
+  for (const target of targets) {
+    const source = await readFile(path.join(sharedBodiesRoot, path.basename(target)), 'utf8');
+    const copy = await readFile(path.join(presetsRoot, ...target.split('/')), 'utf8');
+    assert.equal(copy.replaceAll('\r\n', '\n'), source.replaceAll('\r\n', '\n'), `stale shared body: ${target}`);
+  }
+});
+
+async function checkRoleBodySynchronization(installer, args) {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'role-body-sync-'));
+  const fixture = await realpath(root);
+  try {
+    const bodies = path.join(fixture, 'shared', 'roles', 'bodies');
+    const presets = path.join(fixture, 'shared', 'roles', 'presets');
+    await mkdir(bodies, { recursive: true });
+    const targets = ['alpha/roles/shared.md', 'beta/roles/shared.md'];
+    await writeFile(path.join(bodies, 'targets.txt'), targets.join('\n') + '\n');
+    await writeFile(path.join(bodies, 'shared.md'), 'updated shared role\n');
+    for (const preset of ['alpha', 'beta']) {
+      await mkdir(path.join(presets, preset, 'roles'), { recursive: true });
+      await writeFile(path.join(presets, preset, 'preset.toml'), `description = "${preset}"\n`);
+      await writeFile(path.join(presets, preset, 'roles', 'other.md'), `unchanged ${preset}\n`);
+    }
+    for (const target of targets.slice(1)) {
+      await writeFile(path.join(presets, ...target.split('/')), 'old body\n');
+    }
+    const fixtureInstaller = path.join(fixture, path.basename(installer));
+    await cp(installer, fixtureInstaller);
+    const runUpdate = async () => {
+      const updateFlag = installer === posixInstaller ? '--update-role-manifest' : '-UpdateRoleManifest';
+      const commandArgs = [...args.slice(1), fixtureInstaller, updateFlag];
+      const result = await runResult(args[0], commandArgs, { cwd: fixture });
+      assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+    };
+    await runUpdate();
+    const manifestPath = path.join(fixture, 'shared', 'roles', 'presets.sha256');
+    const firstManifest = await readFile(manifestPath, 'utf8');
+    const entries = new Map(firstManifest.trim().split(/\r?\n/).map((line) => {
+      const match = line.match(/^([0-9a-f]{64})  (.+)$/);
+      assert.ok(match, `invalid manifest line: ${line}`);
+      return [match[2], match[1]];
+    }));
+    for (const target of targets) {
+      const actual = await readFile(path.join(presets, ...target.split('/')));
+      assert.deepEqual(actual, await readFile(path.join(bodies, path.basename(target))), target);
+      assert.equal(entries.get(target), normalizedHash(actual), `manifest mismatch: ${target}`);
+    }
+    for (const preset of ['alpha', 'beta']) {
+      assert.equal(await readFile(path.join(presets, preset, 'roles', 'other.md'), 'utf8'), `unchanged ${preset}\n`);
+    }
+    await runUpdate();
+    assert.equal(await readFile(manifestPath, 'utf8'), firstManifest);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+test('POSIX manifest maintenance synchronizes shared role bodies', async (t) => {
+  const shell = await findPosixShell();
+  if (!shell) return t.skip('POSIX shell is unavailable');
+  await checkRoleBodySynchronization(posixInstaller, [shell]);
+});
+
+test('PowerShell manifest maintenance synchronizes shared role bodies', { skip: process.platform !== 'win32' }, async () => {
+  await checkRoleBodySynchronization(powerInstaller, ['pwsh.exe', '-NoLogo', '-NoProfile', '-File']);
+});
+
 test('all thirteen gpt preset roles carry model routing fields', async () => {
   const expectedAllocation = {
     luna_medium: { model: 'gpt-6-luna', nativeEffort: 'medium' },
@@ -437,7 +508,7 @@ test('every review role answers the checklist attached to the dispatch', async (
 });
 
 test('design roles inherit the full toolset, share one body and the workflow routes interface changes to them', async () => {
-  const bodies = new Set();
+  const body = (await readFile(path.join(sharedBodiesRoot, 'design_high.md'), 'utf8')).replaceAll('\r\n', '\n');
   for (const preset of ['glm', 'gpt', 'ds']) {
     const presetText = await readFile(path.join(presetsRoot, preset, 'preset.toml'), 'utf8');
     const blocks = presetText.split(/\[\[(?:zcode|codex)\.role\]\]/).slice(1);
@@ -448,10 +519,8 @@ test('design roles inherit the full toolset, share one body and the workflow rou
     assert.match(block, /^readonly = false$/m, `design role must inherit the host toolset: ${preset}`);
     assert.doesNotMatch(block, /^tools = /m, `design role must not narrow its tools: ${preset}`);
     assert.match(field(block, 'skill_desc'), /界面渲染有新增或改动时使用，不参与通用取证、复审与写入的回退/, `design role route mismatch: ${preset}`);
-    bodies.add((await readFile(path.join(presetsRoot, preset, 'roles', 'design_high.md'), 'utf8')).replaceAll('\r\n', '\n'));
+    assert.equal((await readFile(path.join(presetsRoot, preset, 'roles', 'design_high.md'), 'utf8')).replaceAll('\r\n', '\n'), body, `stale design body: ${preset}`);
   }
-  assert.equal(bodies.size, 1, 'design role body must be identical across presets');
-  const body = [...bodies][0];
   for (const required of ['冷看', '任务走查', '清单走查', '没有截图时', 'Unverified', '不编辑项目文件']) {
     assert.ok(body.includes(required), `design role must state: ${required}`);
   }
