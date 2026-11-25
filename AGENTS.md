@@ -22,11 +22,11 @@
 
 - 两个宿主共用[全局行为规范](shared/global-instructions.md)、[平台文档](shared/docs/system/README.md)和 [skills](shared/skills/)。安装器将全局规范中的 `<GLOBAL_HOME>` 展开为目标 home。
 - 工作流路由、交接与验收见[工作流 skill](shared/skills/orchestrate-model-workflow/SKILL.md)。Codex 专属技能资产在 [skill-assets/](codex-global-config/skill-assets/)。
-- 角色数据在[预设目录](shared/roles/presets/)中维护。schema、模型绑定与宿主翻译见[角色规范](shared/roles/README.md)。宿主角色文件由安装器生成。
+- 角色数据在[预设目录](shared/roles/presets/)中维护。schema、模型绑定（含 `local:<key>_<label>` 多 provider 变体）与宿主翻译见[角色规范](shared/roles/README.md)。宿主角色文件由安装器生成。
 - 安装参数与合并行为以 [Windows 安装器](install.ps1)和 [macOS/Linux 安装器](install.sh)为准。
 
 ## 修改与验证
 
-1. 修改仓库中的权威来源，安装产物由安装器生成。内置预设的 `preset.toml` 或角色正文变更后，运行 `-UpdateRoleManifest` / `--update-role-manifest` 更新 [presets.sha256](shared/roles/presets.sha256)。新增模型方案只需增加预设并更新 manifest。本机模型绑定保存在仓库外。
+1. 修改仓库中的权威来源，安装产物由安装器生成。内置预设的 `preset.toml` 或角色正文变更后，运行 `-UpdateRoleManifest` / `--update-role-manifest` 更新 [presets.sha256](shared/roles/presets.sha256)。新增模型方案只需增加预设并更新 manifest；为使用 `local:` 的已有预设增加同一逻辑模型的第二个 ZCode provider，只需在仓库外的绑定文件加后缀键并重跑安装，不修改预设或 manifest。本机模型绑定保存在仓库外。
 2. 只有用户要求部署时，运行对应平台的 `install` 脚本并选择目标客户端与预设，核对已安装文件与渲染产物一致。
 3. 保留实际错误和未验证项；不得用未证明兼容的 fallback 隐藏问题。

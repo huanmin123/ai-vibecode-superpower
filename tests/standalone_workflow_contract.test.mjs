@@ -374,6 +374,17 @@ test('workflow preserves safe work and discloses missing review when no subagent
   assert.match(recovery, /独立验收未列为必需项[^。]*其余验收条件均满足[^。]*自查证据[^。]*限制[^。]*交付结果/);
 });
 
+test('workflow routes role variants by the current provider model', async () => {
+  const text = await readFile(skillBase, 'utf8');
+  const selection = markdownSection(text, '角色选择');
+  const recovery = markdownSection(text, '错误与恢复');
+  assert.match(selection, /角色清单行带有 `model: <providerId>\/<modelId>` 标注时/);
+  assert.match(selection, /只选择标注与当前模型完全一致的变体/);
+  assert.match(selection, /没有该标注的清单行不适用本规则/);
+  assert.doesNotMatch(selection, /You are powered by/);
+  assert.match(recovery, /仅在角色清单带 `model:` 标注时/);
+});
+
 test('workflow checks authorization before selecting protected execution', async () => {
   const text = await readFile(skillBase, 'utf8');
   const work = workflowStage(text, 'Work');
@@ -1291,10 +1302,291 @@ test('POSIX zcode installer resolves ds local model bindings', async (t) => {
       env: { ...process.env, HOME: home, ZCODE_HOME: posixHome(zcodeHome) },
     });
     assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.stdout, /rendered 4 roles\./);
+    assert.doesNotMatch(result.stdout, /provider variants/);
     for (const role of ['ds_4.1_flash_low', 'ds_4.1_flash_high', 'ds_4.1_flash_max']) {
       const text = await readFile(path.join(zcodeHome, 'agents', `${role}.md`), 'utf8');
       assert.match(text, /^model: "test-provider\/deepseek-v4\.1-flash"$/m, `resolved model missing: ${role}`);
     }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('POSIX zcode installer expands provider variants and routes skill by model', async (t) => {
+  const shell = await findPosixShell();
+  if (!shell) return t.skip('POSIX shell is unavailable');
+  const root = await mkdtemp(path.join(repository, '.model-variant-ds-'));
+  const home = path.join(root, 'home');
+  const zcodeHome = path.join(root, '.zcode');
+  const baseRoles = ['ds_4.1_flash_low', 'ds_4.1_flash_high', 'ds_4.1_flash_max', 'ds_4.1_flash_design_high'];
+  try {
+    await seedModelBindings(home, {
+      ds_flash: 'provider-a/deepseek-v4.1-flash',
+      ds_flash_b: 'provider-b/deepseek-v4.1-flash',
+    });
+    const result = await runResult(shell, ['install.sh', 'zcode', 'ds'], {
+      cwd: repository,
+      env: { ...process.env, HOME: home, ZCODE_HOME: posixHome(zcodeHome) },
+    });
+    assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.stdout, /rendered 8 roles\. \(provider variants: b\)/);
+    const agentsDir = path.join(zcodeHome, 'agents');
+    const expectedNames = [
+      ...baseRoles.map((role) => `${role}.md`),
+      ...baseRoles.map((role) => `${role}_b.md`),
+    ].sort();
+    assert.deepEqual((await readdir(agentsDir)).filter((name) => name.endsWith('.md') && !name.startsWith('.')).sort(), expectedNames);
+    const managed = await readFile(path.join(agentsDir, '.ai-vibecode-superpower.managed'), 'utf8');
+    assert.deepEqual(managed.trim().split('\n'), expectedNames);
+    for (const role of baseRoles) {
+      const text = await readFile(path.join(agentsDir, `${role}.md`), 'utf8');
+      assert.match(text, /^model: "provider-a\/deepseek-v4\.1-flash"$/m, `default model missing: ${role}`);
+      assert.match(text, /（model: provider-a\/deepseek-v4\.1-flash）/, `default description annotation missing: ${role}`);
+      const variant = await readFile(path.join(agentsDir, `${role}_b.md`), 'utf8');
+      assert.match(variant, /^model: "provider-b\/deepseek-v4\.1-flash"$/m, `variant model missing: ${role}_b`);
+      assert.match(variant, /（model: provider-b\/deepseek-v4\.1-flash）/, `variant description annotation missing: ${role}_b`);
+    }
+    assert.match(await readFile(path.join(agentsDir, 'ds_4.1_flash_low_b.md'), 'utf8'), /ds_4\.1_flash_high_b/);
+    assert.match(await readFile(path.join(agentsDir, 'ds_4.1_flash_high_b.md'), 'utf8'), /ds_4\.1_flash_max_b/);
+    const skill = await readFile(path.join(zcodeHome, 'skills', 'orchestrate-model-workflow', 'SKILL.md'), 'utf8');
+    assert.match(skill, /- `ds_4\.1_flash_low`：只读常规取证与实施后预审。（model: provider-a\/deepseek-v4\.1-flash）/);
+    assert.match(skill, /- `ds_4\.1_flash_low_b`：只读常规取证与实施后预审。（model: provider-b\/deepseek-v4\.1-flash）/);
+    assert.doesNotMatch(skill, /<!-- preset-roles -->/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('POSIX zcode installer expands glm variants across role model overrides', async (t) => {
+  const shell = await findPosixShell();
+  if (!shell) return t.skip('POSIX shell is unavailable');
+  const root = await mkdtemp(path.join(repository, '.model-variant-glm-'));
+  const home = path.join(root, 'home');
+  const zcodeHome = path.join(root, '.zcode');
+  try {
+    await seedModelBindings(home, {
+      glm_flash_b: 'provider-b/GLM-5.3-Flash',
+      glm_main_b: 'provider-b/GLM-5.4',
+    });
+    const result = await runResult(shell, ['install.sh', 'zcode', 'glm'], {
+      cwd: repository,
+      env: { ...process.env, HOME: home, ZCODE_HOME: posixHome(zcodeHome) },
+    });
+    assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+    const agentsDir = path.join(zcodeHome, 'agents');
+    assert.equal((await readdir(agentsDir)).filter((name) => name.endsWith('.md')).length, 12);
+    const highVariant = await readFile(path.join(agentsDir, 'glm_5.4_high_b.md'), 'utf8');
+    assert.match(highVariant, /^model: "provider-b\/GLM-5\.4"$/m);
+    assert.match(highVariant, /（model: provider-b\/GLM-5\.4）/);
+    const lowVariant = await readFile(path.join(agentsDir, 'glm_5.3_flash_low_b.md'), 'utf8');
+    assert.match(lowVariant, /glm_5\.3_flash_high_b/);
+    const managed = await readFile(path.join(agentsDir, '.ai-vibecode-superpower.managed'), 'utf8');
+    assert.match(managed, /glm_5\.4_high_b\.md/);
+    assert.match(managed, /glm_5\.3_flash_low_b\.md/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('POSIX zcode installer leaves fixed-model roles unannotated in variant installs', async (t) => {
+  const shell = await findPosixShell();
+  if (!shell) return t.skip('POSIX shell is unavailable');
+  const root = await mkdtemp(path.join(repository, '.model-variant-fixed-'));
+  const home = path.join(root, 'home');
+  const zcodeHome = path.join(root, '.zcode');
+  const presetDir = path.join(root, 'preset');
+  try {
+    await mkdir(path.join(presetDir, 'roles'), { recursive: true });
+    await seedModelBindings(home, { ds_flash_b: 'provider-b/deepseek-v4.1-flash' });
+    await writeFile(path.join(presetDir, 'preset.toml'), [
+      'description = "mixed fixed and local roles"',
+      '[zcode]',
+      'model = "local:ds_flash"',
+      '[[zcode.role]]',
+      'id = "fixed"',
+      'name = "fixed_role"',
+      'description = "fixed role"',
+      'effort = "basic"',
+      'model = "fixed-provider/fixed-model"',
+      '[[zcode.role]]',
+      'id = "worker"',
+      'name = "worker"',
+      'description = "worker"',
+      'effort = "basic"',
+      '',
+    ].join('\n'));
+    await writeFile(path.join(presetDir, 'roles', 'fixed.md'), 'fixed\n');
+    await writeFile(path.join(presetDir, 'roles', 'worker.md'), 'delegate to {{role:fixed}}\n');
+    const result = await runResult(shell, ['install.sh', 'zcode', presetDir], {
+      cwd: repository,
+      env: { ...process.env, HOME: home, ZCODE_HOME: posixHome(zcodeHome) },
+    });
+    assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+    const agentsDir = path.join(zcodeHome, 'agents');
+    assert.deepEqual((await readdir(agentsDir)).filter((name) => name.endsWith('.md')).sort(), [
+      'fixed_role.md', 'worker.md', 'worker_b.md',
+    ]);
+    const fixed = await readFile(path.join(agentsDir, 'fixed_role.md'), 'utf8');
+    assert.match(fixed, /^model: "fixed-provider\/fixed-model"$/m);
+    assert.match(fixed, /^description: "fixed role"$/m);
+    assert.doesNotMatch(fixed, /（model:/);
+    assert.match(await readFile(path.join(agentsDir, 'worker.md'), 'utf8'), /（model: test-deepseek\/deepseek-v4\.1-flash）/);
+    const workerVariant = await readFile(path.join(agentsDir, 'worker_b.md'), 'utf8');
+    assert.match(workerVariant, /（model: provider-b\/deepseek-v4\.1-flash）/);
+    assert.match(workerVariant, /delegate to fixed_role/);
+    assert.doesNotMatch(workerVariant, /fixed_role_b/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('POSIX zcode installer treats explicitly referenced suffix keys as exact bindings', async (t) => {
+  const shell = await findPosixShell();
+  if (!shell) return t.skip('POSIX shell is unavailable');
+  const root = await mkdtemp(path.join(repository, '.model-variant-exact-'));
+  const home = path.join(root, 'home');
+  const zcodeHome = path.join(root, '.zcode');
+  const presetDir = path.join(root, 'preset');
+  try {
+    await mkdir(path.join(presetDir, 'roles'), { recursive: true });
+    await seedModelBindings(home, {
+      ds_flash: 'provider-a/deepseek-v4.1-flash',
+      ds_flash_b: 'provider-b/deepseek-v4.1-flash',
+    });
+    await writeFile(path.join(presetDir, 'preset.toml'), [
+      'description = "exact suffix key"',
+      '[zcode]',
+      'model = "local:ds_flash"',
+      '[[zcode.role]]',
+      'id = "one"',
+      'name = "one"',
+      'description = "one"',
+      'effort = "basic"',
+      '[[zcode.role]]',
+      'id = "two"',
+      'name = "two"',
+      'description = "two"',
+      'effort = "basic"',
+      'model = "local:ds_flash_b"',
+      '',
+    ].join('\n'));
+    await writeFile(path.join(presetDir, 'roles', 'one.md'), 'one\n');
+    await writeFile(path.join(presetDir, 'roles', 'two.md'), 'two\n');
+    const result = await runResult(shell, ['install.sh', 'zcode', presetDir], {
+      cwd: repository,
+      env: { ...process.env, HOME: home, ZCODE_HOME: posixHome(zcodeHome) },
+    });
+    assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+    assert.match(result.stdout, /rendered 2 roles\.(?! \(provider variants:)/);
+    const agentsDir = path.join(zcodeHome, 'agents');
+    assert.deepEqual((await readdir(agentsDir)).filter((name) => name.endsWith('.md')).sort(), ['one.md', 'two.md']);
+    assert.match(await readFile(path.join(agentsDir, 'one.md'), 'utf8'), /^model: "provider-a\/deepseek-v4\.1-flash"$/m);
+    assert.match(await readFile(path.join(agentsDir, 'two.md'), 'utf8'), /^model: "provider-b\/deepseek-v4\.1-flash"$/m);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('POSIX zcode installer requires provider variants for every referenced key', async (t) => {
+  const shell = await findPosixShell();
+  if (!shell) return t.skip('POSIX shell is unavailable');
+  const root = await mkdtemp(path.join(repository, '.model-variant-incomplete-'));
+  const home = path.join(root, 'home');
+  const zcodeHome = path.join(root, '.zcode');
+  try {
+    await seedModelBindings(home, { glm_flash_b: 'provider-b/GLM-5.3-Flash' });
+    const result = await runResult(shell, ['install.sh', 'zcode', 'glm'], {
+      cwd: repository,
+      env: { ...process.env, HOME: home, ZCODE_HOME: posixHome(zcodeHome) },
+    });
+    assert.notEqual(result.code, 0, result.stdout);
+    const output = result.stdout + '\n' + result.stderr;
+    assert.match(output, /Variant labels must cover every referenced key/);
+    assert.match(output, /glm_main_b/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('POSIX zcode installer rejects invalid and duplicate provider variants', async (t) => {
+  const shell = await findPosixShell();
+  if (!shell) return t.skip('POSIX shell is unavailable');
+  for (const [label, overrides, expected] of [
+    ['label', { ds_flash_B: 'provider-b/deepseek-v4.1-flash' }, /Invalid model variant label.*ds_flash_B/],
+    ['duplicate', { ds_flash: 'same/provider-model', ds_flash_b: 'same/provider-model' }, /Duplicate model binding value/],
+  ]) {
+    const root = await mkdtemp(path.join(repository, `.model-variant-${label}-`));
+    const home = path.join(root, 'home');
+    const zcodeHome = path.join(root, '.zcode');
+    try {
+      await seedModelBindings(home, overrides);
+      const result = await runResult(shell, ['install.sh', 'zcode', 'ds'], {
+        cwd: repository,
+        env: { ...process.env, HOME: home, ZCODE_HOME: posixHome(zcodeHome) },
+      });
+      assert.notEqual(result.code, 0, result.stdout);
+      assert.match(result.stdout + '\n' + result.stderr, expected);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test('POSIX zcode installer preserves required role field validation with variants', async (t) => {
+  const shell = await findPosixShell();
+  if (!shell) return t.skip('POSIX shell is unavailable');
+  const root = await mkdtemp(path.join(repository, '.model-variant-schema-'));
+  const home = path.join(root, 'home');
+  const zcodeHome = path.join(root, '.zcode');
+  const presetDir = path.join(root, 'preset');
+  try {
+    await mkdir(path.join(presetDir, 'roles'), { recursive: true });
+    await seedModelBindings(home, { ds_flash_b: 'provider-b/deepseek-v4.1-flash' });
+    await writeFile(path.join(presetDir, 'preset.toml'), 'description = "missing role description"\n[zcode]\nmodel = "local:ds_flash"\n[[zcode.role]]\nid = "worker"\nname = "worker"\neffort = "basic"\n');
+    await writeFile(path.join(presetDir, 'roles', 'worker.md'), 'worker\n');
+    const result = await runResult(shell, ['install.sh', 'zcode', presetDir], {
+      cwd: repository,
+      env: { ...process.env, HOME: home, ZCODE_HOME: posixHome(zcodeHome) },
+    });
+    assert.notEqual(result.code, 0, result.stdout);
+    assert.match(result.stdout + '\n' + result.stderr, /missing description/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('POSIX zcode installer removes stale provider variants on reinstall', async (t) => {
+  const shell = await findPosixShell();
+  if (!shell) return t.skip('POSIX shell is unavailable');
+  const root = await mkdtemp(path.join(repository, '.model-variant-cleanup-'));
+  const home = path.join(root, 'home');
+  const zcodeHome = path.join(root, '.zcode');
+  const baseRoles = ['ds_4.1_flash_low', 'ds_4.1_flash_high', 'ds_4.1_flash_max', 'ds_4.1_flash_design_high'];
+  try {
+    await seedModelBindings(home, {
+      ds_flash: 'provider-a/deepseek-v4.1-flash',
+      ds_flash_b: 'provider-b/deepseek-v4.1-flash',
+      ds_flash_c: 'provider-c/deepseek-v4.1-flash',
+    });
+    const env = { ...process.env, HOME: home, ZCODE_HOME: posixHome(zcodeHome) };
+    assert.equal((await runResult(shell, ['install.sh', 'zcode', 'ds'], { cwd: repository, env })).code, 0);
+    assert.equal((await readdir(path.join(zcodeHome, 'agents'))).filter((name) => name.endsWith('.md')).length, 12);
+    await seedModelBindings(home, {
+      ds_flash: 'provider-a/deepseek-v4.1-flash',
+      ds_flash_b: 'provider-b/deepseek-v4.1-flash',
+    });
+    const result = await runResult(shell, ['install.sh', 'zcode', 'ds'], { cwd: repository, env });
+    assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+    const names = (await readdir(path.join(zcodeHome, 'agents'))).filter((name) => name.endsWith('.md')).sort();
+    assert.deepEqual(names, [
+      ...baseRoles.map((role) => `${role}.md`),
+      ...baseRoles.map((role) => `${role}_b.md`),
+    ].sort());
+    const managed = await readFile(path.join(zcodeHome, 'agents', '.ai-vibecode-superpower.managed'), 'utf8');
+    assert.ok(!managed.includes('_c.md'), 'stale variant must leave the managed list');
+    const backups = (await readdir(path.join(zcodeHome, 'backups'), { recursive: true })).map((entry) => entry.split(/[\\/]/).pop());
+    assert.ok(backups.includes('ds_4.1_flash_low_c.md'), 'stale variant must be backed up');
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1405,6 +1697,84 @@ test('PowerShell zcode installer resolves ds local model bindings', { skip: proc
       const text = await readFile(path.join(zcodeHome, 'agents', `${role}.md`), 'utf8');
       assert.ok(text.includes('model: "test-provider/deepseek-v4.1-flash"'), `resolved model missing: ${role}`);
     }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('PowerShell zcode installer expands and cleans provider variants', { skip: process.platform !== 'win32' }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'model-variant-powershell-'));
+  const home = path.join(root, 'profile');
+  const zcodeHome = path.join(root, '.zcode');
+  const baseRoles = ['ds_4.1_flash_low', 'ds_4.1_flash_high', 'ds_4.1_flash_max', 'ds_4.1_flash_design_high'];
+  try {
+    await seedModelBindings(home, {
+      ds_flash: 'provider-a/deepseek-v4.1-flash',
+      ds_flash_b: 'provider-b/deepseek-v4.1-flash',
+      ds_flash_c: 'provider-c/deepseek-v4.1-flash',
+    });
+    const env = { ...process.env, USERPROFILE: home, ZCODE_HOME: zcodeHome };
+    const args = ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'zcode', '-Preset', 'ds'];
+    const first = await runResult('pwsh.exe', args, { env });
+    assert.equal(first.code, 0, `${first.stdout}\n${first.stderr}`);
+    assert.match(first.stdout, /rendered 12 roles\. \(provider variants: b, c\)/);
+    const agentsDir = path.join(zcodeHome, 'agents');
+    assert.equal((await readdir(agentsDir)).filter((name) => name.endsWith('.md')).length, 12);
+    assert.match(await readFile(path.join(agentsDir, 'ds_4.1_flash_low_b.md'), 'utf8'), /^model: "provider-b\/deepseek-v4\.1-flash"$/m);
+    assert.match(await readFile(path.join(agentsDir, 'ds_4.1_flash_low_b.md'), 'utf8'), /ds_4\.1_flash_high_b/);
+    const skill = await readFile(path.join(zcodeHome, 'skills', 'orchestrate-model-workflow', 'SKILL.md'), 'utf8');
+    assert.match(skill, /- `ds_4\.1_flash_low_b`：只读常规取证与实施后预审。（model: provider-b\/deepseek-v4\.1-flash）/);
+    await seedModelBindings(home, {
+      ds_flash: 'provider-a/deepseek-v4.1-flash',
+      ds_flash_b: 'provider-b/deepseek-v4.1-flash',
+    });
+    const second = await runResult('pwsh.exe', args, { env });
+    assert.equal(second.code, 0, `${second.stdout}\n${second.stderr}`);
+    const names = (await readdir(agentsDir)).filter((name) => name.endsWith('.md')).sort();
+    assert.deepEqual(names, [
+      ...baseRoles.map((role) => `${role}.md`),
+      ...baseRoles.map((role) => `${role}_b.md`),
+    ].sort());
+    const backups = (await readdir(path.join(zcodeHome, 'backups'), { recursive: true })).map((entry) => entry.split(/[\\/]/).pop());
+    assert.ok(backups.includes('ds_4.1_flash_low_c.md'), 'stale variant must be backed up');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('PowerShell zcode installer requires provider variants for every referenced key', { skip: process.platform !== 'win32' }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'model-variant-powershell-incomplete-'));
+  const home = path.join(root, 'profile');
+  const zcodeHome = path.join(root, '.zcode');
+  try {
+    await seedModelBindings(home, { glm_flash_b: 'provider-b/GLM-5.3-Flash' });
+    const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'zcode', '-Preset', 'glm'], {
+      env: { ...process.env, USERPROFILE: home, ZCODE_HOME: zcodeHome },
+    });
+    assert.notEqual(result.code, 0, result.stdout);
+    const output = result.stdout + '\n' + result.stderr;
+    assert.match(output, /Variant labels must cover every referenced key/);
+    assert.match(output, /glm_main_b/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('PowerShell zcode installer preserves required role field validation with variants', { skip: process.platform !== 'win32' }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'model-variant-powershell-schema-'));
+  const home = path.join(root, 'profile');
+  const zcodeHome = path.join(root, '.zcode');
+  const presetDir = path.join(root, 'preset');
+  try {
+    await mkdir(path.join(presetDir, 'roles'), { recursive: true });
+    await seedModelBindings(home, { ds_flash_b: 'provider-b/deepseek-v4.1-flash' });
+    await writeFile(path.join(presetDir, 'preset.toml'), 'description = "missing role description"\n[zcode]\nmodel = "local:ds_flash"\n[[zcode.role]]\nid = "worker"\nname = "worker"\neffort = "basic"\n');
+    await writeFile(path.join(presetDir, 'roles', 'worker.md'), 'worker\n');
+    const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'zcode', '-Preset', presetDir], {
+      env: { ...process.env, USERPROFILE: home, ZCODE_HOME: zcodeHome },
+    });
+    assert.notEqual(result.code, 0, result.stdout);
+    assert.match(result.stdout + '\n' + result.stderr, /missing description/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

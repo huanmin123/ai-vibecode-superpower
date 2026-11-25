@@ -195,10 +195,16 @@ function Resolve-ModelBindings([hashtable]$Preset, [string]$HostSection, [string
         if ($null -ne $effective -and $effective.StartsWith('local:')) {
             $key = $effective.Substring(6)
             if ($key -cnotmatch '\A[A-Za-z][A-Za-z0-9_-]*\z') { throw "Invalid local model reference in [$HostSection]: $effective (expected local:<key>)" }
+            $role['localKey'] = $key
             if (-not $required.Contains($key)) { $required.Add($key) }
+        } else {
+            $role.Remove('localKey')
         }
     }
-    if ($required.Count -eq 0) { return }
+    $labels = [Collections.Generic.List[string]]::new()
+    $variantModels = [hashtable]::new([StringComparer]::Ordinal)
+    $resolution = @{ Labels = $labels; Models = $variantModels; File = $BindingsFile }
+    if ($required.Count -eq 0) { return $resolution }
     $requiredDisplay = $required -join ', '
     if ([string]::IsNullOrWhiteSpace($BindingsFile)) {
         throw "Cannot resolve model bindings file: USERPROFILE is not set (required keys in [$HostSection]: $requiredDisplay)"
@@ -209,15 +215,114 @@ function Resolve-ModelBindings([hashtable]$Preset, [string]$HostSection, [string
     $bindings = Read-ModelBindings $BindingsFile $HostSection
     $missing = @($required | Where-Object { -not $bindings.ContainsKey($_) })
     if ($missing.Count -gt 0) { throw "Missing model binding keys in ${BindingsFile} [$HostSection]: $($missing -join ', ')" }
+
+    if ($HostSection -ceq 'zcode') {
+        # 精确键是默认组；<key>_<label> 是额外 provider 组。显式引用的 key 优先，不当作更短 key 的变体。
+        $labelSet = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        $orderedKeys = @($bindings.Keys | Sort-Object { $bindings[$_].Line })
+        foreach ($bindingKey in $orderedKeys) {
+            $isRequired = $required.Contains($bindingKey)
+            foreach ($key in $required) {
+                if (-not $bindingKey.StartsWith($key + '_', [StringComparison]::Ordinal)) { continue }
+                $label = $bindingKey.Substring($key.Length + 1)
+                if ($label -cnotmatch '^[a-z0-9][a-z0-9_-]*$') {
+                    if (-not $isRequired) { throw "Invalid model variant label in ${BindingsFile}: $bindingKey (expected <key>_<lowercase-label>)" }
+                    continue
+                }
+                if (-not $isRequired) { [void]$labelSet.Add($label) }
+            }
+        }
+        if ($labelSet.Count -gt 0) {
+            $labelArray = [string[]]@($labelSet)
+            [Array]::Sort($labelArray, [StringComparer]::Ordinal)
+            $missingVariants = [Collections.Generic.List[string]]::new()
+            foreach ($label in $labelArray) {
+                foreach ($key in $required) {
+                    $variantKey = "${key}_${label}"
+                    if (-not $bindings.ContainsKey($variantKey)) { $missingVariants.Add($variantKey) }
+                }
+            }
+            if ($missingVariants.Count -gt 0) {
+                throw "Variant labels must cover every referenced key in ${BindingsFile} [$HostSection]; missing: $($missingVariants -join ', ')"
+            }
+            $seenValues = [hashtable]::new([StringComparer]::Ordinal)
+            foreach ($key in $required) {
+                $binding = $bindings[$key]
+                Assert-ModelBindingValue $HostSection ([string]$binding.Value) "${BindingsFile}:$($binding.Line) ($HostSection/$key)"
+                $seen = $key + "`t" + [string]$binding.Value
+                if ($seenValues.ContainsKey($seen)) { throw "Duplicate model binding value in ${BindingsFile} [$HostSection]" }
+                $seenValues[$seen] = $true
+            }
+            foreach ($label in $labelArray) {
+                foreach ($key in $required) {
+                    $variantKey = "${key}_${label}"
+                    $binding = $bindings[$variantKey]
+                    Assert-ModelBindingValue $HostSection ([string]$binding.Value) "${BindingsFile}:$($binding.Line) ($HostSection/$variantKey)"
+                    $seen = $key + "`t" + [string]$binding.Value
+                    if ($seenValues.ContainsKey($seen)) { throw "Duplicate model binding value in ${BindingsFile} [$HostSection]" }
+                    $seenValues[$seen] = $true
+                    $variantModels[$key + "`t" + $label] = [string]$binding.Value
+                }
+                $labels.Add($label)
+            }
+        }
+    }
+
     foreach ($role in $hostTable.roles) {
-        $effective = $null
-        if ($role.Contains('model')) { $effective = [string]$role.model }
-        elseif ($hostTable.Contains('model')) { $effective = [string]$hostTable.model }
-        if ($null -ne $effective -and $effective.StartsWith('local:')) {
-            $key = $effective.Substring(6)
+        if ($role.Contains('localKey')) {
+            $key = [string]$role.localKey
             $binding = $bindings[$key]
             Assert-ModelBindingValue $HostSection ([string]$binding.Value) "${BindingsFile}:$($binding.Line) ($HostSection/$key)"
             $role['model'] = [string]$binding.Value
+        }
+    }
+    return $resolution
+}
+
+function Expand-ModelVariants([hashtable]$Preset, [string]$HostSection, [hashtable]$Resolution) {
+    if ($Resolution.Labels.Count -eq 0) { return }
+    $hostTable = $Preset.sections[$HostSection]
+    $roles = $hostTable.roles
+    foreach ($role in $roles) {
+        if (-not $role.Contains('localKey')) { continue }
+        $model = if ($role.Contains('model')) { [string]$role.model } else { '' }
+        $origDescription = if ($role.Contains('description')) { [string]$role.description } else { '' }
+        $origSkillDesc = if ($role.Contains('skill_desc')) { [string]$role.skill_desc } else { $origDescription }
+        $role['__origDescription'] = $origDescription
+        $role['__origSkillDesc'] = $origSkillDesc
+        if ($role.Contains('description')) { $role['description'] = $origDescription + "（model: $model）" }
+        $role['skill_desc'] = $origSkillDesc + "（model: $model）"
+    }
+    $baseRoles = @($roles)
+    $variantIds = [hashtable]::new([StringComparer]::Ordinal)
+    foreach ($role in $baseRoles) {
+        if ($role.Contains('localKey')) {
+            $id = if ($role.Contains('id')) { [string]$role.id } else { '' }
+            if ($id.Length -gt 0) { $variantIds[$id] = $true }
+        }
+    }
+    foreach ($label in $Resolution.Labels) {
+        foreach ($role in $baseRoles) {
+            if (-not $role.Contains('localKey')) { continue }
+            $key = [string]$role.localKey
+            $lookup = $key + "`t" + $label
+            if (-not $Resolution.Models.ContainsKey($lookup)) {
+                throw "Missing model variant in $($Resolution.File) [$HostSection]: ${key}_${label}"
+            }
+            $model = [string]$Resolution.Models[$lookup]
+            $baseId = if ($role.Contains('id')) { [string]$role.id } else { '' }
+            $baseName = if ($role.Contains('name')) { [string]$role.name } else { '' }
+            if ($baseId.Length -eq 0 -or $baseName.Length -eq 0) { continue }
+            $clone = $role.Clone()
+            $clone['id'] = $baseId + '_' + $label
+            $clone['name'] = $baseName + '_' + $label
+            $clone['model'] = $model
+            $clone['body'] = if ($role.Contains('body')) { [string]$role.body } else { $baseId + '.md' }
+            $clone['refSuffix'] = '_' + $label
+            $clone['refVariantIds'] = $variantIds
+            if ($role.Contains('description')) { $clone['description'] = [string]$role.__origDescription + "（model: $model）" }
+            $clone['skill_desc'] = [string]$role.__origSkillDesc + "（model: $model）"
+            $roles.Add($clone)
         }
     }
 }
@@ -297,8 +402,11 @@ function Convert-PresetToHostFiles([hashtable]$Preset, [string]$Section, [string
         if (-not (Test-Path -LiteralPath $bodyFile -PathType Leaf)) { throw "Role body file missing: $bodyFile" }
         $body = [IO.File]::ReadAllText($bodyFile)
         $body = $body -replace "`r`n", "`n"
+        $refSuffix = if ($role.Contains('refSuffix')) { [string]$role.refSuffix } else { '' }
+        $refVariantIds = if ($role.Contains('refVariantIds')) { $role.refVariantIds } else { $null }
         $body = [regex]::Replace($body, '\{\{role:([A-Za-z0-9_-]+)\}\}', { param($match)
             $ref = $match.Groups[1].Value
+            if ($refSuffix.Length -gt 0 -and $null -ne $refVariantIds -and $refVariantIds.ContainsKey($ref)) { $ref = $ref + $refSuffix }
             if (-not $nameById.ContainsKey($ref)) { throw "Role [$Section]/$id references unknown role id: $ref" }
             $nameById[$ref]
         })
@@ -817,9 +925,11 @@ $isManagedPreset = $presetDir.TrimEnd('\').StartsWith($presetsRoot.TrimEnd('\') 
 if ($isManagedPreset) { Assert-PresetSources $presetsRoot ([IO.Path]::GetFileName($presetDir.TrimEnd('\'))) $presetManifest }
 $presetData = Read-Preset $presetFile
 if (-not $presetData.sections.Contains($profile.HostSection)) { throw "Preset '$presetName' has no [$($profile.HostSection)] section and cannot be installed for $label" }
-Resolve-ModelBindings $presetData $profile.HostSection $modelBindingsFile
+$modelResolution = Resolve-ModelBindings $presetData $profile.HostSection $modelBindingsFile
+Expand-ModelVariants $presetData $profile.HostSection $modelResolution
 $rendered = Convert-PresetToHostFiles $presetData $profile.HostSection $profile.RoleKind $presetDir
 $expectedRoleCount = $rendered.Count
+$variantLabelsNote = if ($modelResolution.Labels.Count -gt 0) { ' (provider variants: ' + ($modelResolution.Labels -join ', ') + ')' } else { '' }
 
 $profilePath = if ($env:USERPROFILE) { $env:USERPROFILE } else { [Environment]::GetFolderPath('UserProfile') }
 $homeEnvValue = [Environment]::GetEnvironmentVariable($profile.HomeEnv)
@@ -952,7 +1062,7 @@ try {
     else { Assert-TomlRoleStructure (Join-Path $homePath 'agents\ai-vibecode-superpower') $expectedRoleCount }
     foreach ($note in $rendered.Ignored) { Write-Warning "Preset field not consumed: $note" }
     Write-Host "$label configuration installed in: $homePath"
-    Write-Host "Preset '$presetName' rendered $expectedRoleCount roles."
+    Write-Host "Preset '$presetName' rendered $expectedRoleCount roles.$variantLabelsNote"
     Write-Host 'Standalone skills and managed agent roles installed.'
     Write-Host "Restart $label to load the new configuration and skills."
     Write-Host "Backup directory: $backup"

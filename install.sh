@@ -687,10 +687,14 @@ resolve_model_bindings() {
                         ''|[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz]*|*[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-]*)
                             die "Invalid local model reference in $preset_file: $RMB_EFFECTIVE (expected local:<key>)" ;;
                     esac
+                    pset "P_R${rmb_role}_LOCAL_KEY" "$rmb_key"
                     case " $rmb_required " in
                         *" $rmb_key "*) ;;
                         *) rmb_required="${rmb_required:+$rmb_required }$rmb_key" ;;
                     esac
+                    ;;
+                *)
+                    pset "P_R${rmb_role}_LOCAL_KEY" ""
                     ;;
             esac
         fi
@@ -717,6 +721,7 @@ resolve_model_bindings() {
     if [ -n "$rmb_missing" ]; then
         die "Missing model binding keys in $rmb_file [$rmb_host]: $rmb_missing"
     fi
+    collect_model_variants
     rmb_role=1
     while [ "$rmb_role" -le "$P_ROLES" ]; do
         if [ "$(pget "P_R${rmb_role}_HOST")" = "$rmb_host" ]; then
@@ -735,6 +740,234 @@ resolve_model_bindings() {
         fi
         rmb_role=$((rmb_role+1))
     done
+}
+
+# 枚举 ZCode 后缀 provider 变体：精确键是默认组；<key>_<label> 是额外组。
+# 只用绑定文件显式写出的键；label 必须小写；被引用的所有 key 必须有同一 label。
+collect_model_variants() {
+    cmv_labels_file=$render_dir/variant-labels.txt
+    cmv_rows_file=$render_dir/variants.tsv
+    : > "$cmv_labels_file"
+    : > "$cmv_rows_file"
+    [ "$rmb_host" = zcode ] || return 0
+    [ -n "$rmb_required" ] || return 0
+
+    cmv_labels=
+    cmv_i=1
+    while [ "$cmv_i" -le "${MB_COUNT:-0}" ]; do
+        cmv_key=$(pget "MB_KEY_${cmv_i}")
+        cmv_is_required=0
+        case " $rmb_required " in *" $cmv_key "*) cmv_is_required=1 ;; esac
+        cmv_role=1
+        while [ "$cmv_role" -le "$P_ROLES" ]; do
+            if [ "$(pget "P_R${cmv_role}_HOST")" = "$rmb_host" ]; then
+                cmv_base_key=$(pget "P_R${cmv_role}_LOCAL_KEY")
+                if [ -n "$cmv_base_key" ]; then
+                    case "$cmv_key" in
+                        "$cmv_base_key"_*)
+                            cmv_label=${cmv_key#"$cmv_base_key"_}
+                            case "$cmv_label" in
+                                ''|[!a-z0-9]*|*[!a-z0-9_-]*)
+                                    # 显式引用的 key 优先，不会被当作更短 key 的变体。
+                                    if [ "$cmv_is_required" = 0 ]; then
+                                        die "Invalid model variant label in $rmb_file: $cmv_key (expected <key>_<lowercase-label>)"
+                                    fi
+                                    ;;
+                                *)
+                                    if [ "$cmv_is_required" = 0 ]; then
+                                        case " $cmv_labels " in
+                                            *" $cmv_label "*) ;;
+                                            *) cmv_labels="${cmv_labels:+$cmv_labels }$cmv_label" ;;
+                                        esac
+                                    fi
+                                    ;;
+                            esac
+                            ;;
+                    esac
+                fi
+            fi
+            cmv_role=$((cmv_role+1))
+        done
+        cmv_i=$((cmv_i+1))
+    done
+    [ -n "$cmv_labels" ] || return 0
+
+    cmv_sorted=$(printf '%s\n' $cmv_labels | LC_ALL=C sort -u)
+    cmv_missing=
+    for cmv_label in $cmv_sorted; do
+        for cmv_key in $rmb_required; do
+            if ! mb_find_binding "${cmv_key}_${cmv_label}"; then
+                cmv_missing="${cmv_missing:+$cmv_missing, }${cmv_key}_${cmv_label}"
+            fi
+        done
+    done
+    if [ -n "$cmv_missing" ]; then
+        die "Variant labels must cover every referenced key in $rmb_file [$rmb_host]; missing: $cmv_missing"
+    fi
+
+    : > "$render_dir/all-bindings.tsv"
+    for cmv_key in $rmb_required; do
+        if ! mb_find_binding "$cmv_key"; then
+            die "Missing model binding key in $rmb_file [$rmb_host]: $cmv_key"
+        fi
+        validate_model_binding_value "$rmb_host" "$MB_FOUND_VALUE" "$rmb_file:$MB_FOUND_LINE ($rmb_host/$cmv_key)"
+        printf '%s\t%s\t%s\n' "$cmv_key" "" "$MB_FOUND_VALUE" >> "$render_dir/all-bindings.tsv"
+    done
+    for cmv_label in $cmv_sorted; do
+        for cmv_key in $rmb_required; do
+            if ! mb_find_binding "${cmv_key}_${cmv_label}"; then
+                die "Missing model binding key in $rmb_file [$rmb_host]: ${cmv_key}_${cmv_label}"
+            fi
+            validate_model_binding_value "$rmb_host" "$MB_FOUND_VALUE" "$rmb_file:$MB_FOUND_LINE ($rmb_host/${cmv_key}_${cmv_label})"
+            printf '%s\t%s\t%s\n' "$cmv_key" "$cmv_label" "$MB_FOUND_VALUE" >> "$cmv_rows_file"
+            printf '%s\t%s\t%s\n' "$cmv_key" "$cmv_label" "$MB_FOUND_VALUE" >> "$render_dir/all-bindings.tsv"
+        done
+        printf '%s\n' "$cmv_label" >> "$cmv_labels_file"
+    done
+    if ! LC_ALL=C awk -F '\t' '
+        { key = $1 "\t" $3; if (seen[key]++) { printf "Duplicate model binding for key %s: %s\n", $1, $3 > "/dev/stderr"; exit 1 } }
+    ' "$render_dir/all-bindings.tsv"; then
+        die "Duplicate model binding value in $rmb_file [$rmb_host]"
+    fi
+}
+
+# 按 label 复制 ZCode 角色并生成同 label 正文；单 provider 时保持原输出。
+expand_model_variants() {
+    vx_labels_file=$render_dir/variant-labels.txt
+    [ -s "$vx_labels_file" ] || return 0
+
+    vx_original_roles=$P_ROLES
+    vx_body_root=$render_dir/expanded/roles
+    render_body_root=$vx_body_root
+    mkdir -p "$vx_body_root" || die "Could not create variant body directory: $vx_body_root"
+
+    # 只标注参与 provider 变体的角色；固定 model 的角色保持无标注，按正常路由派发。
+    vx_role=1
+    while [ "$vx_role" -le "$vx_original_roles" ]; do
+        if [ "$(pget "P_R${vx_role}_HOST")" = "$host_section" ]; then
+            if [ -n "$(pget "P_R${vx_role}_LOCAL_KEY")" ]; then
+                vx_model=$(pget "P_R${vx_role}_model")
+                vx_orig_desc=$(pget "P_R${vx_role}_description")
+                pset "P_R${vx_role}_ORIG_DESCRIPTION" "$vx_orig_desc"
+                if [ "$(pget "P_R${vx_role}_SET_skill_desc")" = 1 ]; then
+                    vx_orig_skill=$(pget "P_R${vx_role}_skill_desc")
+                else
+                    vx_orig_skill=$vx_orig_desc
+                fi
+                pset "P_R${vx_role}_ORIG_SKILL_DESC" "$vx_orig_skill"
+                if [ "$(pget "P_R${vx_role}_SET_description")" = 1 ]; then
+                    pset "P_R${vx_role}_description" "${vx_orig_desc}（model: ${vx_model}）"
+                    pset "P_R${vx_role}_SET_description" 1
+                fi
+                pset "P_R${vx_role}_skill_desc" "${vx_orig_skill}（model: ${vx_model}）"
+                pset "P_R${vx_role}_SET_skill_desc" 1
+            fi
+        fi
+        vx_role=$((vx_role+1))
+    done
+
+    vx_variant_ids=
+    vx_role=1
+    while [ "$vx_role" -le "$vx_original_roles" ]; do
+        if [ "$(pget "P_R${vx_role}_HOST")" = "$host_section" ]; then
+            if [ -n "$(pget "P_R${vx_role}_LOCAL_KEY")" ]; then
+                vx_variant_ids="${vx_variant_ids:+$vx_variant_ids }$(pget "P_R${vx_role}_id")"
+            fi
+            if [ "$(pget "P_R${vx_role}_SET_body")" = 1 ]; then
+                vx_body_rel=$(pget "P_R${vx_role}_body")
+            else
+                vx_body_rel=$(pget "P_R${vx_role}_id").md
+            fi
+            case "$vx_body_rel" in
+                ''|/*) die "Invalid role body path in [$host_section]/$(pget "P_R${vx_role}_id"): $vx_body_rel" ;;
+            esac
+            case "/$vx_body_rel/" in
+                */../*) die "Invalid role body path in [$host_section]/$(pget "P_R${vx_role}_id"): $vx_body_rel" ;;
+            esac
+            vx_src=$preset_dir/roles/$vx_body_rel
+            [ -f "$vx_src" ] || die "Role body file missing: $vx_src"
+            vx_dst=$vx_body_root/$vx_body_rel
+            mkdir -p "$(dirname "$vx_dst")" || die "Could not create variant body directory: $(dirname "$vx_dst")"
+            cp "$vx_src" "$vx_dst" || die "Could not copy role body: $vx_src"
+        fi
+        vx_role=$((vx_role+1))
+    done
+
+    while IFS= read -r vx_label || [ -n "$vx_label" ]; do
+        [ -n "$vx_label" ] || continue
+        vx_role=1
+        while [ "$vx_role" -le "$vx_original_roles" ]; do
+            if [ "$(pget "P_R${vx_role}_HOST")" = "$host_section" ]; then
+                vx_key=$(pget "P_R${vx_role}_LOCAL_KEY")
+                if [ -n "$vx_key" ]; then
+                    vx_model=$(LC_ALL=C awk -F '\t' -v k="$vx_key" -v l="$vx_label" '$1 == k && $2 == l { print $3; exit }' "$render_dir/variants.tsv")
+                    [ -n "$vx_model" ] || die "Missing model variant in $rmb_file [$rmb_host]: ${vx_key}_${vx_label}"
+                    vx_new=$((P_ROLES+1))
+                    P_ROLES=$vx_new
+                    pset "P_R${vx_new}_HOST" "$host_section"
+                    for vx_field in id name description effort readonly model body color tools thoughtLevel model_reasoning_effort sandbox_mode skill_desc; do
+                        pset "P_R${vx_new}_SET_${vx_field}" "$(pget "P_R${vx_role}_SET_${vx_field}")"
+                        pset "P_R${vx_new}_ARR_${vx_field}" "$(pget "P_R${vx_role}_ARR_${vx_field}")"
+                        pset "P_R${vx_new}_${vx_field}" "$(pget "P_R${vx_role}_${vx_field}")"
+                        vx_n=$(pget "P_R${vx_role}_ARRN_${vx_field}")
+                        pset "P_R${vx_new}_ARRN_${vx_field}" "$vx_n"
+                        vx_j=1
+                        while [ "$vx_j" -le "${vx_n:-0}" ]; do
+                            pset "P_R${vx_new}_ELEM_${vx_field}_${vx_j}" "$(pget "P_R${vx_role}_ELEM_${vx_field}_${vx_j}")"
+                            vx_j=$((vx_j+1))
+                        done
+                    done
+                    pset "P_R${vx_new}_BOOL_readonly" "$(pget "P_R${vx_role}_BOOL_readonly")"
+                    pset "P_R${vx_new}_LOCAL_KEY" ""
+                    vx_base_id=$(pget "P_R${vx_role}_id")
+                    vx_base_name=$(pget "P_R${vx_role}_name")
+                    pset "P_R${vx_new}_id" "${vx_base_id}_${vx_label}"
+                    pset "P_R${vx_new}_name" "${vx_base_name}_${vx_label}"
+                    pset "P_R${vx_new}_model" "$vx_model"
+                    pset "P_R${vx_new}_SET_model" 1
+                    pset "P_R${vx_new}_body" "__variants/${vx_label}/${vx_base_id}.md"
+                    pset "P_R${vx_new}_SET_body" 1
+                    vx_orig_desc=$(pget "P_R${vx_role}_ORIG_DESCRIPTION")
+                    vx_orig_skill=$(pget "P_R${vx_role}_ORIG_SKILL_DESC")
+                    if [ "$(pget "P_R${vx_role}_SET_description")" = 1 ]; then
+                        pset "P_R${vx_new}_description" "${vx_orig_desc}（model: ${vx_model}）"
+                        pset "P_R${vx_new}_SET_description" 1
+                    fi
+                    pset "P_R${vx_new}_skill_desc" "${vx_orig_skill}（model: ${vx_model}）"
+                    pset "P_R${vx_new}_SET_skill_desc" 1
+                    if [ "$(pget "P_R${vx_role}_SET_body")" = 1 ]; then
+                        vx_body_rel=$(pget "P_R${vx_role}_body")
+                    else
+                        vx_body_rel="${vx_base_id}.md"
+                    fi
+                    vx_src=$preset_dir/roles/$vx_body_rel
+                    vx_dst=$vx_body_root/__variants/$vx_label/$vx_base_id.md
+                    mkdir -p "$(dirname "$vx_dst")" || die "Could not create variant body directory: $(dirname "$vx_dst")"
+                    if ! LC_ALL=C awk -v suffix="_${vx_label}" -v ids="$vx_variant_ids" '
+                        function has_variant(id, n, a, i) {
+                            n = split(ids, a, " ")
+                            for (i = 1; i <= n; i++) if (a[i] == id) return 1
+                            return 0
+                        }
+                        {
+                            line = $0
+                            out = ""
+                            while (match(line, /\{\{role:[A-Za-z0-9_-]+\}\}/)) {
+                                ref = substr(line, RSTART + 7, RLENGTH - 9)
+                                repl = "{{role:" ref (has_variant(ref) ? suffix : "") "}}"
+                                out = out substr(line, 1, RSTART - 1) repl
+                                line = substr(line, RSTART + RLENGTH)
+                            }
+                            print out line
+                        }
+                    ' "$vx_src" > "$vx_dst"; then
+                        die "Role [$host_section]/$vx_base_id variant body references could not be prepared: $vx_src"
+                    fi
+                fi
+            fi
+            vx_role=$((vx_role+1))
+        done
+    done < "$vx_labels_file"
 }
 
 # YAML/双引号安全转义：\ → \\、" → \"；结尾哨兵 X 由调用方剥掉，防止命令替换吞掉结尾换行。
@@ -883,7 +1116,7 @@ render_preset() {
         else
             r_body_rel="$r_id.md"
         fi
-        r_body_file=$preset_dir/roles/$r_body_rel
+        r_body_file=${render_body_root:-$preset_dir/roles}/$r_body_rel
         if [ ! -f "$r_body_file" ]; then
             die "Role body file missing: $r_body_file"
         fi
@@ -1262,6 +1495,7 @@ if [ "$(pget "P_HOST_${host_section}_SET")" != 1 ]; then
     die "Preset '$preset_display_name' has no [$host_section] section and cannot be installed for $client_label"
 fi
 resolve_model_bindings
+expand_model_variants
 render_preset
 role_count=$ROLE_COUNT_OUT
 
@@ -1772,7 +2006,12 @@ if [ -s "$render_dir/ignored.txt" ]; then
         printf '%s\n' "Warning: Preset field not consumed: $ignored_note" >&2
     done < "$render_dir/ignored.txt"
 fi
+variant_labels_note=
+if [ -s "$render_dir/variant-labels.txt" ]; then
+    variant_labels_note=$(LC_ALL=C awk 'BEGIN { first = 1 } { if (!first) printf ", "; printf "%s", $0; first = 0 }' "$render_dir/variant-labels.txt")
+    variant_labels_note=" (provider variants: $variant_labels_note)"
+fi
 completed=1
-printf '%s\n' "$client_label configuration installed in: $client_home" "Preset '$preset_display_name' rendered $role_count roles." 'Standalone skills and managed agent roles installed.' "Restart $client_label to load the new configuration and skills."
+printf '%s\n' "$client_label configuration installed in: $client_home" "Preset '$preset_display_name' rendered $role_count roles.${variant_labels_note}" 'Standalone skills and managed agent roles installed.' "Restart $client_label to load the new configuration and skills."
 if [ "$client" = zcode ]; then printf '%s\n' 'Unmanaged ZCode state (cli/, v2/, plugins, other skills and agents) was not modified.'; fi
 if [ -n "$backup_dir" ]; then printf '%s\n' "Backup directory: $backup_dir"; fi

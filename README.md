@@ -77,9 +77,11 @@ flowchart LR
 glm_flash = "<your-glm-plan>/GLM-5.3-Flash"
 glm_main  = "<your-glm-plan>/GLM-5.4"
 ds_flash  = "<your-deepseek-provider>/<your-deepseek-model>"
+# 可选：为同一逻辑模型增加第二个 provider 变体
+# ds_flash_b = "<another-provider>/<your-deepseek-model>"
 ```
 
-只需提供所选预设引用的键，缺失时安装会直接报错。外部预设写具体 `provider/model` 时仍兼容、不需要绑定文件；写 `local:` 时同样走绑定层。要用其他模型或混合模型（如 GPT 写码 + GLM 复审）时，复制一个预设目录并修改角色 `model` 即可，详见 [`shared/roles/README.md`](shared/roles/README.md)。预设也可以放在仓库外：固定目录为 `~/.ai-vibecode-superpower/presets/`，安装时选择 External 来源或传 `--external` / `-External`，不会修改仓库。安装交互会先选内置/外置来源，再选客户端，然后只列出支持该客户端的预设并标注默认值。
+只需提供所选预设引用的精确键，缺失时安装会直接报错；后缀键是可选的额外 provider 组。切换已安装的后缀组不需要重装；新增一个 provider 时，在绑定文件加后缀键并重跑安装器。外部预设写具体 `provider/model` 时仍兼容、不需要绑定文件；写 `local:` 时同样走绑定层。角色结构本身不同（而不是同一结构换 provider）时，才复制预设目录并修改角色 `model`，详见 [`shared/roles/README.md`](shared/roles/README.md)。预设也可以放在仓库外：固定目录为 `~/.ai-vibecode-superpower/presets/`，安装时选择 External 来源或传 `--external` / `-External`，不会修改仓库。安装交互会先选内置/外置来源，再选客户端，然后只列出支持该客户端的预设并标注默认值。
 
 ### Codex
 
@@ -125,8 +127,8 @@ goals = true
 ### ZCode
 
 - 可在 ZCode 会话运行时安装；安装成功后重启 ZCode，使 `~/.zcode/agents` 的角色和 `~/.zcode/skills` 生效。
-- 角色由所选预设（默认 `glm`，6 个角色）翻译生成；命名公式与各角色职责见 [`shared/roles/README.md`](shared/roles/README.md) 与预设文件。换个预设，同一套安装流程生成不同的角色集合。
-- 内置 `glm` / `ds` 的 `model` 为 `local:` 键；先按“角色预设”创建绑定文件，再运行安装器。缺失绑定会安装失败；外部预设写具体 `provider/model` 时不需要绑定文件。
+- 角色由所选预设（默认 `glm`，6 个逻辑角色）翻译生成；提供后缀 provider 键时，每个 label 生成一组变体，本地绑定角色按组倍增。命名公式与各角色职责见 [`shared/roles/README.md`](shared/roles/README.md) 与预设文件。换个预设，同一套安装流程生成不同的角色集合。
+- 内置 `glm` / `ds` 的 `model` 为 `local:` 键；先按“角色预设”创建绑定文件，再运行安装器。缺失精确键会安装失败；后缀键可选，用于同一逻辑模型的多个 provider。外部预设写具体 `provider/model` 时不需要绑定文件。
 - 安装器只管理 `AGENTS.md`、`docs/`、按所选预设渲染后平铺安装到 `~/.zcode/agents/` 顶层的 md agent（新版 ZCode 宿主只扫描该目录顶层，子目录不参与发现）和受管的 skills；不修改 ZCode 的 `cli/`、`v2/`、插件缓存或用户自建的其它 skills/agents。已有的 `AGENTS.md` 会先备份再替换。
 
 **Windows（PowerShell 7）**，在仓库根目录运行：
