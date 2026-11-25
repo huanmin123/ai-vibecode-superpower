@@ -436,7 +436,7 @@ test('design roles inherit the full toolset, share one body and the workflow rou
     assert.equal(field(block, 'effort'), 'deep', `design role effort mismatch: ${preset}`);
     assert.match(block, /^readonly = false$/m, `design role must inherit the host toolset: ${preset}`);
     assert.doesNotMatch(block, /^tools = /m, `design role must not narrow its tools: ${preset}`);
-    assert.match(field(block, 'skill_desc'), /界面渲染有新增或改动时使用/, `design role route mismatch: ${preset}`);
+    assert.match(field(block, 'skill_desc'), /界面渲染有新增或改动时使用，不参与通用取证、复审与写入的回退/, `design role route mismatch: ${preset}`);
     bodies.add((await readFile(path.join(presetsRoot, preset, 'roles', 'design_high.md'), 'utf8')).replaceAll('\r\n', '\n'));
   }
   assert.equal(bodies.size, 1, 'design role body must be identical across presets');
@@ -449,6 +449,8 @@ test('design roles inherit the full toolset, share one body and the workflow rou
   const skill = await readFile(skillBase, 'utf8');
   assert.match(workflowStage(skill, 'Plan'), /界面渲染有新增或改动时[^。]*承担界面设计定案职责的角色/);
   assert.match(workflowStage(skill, 'Critique'), /界面渲染有新增或改动时[^。]*承担设计复审职责的角色[^。]*截图/);
+  assert.match(workflowStage(skill, 'Critique'), /派发时说明走查环境与可操作的数据范围/, 'design review dispatch must state the walkthrough environment');
+  assert.match(workflowStage(skill, 'Critique'), /设计复审也不替代通用复审/, 'design review must not replace the general review');
 });
 
 test('glm preset keeps six roles with model routing and cross references', async () => {
@@ -711,6 +713,9 @@ test('PowerShell installer deploys the standalone skill into an isolated nested 
     const roleFiles = (await readdir(roleDir)).filter((name) => name.endsWith('.toml')).sort();
     assert.equal(roleFiles.length, 13);
     assert.match(await readFile(path.join(roleDir, 'gpt_6.1_terra_high.toml'), 'utf8'), /^name = "gpt_6\.1_terra_high"$/m);
+    const designRole = await readFile(path.join(roleDir, 'gpt_6.2_sol_design_high.toml'), 'utf8');
+    assert.match(designRole, /^sandbox_mode = "danger-full-access"$/m);
+    assert.match(designRole, /^model_reasoning_effort = "high"$/m);
     await assertSharedSkillsDeployed(path.join(codexHome, 'skills'), 'codex');
     const agents = await readFile(path.join(codexHome, 'AGENTS.md'), 'utf8');
     assert.doesNotMatch(agents, /<CODEX_HOME>|\$CODEX_HOME/);
@@ -1070,11 +1075,16 @@ test('PowerShell zcode installer composes shared and zcode sources and leaves un
       'glm_5.3_flash_max': testModelBindings.glm_flash,
       'glm_5.4_high': testModelBindings.glm_main,
       'glm_5.4_max': testModelBindings.glm_main,
+      'glm_5.4_design_high': testModelBindings.glm_main,
     };
     for (const [role, expected] of Object.entries(glmModels)) {
       const text = await readFile(path.join(zcodeHome, 'agents', `${role}.md`), 'utf8');
       assert.ok(text.includes(`model: "${expected}"`), `resolved model mismatch: ${role}`);
     }
+    const designAgent = await readFile(path.join(zcodeHome, 'agents', 'glm_5.4_design_high.md'), 'utf8');
+    assert.match(designAgent, /^color: pink$/m);
+    assert.match(designAgent, /^thoughtLevel: high$/m);
+    assert.doesNotMatch(designAgent, /^tools:/m);
     const docsReadme = await readFile(path.join(zcodeHome, 'docs', 'README.md'), 'utf8');
     assert.match(docsReadme, /ZCode 全局参考文档/);
     const systemDocs = await readdir(path.join(zcodeHome, 'docs', 'system'));
@@ -1135,6 +1145,7 @@ test('POSIX zcode installer deploys a fresh home without codex configuration', a
       'glm_5.3_flash_max': testModelBindings.glm_flash,
       'glm_5.4_high': testModelBindings.glm_main,
       'glm_5.4_max': testModelBindings.glm_main,
+      'glm_5.4_design_high': testModelBindings.glm_main,
     };
     for (const [role, expected] of Object.entries(glmModels)) {
       const text = await readFile(path.join(zcodeHome, 'agents', `${role}.md`), 'utf8');
@@ -1308,6 +1319,7 @@ test('POSIX zcode installer resolves glm local bindings including role overrides
       'glm_5.3_flash_max': testModelBindings.glm_flash,
       'glm_5.4_high': testModelBindings.glm_main,
       'glm_5.4_max': testModelBindings.glm_main,
+      'glm_5.4_design_high': testModelBindings.glm_main,
     };
     for (const [role, expected] of Object.entries(expectedModels)) {
       const text = await readFile(path.join(zcodeHome, 'agents', `${role}.md`), 'utf8');

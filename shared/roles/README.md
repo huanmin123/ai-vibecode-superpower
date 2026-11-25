@@ -78,8 +78,8 @@ readonly = true
 - 绑定 key 缺失或绑定值非法时安装失败；缺失 key 一次性汇总列出，不静默回退。
 - `id` 必填，预设内唯一，格式 `^[A-Za-z0-9][A-Za-z0-9_-]*$`；`name` 必填，格式 `^[A-Za-z0-9][A-Za-z0-9._-]*$`（首字符必须字母或数字，防止路径歧义），在同一预设内也必须唯一。
 - `effort`（取值 `basic` | `deep` | `max`）与宿主原生档位字段（ZCode `thoughtLevel`、Codex `model_reasoning_effort`）必须提供其一；两者同时提供时报错，不允许歧义配置。
-- `readonly` 缺省视为 `true`，必须为标量布尔；`true` 表达角色不得写入的职责约束，不证明宿主工具层已禁止写入；`false` 只表示继承宿主全工具，是否写入由角色正文的职责决定。
-- `tools` 必须是数组形式（如 `[Read, Bash]`）；标量形式报错，`readonly = false` 的角色显式写 `tools` 也报错（写入角色继承宿主全工具）。
+- `readonly` 缺省视为 `true`，必须为标量布尔；`true` 表达角色不得写入的职责约束，不证明宿主工具层已禁止写入；`false` 表示继承宿主全工具（Codex 侧并据此推导 `sandbox_mode` 缺省值），是否写入由角色正文的职责决定。
+- `tools` 必须是数组形式（如 `[Read, Bash]`）；标量形式报错，`readonly = false` 的角色显式写 `tools` 也报错（这类角色继承宿主全工具，是否写入由正文决定）。
 - 命名公式 `模型_版本_类型_思考档`（如 `glm_5.3_flash_low`）是推荐约定，不是机制；翻译器不推导名字。
 
 ## 本地模型绑定
@@ -178,12 +178,12 @@ sandbox_mode = "<readonly 推导或显式值>"
 
 - `presets/glm/`：ZCode 6 角色（与既有 `glm_5.3_flash_*` / `glm_5.4_*` 行为等价，另含界面设计角色），`model = local:glm_flash`，`review_high` / `review_max` / `design_high` 使用 `local:glm_main`；需在绑定文件 `[zcode]` 提供 `glm_flash` 与 `glm_main`。不含 `[codex]` 小节——在 Codex 使用 GLM 需要用户先在 Codex 配置对应 model provider，属用户环境配置，仓库不代设。
 - `presets/gpt/`：Codex 13 角色（luna / terra / sol / astra 四档分工），不含 `[zcode]` 小节。
-- `presets/ds/`：ZCode 4 角色，`model = local:ds_flash`（2 读 2 写；复审/终审由 `ds_4.1_flash_max` 兼任，复审派发必须是全新实例且不信任写入实例的自述）；需在绑定文件 `[zcode]` 提供 `ds_flash`。不含 `[codex]` 小节，理由同 glm。
+- `presets/ds/`：ZCode 4 角色，`model = local:ds_flash`（2 读 1 写，另含界面设计角色；复审/终审由 `ds_4.1_flash_max` 兼任，复审派发必须是全新实例且不信任写入实例的自述）；需在绑定文件 `[zcode]` 提供 `ds_flash`。不含 `[codex]` 小节，理由同 glm。
 - 新增模型方案：新增 `presets/<name>/` 并运行 `-UpdateRoleManifest`，不改代码；使用 `local:` 时在预设描述中注明所需 key。
 
 ### 界面设计角色
 
-三个内置预设都含界面设计角色 `design_high`，正文相同。它在界面实现前给出设计定案（本屏意图、取舍、组件映射、主任务脚本），实现后按“冷看 → 任务走查 → 清单走查”的顺序以实际截图复审；只报告问题和修改方向，不修改界面和项目代码，修改由主代理安排写入角色完成。它设为 `readonly = false` 以继承宿主全工具，可以自行编写走查脚本、截图并使用宿主提供的浏览器控制；不写项目代码是正文约束的职责边界，不是工具隔离，Codex 侧对应生成 `sandbox_mode = "danger-full-access"`。走查在本地或已授权的测试环境里不受操作限制，可以增删改测试数据；走查脚本和截图这类取证产物放在临时目录，不进源码或测试目录。项目成文规范优先于角色自带的缺陷清单，`visual-aesthetics` 提供方法与评审维度。glm 绑定 `local:glm_main`，ds 继承 `local:ds_flash`，gpt 绑定 `gpt-6.2-sol`。工作流在 Plan 与 Critique 阶段按职责措辞路由，不写角色名。
+三个内置预设都含界面设计角色 `design_high`，正文相同。它在界面实现前给出设计定案（本屏意图、取舍、组件映射、主任务脚本），实现后按“冷看 → 任务走查 → 清单走查”的顺序以实际截图复审；只报告问题和修改方向，不修改界面和项目代码，修改由主代理安排写入角色完成。它设为 `readonly = false` 以继承宿主全工具，可以自行编写走查脚本、截图并使用宿主提供的浏览器控制；不写项目代码是正文约束的职责边界，不是工具隔离；Codex 侧对应生成 `sandbox_mode = "danger-full-access"`，该字段不覆盖父会话设置（见上文 Codex toml role 的 `sandbox_mode` 缺省规则）。走查在本地或已授权的测试环境里不受操作限制，可以增删改测试数据；走查脚本和截图这类取证产物放在临时目录，不进源码或测试目录。项目成文规范优先于角色自带的缺陷清单，`visual-aesthetics` 提供方法与评审维度。glm 绑定 `local:glm_main`，ds 继承 `local:ds_flash`，gpt 绑定 `gpt-6.2-sol`。工作流在 Plan 与 Critique 阶段按职责措辞路由，不写角色名。
 
 ## 运行时路由约定
 

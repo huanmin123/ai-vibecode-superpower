@@ -1,7 +1,7 @@
-# DeepSeek 预设：单模型 deepseek-v4.1-flash 拆 3 档，另设界面设计角色（共 2 读 2 写，复审/终审由写入档承担）。
+# DeepSeek 预设：单模型 deepseek-v4.1-flash 拆 3 档（2 读 1 写），另设界面设计角色（readonly = false 以继承宿主全工具，不写项目代码）；复审/终审由写入档承担。
 # ZCode 的 providerId/modelId 随账号与自建 provider 变化，预设只写 local:<key>；
 # 安装时从 ~/.ai-vibecode-superpower/model-bindings.toml 的 [zcode] 小节解析实际值。
-description = "DeepSeek 预设：ZCode 4 角色绑定 deepseek-v4.1-flash（2 读 2 写，审核由 max 档承担）。"
+description = "DeepSeek 预设：ZCode 4 角色绑定 deepseek-v4.1-flash（2 读 1 写，另含界面设计角色；审核由 max 档承担）。"
 
 [zcode]
 model = "local:ds_flash"
