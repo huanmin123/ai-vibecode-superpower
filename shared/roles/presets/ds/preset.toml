@@ -1,7 +1,7 @@
-# DeepSeek 预设：单模型 deepseek-v4.1-flash 拆 3 档（2 读 1 写，复审/终审由写入档承担）。
+# DeepSeek 预设：单模型 deepseek-v4.1-flash 拆 3 档，另设界面设计角色（共 2 读 2 写，复审/终审由写入档承担）。
 # ZCode 的 providerId/modelId 随账号与自建 provider 变化，预设只写 local:<key>；
 # 安装时从 ~/.ai-vibecode-superpower/model-bindings.toml 的 [zcode] 小节解析实际值。
-description = "DeepSeek 预设：ZCode 3 角色绑定 deepseek-v4.1-flash（2 读 1 写，审核由 max 档承担）。"
+description = "DeepSeek 预设：ZCode 4 角色绑定 deepseek-v4.1-flash（2 读 2 写，审核由 max 档承担）。"
 
 [zcode]
 model = "local:ds_flash"
@@ -30,3 +30,12 @@ skill_desc = "写代码主力与复审终审（同一角色按委派类型二选
 effort = "max"
 readonly = false
 color = "green"
+
+[[zcode.role]]
+id = "design_high"
+name = "ds_4.1_flash_design_high"
+description = "界面设计定案与设计复审：实现前定结构、组件与主任务脚本，实现后按用户走查和缺陷清单看截图复审；只报告问题和修改方向，不改界面和项目代码。"
+skill_desc = "界面设计定案与设计复审；界面渲染有新增或改动时使用，不参与通用取证、复审与写入的回退。"
+effort = "deep"
+readonly = false
+color = "pink"

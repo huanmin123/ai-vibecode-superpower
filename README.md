@@ -125,7 +125,7 @@ goals = true
 ### ZCode
 
 - 可在 ZCode 会话运行时安装；安装成功后重启 ZCode，使 `~/.zcode/agents` 的角色和 `~/.zcode/skills` 生效。
-- 角色由所选预设（默认 `glm`，5 个角色）翻译生成；命名公式与各角色职责见 [`shared/roles/README.md`](shared/roles/README.md) 与预设文件。换个预设，同一套安装流程生成不同的角色集合。
+- 角色由所选预设（默认 `glm`，6 个角色）翻译生成；命名公式与各角色职责见 [`shared/roles/README.md`](shared/roles/README.md) 与预设文件。换个预设，同一套安装流程生成不同的角色集合。
 - 内置 `glm` / `ds` 的 `model` 为 `local:` 键；先按“角色预设”创建绑定文件，再运行安装器。缺失绑定会安装失败；外部预设写具体 `provider/model` 时不需要绑定文件。
 - 安装器只管理 `AGENTS.md`、`docs/`、按所选预设渲染后平铺安装到 `~/.zcode/agents/` 顶层的 md agent（新版 ZCode 宿主只扫描该目录顶层，子目录不参与发现）和受管的 skills；不修改 ZCode 的 `cli/`、`v2/`、插件缓存或用户自建的其它 skills/agents。已有的 `AGENTS.md` 会先备份再替换。
 

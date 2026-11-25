@@ -21,7 +21,7 @@ const ripgrepDoc = path.join(repository, 'shared', 'docs', 'system', 'rg.md');
 const zcodeDocsReadme = path.join(repository, 'zcode-global-config', 'docs', 'README.md');
 const zcodePosixInstaller = path.join(repository, 'install.sh');
 const zcodeRoleNames = [
-  'glm_5.3_flash_low', 'glm_5.3_flash_high', 'glm_5.3_flash_max', 'glm_5.4_high', 'glm_5.4_max'
+  'glm_5.3_flash_low', 'glm_5.3_flash_high', 'glm_5.3_flash_max', 'glm_5.4_high', 'glm_5.4_max', 'glm_5.4_design_high'
 ];
 const bracketedTables = [
   '[hooks.state."browser@openai-bundled:plugin.json#hooks[0]:stop:0:0"]',
@@ -250,7 +250,7 @@ test('terra write tiers delegate simple writes to the luna_max leaf executor', a
 
 test('the preset manifest covers every source file of all built-in presets', async () => {
   const lines = (await readFile(presetManifest, 'utf8')).trim().split(/\r?\n/);
-  assert.equal(lines.length, 23);
+  assert.equal(lines.length, 26);
   const entries = new Map(lines.map((line) => {
     const match = line.trim().match(/^([0-9a-f]{64}) {2}([^\s]+)$/);
     assert.ok(match, `invalid preset manifest line: ${line}`);
@@ -267,7 +267,7 @@ test('the preset manifest covers every source file of all built-in presets', asy
   }
 });
 
-test('all twelve gpt preset roles carry model routing fields', async () => {
+test('all thirteen gpt preset roles carry model routing fields', async () => {
   const expectedAllocation = {
     luna_medium: { model: 'gpt-6-luna', nativeEffort: 'medium' },
     luna_high: { model: 'gpt-6-luna', effort: 'deep' },
@@ -280,17 +280,18 @@ test('all twelve gpt preset roles carry model routing fields', async () => {
     sol_xhigh: { model: 'gpt-6.2-sol', nativeEffort: 'xhigh' },
     astra_high: { model: 'gpt-6.2-astra', effort: 'deep' },
     astra_xhigh: { model: 'gpt-6.2-astra', nativeEffort: 'xhigh' },
-    astra_max: { model: 'gpt-6.2-astra', effort: 'max' }
+    astra_max: { model: 'gpt-6.2-astra', effort: 'max' },
+    design_high: { model: 'gpt-6.2-sol', effort: 'deep', readonly: 'false', name: 'gpt_6.2_sol_design_high' }
   };
   const text = await readFile(path.join(presetsRoot, 'gpt', 'preset.toml'), 'utf8');
   const blocks = text.split(/\[\[codex\.role\]\]/).slice(1);
-  assert.equal(blocks.length, 12);
+  assert.equal(blocks.length, 13);
   const field = (block, key) => block.match(new RegExp(`^${key} = "([^"]*)"`, 'm'))?.[1];
   for (const [id, expected] of Object.entries(expectedAllocation)) {
     const block = blocks.find((candidate) => field(candidate, 'id') === id);
     assert.ok(block, `missing gpt preset role: ${id}`);
     const tier = id.slice(id.lastIndexOf('_') + 1);
-    const expectedName = `${expected.model.replaceAll('-', '_')}_${tier}`;
+    const expectedName = expected.name ?? `${expected.model.replaceAll('-', '_')}_${tier}`;
     assert.equal(field(block, 'name'), expectedName, `name mismatch: ${id}`);
     assert.ok(field(block, 'description'), `description missing: ${id}`);
     assert.equal(field(block, 'model'), expected.model, `model mismatch: ${id}`);
@@ -424,18 +425,45 @@ test('every review role answers the checklist attached to the dispatch', async (
   }
 });
 
-test('glm preset keeps five roles with model routing and cross references', async () => {
+test('design roles inherit the full toolset, share one body and the workflow routes interface changes to them', async () => {
+  const bodies = new Set();
+  for (const preset of ['glm', 'gpt', 'ds']) {
+    const presetText = await readFile(path.join(presetsRoot, preset, 'preset.toml'), 'utf8');
+    const blocks = presetText.split(/\[\[(?:zcode|codex)\.role\]\]/).slice(1);
+    const field = (block, key) => block.match(new RegExp(`^${key} = "([^"]*)"`, 'm'))?.[1];
+    const block = blocks.find((candidate) => field(candidate, 'id') === 'design_high');
+    assert.ok(block, `missing design role: ${preset}`);
+    assert.equal(field(block, 'effort'), 'deep', `design role effort mismatch: ${preset}`);
+    assert.match(block, /^readonly = false$/m, `design role must inherit the host toolset: ${preset}`);
+    assert.doesNotMatch(block, /^tools = /m, `design role must not narrow its tools: ${preset}`);
+    assert.match(field(block, 'skill_desc'), /界面渲染有新增或改动时使用/, `design role route mismatch: ${preset}`);
+    bodies.add((await readFile(path.join(presetsRoot, preset, 'roles', 'design_high.md'), 'utf8')).replaceAll('\r\n', '\n'));
+  }
+  assert.equal(bodies.size, 1, 'design role body must be identical across presets');
+  const body = [...bodies][0];
+  for (const required of ['冷看', '任务走查', '清单走查', '没有截图时', 'Unverified', '不编辑项目文件']) {
+    assert.ok(body.includes(required), `design role must state: ${required}`);
+  }
+  assert.ok(body.indexOf('冷看') < body.indexOf('任务走查') && body.indexOf('任务走查') < body.indexOf('清单走查'),
+    'design review must run cold look, task walkthrough, then checklist in order');
+  const skill = await readFile(skillBase, 'utf8');
+  assert.match(workflowStage(skill, 'Plan'), /界面渲染有新增或改动时[^。]*承担界面设计定案职责的角色/);
+  assert.match(workflowStage(skill, 'Critique'), /界面渲染有新增或改动时[^。]*承担设计复审职责的角色[^。]*截图/);
+});
+
+test('glm preset keeps six roles with model routing and cross references', async () => {
   const presetText = await readFile(path.join(presetsRoot, 'glm', 'preset.toml'), 'utf8');
-  assert.match(presetText, /\[zcode\]\nmodel = "local:glm_flash"/);
+  assert.match(presetText, /\[zcode\]\r?\nmodel = "local:glm_flash"/);
   const expectedAllocation = {
     flash_low: { name: 'glm_5.3_flash_low', model: null, effort: 'basic', readonly: true },
     flash_high: { name: 'glm_5.3_flash_high', model: null, effort: 'deep', readonly: true },
     flash_max: { name: 'glm_5.3_flash_max', model: null, effort: 'max', readonly: false },
     review_high: { name: 'glm_5.4_high', model: 'local:glm_main', effort: 'deep', readonly: true },
-    review_max: { name: 'glm_5.4_max', model: 'local:glm_main', effort: 'max', readonly: true }
+    review_max: { name: 'glm_5.4_max', model: 'local:glm_main', effort: 'max', readonly: true },
+    design_high: { name: 'glm_5.4_design_high', model: 'local:glm_main', effort: 'deep', readonly: false }
   };
   const blocks = presetText.split(/\[\[zcode\.role\]\]/).slice(1);
-  assert.equal(blocks.length, 5);
+  assert.equal(blocks.length, 6);
   const field = (block, key) => block.match(new RegExp(`^${key} = "([^"]*)"`, 'm'))?.[1];
   for (const [id, expected] of Object.entries(expectedAllocation)) {
     const block = blocks.find((candidate) => field(candidate, 'id') === id);
@@ -454,16 +482,17 @@ test('glm preset keeps five roles with model routing and cross references', asyn
   assert.match(reviewHighBody, /升级到 `\{\{role:review_max\}\}` 复审/);
 });
 
-test('ds preset keeps three roles on a single model with max carrying review duty', async () => {
+test('ds preset keeps four roles on a single model with max carrying review duty', async () => {
   const presetText = await readFile(path.join(presetsRoot, 'ds', 'preset.toml'), 'utf8');
-  assert.match(presetText, /\[zcode\]\nmodel = "local:ds_flash"/);
+  assert.match(presetText, /\[zcode\]\r?\nmodel = "local:ds_flash"/);
   const expectedAllocation = {
     flash_low: { name: 'ds_4.1_flash_low', effort: 'basic', readonly: true },
     flash_high: { name: 'ds_4.1_flash_high', effort: 'deep', readonly: true },
-    flash_max: { name: 'ds_4.1_flash_max', effort: 'max', readonly: false }
+    flash_max: { name: 'ds_4.1_flash_max', effort: 'max', readonly: false },
+    design_high: { name: 'ds_4.1_flash_design_high', effort: 'deep', readonly: false }
   };
   const blocks = presetText.split(/\[\[zcode\.role\]\]/).slice(1);
-  assert.equal(blocks.length, 3);
+  assert.equal(blocks.length, 4);
   const field = (block, key) => block.match(new RegExp(`^${key} = "([^"]*)"`, 'm'))?.[1];
   for (const [id, expected] of Object.entries(expectedAllocation)) {
     const block = blocks.find((candidate) => field(candidate, 'id') === id);
@@ -680,7 +709,7 @@ test('PowerShell installer deploys the standalone skill into an isolated nested 
     );
     const roleDir = path.join(codexHome, 'agents', 'ai-vibecode-superpower');
     const roleFiles = (await readdir(roleDir)).filter((name) => name.endsWith('.toml')).sort();
-    assert.equal(roleFiles.length, 12);
+    assert.equal(roleFiles.length, 13);
     assert.match(await readFile(path.join(roleDir, 'gpt_6.1_terra_high.toml'), 'utf8'), /^name = "gpt_6\.1_terra_high"$/m);
     await assertSharedSkillsDeployed(path.join(codexHome, 'skills'), 'codex');
     const agents = await readFile(path.join(codexHome, 'AGENTS.md'), 'utf8');
@@ -1034,7 +1063,7 @@ test('PowerShell zcode installer composes shared and zcode sources and leaves un
     );
     const agentFiles = (await readdir(path.join(zcodeHome, 'agents'))).filter((name) => name.endsWith('.md'));
     for (const role of zcodeRoleNames) assert.ok(agentFiles.includes(`${role}.md`), `missing flat agent: ${role}.md`);
-    assert.equal(agentFiles.filter((name) => zcodeRoleNames.includes(name.slice(0, -3))).length, 5);
+    assert.equal(agentFiles.filter((name) => zcodeRoleNames.includes(name.slice(0, -3))).length, 6);
     const glmModels = {
       'glm_5.3_flash_low': testModelBindings.glm_flash,
       'glm_5.3_flash_high': testModelBindings.glm_flash,
@@ -1099,7 +1128,7 @@ test('POSIX zcode installer deploys a fresh home without codex configuration', a
     await assertSharedSkillsDeployed(path.join(zcodeHome, 'skills'), 'zcode');
     const agentFiles = (await readdir(path.join(zcodeHome, 'agents'))).filter((name) => name.endsWith('.md'));
     for (const role of zcodeRoleNames) assert.ok(agentFiles.includes(`${role}.md`), `missing flat agent: ${role}.md`);
-    assert.equal(agentFiles.filter((name) => zcodeRoleNames.includes(name.slice(0, -3))).length, 5);
+    assert.equal(agentFiles.filter((name) => zcodeRoleNames.includes(name.slice(0, -3))).length, 6);
     const glmModels = {
       'glm_5.3_flash_low': testModelBindings.glm_flash,
       'glm_5.3_flash_high': testModelBindings.glm_flash,
@@ -1631,7 +1660,7 @@ test('POSIX codex installer installs an external preset from the fixed root', as
     assert.match(result.stdout, /External preset directory:/);
     const roleDir = path.join(codexHome, 'agents', 'ai-vibecode-superpower');
     const roleFiles = (await readdir(roleDir)).filter((name) => name.endsWith('.toml'));
-    assert.equal(roleFiles.length, 12);
+    assert.equal(roleFiles.length, 13);
     const firstRole = await readFile(path.join(roleDir, 'gpt_6_luna_high.toml'), 'utf8');
     assert.match(firstRole, /^model = "gpt-6-luna"$/m);
   } finally {

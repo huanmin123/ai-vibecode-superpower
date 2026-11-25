@@ -1,7 +1,7 @@
-# GLM 预设：ZCode 5 角色绑定 GLM-5.3-Flash / GLM-5.4。
+# GLM 预设：ZCode 6 角色绑定 GLM-5.3-Flash / GLM-5.4。
 # ZCode 的 providerId/modelId 随账号与套餐变化，预设只写 local:<key>；
 # 安装时从 ~/.ai-vibecode-superpower/model-bindings.toml 的 [zcode] 小节解析实际值。
-description = "GLM 预设：ZCode 5 角色绑定 GLM-5.3-Flash / GLM-5.4。"
+description = "GLM 预设：ZCode 6 角色绑定 GLM-5.3-Flash / GLM-5.4。"
 
 [zcode]
 model = "local:glm_flash"
@@ -46,4 +46,14 @@ description = "只读最高强度独立复审与最终升级验收（终审）�
 effort = "max"
 readonly = true
 color = "orange"
+model = "local:glm_main"
+
+[[zcode.role]]
+id = "design_high"
+name = "glm_5.4_design_high"
+description = "界面设计定案与设计复审：实现前定结构、组件与主任务脚本，实现后按用户走查和缺陷清单看截图复审；只报告问题和修改方向，不改界面和项目代码。"
+skill_desc = "界面设计定案与设计复审；界面渲染有新增或改动时使用，不参与通用取证、复审与写入的回退。"
+effort = "deep"
+readonly = false
+color = "pink"
 model = "local:glm_main"
