@@ -201,7 +201,7 @@ while [ "$#" -gt 0 ]; do
             shift
             ;;
         -h|--help)
-            printf '%s\n' 'Usage: sh install.sh [--external] <codex|zcode> [preset]'
+            printf '%s\n' 'Usage: sh install.sh [--external] <codex|zcode|antigravity> [preset]'
             exit 0
             ;;
         --)
@@ -265,23 +265,25 @@ fi
 client=$positional_client
 if [ -z "$client" ]; then
     if [ -t 0 ]; then
-        printf '%s\n' 'Select the client to install:' '  1) Codex' '  2) ZCode'
+        printf '%s\n' 'Select the client to install:' '  1) Codex' '  2) ZCode' '  3) Antigravity'
         printf 'Enter number or name (q to quit): '
         read -r client_choice
         case "$client_choice" in
             1|[cC]odex) client=codex ;;
             2|[zZ][cC]ode) client=zcode ;;
+            3|[aA]ntigravity) client=antigravity ;;
             [qQ]) exit 0 ;;
             *) die "Invalid selection: $client_choice" ;;
         esac
     else
-        die 'No client specified. Usage: sh install.sh <codex|zcode> [preset] [--external]'
+        die 'No client specified. Usage: sh install.sh <codex|zcode|antigravity> [preset] [--external]'
     fi
 fi
 case "$client" in
     [cC]odex) client=codex ;;
     [zZ][cC]ode) client=zcode ;;
-    *) die "Unknown client: $client (supported: codex|zcode)" ;;
+    [aA]ntigravity) client=antigravity ;;
+    *) die "Unknown client: $client (supported: codex|zcode|antigravity)" ;;
 esac
 
 # ---- 按客户端装配来源 ----
@@ -289,6 +291,9 @@ esac
 source_system_docs=$script_dir/shared/docs/system
 shared_skills=$script_dir/shared/skills
 has_config=0
+instructions_rel=AGENTS.md
+source_plugin_manifest=
+source_plugin_assets=
 case "$client" in
     codex)
         client_label=Codex
@@ -316,6 +321,22 @@ case "$client" in
         placeholder=ZCODE_HOME
         source_instructions=$script_dir/shared/global-instructions.md
         source_docs=$script_dir/zcode-global-config/docs
+        skill_assets_dir=
+        skill_specs='agent-toolchain:shared project-doc-planner:shared visual-aesthetics:shared deep-dive-review:shared orchestrate-model-workflow:shared test-strategy:shared security-audit:shared'
+        ;;
+    antigravity)
+        client_label=Antigravity
+        home_env=ANTIGRAVITY_HOME
+        default_home=.gemini/config/plugins/ai-vibecode-superpower
+        role_kind=agy-md
+        host_section=antigravity
+        default_preset=antigravity
+        placeholder=ANTIGRAVITY_HOME
+        instructions_rel=rules/AGENTS.md
+        source_instructions=$script_dir/shared/global-instructions.md
+        source_docs=$script_dir/antigravity-global-config/docs
+        source_plugin_manifest=$script_dir/antigravity-global-config/plugin.json
+        source_plugin_assets=$script_dir/antigravity-global-config/assets
         skill_assets_dir=
         skill_specs='agent-toolchain:shared project-doc-planner:shared visual-aesthetics:shared deep-dive-review:shared orchestrate-model-workflow:shared test-strategy:shared security-audit:shared'
         ;;
@@ -359,8 +380,8 @@ parse_preset_header() {
                         sub(/\.role$/, "", header)
                         print header; print 1; exit 0
                     }
-                    # [<host>]：必须单括号形式且 host ∈ {zcode, codex}（ps1:111 白名单）
-                    if (header != "zcode" && header != "codex") exit 1
+                    # [<host>]：必须单括号形式且 host ∈ {zcode, codex, antigravity}（ps1 白名单）
+                    if (header != "zcode" && header != "codex" && header != "antigravity") exit 1
                     print header; print 0; exit 0
                 }
             }
@@ -476,8 +497,10 @@ read_preset() {
     P_ROLES=0
     P_HOST_zcode_SET=0
     P_HOST_codex_SET=0
+    P_HOST_antigravity_SET=0
     P_HOST_zcode_MODEL_SET=0
     P_HOST_codex_MODEL_SET=0
+    P_HOST_antigravity_MODEL_SET=0
     rp_host=
     rp_role=
 
@@ -624,8 +647,10 @@ read_model_bindings() {
     MB_COUNT=0
     MB_SEEN_KEYS_zcode=
     MB_SEEN_KEYS_codex=
+    MB_SEEN_KEYS_antigravity=
     mb_seen_table_zcode=0
     mb_seen_table_codex=0
+    mb_seen_table_antigravity=0
     mb_section=
     mb_lineno=0
     mb_bom=$(printf '\357\273\277')
@@ -656,13 +681,20 @@ read_model_bindings() {
                         mb_seen_table_codex=1
                         mb_section=codex
                         ;;
+                    '[antigravity]')
+                        if [ "$mb_seen_table_antigravity" = 1 ]; then
+                            die "Repeated model binding table in $mb_file:$mb_lineno: $mb_trim"
+                        fi
+                        mb_seen_table_antigravity=1
+                        mb_section=antigravity
+                        ;;
                     *) die "Unsupported model binding table in $mb_file:$mb_lineno: $mb_trim" ;;
                 esac
                 continue
                 ;;
         esac
         if [ -z "$mb_section" ]; then
-            die "Unsupported model binding line in $mb_file:$mb_lineno: $mb_trim (expected [zcode] or [codex] section first)"
+            die "Unsupported model binding line in $mb_file:$mb_lineno: $mb_trim (expected [zcode], [codex], or [antigravity] section first)"
         fi
         case "$mb_trim" in
             *=*) mb_key=$(trim_ws "${mb_trim%%=*}"); mb_value_raw=${mb_trim#*=} ;;
@@ -1117,33 +1149,53 @@ render_preset() {
         if [ -z "$(trim_ws "$r_model")" ]; then
             die "Role [$host_section]/$r_id has no model (neither role model nor [$host_section] model)"
         fi
-        if [ "$role_kind" = md ]; then
-            r_effort_key=thoughtLevel
-            r_foreign_key=model_reasoning_effort
-        else
-            r_effort_key=model_reasoning_effort
-            r_foreign_key=thoughtLevel
-        fi
-        if [ "$(pget "P_R${rridx}_SET_${r_effort_key}")" = 1 ]; then
+        if [ "$role_kind" = agy-md ]; then
             if [ "$(pget "P_R${rridx}_SET_effort")" = 1 ]; then
-                die "Role [$host_section]/$r_id must not set both effort and $r_effort_key"
+                r_effort_value=$(pget "P_R${rridx}_effort")
+                case "$r_effort_value" in
+                    basic) r_effort=low ;;
+                    deep) r_effort=high ;;
+                    max) r_effort=max ;;
+                    *) die "Role [$host_section]/${r_id}: unsupported effort $r_effort_value" ;;
+                esac
+            else
+                die "Role [$host_section]/$r_id requires effort (basic, deep, or max)"
             fi
-            r_effort=$(pget "P_R${rridx}_${r_effort_key}")
-        elif [ "$(pget "P_R${rridx}_SET_effort")" = 1 ]; then
-            r_effort_value=$(pget "P_R${rridx}_effort")
-            case "$r_effort_value" in
-                basic) r_effort=low ;;
-                deep) r_effort=high ;;
-                max) r_effort=max ;;
-                *) die "Role [$host_section]/${r_id}: unsupported effort $r_effort_value" ;;
-            esac
-        elif [ "$(pget "P_R${rridx}_SET_${r_foreign_key}")" = 1 ]; then
-            die "Role [$host_section]/$r_id sets only $r_foreign_key which is not consumed by this host; set effort or $r_effort_key"
+            if [ "$(pget "P_R${rridx}_SET_thoughtLevel")" = 1 ]; then
+                printf '%s\n' "[$host_section]/${r_id}: thoughtLevel is not consumed by Antigravity" >> "$render_dir/ignored.txt"
+            fi
+            if [ "$(pget "P_R${rridx}_SET_model_reasoning_effort")" = 1 ]; then
+                printf '%s\n' "[$host_section]/${r_id}: model_reasoning_effort is not consumed by Antigravity" >> "$render_dir/ignored.txt"
+            fi
         else
-            die "Role [$host_section]/$r_id has neither effort nor $r_effort_key"
-        fi
-        if [ "$(pget "P_R${rridx}_SET_${r_foreign_key}")" = 1 ]; then
-            printf '%s\n' "[$host_section]/${r_id}: $r_foreign_key is not consumed by this host" >> "$render_dir/ignored.txt"
+            if [ "$role_kind" = md ]; then
+                r_effort_key=thoughtLevel
+                r_foreign_key=model_reasoning_effort
+            else
+                r_effort_key=model_reasoning_effort
+                r_foreign_key=thoughtLevel
+            fi
+            if [ "$(pget "P_R${rridx}_SET_${r_effort_key}")" = 1 ]; then
+                if [ "$(pget "P_R${rridx}_SET_effort")" = 1 ]; then
+                    die "Role [$host_section]/$r_id must not set both effort and $r_effort_key"
+                fi
+                r_effort=$(pget "P_R${rridx}_${r_effort_key}")
+            elif [ "$(pget "P_R${rridx}_SET_effort")" = 1 ]; then
+                r_effort_value=$(pget "P_R${rridx}_effort")
+                case "$r_effort_value" in
+                    basic) r_effort=low ;;
+                    deep) r_effort=high ;;
+                    max) r_effort=max ;;
+                    *) die "Role [$host_section]/${r_id}: unsupported effort $r_effort_value" ;;
+                esac
+            elif [ "$(pget "P_R${rridx}_SET_${r_foreign_key}")" = 1 ]; then
+                die "Role [$host_section]/$r_id sets only $r_foreign_key which is not consumed by this host; set effort or $r_effort_key"
+            else
+                die "Role [$host_section]/$r_id has neither effort nor $r_effort_key"
+            fi
+            if [ "$(pget "P_R${rridx}_SET_${r_foreign_key}")" = 1 ]; then
+                printf '%s\n' "[$host_section]/${r_id}: $r_foreign_key is not consumed by this host" >> "$render_dir/ignored.txt"
+            fi
         fi
         if [ "$(pget "P_R${rridx}_SET_body")" = 1 ]; then
             r_body_rel=$(pget "P_R${rridx}_body")
@@ -1190,7 +1242,55 @@ render_preset() {
             }
         ' "$render_dir/body.pre.$rridx" > "$render_dir/body.$rridx"
 
-        if [ "$role_kind" = md ]; then
+        if [ "$role_kind" = agy-md ]; then
+            case "$r_model" in
+                flash_lite|flash|inherit|pro) ;;
+                *) die "Role [$host_section]/${r_id}: unsupported Antigravity model tier $r_model (expected flash_lite, flash, inherit, or pro)" ;;
+            esac
+            if [ "$(pget "P_R${rridx}_SET_sandbox_mode")" = 1 ]; then
+                printf '%s\n' "[$host_section]/${r_id}: sandbox_mode is not consumed by Antigravity" >> "$render_dir/ignored.txt"
+            fi
+            if [ "$(pget "P_R${rridx}_SET_color")" = 1 ]; then
+                printf '%s\n' "[$host_section]/${r_id}: color is not consumed by Antigravity" >> "$render_dir/ignored.txt"
+            fi
+            if [ "$r_readonly" = true ]; then
+                if [ "$(pget "P_R${rridx}_SET_tools")" = 1 ]; then
+                    if [ "$(pget "P_R${rridx}_ARR_tools")" != 1 ]; then
+                        die "Role [$host_section]/$r_id: tools must be an array"
+                    fi
+                    r_tools=
+                    r_tool_count=$(pget "P_R${rridx}_ARRN_tools")
+                    rt_j=1
+                    while [ "$rt_j" -le "$r_tool_count" ]; do
+                        rt_elem=$(pget "P_R${rridx}_ELEM_tools_${rt_j}")
+                        if [ -z "$r_tools" ]; then r_tools=$rt_elem; else r_tools="$r_tools, $rt_elem"; fi
+                        rt_j=$((rt_j+1))
+                    done
+                else
+                    r_tools='read_file, run_command, manage_task, search_web'
+                fi
+            else
+                if [ "$(pget "P_R${rridx}_SET_tools")" = 1 ]; then
+                    die "Role [$host_section]/$r_id must not set tools for a writable role"
+                fi
+                r_tools='read_file, edit_file, write_file, run_command, manage_task, search_web'
+            fi
+            r_agy_desc="${r_desc}（invoke_subagent Model: ${r_model}）"
+            r_desc_q=$(escape_quoted_apply "$r_agy_desc"); r_desc_q=${r_desc_q%X}
+            {
+                printf '%s\n' '---'
+                printf 'name: %s\n' "$r_name"
+                printf 'description: "%s"\n' "$r_desc_q"
+                printf '%s\n' 'subagent: true'
+                printf '%s\n' 'mainAgent: false'
+                printf 'tools: [%s]\n' "$r_tools"
+                printf '%s\n' '---'
+                printf '%s\n' ''
+                cat "$render_dir/body.$rridx"
+                printf '\n'
+            } > "$rd_files/$r_name.md"
+            printf '%s\n' "$r_name.md" >> "$render_dir/names.txt"
+        elif [ "$role_kind" = md ]; then
             if [ "$(pget "P_R${rridx}_SET_sandbox_mode")" = 1 ]; then
                 printf '%s\n' "[$host_section]/${r_id}: sandbox_mode is not consumed by ZCode" >> "$render_dir/ignored.txt"
             fi
@@ -1281,6 +1381,9 @@ render_preset() {
         else
             r_route_desc=$r_desc
         fi
+        if [ "$role_kind" = agy-md ]; then
+            r_route_desc="${r_route_desc}（invoke_subagent Model: ${r_model}）"
+        fi
         printf -- '- `%s`：%s\n' "$r_name" "$r_route_desc" >> "$render_dir/route.txt"
     done < "$render_dir/section-roles.txt"
 
@@ -1336,6 +1439,59 @@ assert_agent_structure() {
     for as_file in "$as_dir"/*.md; do
         if [ -f "$as_file" ]; then
             assert_agent_file "$as_file" || die "Invalid agent profile: ${as_file##*/}"
+        fi
+    done
+}
+
+assert_agy_agent_file() {
+    af_path=$1
+    af_name=${af_path##*/}
+    af_stem=${af_name%.md}
+    awk -v stem="$af_stem" -v fname="$af_name" '
+        { sub(/\r$/, "") }
+        NR == 1 { if ($0 != "---") { err = 1; exit 1 } in_fm = 1; next }
+        in_fm && $0 == "---" { terminated = 1; exit 0 }
+        in_fm && /^(name|description|subagent|mainAgent|tools)[[:space:]]*:/ {
+            key = $0
+            sub(/[[:space:]]*:.*$/, "", key)
+            seen[key]++
+            value = $0
+            sub(/^[^:]*:[[:space:]]*/, "", value)
+            gsub(/^"|"$/, "", value)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+            if (key == "name") fm_name = value
+            if (key == "subagent") fm_subagent = value
+            if (key == "mainAgent") fm_mainagent = value
+        }
+        END {
+            if (err) { printf "Agent frontmatter missing: %s\n", fname > "/dev/stderr"; exit 1 }
+            if (!terminated) { printf "Agent frontmatter unterminated: %s\n", fname > "/dev/stderr"; exit 1 }
+            bad = 0
+            split("name description subagent mainAgent tools", required, " ")
+            for (i = 1; i <= 5; i++) {
+                if (seen[required[i]] != 1) { printf "Agent field missing or repeated: %s/%s\n", fname, required[i] > "/dev/stderr"; bad = 1 }
+            }
+            if (fm_name != stem) { printf "Agent name mismatch: %s/%s\n", fname, fm_name > "/dev/stderr"; bad = 1 }
+            if (fm_subagent != "true") { printf "Agent subagent must be true: %s\n", fname > "/dev/stderr"; bad = 1 }
+            if (fm_mainagent != "false") { printf "Agent mainAgent must be false: %s\n", fname > "/dev/stderr"; bad = 1 }
+            exit bad ? 1 : 0
+        }
+    ' "$af_path"
+}
+
+assert_agy_agent_structure() {
+    as_dir=$1
+    as_expected=$2
+    as_count=0
+    for as_file in "$as_dir"/*.md; do
+        if [ -f "$as_file" ]; then as_count=$((as_count+1)); fi
+    done
+    if [ "$as_count" -ne "$as_expected" ]; then
+        die "Expected $as_expected managed agent files, found $as_count: $as_dir"
+    fi
+    for as_file in "$as_dir"/*.md; do
+        if [ -f "$as_file" ]; then
+            assert_agy_agent_file "$as_file" || die "Invalid agent profile: ${as_file##*/}"
         fi
     done
 }
@@ -1536,6 +1692,8 @@ role_count=$ROLE_COUNT_OUT
 required_sources="$presets_root $source_docs $source_system_docs $source_instructions $shared_skills"
 [ -n "$skill_assets_dir" ] && required_sources="$required_sources $skill_assets_dir"
 [ "$has_config" -eq 1 ] && required_sources="$required_sources $source_config $source_model_provider_settings"
+[ -n "$source_plugin_manifest" ] && required_sources="$required_sources $source_plugin_manifest"
+[ -n "$source_plugin_assets" ] && required_sources="$required_sources $source_plugin_assets"
 for source_path in $required_sources; do
     [ -e "$source_path" ] || die "Missing source: $source_path"
 done
@@ -1763,12 +1921,20 @@ merge_managed_config() {
 }
 
 for target_spec in \
-    "$client_home/AGENTS.md file" \
+    "$client_home/$instructions_rel file" \
     "$client_home/docs directory"; do
     target_path=${target_spec% *}
     target_kind=${target_spec##* }
     assert_target "$target_path" "$target_kind" || die "Unsafe install target: $target_path"
 done
+if [ -n "$source_plugin_manifest" ]; then
+    assert_target "$client_home/plugin.json" file || die "Unsafe install target: $client_home/plugin.json"
+fi
+if [ -n "$source_plugin_assets" ]; then
+    assert_target "$client_home/assets" directory || die "Unsafe install target: $client_home/assets"
+fi
+is_flat_md=0
+if [ "$role_kind" = md ] || [ "$role_kind" = agy-md ]; then is_flat_md=1; fi
 if [ "$role_kind" = toml ]; then
     assert_target "$client_home/agents/ai-vibecode-superpower" directory || die "Unsafe install target: $client_home/agents/ai-vibecode-superpower"
 else
@@ -1790,7 +1956,7 @@ fi
 managed_list=$client_home/agents/.ai-vibecode-superpower.managed
 stale_list=$render_dir/stale.txt
 : > "$stale_list"
-if [ "$role_kind" = md ] && [ -f "$managed_list" ]; then
+if [ "$is_flat_md" -eq 1 ] && [ -f "$managed_list" ]; then
     while IFS= read -r managed_name || [ -n "$managed_name" ]; do
         managed_name=$(trim_ws "$managed_name")
         [ -n "$managed_name" ] || continue
@@ -1800,7 +1966,7 @@ if [ "$role_kind" = md ] && [ -f "$managed_list" ]; then
         printf '%s\n' "$managed_name" >> "$stale_list"
     done < "$managed_list"
 fi
-if [ "$role_kind" = md ]; then
+if [ "$is_flat_md" -eq 1 ]; then
     while IFS= read -r stale_name || [ -n "$stale_name" ]; do
         [ -n "$stale_name" ] || continue
         assert_target "$client_home/agents/$stale_name" file || die "Unsafe install target: $client_home/agents/$stale_name"
@@ -1815,6 +1981,9 @@ done
 for container_path in "$client_home/agents" "$client_home/skills" "$client_home/backups"; do
     assert_directory_container "$container_path" || die "Unsafe managed container: $container_path"
 done
+if [ "$instructions_rel" != "AGENTS.md" ]; then
+    assert_directory_container "$(dirname -- "$client_home/$instructions_rel")" || die "Unsafe managed container: $(dirname -- "$client_home/$instructions_rel")"
+fi
 
 has_state() {
     state_name=$1
@@ -1880,10 +2049,19 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 mkdir -p -- "$stage_dir/state/backed-up" "$stage_dir/state/install-started" "$stage_dir/agents" "$stage_dir/skills"
-cp "$source_instructions" "$stage_dir/AGENTS.md"
+mkdir -p -- "$(dirname -- "$stage_dir/$instructions_rel")"
+cp "$source_instructions" "$stage_dir/$instructions_rel"
 cp -R "$source_docs" "$stage_dir/docs"
 cp -R "$source_system_docs" "$stage_dir/docs/system"
-if [ "$role_kind" = md ]; then
+if [ -n "$source_plugin_manifest" ]; then
+    [ -s "$source_plugin_manifest" ] || die "Empty plugin manifest: $source_plugin_manifest"
+    LC_ALL=C grep -q '"name"[[:space:]]*:' "$source_plugin_manifest" || die "Invalid plugin manifest (missing name): $source_plugin_manifest"
+    cp "$source_plugin_manifest" "$stage_dir/plugin.json"
+fi
+if [ -n "$source_plugin_assets" ]; then
+    cp -R "$source_plugin_assets" "$stage_dir/assets"
+fi
+if [ "$is_flat_md" -eq 1 ]; then
     while IFS= read -r rendered_name || [ -n "$rendered_name" ]; do
         [ -n "$rendered_name" ] || continue
         cp -- "$render_dir/files/$rendered_name" "$stage_dir/agents/$rendered_name"
@@ -1947,6 +2125,8 @@ if [ "$has_config" -eq 1 ]; then
 fi
 if [ "$role_kind" = md ]; then
     assert_agent_structure "$stage_dir/agents" "$role_count"
+elif [ "$role_kind" = agy-md ]; then
+    assert_agy_agent_structure "$stage_dir/agents" "$role_count"
 else
     assert_toml_structure "$stage_dir/agents/ai-vibecode-superpower" "$role_count"
 fi
@@ -1961,19 +2141,21 @@ while IFS= read -r text_file || [ -n "$text_file" ]; do
 done < "$file_list"
 rm -f "$file_list"
 # 展开后不得残留任一宿主的 home 占位符或未解析 token，否则宿主会读到错误的文档路径。
-for guard_file in "$stage_dir/AGENTS.md" "$stage_dir"/skills/*/SKILL.md; do
+for guard_file in "$stage_dir/$instructions_rel" "$stage_dir/docs/README.md" "$stage_dir"/skills/*/SKILL.md; do
     [ -f "$guard_file" ] || continue
     guard_status=0
-    LC_ALL=C grep -qE '(<(CODEX_HOME|ZCODE_HOME|GLOBAL_HOME)>|[$](CODEX_HOME|ZCODE_HOME)|[{][{])' "$guard_file" || guard_status=$?
+    LC_ALL=C grep -qE '(<(CODEX_HOME|ZCODE_HOME|ANTIGRAVITY_HOME|GLOBAL_HOME)>|[$](CODEX_HOME|ZCODE_HOME|ANTIGRAVITY_HOME)|[{][{])' "$guard_file" || guard_status=$?
     [ "$guard_status" -le 1 ] || die "Could not inspect $guard_file"
     [ "$guard_status" -eq 1 ] || die "Unresolved home placeholder in: $guard_file"
 done
 
 manifest=$stage_dir/targets.tsv
-printf 'AGENTS.md\t%s\t%s\tfile\treplace\n' "$client_home/AGENTS.md" "$stage_dir/AGENTS.md" > "$manifest"
+printf '%s\t%s\t%s\tfile\treplace\n' "$instructions_rel" "$client_home/$instructions_rel" "$stage_dir/$instructions_rel" > "$manifest"
 [ "$has_config" -eq 1 ] && printf 'config.toml\t%s\t%s\tfile\treplace\n' "$client_home/config.toml" "$stage_dir/config.toml" >> "$manifest"
+[ -n "$source_plugin_manifest" ] && printf 'plugin.json\t%s\t%s\tfile\treplace\n' "$client_home/plugin.json" "$stage_dir/plugin.json" >> "$manifest"
+[ -n "$source_plugin_assets" ] && printf 'assets\t%s\t%s\tdirectory\treplace\n' "$client_home/assets" "$stage_dir/assets" >> "$manifest"
 printf 'docs\t%s\t%s\tdirectory\treplace\n' "$client_home/docs" "$stage_dir/docs" >> "$manifest"
-if [ "$role_kind" = md ]; then
+if [ "$is_flat_md" -eq 1 ]; then
     while IFS= read -r agent_name || [ -n "$agent_name" ]; do
         [ -n "$agent_name" ] || continue
         printf 'agents/%s\t%s\t%s\tfile\treplace\n' "$agent_name" "$client_home/agents/$agent_name" "$stage_dir/agents/$agent_name" >> "$manifest"
@@ -2031,6 +2213,14 @@ if [ "$role_kind" = md ]; then
         fi
         assert_agent_file "$client_home/agents/$installed_name" || die "Invalid agent profile: $installed_name"
     done < "$render_dir/names.txt"
+elif [ "$role_kind" = agy-md ]; then
+    while IFS= read -r installed_name || [ -n "$installed_name" ]; do
+        [ -n "$installed_name" ] || continue
+        if [ ! -f "$client_home/agents/$installed_name" ]; then
+            die "Managed agent file missing: $client_home/agents/$installed_name"
+        fi
+        assert_agy_agent_file "$client_home/agents/$installed_name" || die "Invalid agent profile: $installed_name"
+    done < "$render_dir/names.txt"
 else
     assert_toml_structure "$client_home/agents/ai-vibecode-superpower" "$role_count"
 fi
@@ -2046,6 +2236,11 @@ if [ -s "$render_dir/variant-labels.txt" ]; then
     variant_labels_note=" (provider variants: $variant_labels_note)"
 fi
 completed=1
-printf '%s\n' "$client_label configuration installed in: $client_home" "Preset '$preset_display_name' rendered $role_count roles.${variant_labels_note}" 'Standalone skills and managed agent roles installed.' "Restart $client_label to load the new configuration and skills."
+printf '%s\n' "$client_label configuration installed in: $client_home" "Preset '$preset_display_name' rendered $role_count roles.${variant_labels_note}" 'Standalone skills and managed agent roles installed.'
+if [ "$client" = antigravity ]; then
+    printf '%s\n' 'Antigravity discovers the plugin automatically from the next turn; manage it from Customizations.' 'Other Antigravity plugins and global config.json were not modified.'
+else
+    printf '%s\n' "Restart $client_label to load the new configuration and skills."
+fi
 if [ "$client" = zcode ]; then printf '%s\n' 'Unmanaged ZCode state (cli/, v2/, plugins, other skills and agents) was not modified.'; fi
 if [ -n "$backup_dir" ]; then printf '%s\n' "Backup directory: $backup_dir"; fi

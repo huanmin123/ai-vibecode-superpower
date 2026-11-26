@@ -1,6 +1,6 @@
 # ai-vibecode-superpower
 
-本仓库维护可安装的 Codex 与 ZCode 全局配置、agent role 与 standalone skills；共享平台文档、skills、角色预设与行为规范放在 `shared/`，全局指令与工作流 skill 以 `shared/` 共享正文为准；只有 docs、config 与 Codex 技能资产等客户端资源由各自目录维护。项目级约定只在本文件说明；运行时全局行为不在此复制。
+本仓库维护可安装的 Codex、ZCode 与 Antigravity 全局配置、agent role 与 standalone skills；共享平台文档、skills、角色预设与行为规范放在 `shared/`，全局指令与工作流 skill 以 `shared/` 共享正文为准；只有 docs、config、Antigravity 插件清单/图标与 Codex 技能资产等客户端资源由各自目录维护。项目级约定只在本文件说明；运行时全局行为不在此复制。
 
 ## 提示词与文档写作
 

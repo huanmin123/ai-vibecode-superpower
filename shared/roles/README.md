@@ -1,6 +1,6 @@
 # 角色预设与翻译器规范
 
-本目录是跨宿主角色配置的权威来源：预设（preset）以中立 schema 描述一套 agent 角色，安装器在安装时把预设翻译为 ZCode 的 md agent 与 Codex 的 toml role。仓库不直接维护任何宿主角色文件；宿主文件是本目录预设的编译产物。
+本目录是跨宿主角色配置的权威来源：预设（preset）以中立 schema 描述一套 agent 角色，安装器在安装时把预设翻译为 ZCode 的 md agent、Codex 的 toml role 与 Antigravity 的原生插件子代理（md agent）。仓库不直接维护任何宿主角色文件；宿主文件是本目录预设的编译产物。
 
 ## 目标与非目标
 
@@ -72,7 +72,7 @@ readonly = true
 字段规则：
 
 - 顶层 `description` 必填，安装交互时展示给用户。
-- 宿主小节 `[zcode]` / `[codex]` 至少出现一个；安装器只翻译与目标客户端匹配的小节。
+- 宿主小节 `[zcode]` / `[codex]` / `[antigravity]` 至少出现一个；安装器只翻译与目标客户端匹配的小节。
 - 宿主小节的 `model` 为该宿主角色默认值；角色块 `model` 覆盖之；两者都缺失时安装报错，不做静默回退。
 - `model` 可写具体值或 `local:<key>`。`local:` 是保留前缀，任何以它开头的值都按本机绑定键解析，不能表示字面模型 ID；key 必须匹配 `^[A-Za-z][A-Za-z0-9_-]*$`。
 - 解析优先级：先按角色块 `model` > 宿主小节 `model` 选中值，再解析其中的 `local:`；具体值原样使用。ZCode 下 `local:` 的解析结果必须是 `providerId/modelId`（至少一个 `/`，两段非空且不含空白），直接写具体值时安装器只做非空校验；Codex 下 `local:` 的解析结果只要求非空。绑定值在两个宿主下都不得以 `local:` 开头，且不得包含控制字符。
@@ -163,6 +163,24 @@ sandbox_mode = "<readonly 推导或显式值>"
 - `sandbox_mode` 缺省规则：`readonly = true` → `read-only`；`readonly = false` → `danger-full-access`。当前 Codex 的 custom agent 配置不会用该字段覆盖父会话的 `sandbox_mode` 或 `approval_policy`，因此生成此字段本身不能建立角色级只读沙箱；实际权限由宿主支持的权限边界决定。需要强制隔离时，应采用并验证当前宿主实际支持的权限设置，详见 [Codex 子代理权限说明](https://learn.chatgpt.com/docs/agent-configuration/subagents#custom-agent-file-schema)。
 - `tools`、`color` 在 Codex 侧无对应字段，被忽略。角色正文表达职责要求；这些文本要求不构成工具层的写入隔离。
 
+### Antigravity 原生子代理（安装到 `<ANTIGRAVITY_HOME>/agents/<name>.md`，默认 `<ANTIGRAVITY_HOME>` 为 `~/.gemini/config/plugins/ai-vibecode-superpower`）
+
+```markdown
+---
+name: <name>
+description: "<description>"
+subagent: true
+mainAgent: false
+tools: [read_file, run_command, manage_task, search_web]   # readonly = true 缺省；readonly = false 展开为全量工具集
+---
+
+<正文，互引已解析>
+```
+
+- `subagent: true` 与 `mainAgent: false` 固定生成，确保角色作为 Antigravity 子代理被主代理通过 `invoke_subagent` 派发，而不污染主代理列表。
+- Antigravity 的子代理工具白名单在省略 `tools` 时会收缩为极小只读默认集，因此翻译器对 `readonly = false` 显式展开为 `[read_file, edit_file, write_file, run_command, manage_task, search_web]`，对 `readonly = true` 缺省展开为 `[read_file, run_command, manage_task, search_web]`（剥离 `edit_file`/`write_file`，也可在预设里通过 `tools` 数组进一步收窄）。
+- Antigravity 的子代理模型档位由主代理在调用 `invoke_subagent` 时通过 `Model` 参数指定；`[antigravity]` 中的 `model` 必须为 `flash_lite`、`flash`、`inherit` 或 `pro`（非法值在安装期报错拒绝）。翻译器不向 agent frontmatter 写入 `model`、`thoughtLevel`、`color` 或 `sandbox_mode`，而是将解析后的 `model` 自动追加为 `（invoke_subagent Model: <model>）` 写入 agent `description` 与 `orchestrate-model-workflow` 的 `SKILL.md` 角色清单，保证单一事实源；预设里的 `effort` 仍按 `basic` / `deep` / `max` 校验。
+
 ### 互引解析
 
 - 正文中 `{{role:<id>}}` 替换为**同一宿主小节、同一 provider label 内**该 `id` 角色的 `name`；被引用角色没有同 label 变体时回落到默认组的 `name`（通常只发生在固定了具体 `model` 的角色上）。
@@ -198,6 +216,7 @@ sandbox_mode = "<readonly 推导或显式值>"
 - `presets/glm/`：ZCode 6 个逻辑角色（与既有 `glm_5.3_flash_*` / `glm_5.4_*` 行为等价，另含界面设计角色），`model = local:glm_flash`，`review_high` / `review_max` / `design_high` 使用 `local:glm_main`；需在绑定文件 `[zcode]` 提供 `glm_flash` 与 `glm_main`。提供后缀 label 时按 label 倍增为多组变体。不含 `[codex]` 小节——在 Codex 使用 GLM 需要用户先在 Codex 配置对应 model provider，属用户环境配置，仓库不代设。
 - `presets/gpt/`：Codex 13 角色（luna / terra / sol / astra 四档分工），不含 `[zcode]` 小节。
 - `presets/ds/`：ZCode 4 个逻辑角色，`model = local:ds_flash`（2 读 1 写，另含界面设计角色；复审/终审由 `ds_4.1_flash_max` 兼任，复审派发必须是全新实例且不信任写入实例的自述）；需在绑定文件 `[zcode]` 提供 `ds_flash`。提供后缀 label 时按 label 倍增为多组变体。不含 `[codex]` 小节，理由同 glm。
+- `presets/antigravity/`：Antigravity 6 个原生子代理（2 只读取证 `agy_scout_flash` / `agy_scout_deep`、1 写码主力 `agy_worker`、2 只读复审/终审 `agy_reviewer` / `agy_auditor`、1 界面设计 `agy_designer`），映射到 Antigravity 的 `flash` / `inherit` / `pro` 档位，开箱即用无需本地模型绑定文件。
 - 新增模型方案：新增 `presets/<name>/` 并运行 `-UpdateRoleManifest`，不改代码；使用 `local:` 时在预设描述中注明所需 key。为使用 `local:` 的已有预设增加同逻辑模型的第二个 provider 只需在绑定文件加后缀键并重跑安装，不需要新增预设或更新 manifest。
 
 ### 界面设计角色

@@ -1,8 +1,8 @@
 # ai-vibecode-superpower
 
-> 把 Codex 与 ZCode 从“单次对话工具”升级为一套面向复杂开发的工程协作系统：**更快推进、更强判断、更少浪费**。
+> 把 Codex、ZCode 与 Antigravity 从“单次对话工具”升级为一套面向复杂开发的工程协作系统：**更快推进、更强判断、更少浪费**。
 
-`ai-vibecode-superpower` 是可安装的 Codex / ZCode 配置包。它为复杂开发建立可追溯的取证、执行、验证与独立复查闭环；小任务仍然保持直接、轻量，不为工作流而工作流。两个宿主共享同一套平台文档和通用 skills；全局指令、agent 角色、工作流骨架与角色清单、安装行为通过 `codex-global-config/` 与 `zcode-global-config/` 目录及 `shared/` 的共享内容组合。
+`ai-vibecode-superpower` 是可安装的 Codex / ZCode / Antigravity 配置包。它为复杂开发建立可追溯的取证、执行、验证与独立复查闭环；小任务仍然保持直接、轻量，不为工作流而工作流。三个宿主共享同一套平台文档和通用 skills；全局指令、agent 角色、工作流骨架与角色清单、安装行为通过 `codex-global-config/`、`zcode-global-config/`、`antigravity-global-config/` 目录及 `shared/` 的共享内容组合。
 
 ## 你真正得到的提升
 
@@ -146,6 +146,28 @@ goals = true
 sh ./install.sh zcode          # 交互选择来源与预设
 sh ./install.sh zcode glm
 sh ./install.sh zcode --external zcode-ds   # 外部预设
+```
+
+### Antigravity
+
+- 以原生 Antigravity 插件形式安装到 `~/.gemini/config/plugins/ai-vibecode-superpower/`（可用 `ANTIGRAVITY_HOME` 覆盖）：包含 `plugin.json`、`assets/logo.svg`、`rules/AGENTS.md`、`docs/`（含 `docs/system/`）、平铺原生子代理 `agents/*.md` 以及 7 个受管 skills；不修改全局 `~/.gemini/config/config.json` 或其他已安装插件。
+- 默认内置预设 `antigravity`（6 个原生子代理，按 `flash` / `inherit` / `pro` 档位分工，只读角色在 `tools` 白名单层剥离 `edit_file` 与 `write_file`），无需额外模型绑定文件，开箱即用。
+- 安装完成后 Antigravity 从下一轮对话自动加载，并可在 Customizations 页面一键启停或卸载。
+
+**Windows（PowerShell 7）**，在仓库根目录运行：
+
+```powershell
+& .\install.ps1 -Client antigravity
+& .\install.ps1 -Client antigravity -Preset antigravity
+& .\install.ps1 -Client antigravity -Preset agy-local -External   # 外部预设
+```
+
+**macOS 或 Linux**：
+
+```sh
+sh ./install.sh antigravity
+sh ./install.sh antigravity antigravity
+sh ./install.sh antigravity --external agy-local   # 外部预设
 ```
 
 ## 使用方式与可选能力

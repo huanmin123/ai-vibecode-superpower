@@ -1,0 +1,54 @@
+# Antigravity 预设：原生 6 角色，model 对应 Antigravity invoke_subagent 的 Model 档位（flash_lite / flash / inherit / pro），只读角色通过 tools 白名单剥离写入工具。
+description = "Antigravity 预设：6 个原生子代理（2 读 1 写 2 审 1 设计），映射到 flash / inherit / pro 档位。"
+
+[antigravity]
+model = "inherit"
+
+[[antigravity.role]]
+id = "flash_low"
+name = "agy_scout_flash"
+description = "只读常规取证与实施后预审。"
+skill_desc = "常规跨文件取证与实施后预审，只读。"
+effort = "basic"
+readonly = true
+model = "flash"
+
+[[antigravity.role]]
+id = "flash_high"
+name = "agy_scout_deep"
+description = "只读深度取证与复杂预审。"
+skill_desc = "需要更深局部理解的跨文件取证与复杂预审，只读。"
+effort = "deep"
+readonly = true
+
+[[antigravity.role]]
+id = "worker_main"
+name = "agy_worker"
+description = "写代码主力：受控契约执行、受保护写入、共享状态处理与集成。"
+effort = "max"
+readonly = false
+
+[[antigravity.role]]
+id = "review_high"
+name = "agy_reviewer"
+description = "只读有界技术定案、常规独立复审与对抗证伪主力。"
+skill_desc = "有界技术定案、常规独立复审与对抗证伪主力，只读。"
+effort = "deep"
+readonly = true
+
+[[antigravity.role]]
+id = "review_max"
+name = "agy_auditor"
+description = "只读最高强度独立终审、疑难根因升级调查与安全审计验证。"
+skill_desc = "最高强度独立复审、疑难根因调查与最终升级验收，只读。"
+effort = "max"
+readonly = true
+model = "pro"
+
+[[antigravity.role]]
+id = "design_high"
+name = "agy_designer"
+description = "界面设计定案与设计复审：实现前定结构、组件与主任务脚本，实现后按用户走查和缺陷清单看截图复审；只报告问题和修改方向，不改界面和项目代码。"
+skill_desc = "界面设计定案与设计复审；界面渲染有新增或改动时使用，不参与通用取证、复审与写入的回退。"
+effort = "deep"
+readonly = false

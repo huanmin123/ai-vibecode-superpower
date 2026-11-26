@@ -72,7 +72,7 @@ async function runResult(command, args, options) {
 
 async function findPosixShell() {
   const candidates = process.platform === 'win32'
-    ? ['E:\\Git\\bin\\bash.exe', 'E:\\tools\\w64devkit-2.8.0\\w64devkit\\bin\\bash.exe', 'bash']
+    ? ['C:\\Program Files\\Git\\bin\\bash.exe', 'E:\\Git\\bin\\bash.exe', 'E:\\tools\\w64devkit-2.8.0\\w64devkit\\bin\\bash.exe', 'bash']
     : ['sh', 'bash'];
   for (const candidate of candidates) {
     const result = await runResult(candidate, ['-c', 'exit 0'], {});
@@ -251,13 +251,13 @@ test('terra write tiers delegate simple writes to the luna_max leaf executor', a
 
 test('the preset manifest covers every source file of all built-in presets', async () => {
   const lines = (await readFile(presetManifest, 'utf8')).trim().split(/\r?\n/);
-  assert.equal(lines.length, 26);
+  assert.equal(lines.length, 33);
   const entries = new Map(lines.map((line) => {
     const match = line.trim().match(/^([0-9a-f]{64}) {2}([^\s]+)$/);
     assert.ok(match, `invalid preset manifest line: ${line}`);
     return [match[2], match[1]];
   }));
-  for (const preset of ['glm', 'gpt', 'ds']) {
+  for (const preset of ['glm', 'gpt', 'ds', 'antigravity']) {
     const presetFile = path.join(presetsRoot, preset, 'preset.toml');
     assert.equal(entries.get(`${preset}/preset.toml`), normalizedHash(await readFile(presetFile)), `preset manifest hash mismatch: ${preset}/preset.toml`);
     const roleDir = path.join(presetsRoot, preset, 'roles');
@@ -499,7 +499,9 @@ test('every review role answers the checklist attached to the dispatch', async (
     ['gpt', 'sol_xhigh'],
     ['gpt', 'astra_high'],
     ['gpt', 'astra_max'],
-    ['ds', 'flash_max']
+    ['ds', 'flash_max'],
+    ['antigravity', 'review_high'],
+    ['antigravity', 'review_max']
   ];
   for (const [preset, id] of reviewRoles) {
     const body = await readFile(path.join(presetsRoot, preset, 'roles', `${id}.md`), 'utf8');
@@ -509,9 +511,9 @@ test('every review role answers the checklist attached to the dispatch', async (
 
 test('design roles inherit the full toolset, share one body and the workflow routes interface changes to them', async () => {
   const body = (await readFile(path.join(sharedBodiesRoot, 'design_high.md'), 'utf8')).replaceAll('\r\n', '\n');
-  for (const preset of ['glm', 'gpt', 'ds']) {
+  for (const preset of ['glm', 'gpt', 'ds', 'antigravity']) {
     const presetText = await readFile(path.join(presetsRoot, preset, 'preset.toml'), 'utf8');
-    const blocks = presetText.split(/\[\[(?:zcode|codex)\.role\]\]/).slice(1);
+    const blocks = presetText.split(/\[\[(?:zcode|codex|antigravity)\.role\]\]/).slice(1);
     const field = (block, key) => block.match(new RegExp(`^${key} = "([^"]*)"`, 'm'))?.[1];
     const block = blocks.find((candidate) => field(candidate, 'id') === 'design_high');
     assert.ok(block, `missing design role: ${preset}`);
@@ -653,12 +655,12 @@ test('direct ripgrep release examples verify SHA-256 before extraction', async (
 
 test('shared instruction and skill bases are host-agnostic', async () => {
   const baseText = await readFile(baseAgents, 'utf8');
-  assert.doesNotMatch(baseText, /<!-- @section|<!-- @override|\{\{|CODEX_HOME|ZCODE_HOME|Codex|ZCode/);
+  assert.doesNotMatch(baseText, /<!-- @section|<!-- @override|\{\{|CODEX_HOME|ZCODE_HOME|ANTIGRAVITY_HOME|Codex|ZCode|Antigravity/);
   assert.match(baseText, /<GLOBAL_HOME>/);
   assert.match(baseText, /主代理按其规则调度角色/);
   assert.match(baseText, /保持正常语义/);
   const skillText = await readFile(skillBase, 'utf8');
-  assert.doesNotMatch(skillText, /<!-- @section|<!-- @override|\{\{|CODEX_HOME|ZCODE_HOME|Codex|ZCode/);
+  assert.doesNotMatch(skillText, /<!-- @section|<!-- @override|\{\{|CODEX_HOME|ZCODE_HOME|ANTIGRAVITY_HOME|Codex|ZCode|Antigravity/);
   assert.match(skillText, /<!-- preset-roles -->/);
   assert.match(skillText, /宿主负责子代理/);
   assert.match(skillText, /承担写入职责的角色/);
@@ -684,9 +686,9 @@ test('test strategy skill references resolve and installers register it', async 
     assert.doesNotMatch(content, /Codex|ZCode|CODEX_HOME|ZCODE_HOME/, `reference must stay host-agnostic: ${ref}`);
   }
   const posixText = await readFile(posixInstaller, 'utf8');
-  assert.equal((posixText.match(/test-strategy:shared/g) ?? []).length, 2, 'both install.sh client profiles must register test-strategy');
+  assert.equal((posixText.match(/test-strategy:shared/g) ?? []).length, 3, 'all three install.sh client profiles must register test-strategy');
   const powerText = await readFile(powerInstaller, 'utf8');
-  assert.equal((powerText.match(/Name = 'test-strategy'/g) ?? []).length, 2, 'both install.ps1 client profiles must register test-strategy');
+  assert.equal((powerText.match(/Name = 'test-strategy'/g) ?? []).length, 3, 'all three install.ps1 client profiles must register test-strategy');
 });
 
 test('security audit skill is guidance-first, attacker-oriented, and evidence-gated', async () => {
@@ -724,9 +726,9 @@ test('security audit skill is guidance-first, attacker-oriented, and evidence-ga
   assert.match(sweep, /连续两轮/);
   assert.match(sweep, /deep-dive-review[^\n]*只读、只出报告[^\n]*不沿用其自主修复语义/);
   const posixText = await readFile(posixInstaller, 'utf8');
-  assert.equal((posixText.match(/security-audit:shared/g) ?? []).length, 2, 'both install.sh client profiles must register security-audit');
+  assert.equal((posixText.match(/security-audit:shared/g) ?? []).length, 3, 'all three install.sh client profiles must register security-audit');
   const powerText = await readFile(powerInstaller, 'utf8');
-  assert.equal((powerText.match(/Name = 'security-audit'/g) ?? []).length, 2, 'both install.ps1 client profiles must register security-audit');
+  assert.equal((powerText.match(/Name = 'security-audit'/g) ?? []).length, 3, 'all three install.ps1 client profiles must register security-audit');
   const asset = await readFile(path.join(repository, 'codex-global-config', 'skill-assets', 'security-audit', 'agents', 'openai.yaml'), 'utf8');
   assert.match(asset, /display_name:/);
   assert.match(asset, /default_prompt:.*\$security-audit/);
@@ -2172,7 +2174,7 @@ test('merged POSIX installer requires an explicit client when stdin is not inter
   if (!shell) return t.skip('POSIX shell is unavailable');
   const result = await runResult(shell, ['install.sh'], { cwd: repository });
   assert.notEqual(result.code, 0, result.stdout);
-  assert.match(result.stdout + '\n' + result.stderr, /No client specified\. Usage: sh install\.sh <codex\|zcode>/);
+  assert.match(result.stdout + '\n' + result.stderr, /No client specified\. Usage: sh install\.sh <codex\|zcode\|antigravity>/);
 });
 
 test('merged POSIX installer rejects unknown clients', async (t) => {
@@ -2247,7 +2249,7 @@ test('merged PowerShell installer requires an explicit preset when input is redi
 test('merged PowerShell installer requires an explicit client when input is redirected', { skip: process.platform !== 'win32' }, async () => {
   const result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller], { cwd: repository });
   assert.notEqual(result.code, 0, result.stdout);
-  assert.match(result.stdout + '\n' + result.stderr, /No client specified\. Usage: \.\\install\.ps1 -Client <codex\|zcode>/);
+  assert.match(result.stdout + '\n' + result.stderr, /No client specified\. Usage: \.\\install\.ps1 -Client <codex\|zcode\|antigravity>/);
 });
 
 test('deep dive review defaults to report-only and has executable convergence rules', async () => {
@@ -2314,4 +2316,152 @@ test('deep dive review defaults to report-only and has executable convergence ru
   assert.match(termination, /连续三轮视角互不相同/);
   assert.match(termination, /fix 模式还要求连续 3 轮零 B 类确认、零回归/);
   assert.match(termination, /report-only 模式要求连续 3 轮无新确认项，任何新确认均重置计数/);
+});
+
+test('antigravity preset keeps six native roles with model routing and cross references', async () => {
+  const presetText = await readFile(path.join(presetsRoot, 'antigravity', 'preset.toml'), 'utf8');
+  assert.match(presetText, /\[antigravity\]\r?\nmodel = "inherit"/);
+  const expectedAllocation = {
+    flash_low: { name: 'agy_scout_flash', model: 'flash', effort: 'basic', readonly: true },
+    flash_high: { name: 'agy_scout_deep', model: null, effort: 'deep', readonly: true },
+    worker_main: { name: 'agy_worker', model: null, effort: 'max', readonly: false },
+    review_high: { name: 'agy_reviewer', model: null, effort: 'deep', readonly: true },
+    review_max: { name: 'agy_auditor', model: 'pro', effort: 'max', readonly: true },
+    design_high: { name: 'agy_designer', model: null, effort: 'deep', readonly: false }
+  };
+  const blocks = presetText.split(/\[\[antigravity\.role\]\]/).slice(1);
+  assert.equal(blocks.length, 6);
+  const field = (block, key) => block.match(new RegExp(`^${key} = "([^"]*)"`, 'm'))?.[1];
+  for (const [id, expected] of Object.entries(expectedAllocation)) {
+    const block = blocks.find((candidate) => field(candidate, 'id') === id);
+    assert.ok(block, `missing antigravity preset role: ${id}`);
+    assert.equal(field(block, 'name'), expected.name, `name mismatch: ${id}`);
+    assert.ok(field(block, 'description'), `description missing: ${id}`);
+    if (expected.model === null) assert.equal(field(block, 'model'), undefined, `model must inherit host default: ${id}`);
+    else assert.equal(field(block, 'model'), expected.model, `model mismatch: ${id}`);
+    assert.equal(field(block, 'effort'), expected.effort, `effort mismatch: ${id}`);
+    assert.match(block, new RegExp(`^readonly = ${expected.readonly}$`, 'm'), `readonly mismatch: ${id}`);
+  }
+  const lowBody = await readFile(path.join(presetsRoot, 'antigravity', 'roles', 'flash_low.md'), 'utf8');
+  assert.match(lowBody, /建议升级到 `\{\{role:flash_high\}\}` 取证/);
+  const reviewHighBody = await readFile(path.join(presetsRoot, 'antigravity', 'roles', 'review_high.md'), 'utf8');
+  assert.match(reviewHighBody, /升级到 `\{\{role:review_max\}\}` 复审/);
+  const pluginManifest = JSON.parse(await readFile(path.join(repository, 'antigravity-global-config', 'plugin.json'), 'utf8'));
+  assert.equal(pluginManifest.name, 'ai-vibecode-superpower');
+  assert.equal(pluginManifest.logo, 'assets/logo.svg');
+});
+
+test('merged installer sources register the antigravity client with plugin targets', async () => {
+  const posixText = await readFile(zcodePosixInstaller, 'utf8');
+  assert.match(posixText, /client_label=Antigravity/);
+  assert.match(posixText, /home_env=ANTIGRAVITY_HOME/);
+  assert.match(posixText, /default_home=\.gemini\/config\/plugins\/ai-vibecode-superpower/);
+  assert.match(posixText, /instructions_rel=rules\/AGENTS\.md/);
+  assert.match(posixText, /role_kind=agy-md/);
+  const psText = await readFile(powerInstaller, 'utf8');
+  assert.match(psText, /HomeEnv = 'ANTIGRAVITY_HOME'/);
+  assert.match(psText, /RoleKind = 'agy-md'/);
+  assert.match(psText, /InstructionsTarget = 'rules\\AGENTS\.md'/);
+});
+
+test('PowerShell antigravity installer deploys native plugin bundle, renders roles and cleans stale agents', { skip: process.platform !== 'win32' }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'agy-ps-install-'));
+  const agyHome = path.join(root, 'plugin-home');
+  const extPreset = path.join(root, 'custom-agy');
+  try {
+    const env = { ...process.env, USERPROFILE: root, ANTIGRAVITY_HOME: agyHome };
+    let result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'antigravity', '-Preset', 'antigravity'], { env });
+    assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+
+    const manifest = JSON.parse(await readFile(path.join(agyHome, 'plugin.json'), 'utf8'));
+    assert.equal(manifest.name, 'ai-vibecode-superpower');
+    assert.match(await readFile(path.join(agyHome, 'assets', 'logo.svg'), 'utf8'), /<svg /);
+
+    const rules = await readFile(path.join(agyHome, 'rules', 'AGENTS.md'), 'utf8');
+    assert.ok(rules.includes(agyHome), 'rules/AGENTS.md must expand <GLOBAL_HOME>');
+    assert.doesNotMatch(rules, /<(?:GLOBAL_HOME|ANTIGRAVITY_HOME|CODEX_HOME|ZCODE_HOME)>/);
+    const docsReadme = await readFile(path.join(agyHome, 'docs', 'README.md'), 'utf8');
+    assert.ok(docsReadme.includes(agyHome), 'docs/README.md must expand <ANTIGRAVITY_HOME>');
+    assert.ok((await readFile(path.join(agyHome, 'docs', 'system', 'README.md'), 'utf8')).includes('系统命令路由'));
+
+    const scout = await readFile(path.join(agyHome, 'agents', 'agy_scout_flash.md'), 'utf8');
+    assert.match(scout, /^name: agy_scout_flash$/m);
+    assert.match(scout, /^description: ".*（invoke_subagent Model: flash）"$/m);
+    assert.match(scout, /^subagent: true$/m);
+    assert.match(scout, /^mainAgent: false$/m);
+    assert.match(scout, /^tools: \[read_file, run_command, manage_task, search_web\]$/m);
+    assert.doesNotMatch(scout, /edit_file|write_file/);
+    assert.match(scout, /升级到 `agy_scout_deep` 取证/);
+
+    const worker = await readFile(path.join(agyHome, 'agents', 'agy_worker.md'), 'utf8');
+    assert.match(worker, /^tools: \[read_file, edit_file, write_file, run_command, manage_task, search_web\]$/m);
+
+    const designer = await readFile(path.join(agyHome, 'agents', 'agy_designer.md'), 'utf8');
+    assert.match(designer, /^tools: \[read_file, edit_file, write_file, run_command, manage_task, search_web\]$/m);
+    assert.match(designer, /冷看/);
+
+    const reviewer = await readFile(path.join(agyHome, 'agents', 'agy_reviewer.md'), 'utf8');
+    assert.match(reviewer, /升级到 `agy_auditor` 复审/);
+
+    await assertSharedSkillsDeployed(path.join(agyHome, 'skills'), 'antigravity');
+    const skillText = await readFile(path.join(agyHome, 'skills', 'orchestrate-model-workflow', 'SKILL.md'), 'utf8');
+    assert.doesNotMatch(skillText, /<!-- preset-roles -->/);
+    assert.match(skillText, /`agy_auditor`：.*（invoke_subagent Model: pro）/);
+
+    await writeFile(path.join(agyHome, 'agents', 'user_custom.md'), 'custom agent\n');
+    await mkdir(path.join(extPreset, 'roles'), { recursive: true });
+    await writeFile(path.join(extPreset, 'preset.toml'), 'description = "Minimal Antigravity preset"\n\n[antigravity]\nmodel = "pro"\n\n[[antigravity.role]]\nid = "solo"\nname = "agy_solo"\ndescription = "Solo readonly role"\neffort = "deep"\nreadonly = true\n');
+    await writeFile(path.join(extPreset, 'roles', 'solo.md'), 'solo body\n');
+    result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'antigravity', '-Preset', extPreset], { env });
+    assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+    const agentFiles = (await readdir(path.join(agyHome, 'agents'))).sort();
+    assert.deepEqual(agentFiles, ['.ai-vibecode-superpower.managed', 'agy_solo.md', 'user_custom.md']);
+    assert.match(await readFile(path.join(agyHome, 'agents', 'agy_solo.md'), 'utf8'), /（invoke_subagent Model: pro）/);
+    assert.match(await readFile(path.join(agyHome, 'skills', 'orchestrate-model-workflow', 'SKILL.md'), 'utf8'), /`agy_solo`：Solo readonly role（invoke_subagent Model: pro）/);
+
+    await writeFile(path.join(extPreset, 'preset.toml'), 'description = "Invalid Antigravity tier"\n\n[antigravity]\nmodel = "bogus-tier"\n\n[[antigravity.role]]\nid = "solo"\nname = "agy_solo"\ndescription = "Solo"\neffort = "deep"\nreadonly = true\n');
+    const badResult = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'antigravity', '-Preset', extPreset], { env });
+    assert.notEqual(badResult.code, 0, badResult.stdout);
+    assert.match(badResult.stdout + '\n' + badResult.stderr, /unsupported Antigravity model tier/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('POSIX antigravity installer deploys native plugin bundle and removes stale agents', async (t) => {
+  const shell = await findPosixShell();
+  if (!shell) return t.skip('POSIX shell is unavailable');
+  const root = await mkdtemp(path.join(repository, '.agy-posix-install-'));
+  const agyHome = path.join(root, 'plugin-home');
+  const extPreset = path.join(root, 'custom-agy');
+  try {
+    const base = { cwd: repository, env: { ...process.env, HOME: posixHome(root), ANTIGRAVITY_HOME: posixHome(agyHome) } };
+    let result = await runResult(shell, ['install.sh', 'antigravity', 'antigravity'], base);
+    assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+
+    const manifest = JSON.parse(await readFile(path.join(agyHome, 'plugin.json'), 'utf8'));
+    assert.equal(manifest.name, 'ai-vibecode-superpower');
+    assert.match(await readFile(path.join(agyHome, 'assets', 'logo.svg'), 'utf8'), /<svg /);
+    const rules = await readFile(path.join(agyHome, 'rules', 'AGENTS.md'), 'utf8');
+    assert.doesNotMatch(rules, /<(?:GLOBAL_HOME|ANTIGRAVITY_HOME|CODEX_HOME|ZCODE_HOME)>/);
+    const scout = await readFile(path.join(agyHome, 'agents', 'agy_scout_flash.md'), 'utf8');
+    assert.match(scout, /^subagent: true$/m);
+    assert.match(scout, /^mainAgent: false$/m);
+    assert.match(scout, /^tools: \[read_file, run_command, manage_task, search_web\]$/m);
+    assert.match(scout, /升级到 `agy_scout_deep` 取证/);
+    const worker = await readFile(path.join(agyHome, 'agents', 'agy_worker.md'), 'utf8');
+    assert.match(worker, /^tools: \[read_file, edit_file, write_file, run_command, manage_task, search_web\]$/m);
+    await assertSharedSkillsDeployed(path.join(agyHome, 'skills'), 'antigravity');
+
+    await writeFile(path.join(agyHome, 'agents', 'user_custom.md'), 'custom agent\n');
+    await mkdir(path.join(extPreset, 'roles'), { recursive: true });
+    await writeFile(path.join(extPreset, 'preset.toml'), 'description = "Minimal Antigravity preset"\n\n[antigravity]\nmodel = "inherit"\n\n[[antigravity.role]]\nid = "solo"\nname = "agy_solo"\ndescription = "Solo readonly role"\neffort = "deep"\nreadonly = true\n');
+    await writeFile(path.join(extPreset, 'roles', 'solo.md'), 'solo body\n');
+    result = await runResult(shell, ['install.sh', 'antigravity', posixHome(extPreset)], base);
+    assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+    const agentFiles = (await readdir(path.join(agyHome, 'agents'))).sort();
+    assert.deepEqual(agentFiles, ['.ai-vibecode-superpower.managed', 'agy_solo.md', 'user_custom.md']);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

@@ -117,6 +117,7 @@ test('posix driver stays syntactically valid and keeps the client wiring branche
   const text = await readFile(posixDriver, 'utf8');
   assert.match(text, /--client\) \[ "\$#" -ge 2 \] \|\| die "--client 缺少取值"/);
   assert.match(text, /wire_codex=1; wire_zcode=1/);
+  assert.match(text, /wire_antigravity=1/);
   assert.match(text, /mcp\.servers/);
   assert.match(text, /\[ -t 0 \]/);
   assert.match(text, /Enter number or name \(q to quit\)/);
@@ -134,6 +135,7 @@ test('powerShell driver keeps the interactive client prompt behind a tty guard',
   assert.match(text, /\[Console\]::IsInputRedirected/);
   assert.match(text, /Enter number or name \(q to quit\)/);
   assert.match(text, /'  3\) Both'/);
+  assert.match(text, /'  4\) Antigravity'/);
   assert.match(text, /Cancelled: no client selected; nothing was written\./);
   assert.doesNotMatch(text, /--migrate-managed/);
   assert.match(text, /agent-toolchain-managed:v4/);
@@ -163,6 +165,40 @@ test('configure wires both clients (POSIX)', { skip: process.platform === 'win32
     assert.match(gitignore, /^\/\.codegraph\/$/m);
     assert.match(gitignore, /^\/\.codex\/$/m);
     assert.match(gitignore, /^\/\.zcode\/$/m);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('configure wires antigravity workspace plugin and stays idempotent (POSIX)', { skip: process.platform === 'win32' }, async (t) => {
+  const syntax = await runResult('sh', ['-c', 'command -v python3'], {});
+  if (syntax.code !== 0) return t.skip('python3 is unavailable');
+  const root = await mkdtemp(path.join(os.tmpdir(), 'agent-toolchain-agy-posix-'));
+  const project = path.join(root, 'target-project');
+  try {
+    await mkdir(project, { recursive: true });
+    let result = await runResult('sh', [posixDriver, 'configure', '--project', project, '--client', 'antigravity'], { cwd: repository });
+    assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+    const pluginDir = path.join(project, '.agents', 'plugins', 'codegraph');
+    const manifest = JSON.parse(await readFile(path.join(pluginDir, 'plugin.json'), 'utf8'));
+    assert.equal(manifest.name, 'codegraph');
+    const mcp = JSON.parse(await readFile(path.join(pluginDir, 'mcp_config.json'), 'utf8'));
+    assert.equal(mcp.mcpServers?.codegraph?.command, 'codegraph');
+    assert.deepEqual(mcp.mcpServers?.codegraph?.args, ['serve', '--mcp']);
+    assert.equal(mcp.mcpServers?.codegraph?.env?.CODEGRAPH_TELEMETRY, '0');
+    const gitignore = await readFile(path.join(project, '.gitignore'), 'utf8');
+    assert.match(gitignore, /^\/\.codegraph\/$/m);
+    assert.match(gitignore, /^\/\.agents\/plugins\/codegraph\/$/m);
+    assert.doesNotMatch(gitignore, /^\/\.codex\/$/m);
+
+    result = await runResult('sh', [posixDriver, 'configure', '--project', project], { cwd: repository });
+    assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+
+    mcp.mcpServers.codegraph.command = 'other';
+    await writeFile(path.join(pluginDir, 'mcp_config.json'), JSON.stringify(mcp, null, 2));
+    result = await runResult('sh', [posixDriver, 'configure', '--project', project], { cwd: repository });
+    assert.notEqual(result.code, 0, result.stdout);
+    assert.match(result.stdout + '\n' + result.stderr, /mcp_config\.json/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -316,6 +352,38 @@ test('configure does not read the managed marker past a Setext H2 (PowerShell)',
     assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
     assert.match(result.stdout + '\n' + result.stderr, /managed-agents-block\.md/);
     assert.equal(await readFile(path.join(root, 'AGENTS.md'), 'utf8'), original);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('configure wires antigravity workspace plugin and stays idempotent (PowerShell)', { skip: process.platform !== 'win32' }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'agent-toolchain-agy-'));
+  const project = path.join(root, 'target-project');
+  try {
+    await mkdir(project, { recursive: true });
+    let result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerShellDriver, 'configure', '--project', project, '--client', 'antigravity']);
+    assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+    const pluginDir = path.join(project, '.agents', 'plugins', 'codegraph');
+    const manifest = JSON.parse(await readFile(path.join(pluginDir, 'plugin.json'), 'utf8'));
+    assert.equal(manifest.name, 'codegraph');
+    const mcp = JSON.parse(await readFile(path.join(pluginDir, 'mcp_config.json'), 'utf8'));
+    assert.equal(mcp.mcpServers?.codegraph?.command, 'codegraph');
+    assert.deepEqual(mcp.mcpServers?.codegraph?.args, ['serve', '--mcp']);
+    assert.equal(mcp.mcpServers?.codegraph?.env?.CODEGRAPH_TELEMETRY, '0');
+    const gitignore = await readFile(path.join(project, '.gitignore'), 'utf8');
+    assert.match(gitignore, /^\/\.codegraph\/$/m);
+    assert.match(gitignore, /^\/\.agents\/plugins\/codegraph\/$/m);
+    assert.doesNotMatch(gitignore, /^\/\.codex\/$/m);
+
+    result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerShellDriver, 'configure', '--project', project]);
+    assert.equal(result.code, 0, `${result.stdout}\n${result.stderr}`);
+
+    mcp.mcpServers.codegraph.command = 'other';
+    await writeFile(path.join(pluginDir, 'mcp_config.json'), JSON.stringify(mcp, null, 2));
+    result = await runResult('pwsh.exe', ['-NoLogo', '-NoProfile', '-File', powerShellDriver, 'configure', '--project', project]);
+    assert.notEqual(result.code, 0, result.stdout);
+    assert.match(result.stdout + '\n' + result.stderr, /mcp_config\.json/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

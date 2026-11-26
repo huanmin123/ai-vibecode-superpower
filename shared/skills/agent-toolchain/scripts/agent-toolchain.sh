@@ -11,7 +11,7 @@ note() { printf '%s\n' "agent-toolchain: $*"; }
 usage() {
   cat <<'EOF'
 Usage:
-  agent-toolchain.sh configure --project PATH [--client codex|zcode|both]
+  agent-toolchain.sh configure --project PATH [--client codex|zcode|both|antigravity|all]
   agent-toolchain.sh doctor --project PATH [--quick]
   agent-toolchain.sh bootstrap --project PATH --dry-run|--apply
   agent-toolchain.sh upgrade --project PATH --dry-run|--apply
@@ -59,8 +59,8 @@ parse_args() {
   [ "$QUICK" -eq 0 ] || [ "$ACTION" = doctor ] || die "--quick 仅适用于 doctor"
   if [ -n "$CLIENT" ]; then
     case "$CLIENT" in
-      codex|zcode|both) ;;
-      *) die "未知 --client 取值：$CLIENT（可用：codex|zcode|both）" ;;
+      codex|zcode|both|antigravity|all) ;;
+      *) die "未知 --client 取值：$CLIENT（可用：codex|zcode|both|antigravity|all）" ;;
     esac
     [ "$ACTION" = configure ] || die '--client 仅适用于 configure'
   fi
@@ -247,34 +247,45 @@ configure_project() {
   codex_config="$codex_dir/config.toml"
   zcode_dir="$PROJECT/.zcode"
   zcode_config="$zcode_dir/config.json"
+  agy_agents_dir="$PROJECT/.agents"
+  agy_plugins_dir="$agy_agents_dir/plugins"
+  agy_plugin_dir="$agy_plugins_dir/codegraph"
+  agy_manifest="$agy_plugin_dir/plugin.json"
+  agy_mcp_config="$agy_plugin_dir/mcp_config.json"
   agents="$PROJECT/AGENTS.md"
   ignore="$PROJECT/.gitignore"
 
   wire_codex=0
   wire_zcode=0
+  wire_antigravity=0
   if [ -n "$CLIENT" ]; then
     case "$CLIENT" in
       codex) wire_codex=1 ;;
       zcode) wire_zcode=1 ;;
       both) wire_codex=1; wire_zcode=1 ;;
+      antigravity) wire_antigravity=1 ;;
+      all) wire_codex=1; wire_zcode=1; wire_antigravity=1 ;;
     esac
   else
     [ -d "$codex_dir" ] && wire_codex=1
     [ -d "$zcode_dir" ] && wire_zcode=1
-    if [ "$wire_codex" -eq 0 ] && [ "$wire_zcode" -eq 0 ]; then
+    [ -d "$agy_plugin_dir" ] && wire_antigravity=1
+    if [ "$wire_codex" -eq 0 ] && [ "$wire_zcode" -eq 0 ] && [ "$wire_antigravity" -eq 0 ]; then
       if [ -t 0 ]; then
-        printf '%s\n' 'Select the client to onboard for this project:' '  1) Codex' '  2) ZCode' '  3) Both'
+        printf '%s\n' 'Select the client to onboard for this project:' '  1) Codex' '  2) ZCode' '  3) Both' '  4) Antigravity' '  5) All'
         printf 'Enter number or name (q to quit): '
         read -r client_choice
         case "$client_choice" in
           1|[cC]odex) wire_codex=1 ;;
           2|[zZ][cC]ode) wire_zcode=1 ;;
           3|[bB]oth) wire_codex=1; wire_zcode=1 ;;
+          4|[aA]ntigravity) wire_antigravity=1 ;;
+          5|[aA]ll) wire_codex=1; wire_zcode=1; wire_antigravity=1 ;;
           [qQ]) note 'Cancelled: no client selected; nothing was written.'; return 0 ;;
           *) die "Invalid selection: $client_choice" ;;
         esac
       else
-        die '未检测到 .codex/ 或 .zcode/ 客户端目录；请用 --client codex|zcode|both 指定要接入的客户端'
+        die '未检测到客户端目录；请用 --client codex|zcode|both|antigravity|all 指定客户端'
       fi
     fi
   fi
@@ -287,17 +298,29 @@ configure_project() {
     [ ! -L "$zcode_dir" ] || die ".zcode 不能是 symlink"
     [ ! -e "$zcode_dir" ] || [ -d "$zcode_dir" ] || die ".zcode 必须是目录"
   fi
+  if [ "$wire_antigravity" -eq 1 ]; then
+    for agy_check_dir in "$agy_agents_dir" "$agy_plugins_dir" "$agy_plugin_dir"; do
+      [ ! -L "$agy_check_dir" ] || die "$agy_check_dir 不能是 symlink"
+      [ ! -e "$agy_check_dir" ] || [ -d "$agy_check_dir" ] || die "$agy_check_dir 必须是目录"
+    done
+  fi
   assert_plain_file_or_absent "$codex_config"
   assert_plain_file_or_absent "$zcode_config"
+  assert_plain_file_or_absent "$agy_manifest"
+  assert_plain_file_or_absent "$agy_mcp_config"
   assert_plain_file_or_absent "$agents"
   assert_plain_file_or_absent "$ignore"
 
   codex_config_needs_write=0
   zcode_config_needs_write=0
+  agy_manifest_needs_write=0
+  agy_mcp_needs_write=0
+  agy_mcp_needs_merge=0
   agents_needs_write=0
   ignore_needs_codegraph=0
   ignore_needs_codex=0
   ignore_needs_zcode=0
+  ignore_needs_agy=0
   agents_heading='## CodeGraph 与 RTK'
   managed_marker='<!-- agent-toolchain-managed:v4 -->'
   agents_block=$(managed_agents_block) || die '无法读取受管段落模板'
@@ -368,6 +391,60 @@ PYEOF
     fi
   fi
 
+  if [ "$wire_antigravity" -eq 1 ]; then
+    if [ -f "$agy_manifest" ]; then
+      command -v python3 >/dev/null 2>&1 || die '校验已存在的 .agents/plugins/codegraph/plugin.json 需要 python3；未写入任何文件'
+      python3 - "$agy_manifest" <<'PYEOF'
+import json
+import sys
+
+with open(sys.argv[1], 'r', encoding='utf-8') as handle:
+    data = json.load(handle)
+if not isinstance(data, dict) or data.get('name') != 'codegraph':
+    raise SystemExit('.agents/plugins/codegraph/plugin.json 配置冲突')
+PYEOF
+    else
+      agy_manifest_needs_write=1
+    fi
+    if [ -f "$agy_mcp_config" ]; then
+      command -v python3 >/dev/null 2>&1 || die '合并已存在的 .agents/plugins/codegraph/mcp_config.json 需要 python3；未写入任何文件'
+      agy_mcp_state=$(python3 - "$agy_mcp_config" <<'PYEOF'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, 'r', encoding='utf-8') as handle:
+    data = json.load(handle)
+if not isinstance(data, dict):
+    raise SystemExit('.agents/plugins/codegraph/mcp_config.json 顶层必须是 JSON 对象')
+servers = data.get('mcpServers')
+if servers is None:
+    print('merge')
+    raise SystemExit(0)
+if not isinstance(servers, dict):
+    raise SystemExit('.agents/plugins/codegraph/mcp_config.json 的 mcpServers 必须是对象')
+if 'codegraph' in servers:
+    server = servers['codegraph']
+    env = server.get('env') if isinstance(server, dict) else None
+    if (not isinstance(server, dict)
+            or server.get('command') != 'codegraph'
+            or list(server.get('args') or []) != ['serve', '--mcp']
+            or not isinstance(env, dict)
+            or env.get('CODEGRAPH_TELEMETRY') != '0'
+            or env.get('CODEGRAPH_NO_UPDATE_CHECK') != '1'
+            or env.get('DO_NOT_TRACK') != '1'):
+        raise SystemExit('.agents/plugins/codegraph/mcp_config.json 的 CodeGraph 配置冲突')
+    print('ok')
+else:
+    print('merge')
+PYEOF
+      ) || exit 1
+      [ "$agy_mcp_state" = merge ] && agy_mcp_needs_merge=1
+    else
+      agy_mcp_needs_write=1
+    fi
+  fi
+
   if [ -f "$agents" ] && agents_heading_candidate "$agents" 'AI 工具'; then
     die 'AGENTS.md 包含旧版 AI 工具注入标题；请人工迁移为当前 CodeGraph 与 RTK 受管标题'
   fi
@@ -397,6 +474,11 @@ PYEOF
   if [ "$wire_zcode" -eq 1 ]; then
     if [ ! -f "$ignore" ] || ! rg -q '^/\.zcode/\r?$' "$ignore"; then
       ignore_needs_zcode=1
+    fi
+  fi
+  if [ "$wire_antigravity" -eq 1 ]; then
+    if [ ! -f "$ignore" ] || ! rg -q '^/\.agents/plugins/codegraph/\r?$' "$ignore"; then
+      ignore_needs_agy=1
     fi
   fi
 
@@ -435,6 +517,52 @@ DO_NOT_TRACK = "1"'
 }' > "$zcode_config"
     fi
   fi
+  if [ "$wire_antigravity" -eq 1 ]; then
+    [ -e "$agy_plugin_dir" ] || mkdir -p "$agy_plugin_dir"
+    if [ "$agy_manifest_needs_write" -eq 1 ]; then
+      printf '%s\n' '{
+  "name": "codegraph",
+  "description": "Workspace CodeGraph MCP plugin managed by agent-toolchain."
+}' > "$agy_manifest"
+    fi
+    if [ "$agy_mcp_needs_merge" -eq 1 ]; then
+      python3 - "$agy_mcp_config" <<'PYEOF'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, 'r', encoding='utf-8') as handle:
+    data = json.load(handle)
+servers = data.setdefault('mcpServers', {})
+servers['codegraph'] = {
+    'command': 'codegraph',
+    'args': ['serve', '--mcp'],
+    'env': {
+        'CODEGRAPH_TELEMETRY': '0',
+        'CODEGRAPH_NO_UPDATE_CHECK': '1',
+        'DO_NOT_TRACK': '1',
+    },
+}
+with open(path, 'w', encoding='utf-8') as handle:
+    json.dump(data, handle, indent=2, ensure_ascii=False)
+    handle.write('\n')
+PYEOF
+    elif [ "$agy_mcp_needs_write" -eq 1 ]; then
+      printf '%s\n' '{
+  "mcpServers": {
+    "codegraph": {
+      "command": "codegraph",
+      "args": ["serve", "--mcp"],
+      "env": {
+        "CODEGRAPH_TELEMETRY": "0",
+        "CODEGRAPH_NO_UPDATE_CHECK": "1",
+        "DO_NOT_TRACK": "1"
+      }
+    }
+  }
+}' > "$agy_mcp_config"
+    fi
+  fi
   [ "$agents_needs_write" -eq 0 ] || append_project_text "$agents" "$agents_block"
   ignore_write=''
   if [ "$ignore_needs_codegraph" -eq 1 ]; then
@@ -446,6 +574,14 @@ DO_NOT_TRACK = "1"'
 /.codex/"
     else
       ignore_write='/.codex/'
+    fi
+  fi
+  if [ "$ignore_needs_agy" -eq 1 ]; then
+    if [ -n "$ignore_write" ]; then
+      ignore_write="$ignore_write
+/.agents/plugins/codegraph/"
+    else
+      ignore_write='/.agents/plugins/codegraph/'
     fi
   fi
   if [ "$ignore_needs_zcode" -eq 1 ]; then

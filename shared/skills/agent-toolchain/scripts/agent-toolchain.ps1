@@ -15,7 +15,7 @@ function Note([string]$Message) { Write-Output "agent-toolchain: $Message" }
 function Show-Usage {
   @'
 Usage:
-  agent-toolchain.ps1 configure --project PATH [--client codex|zcode|both]
+  agent-toolchain.ps1 configure --project PATH [--client codex|zcode|both|antigravity|all]
   agent-toolchain.ps1 doctor --project PATH [--quick]
   agent-toolchain.ps1 bootstrap --project PATH --dry-run|--apply
   agent-toolchain.ps1 upgrade --project PATH --dry-run|--apply
@@ -80,7 +80,7 @@ function Parse-Arguments {
       '--client' {
         if ($index + 1 -ge $DriverArgs.Count) { Fail '--client 缺少取值' }
         $script:Client = $DriverArgs[$index + 1]
-        if ($script:Client -notin @('codex', 'zcode', 'both')) { Fail "--client 取值无效：$($script:Client)（可用：codex|zcode|both）" }
+        if ($script:Client -notin @('codex', 'zcode', 'both', 'antigravity', 'all')) { Fail "--client 取值无效：$($script:Client)（可用：codex|zcode|both|antigravity|all）" }
         $index += 2
       }
       'codegraph' { if ($script:Action -ne 'rollback') { Fail "未知参数：$argument" }; $script:RollbackTool = $argument; $index += 1 }
@@ -188,30 +188,41 @@ function Configure-Project {
   $codexConfigPath = Join-Path $codexDirectory 'config.toml'
   $zcodeDirectory = Join-Path $script:Project '.zcode'
   $zcodeConfigPath = Join-Path $zcodeDirectory 'config.json'
+  $agyPluginDirectory = Join-Path (Join-Path (Join-Path $script:Project '.agents') 'plugins') 'codegraph'
+  $agyPluginManifestPath = Join-Path $agyPluginDirectory 'plugin.json'
+  $agyMcpConfigPath = Join-Path $agyPluginDirectory 'mcp_config.json'
   $agentsPath = Join-Path $script:Project 'AGENTS.md'
   $ignorePath = Join-Path $script:Project '.gitignore'
 
-  $wireCodex = $false; $wireZcode = $false
+  $wireCodex = $false; $wireZcode = $false; $wireAntigravity = $false
   if ($script:Client) {
-    $wireCodex = ($script:Client -eq 'codex') -or ($script:Client -eq 'both')
-    $wireZcode = ($script:Client -eq 'zcode') -or ($script:Client -eq 'both')
+    $wireCodex = ($script:Client -eq 'codex') -or ($script:Client -eq 'both') -or ($script:Client -eq 'all')
+    $wireZcode = ($script:Client -eq 'zcode') -or ($script:Client -eq 'both') -or ($script:Client -eq 'all')
+    $wireAntigravity = ($script:Client -eq 'antigravity') -or ($script:Client -eq 'all')
   } else {
     $wireCodex = Test-Path -LiteralPath $codexDirectory
     $wireZcode = Test-Path -LiteralPath $zcodeDirectory
-    if (-not $wireCodex -and -not $wireZcode) {
-      if ([Console]::IsInputRedirected) { Fail '未检测到 .codex/ 或 .zcode/ 客户端目录；请用 --client codex|zcode|both 指定要接入的客户端' }
+    $wireAntigravity = Test-Path -LiteralPath $agyPluginDirectory
+    if (-not $wireCodex -and -not $wireZcode -and -not $wireAntigravity) {
+      if ([Console]::IsInputRedirected) { Fail '未检测到客户端目录；请用 --client codex|zcode|both|antigravity|all 指定客户端' }
       Write-Host 'Select the client to onboard for this project:'
       Write-Host '  1) Codex'
       Write-Host '  2) ZCode'
       Write-Host '  3) Both'
+      Write-Host '  4) Antigravity'
+      Write-Host '  5) All'
       $choice = Read-Host 'Enter number or name (q to quit)'
       switch ($choice) {
         '1' { $wireCodex = $true }
         '2' { $wireZcode = $true }
         '3' { $wireCodex = $true; $wireZcode = $true }
+        '4' { $wireAntigravity = $true }
+        '5' { $wireCodex = $true; $wireZcode = $true; $wireAntigravity = $true }
         'codex' { $wireCodex = $true }
         'zcode' { $wireZcode = $true }
         'both' { $wireCodex = $true; $wireZcode = $true }
+        'antigravity' { $wireAntigravity = $true }
+        'all' { $wireCodex = $true; $wireZcode = $true; $wireAntigravity = $true }
         'q' { Note 'Cancelled: no client selected; nothing was written.'; return }
         default { Fail "Invalid selection: $choice" }
       }
@@ -226,13 +237,23 @@ function Configure-Project {
     $zcodeItem = Get-Item -LiteralPath $zcodeDirectory -Force
     if (($zcodeItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or -not $zcodeItem.PSIsContainer) { Fail '.zcode 必须是非链接目录' }
   }
+  if ($wireAntigravity) {
+    foreach ($agyDir in @((Join-Path $script:Project '.agents'), (Join-Path (Join-Path $script:Project '.agents') 'plugins'), $agyPluginDirectory)) {
+      if (Test-Path -LiteralPath $agyDir) {
+        $agyItem = Get-Item -LiteralPath $agyDir -Force
+        if (($agyItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or -not $agyItem.PSIsContainer) { Fail "$agyDir 必须是非链接目录" }
+      }
+    }
+  }
   Assert-PlainFileOrAbsent $codexConfigPath
   Assert-PlainFileOrAbsent $zcodeConfigPath
+  Assert-PlainFileOrAbsent $agyPluginManifestPath
+  Assert-PlainFileOrAbsent $agyMcpConfigPath
   Assert-PlainFileOrAbsent $agentsPath
   Assert-PlainFileOrAbsent $ignorePath
 
-  $needsCodexConfig = $false; $needsZcodeConfig = $false; $needsAgents = $false
-  $needsIgnoreCodegraph = $false; $needsIgnoreCodex = $false; $needsIgnoreZcode = $false
+  $needsCodexConfig = $false; $needsZcodeConfig = $false; $needsAgyManifest = $false; $needsAgyMcp = $false; $needsAgents = $false
+  $needsIgnoreCodegraph = $false; $needsIgnoreCodex = $false; $needsIgnoreZcode = $false; $needsIgnoreAgy = $false
   $agentsHeading = '## CodeGraph 与 RTK'
   $agentsBlockPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'references/managed-agents-block.md'
   if (-not (Test-Path -LiteralPath $agentsBlockPath -PathType Leaf)) { Fail "缺少受管段落模板：$agentsBlockPath" }
@@ -282,6 +303,40 @@ function Configure-Project {
     }
   }
 
+  $agyManifestJson = $null
+  $agyMcpJson = $null
+  if ($wireAntigravity) {
+    if (Test-Path -LiteralPath $agyPluginManifestPath) {
+      try { $agyManifestJson = Get-Content -LiteralPath $agyPluginManifestPath -Raw | ConvertFrom-Json -AsHashtable } catch { Fail '.agents/plugins/codegraph/plugin.json 不是有效的 JSON' }
+      if ($agyManifestJson -isnot [System.Collections.IDictionary] -or $agyManifestJson['name'] -ne 'codegraph') { Fail '.agents/plugins/codegraph/plugin.json 配置冲突' }
+    } else {
+      $agyManifestJson = [ordered]@{ name = 'codegraph'; description = 'Workspace CodeGraph MCP plugin managed by agent-toolchain.' }
+      $needsAgyManifest = $true
+    }
+    if (Test-Path -LiteralPath $agyMcpConfigPath) {
+      try { $agyMcpJson = Get-Content -LiteralPath $agyMcpConfigPath -Raw | ConvertFrom-Json -AsHashtable } catch { Fail '.agents/plugins/codegraph/mcp_config.json 不是有效的 JSON' }
+    } else {
+      $agyMcpJson = [ordered]@{}
+    }
+    if ($agyMcpJson -isnot [System.Collections.IDictionary]) { Fail '.agents/plugins/codegraph/mcp_config.json 顶层必须是 JSON 对象' }
+    if (-not $agyMcpJson.Contains('mcpServers')) { $agyMcpJson['mcpServers'] = [ordered]@{} }
+    elseif ($agyMcpJson['mcpServers'] -isnot [System.Collections.IDictionary]) { Fail '.agents/plugins/codegraph/mcp_config.json 的 mcpServers 必须是对象' }
+    $agyServers = $agyMcpJson['mcpServers']
+    if ($agyServers.Contains('codegraph')) {
+      $existing = $agyServers['codegraph']
+      $existingEnv = $null
+      if ($existing -is [System.Collections.IDictionary]) { $existingEnv = $existing['env'] }
+      if ($existing -isnot [System.Collections.IDictionary] -or $existing['command'] -ne 'codegraph' -or (@($existing['args']) -join ',') -ne 'serve,--mcp' -or $existingEnv -isnot [System.Collections.IDictionary] -or $existingEnv['CODEGRAPH_TELEMETRY'] -ne '0' -or $existingEnv['CODEGRAPH_NO_UPDATE_CHECK'] -ne '1' -or $existingEnv['DO_NOT_TRACK'] -ne '1') { Fail '.agents/plugins/codegraph/mcp_config.json 的 CodeGraph 配置冲突' }
+    } else {
+      $agyServers['codegraph'] = [ordered]@{
+        command = 'codegraph'
+        args = @('serve', '--mcp')
+        env = [ordered]@{ CODEGRAPH_TELEMETRY = '0'; CODEGRAPH_NO_UPDATE_CHECK = '1'; DO_NOT_TRACK = '1' }
+      }
+      $needsAgyMcp = $true
+    }
+  }
+
   $agentsText = if (Test-Path -LiteralPath $agentsPath) { Get-Content -LiteralPath $agentsPath -Raw } else { '' }
   $agentsLines = @($agentsText -replace "`r`n", "`n" -split "`n")
   if ($agentsLines.Count -gt 0) { $agentsLines[0] = $agentsLines[0].TrimStart([char]0xFEFF) }
@@ -301,6 +356,7 @@ function Configure-Project {
   if ($ignoreText -notmatch '(?m)^/\.codegraph/\s*$') { $needsIgnoreCodegraph = $true }
   if ($wireCodex -and $ignoreText -notmatch '(?m)^/\.codex/\s*$') { $needsIgnoreCodex = $true }
   if ($wireZcode -and $ignoreText -notmatch '(?m)^/\.zcode/\s*$') { $needsIgnoreZcode = $true }
+  if ($wireAntigravity -and $ignoreText -notmatch '(?m)^/\.agents/plugins/codegraph/\s*$') { $needsIgnoreAgy = $true }
 
   if ($wireCodex) {
     if (-not (Test-Path -LiteralPath $codexDirectory)) { New-Item -ItemType Directory -Path $codexDirectory | Out-Null }
@@ -326,6 +382,15 @@ DO_NOT_TRACK = "1"
       [IO.File]::WriteAllText($zcodeConfigPath, "$($zcodeJson | ConvertTo-Json -Depth 10)`n", [Text.UTF8Encoding]::new($false))
     }
   }
+  if ($wireAntigravity) {
+    if (-not (Test-Path -LiteralPath $agyPluginDirectory)) { New-Item -ItemType Directory -Path $agyPluginDirectory -Force | Out-Null }
+    if ($needsAgyManifest) {
+      [IO.File]::WriteAllText($agyPluginManifestPath, "$($agyManifestJson | ConvertTo-Json -Depth 10)`n", [Text.UTF8Encoding]::new($false))
+    }
+    if ($needsAgyMcp) {
+      [IO.File]::WriteAllText($agyMcpConfigPath, "$($agyMcpJson | ConvertTo-Json -Depth 10)`n", [Text.UTF8Encoding]::new($false))
+    }
+  }
   if ($needsAgents) {
     Append-ProjectText $agentsPath $agentsBlock
   }
@@ -333,6 +398,7 @@ DO_NOT_TRACK = "1"
   if ($needsIgnoreCodegraph) { $ignoreWrite += '/.codegraph/' }
   if ($needsIgnoreCodex) { $ignoreWrite += '/.codex/' }
   if ($needsIgnoreZcode) { $ignoreWrite += '/.zcode/' }
+  if ($needsIgnoreAgy) { $ignoreWrite += '/.agents/plugins/codegraph/' }
   if ($ignoreWrite.Count -gt 0) { Append-ProjectText $ignorePath ($ignoreWrite -join "`n") }
   Note '项目 CodeGraph、RTK 受管配置已就绪'
 }
