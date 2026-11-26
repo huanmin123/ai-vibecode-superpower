@@ -109,7 +109,7 @@ function Read-Preset([string]$PresetFile) {
                 $preset.sections[$hostName].roles.Add(@{})
                 $section = @{ Host = $hostName; RoleIndex = $preset.sections[$hostName].roles.Count - 1 }
             } else {
-                if ($table.Value -notin @('zcode', 'codex')) { throw "Unsupported preset table: $trimmed" }
+                if ($table.Value -notin @('zcode', 'codex', 'antigravity')) { throw "Unsupported preset table: $trimmed" }
                 if (-not $preset.sections.Contains($table.Value)) { $preset.sections[$table.Value] = @{ roles = [Collections.Generic.List[hashtable]]::new() } }
                 $section = @{ Host = $table.Value; RoleIndex = $null }
             }
@@ -152,7 +152,7 @@ function Assert-ModelBindingValue([string]$HostSection, [string]$Value, [string]
 function Read-ModelBindings([string]$Path, [string]$HostSection) {
     # 顶层 key -> 绑定值记录；Value 为解析后的字符串，Line 供 resolve 报错定位。
     $bindings = [hashtable]::new([StringComparer]::Ordinal)
-    $seen = @{ zcode = [hashtable]::new([StringComparer]::Ordinal); codex = [hashtable]::new([StringComparer]::Ordinal) }
+    $seen = @{ zcode = [hashtable]::new([StringComparer]::Ordinal); codex = [hashtable]::new([StringComparer]::Ordinal); antigravity = [hashtable]::new([StringComparer]::Ordinal) }
     $seenTables = [hashtable]::new([StringComparer]::Ordinal)
     $section = $null
     $lineNumber = 0
@@ -162,13 +162,13 @@ function Read-ModelBindings([string]$Path, [string]$HostSection) {
         $trimmed = $line.Trim()
         if ([string]::IsNullOrWhiteSpace($trimmed) -or $trimmed.StartsWith('#')) { continue }
         if ($trimmed.StartsWith('[')) {
-            if ($trimmed -cne '[zcode]' -and $trimmed -cne '[codex]') { throw "Unsupported model binding table in ${Path}:${lineNumber}: $trimmed" }
+            if ($trimmed -cne '[zcode]' -and $trimmed -cne '[codex]' -and $trimmed -cne '[antigravity]') { throw "Unsupported model binding table in ${Path}:${lineNumber}: $trimmed" }
             if ($seenTables.ContainsKey($trimmed)) { throw "Repeated model binding table in ${Path}:${lineNumber}: $trimmed" }
             $seenTables[$trimmed] = $true
             $section = $trimmed.Substring(1, $trimmed.Length - 2)
             continue
         }
-        if ($null -eq $section) { throw "Unsupported model binding line in ${Path}:${lineNumber}: $trimmed (expected [zcode] or [codex] section first)" }
+        if ($null -eq $section) { throw "Unsupported model binding line in ${Path}:${lineNumber}: $trimmed (expected [zcode], [codex], or [antigravity] section first)" }
         $separator = $trimmed.IndexOf('=')
         if ($separator -lt 1) { throw "Unsupported model binding line in ${Path}:${lineNumber}: $trimmed" }
         $key = $trimmed.Substring(0, $separator).Trim()
@@ -336,11 +336,15 @@ function ConvertTo-TomlMultiline([string]$Value) {
     return '"""' + "`n" + $escaped + "`n" + '"""'
 }
 
-function Convert-PresetToSkillRoute([hashtable]$Preset, [string]$Section) {
+function Convert-PresetToSkillRoute([hashtable]$Preset, [string]$Section, [string]$Kind = '') {
     $hostTable = $Preset.sections[$Section]
     $lines = [Collections.Generic.List[string]]::new()
     foreach ($role in $hostTable.roles) {
         $desc = if ($role.Contains('skill_desc')) { [string]$role.skill_desc } else { [string]$role.description }
+        if ($Kind -eq 'agy-md') {
+            $effectiveModel = if ($role.Contains('model')) { [string]$role.model } elseif ($hostTable.Contains('model')) { [string]$hostTable.model } else { '' }
+            $desc = $desc + "（invoke_subagent Model: $effectiveModel）"
+        }
         $lines.Add('- `' + [string]$role.name + '`：' + $desc)
     }
     return ($lines -join "`n")
@@ -370,6 +374,8 @@ function Convert-PresetToHostFiles([hashtable]$Preset, [string]$Section, [string
     foreach ($role in $roles) { $nameById[[string]$role.id] = [string]$role.name }
     $effortMap = @{ basic = 'low'; deep = 'high'; max = 'max' }
     $defaultTools = @('Read', 'Bash', 'WebFetch', 'WebSearch', 'TodoWrite')
+    $defaultAgyReadonlyTools = @('read_file', 'run_command', 'manage_task', 'search_web')
+    $defaultAgyWritableTools = @('read_file', 'edit_file', 'write_file', 'run_command', 'manage_task', 'search_web')
     $ignored = [Collections.Generic.List[string]]::new()
     $files = [ordered]@{}
     foreach ($role in $roles) {
@@ -384,20 +390,30 @@ function Convert-PresetToHostFiles([hashtable]$Preset, [string]$Section, [string
         if ($role.Contains('model')) { $model = [string]$role.model }
         elseif ($hostTable.Contains('model')) { $model = [string]$hostTable.model }
         if ([string]::IsNullOrWhiteSpace($model)) { throw "Role [$Section]/$id has no model (neither role model nor [$Section] model)" }
-        $effortKey = if ($Kind -eq 'md') { 'thoughtLevel' } else { 'model_reasoning_effort' }
-        $foreignEffortKey = if ($Kind -eq 'md') { 'model_reasoning_effort' } else { 'thoughtLevel' }
         $effort = $null
-        if ($role.Contains($effortKey)) {
-            if ($role.Contains('effort')) { throw "Role [$Section]/$id must not set both effort and $effortKey" }
-            $effort = [string]$role[$effortKey]
-        } elseif ($role.Contains('effort')) {
-            $effortValue = [string]$role.effort
-            if (-not $effortMap.ContainsKey($effortValue)) { throw "Role [$Section]/${id}: unsupported effort $effortValue" }
-            $effort = $effortMap[$effortValue]
-        } elseif ($role.Contains($foreignEffortKey)) {
-            throw "Role [$Section]/$id sets only $foreignEffortKey which is not consumed by this host; set effort or $effortKey"
-        } else { throw "Role [$Section]/$id has neither effort nor $effortKey" }
-        if ($role.Contains($foreignEffortKey) -and $null -ne $effort) { $ignored.Add("[$Section]/${id}: $foreignEffortKey is not consumed by this host") }
+        if ($Kind -eq 'agy-md') {
+            if ($role.Contains('effort')) {
+                $effortValue = [string]$role.effort
+                if (-not $effortMap.ContainsKey($effortValue)) { throw "Role [$Section]/${id}: unsupported effort $effortValue" }
+                $effort = $effortMap[$effortValue]
+            } else { throw "Role [$Section]/$id requires effort (basic, deep, or max)" }
+            if ($role.Contains('thoughtLevel')) { $ignored.Add("[$Section]/${id}: thoughtLevel is not consumed by Antigravity") }
+            if ($role.Contains('model_reasoning_effort')) { $ignored.Add("[$Section]/${id}: model_reasoning_effort is not consumed by Antigravity") }
+        } else {
+            $effortKey = if ($Kind -eq 'md') { 'thoughtLevel' } else { 'model_reasoning_effort' }
+            $foreignEffortKey = if ($Kind -eq 'md') { 'model_reasoning_effort' } else { 'thoughtLevel' }
+            if ($role.Contains($effortKey)) {
+                if ($role.Contains('effort')) { throw "Role [$Section]/$id must not set both effort and $effortKey" }
+                $effort = [string]$role[$effortKey]
+            } elseif ($role.Contains('effort')) {
+                $effortValue = [string]$role.effort
+                if (-not $effortMap.ContainsKey($effortValue)) { throw "Role [$Section]/${id}: unsupported effort $effortValue" }
+                $effort = $effortMap[$effortValue]
+            } elseif ($role.Contains($foreignEffortKey)) {
+                throw "Role [$Section]/$id sets only $foreignEffortKey which is not consumed by this host; set effort or $effortKey"
+            } else { throw "Role [$Section]/$id has neither effort nor $effortKey" }
+            if ($role.Contains($foreignEffortKey) -and $null -ne $effort) { $ignored.Add("[$Section]/${id}: $foreignEffortKey is not consumed by this host") }
+        }
         $bodyFile = if ($role.Contains('body')) { Join-Path $PresetDir ('roles\' + [string]$role.body) } else { Join-Path $PresetDir "roles\$id.md" }
         if (-not (Test-Path -LiteralPath $bodyFile -PathType Leaf)) { throw "Role body file missing: $bodyFile" }
         $body = [IO.File]::ReadAllText($bodyFile)
@@ -410,7 +426,31 @@ function Convert-PresetToHostFiles([hashtable]$Preset, [string]$Section, [string
             if (-not $nameById.ContainsKey($ref)) { throw "Role [$Section]/$id references unknown role id: $ref" }
             $nameById[$ref]
         })
-        if ($Kind -eq 'md') {
+        if ($Kind -eq 'agy-md') {
+            if ($model -cnotin @('flash_lite', 'flash', 'inherit', 'pro')) { throw "Role [$Section]/${id}: unsupported Antigravity model tier $model (expected flash_lite, flash, inherit, or pro)" }
+            if ($role.Contains('sandbox_mode')) { $ignored.Add("[$Section]/${id}: sandbox_mode is not consumed by Antigravity") }
+            if ($role.Contains('color')) { $ignored.Add("[$Section]/${id}: color is not consumed by Antigravity") }
+            if ($role.Contains('tools') -and $role.tools -isnot [array]) { throw "Role [$Section]/${id}: tools must be an array" }
+            if ($readonly) {
+                $tools = if ($role.Contains('tools')) { @($role.tools | ForEach-Object { [string]$_ }) } else { $defaultAgyReadonlyTools }
+            } elseif ($role.Contains('tools')) {
+                throw "Role [$Section]/${id}: must not set tools for a writable role"
+            } else {
+                $tools = $defaultAgyWritableTools
+            }
+            $agyDesc = $description + "（invoke_subagent Model: $model）"
+            $lines = [Collections.Generic.List[string]]::new()
+            $lines.Add('---')
+            $lines.Add("name: $name")
+            $lines.Add('description: "' + (ConvertTo-SafeQuoted $agyDesc) + '"')
+            $lines.Add('subagent: true')
+            $lines.Add('mainAgent: false')
+            $lines.Add('tools: [' + ($tools -join ', ') + ']')
+            $lines.Add('---')
+            $lines.Add('')
+            $lines.Add($body.TrimEnd())
+            $files[$name + '.md'] = ($lines -join "`n") + "`n"
+        } elseif ($Kind -eq 'md') {
             if ($role.Contains('sandbox_mode')) { $ignored.Add("[$Section]/${id}: sandbox_mode is not consumed by ZCode") }
             if ($role.Contains('model_reasoning_effort')) { $ignored.Add("[$Section]/${id}: model_reasoning_effort is not consumed by ZCode") }
             $color = if ($role.Contains('color')) { [string]$role.color } elseif (-not $readonly) { 'green' } elseif ($effort -eq 'max') { 'orange' } else { 'cyan' }
@@ -490,8 +530,43 @@ function Assert-TomlRoleStructure([string]$Directory, [int]$ExpectedCount) {
     }
 }
 
+function Assert-AgyAgentFile([string]$Path) {
+    $text = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
+    $lines = $text -split "`r?`n"
+    $fileName = [IO.Path]::GetFileName($Path)
+    if ($lines.Count -lt 2 -or $lines[0] -ne '---') { throw "Agent frontmatter missing: $fileName" }
+    $end = -1
+    for ($i = 1; $i -lt $lines.Count; $i++) { if ($lines[$i] -eq '---') { $end = $i; break } }
+    if ($end -lt 1) { throw "Agent frontmatter unterminated: $fileName" }
+    $frontmatter = $lines[1..($end - 1)] -join "`n"
+    $name = $null
+    foreach ($key in 'name', 'description', 'subagent', 'mainAgent', 'tools') {
+        if ($frontmatter -notmatch "(?m)^$key\s*:") { throw "Agent field missing: $fileName/$key" }
+        if ($key -eq 'name' -and $frontmatter -match '(?m)^name\s*:\s*"?([^\r\n"]+?)"?\s*$') { $name = $Matches[1].Trim() }
+    }
+    if ($frontmatter -notmatch '(?m)^subagent\s*:\s*true\s*$') { throw "Agent subagent must be true: $fileName" }
+    if ($frontmatter -notmatch '(?m)^mainAgent\s*:\s*false\s*$') { throw "Agent mainAgent must be false: $fileName" }
+    if ($name -ne [IO.Path]::GetFileNameWithoutExtension($Path)) { throw "Agent name mismatch: $fileName/$name" }
+}
+
+function Assert-AgyAgentStructure([string]$Directory, [int]$ExpectedCount) {
+    $files = @(Get-ChildItem -LiteralPath $Directory -Filter '*.md' -File)
+    if ($files.Count -ne $ExpectedCount) { throw "Expected $ExpectedCount managed agent files, found $($files.Count): $Directory" }
+    foreach ($file in $files) { Assert-AgyAgentFile $file.FullName }
+}
+
+function Assert-AgyAgentFiles([string]$Directory, [System.Collections.ICollection]$FileNames) {
+    foreach ($fileName in $FileNames) {
+        $path = Join-Path $Directory $fileName
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Managed agent file missing: $path" }
+        Assert-AgyAgentFile $path
+    }
+}
+
 function Assert-RoleOutput([string]$Kind, [string]$Directory, [int]$ExpectedCount) {
-    if ($Kind -eq 'toml') { Assert-TomlRoleStructure $Directory $ExpectedCount } else { Assert-AgentStructure $Directory $ExpectedCount }
+    if ($Kind -eq 'toml') { Assert-TomlRoleStructure $Directory $ExpectedCount }
+    elseif ($Kind -eq 'agy-md') { Assert-AgyAgentStructure $Directory $ExpectedCount }
+    else { Assert-AgentStructure $Directory $ExpectedCount }
 }
 
 function Read-SourceManifest([string]$ManifestPath) {
@@ -856,6 +931,23 @@ $clientProfiles = [ordered]@{
             @{ Name = 'security-audit'; Source = (Join-Path $root 'shared\skills\security-audit') }
         )
     }
+    antigravity = @{
+        Label = 'Antigravity'; HomeEnv = 'ANTIGRAVITY_HOME'; DefaultHome = '.gemini\config\plugins\ai-vibecode-superpower'; RoleKind = 'agy-md'; HostSection = 'antigravity'; DefaultPreset = 'antigravity'; Placeholder = 'ANTIGRAVITY_HOME'
+        Instructions = Join-Path $root 'shared\global-instructions.md'
+        InstructionsTarget = 'rules\AGENTS.md'
+        Docs = Join-Path $root 'antigravity-global-config\docs'
+        PluginManifest = Join-Path $root 'antigravity-global-config\plugin.json'
+        PluginAssets = Join-Path $root 'antigravity-global-config\assets'
+        Skills = @(
+            @{ Name = 'agent-toolchain'; Source = (Join-Path $root 'shared\skills\agent-toolchain') },
+            @{ Name = 'project-doc-planner'; Source = (Join-Path $root 'shared\skills\project-doc-planner') },
+            @{ Name = 'visual-aesthetics'; Source = (Join-Path $root 'shared\skills\visual-aesthetics') },
+            @{ Name = 'deep-dive-review'; Source = (Join-Path $root 'shared\skills\deep-dive-review') },
+            @{ Name = 'orchestrate-model-workflow'; Source = (Join-Path $root 'shared\skills\orchestrate-model-workflow') },
+            @{ Name = 'test-strategy'; Source = (Join-Path $root 'shared\skills\test-strategy') },
+            @{ Name = 'security-audit'; Source = (Join-Path $root 'shared\skills\security-audit') }
+        )
+    }
 }
 
 if ([string]::IsNullOrWhiteSpace($Preset) -and -not $External -and -not [Console]::IsInputRedirected) {
@@ -982,6 +1074,8 @@ if ($profile.Contains('SkillAssets') -and (Test-Path -LiteralPath $profile.Skill
     }
 }
 if ($profile.Contains('ConfigTemplate')) { foreach ($path in @($profile.ConfigTemplate, $profile.ProviderSettings)) { if (-not (Test-Path -LiteralPath $path)) { throw "Missing source: $path" } } }
+if ($profile.Contains('PluginManifest') -and -not (Test-Path -LiteralPath $profile.PluginManifest -PathType Leaf)) { throw "Missing source: $($profile.PluginManifest)" }
+if ($profile.Contains('PluginAssets') -and -not (Test-Path -LiteralPath $profile.PluginAssets -PathType Container)) { throw "Missing source: $($profile.PluginAssets)" }
 foreach ($skill in $profile.Skills) {
     if (-not (Test-Path -LiteralPath $skill.Source -PathType Container)) { throw "Missing skill: $($skill.Name)" }
     if (-not (Test-Path -LiteralPath (Join-Path $skill.Source 'SKILL.md') -PathType Leaf)) { throw "Missing SKILL.md for skill: $($skill.Name)" }
@@ -993,15 +1087,24 @@ Assert-NoReparseChain $homePath
 
 $existingConfig = $null
 if ($profile.Contains('ConfigTemplate')) { $existingConfig = Join-Path $homePath 'config.toml' }
+$instructionsRel = if ($profile.Contains('InstructionsTarget')) { [string]$profile.InstructionsTarget } else { 'AGENTS.md' }
+$instructionsName = $instructionsRel.Replace('\', '/')
+$isFlatMdRoles = $profile.RoleKind -in @('md', 'agy-md')
 
 $stage = Join-Path $homePath ('.install-stage-' + [Guid]::NewGuid().ToString('N'))
 $backup = $null
 $targets = @(
-    @{ Name='AGENTS.md'; Target=(Join-Path $homePath 'AGENTS.md'); Candidate=(Join-Path $stage 'AGENTS.md'); Kind='File'; BackedUp=$false; InstallStarted=$false },
+    @{ Name=$instructionsName; Target=(Join-Path $homePath $instructionsRel); Candidate=(Join-Path $stage $instructionsRel); Kind='File'; BackedUp=$false; InstallStarted=$false },
     @{ Name='docs'; Target=(Join-Path $homePath 'docs'); Candidate=(Join-Path $stage 'docs'); Kind='Directory'; BackedUp=$false; InstallStarted=$false }
 )
-# md agents are installed flat: the ZCode host only scans the top level of ~/.zcode/agents.
-if ($profile.RoleKind -eq 'md') {
+if ($profile.Contains('PluginManifest')) {
+    $targets += @{ Name='plugin.json'; Target=(Join-Path $homePath 'plugin.json'); Candidate=(Join-Path $stage 'plugin.json'); Kind='File'; BackedUp=$false; InstallStarted=$false }
+}
+if ($profile.Contains('PluginAssets')) {
+    $targets += @{ Name='assets'; Target=(Join-Path $homePath 'assets'); Candidate=(Join-Path $stage 'assets'); Kind='Directory'; BackedUp=$false; InstallStarted=$false }
+}
+# md / agy-md agents are installed flat under <home>/agents/.
+if ($isFlatMdRoles) {
     foreach ($agentName in $rendered.Files.Keys) {
         $targets += @{ Name="agents/$agentName"; Target=(Join-Path $homePath "agents\$agentName"); Candidate=(Join-Path $stage "agents\$agentName"); Kind='File'; BackedUp=$false; InstallStarted=$false }
     }
@@ -1014,16 +1117,18 @@ if ($profile.RoleKind -eq 'md') {
         $targets += @{ Name="agents/$staleName"; Target=(Join-Path $homePath "agents\$staleName"); Candidate=$null; Kind='File'; BackedUp=$false; InstallStarted=$false }
     }
     $targets += @{ Name='agents/.ai-vibecode-superpower.managed'; Target=$managedList; Candidate=(Join-Path $stage 'agents\.ai-vibecode-superpower.managed'); Kind='File'; BackedUp=$false; InstallStarted=$false }
-    $legacyAgentsDir = Join-Path $homePath 'agents\ai-vibecode-superpower'
-    if (Test-Path -LiteralPath $legacyAgentsDir -PathType Container) {
-        try {
-            Assert-AgentStructure $legacyAgentsDir $expectedRoleCount
-            $legacyNames = @(Get-ChildItem -LiteralPath $legacyAgentsDir -Filter '*.md' -File | Sort-Object Name | ForEach-Object { $_.Name })
-            $expectedNames = @($rendered.Files.Keys | Sort-Object)
-            if (($legacyNames -join '|') -ne ($expectedNames -join '|')) { throw "Legacy agent set differs from preset output" }
-            $targets += @{ Name='agents/ai-vibecode-superpower'; Target=$legacyAgentsDir; Candidate=$null; Kind='Directory'; BackedUp=$false; InstallStarted=$false }
-        } catch {
-            Write-Warning "Legacy managed agent directory does not match the preset; left untouched: $legacyAgentsDir"
+    if ($profile.RoleKind -eq 'md') {
+        $legacyAgentsDir = Join-Path $homePath 'agents\ai-vibecode-superpower'
+        if (Test-Path -LiteralPath $legacyAgentsDir -PathType Container) {
+            try {
+                Assert-AgentStructure $legacyAgentsDir $expectedRoleCount
+                $legacyNames = @(Get-ChildItem -LiteralPath $legacyAgentsDir -Filter '*.md' -File | Sort-Object Name | ForEach-Object { $_.Name })
+                $expectedNames = @($rendered.Files.Keys | Sort-Object)
+                if (($legacyNames -join '|') -ne ($expectedNames -join '|')) { throw "Legacy agent set differs from preset output" }
+                $targets += @{ Name='agents/ai-vibecode-superpower'; Target=$legacyAgentsDir; Candidate=$null; Kind='Directory'; BackedUp=$false; InstallStarted=$false }
+            } catch {
+                Write-Warning "Legacy managed agent directory does not match the preset; left untouched: $legacyAgentsDir"
+            }
         }
     }
 } else {
@@ -1034,7 +1139,9 @@ if ($null -ne $existingConfig) {
 }
 foreach ($skill in $profile.Skills) { $targets += @{ Name="skills/$($skill.Name)"; Target=(Join-Path $homePath "skills\$($skill.Name)"); Candidate=(Join-Path $stage "skills\$($skill.Name)"); Kind='Directory'; BackedUp=$false; InstallStarted=$false } }
 foreach ($target in $targets) { Assert-InstallTarget $target.Target $target.Kind }
-foreach ($container in @((Join-Path $homePath 'agents'),(Join-Path $homePath 'skills'),(Join-Path $homePath 'backups'))) { Assert-InstallContainer $container }
+$containers = @((Join-Path $homePath 'agents'),(Join-Path $homePath 'skills'),(Join-Path $homePath 'backups'))
+if ($profile.Contains('InstructionsTarget')) { $containers += (Split-Path -Parent (Join-Path $homePath $instructionsRel)) }
+foreach ($container in $containers) { Assert-InstallContainer $container }
 
 try {
     New-Item -ItemType Directory -Path $homePath -Force | Out-Null
@@ -1042,13 +1149,22 @@ try {
     New-Item -ItemType Directory -Path $stage -Force | Out-Null
     New-Item -ItemType Directory -Path (Join-Path $stage 'agents') -Force | Out-Null
     New-Item -ItemType Directory -Path (Join-Path $stage 'skills') -Force | Out-Null
-    Copy-Item $profile.Instructions (Join-Path $stage 'AGENTS.md')
+    $stageInstructions = Join-Path $stage $instructionsRel
+    New-Item -ItemType Directory -Path (Split-Path -Parent $stageInstructions) -Force | Out-Null
+    Copy-Item $profile.Instructions $stageInstructions
     Copy-Item $profile.Docs (Join-Path $stage 'docs') -Recurse
     Copy-Item $sourceSystemDocs (Join-Path $stage 'docs\system') -Recurse
+    if ($profile.Contains('PluginManifest')) {
+        $null = Get-Content -LiteralPath $profile.PluginManifest -Raw -Encoding UTF8 | ConvertFrom-Json
+        Copy-Item $profile.PluginManifest (Join-Path $stage 'plugin.json')
+    }
+    if ($profile.Contains('PluginAssets')) {
+        Copy-Item $profile.PluginAssets (Join-Path $stage 'assets') -Recurse
+    }
     $stageAgents = Join-Path $stage 'agents'
     if ($profile.RoleKind -eq 'toml') { $stageAgents = Join-Path $stageAgents 'ai-vibecode-superpower'; New-Item -ItemType Directory -Path $stageAgents -Force | Out-Null }
     foreach ($fileName in $rendered.Files.Keys) { [IO.File]::WriteAllText((Join-Path $stageAgents $fileName), $rendered.Files[$fileName], [Text.UTF8Encoding]::new($false)) }
-    if ($profile.RoleKind -eq 'md') { [IO.File]::WriteAllText((Join-Path $stageAgents '.ai-vibecode-superpower.managed'), ((@($rendered.Files.Keys) | Sort-Object) -join "`n") + "`n", [Text.UTF8Encoding]::new($false)) }
+    if ($isFlatMdRoles) { [IO.File]::WriteAllText((Join-Path $stageAgents '.ai-vibecode-superpower.managed'), ((@($rendered.Files.Keys) | Sort-Object) -join "`n") + "`n", [Text.UTF8Encoding]::new($false)) }
     foreach ($skill in $profile.Skills) { Copy-Item $skill.Source (Join-Path $stage 'skills') -Recurse }
     if ($profile.Contains('SkillAssets') -and (Test-Path -LiteralPath $profile.SkillAssets -PathType Container)) {
         foreach ($asset in Get-ChildItem -LiteralPath $profile.SkillAssets -Directory) {
@@ -1061,7 +1177,7 @@ try {
     if (Test-Path -LiteralPath $skillDoc -PathType Leaf) {
         $skillText = [IO.File]::ReadAllText($skillDoc)
         if ($skillText.Contains('<!-- preset-roles -->')) {
-            $skillText = $skillText.Replace('<!-- preset-roles -->', (Convert-PresetToSkillRoute $presetData $profile.HostSection))
+            $skillText = $skillText.Replace('<!-- preset-roles -->', (Convert-PresetToSkillRoute $presetData $profile.HostSection $profile.RoleKind))
             $skillText = $skillText -replace "`r`n", "`n"
             [IO.File]::WriteAllText($skillDoc, $skillText, [Text.UTF8Encoding]::new($false))
         }
@@ -1069,10 +1185,10 @@ try {
     if ($null -ne $existingConfig) { Merge-Config $profile.ConfigTemplate $existingConfig $profile.ProviderSettings (Join-Path $stage 'config.toml') }
     Expand-Placeholders $stage $profile.Placeholder $homePath
     # 展开后不得残留任一宿主的 home 占位符或未解析 token，否则宿主会读到错误的文档路径。
-    $guardFiles = @((Join-Path $stage 'AGENTS.md')) + @(Get-ChildItem -LiteralPath (Join-Path $stage 'skills') -Directory -ErrorAction SilentlyContinue | ForEach-Object { Join-Path $_.FullName 'SKILL.md' })
+    $guardFiles = @($stageInstructions, (Join-Path $stage 'docs\README.md')) + @(Get-ChildItem -LiteralPath (Join-Path $stage 'skills') -Directory -ErrorAction SilentlyContinue | ForEach-Object { Join-Path $_.FullName 'SKILL.md' })
     foreach ($guardFile in $guardFiles) {
         if (-not (Test-Path -LiteralPath $guardFile -PathType Leaf)) { continue }
-        if ([IO.File]::ReadAllText($guardFile) -match '<(CODEX_HOME|ZCODE_HOME|GLOBAL_HOME)>|\$(CODEX_HOME|ZCODE_HOME)|\{\{') { throw "Unresolved home placeholder in: $guardFile" }
+        if ([IO.File]::ReadAllText($guardFile) -match '<(CODEX_HOME|ZCODE_HOME|ANTIGRAVITY_HOME|GLOBAL_HOME)>|\$(CODEX_HOME|ZCODE_HOME|ANTIGRAVITY_HOME)|\{\{') { throw "Unresolved home placeholder in: $guardFile" }
     }
     Assert-RoleOutput $profile.RoleKind $stageAgents $expectedRoleCount
 
@@ -1095,12 +1211,18 @@ try {
         }
     }
     if ($profile.RoleKind -eq 'md') { Assert-AgentFiles (Join-Path $homePath 'agents') @($rendered.Files.Keys) }
+    elseif ($profile.RoleKind -eq 'agy-md') { Assert-AgyAgentFiles (Join-Path $homePath 'agents') @($rendered.Files.Keys) }
     else { Assert-TomlRoleStructure (Join-Path $homePath 'agents\ai-vibecode-superpower') $expectedRoleCount }
     foreach ($note in $rendered.Ignored) { Write-Warning "Preset field not consumed: $note" }
     Write-Host "$label configuration installed in: $homePath"
     Write-Host "Preset '$presetName' rendered $expectedRoleCount roles.$variantLabelsNote"
     Write-Host 'Standalone skills and managed agent roles installed.'
-    Write-Host "Restart $label to load the new configuration and skills."
+    if ($Client -eq 'antigravity') {
+        Write-Host 'Antigravity discovers the plugin automatically from the next turn; manage it from Customizations.'
+        Write-Host 'Other Antigravity plugins and global config.json were not modified.'
+    } else {
+        Write-Host "Restart $label to load the new configuration and skills."
+    }
     Write-Host "Backup directory: $backup"
     if ($Client -eq 'zcode') { Write-Host 'Unmanaged ZCode state (cli/, v2/, plugins, other skills and agents) was not modified.' }
 }

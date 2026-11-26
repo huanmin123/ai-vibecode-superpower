@@ -1,0 +1,18 @@
+{
+  "name": "ai-vibecode-superpower",
+  "displayName": "AI Vibecode Superpower",
+  "version": "1.0.0",
+  "description": "将 Antigravity 升级为面向复杂开发的工程协作系统：分层原生子代理、五阶段工程工作流、多轮深挖复审、取证式安全审计、视觉美学走查与文档/测试策略。",
+  "logo": "assets/logo.svg",
+  "author": {
+    "name": "huanmin123",
+    "url": "https://github.com/huanmin123"
+  },
+  "homepage": "https://github.com/huanmin123/ai-vibecode-superpower",
+  "repository": "https://github.com/huanmin123/ai-vibecode-superpower",
+  "suggestedPrompts": [
+    "使用 orchestrate-model-workflow 组织这个跨文件复杂开发任务",
+    "使用 deep-dive-review 对当前改动做多轮深挖复审（默认只读出报告）",
+    "使用 security-audit 对当前项目做攻击者视角的取证式安全审计"
+  ]
+}

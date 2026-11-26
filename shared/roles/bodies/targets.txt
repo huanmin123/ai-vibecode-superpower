@@ -1,5 +1,7 @@
 ds/roles/design_high.md
 glm/roles/design_high.md
 gpt/roles/design_high.md
+antigravity/roles/design_high.md
 ds/roles/flash_low.md
 glm/roles/flash_low.md
+antigravity/roles/flash_low.md
