@@ -77,11 +77,19 @@ flowchart LR
 glm_flash = "<your-glm-plan>/GLM-5.3-Flash"
 glm_main  = "<your-glm-plan>/GLM-5.4"
 ds_flash  = "<your-deepseek-provider>/<your-deepseek-model>"
-# 可选：为同一逻辑模型增加第二个 provider 变体
+# 可选：为同一逻辑模型声明第二个 provider 组，安装时选择是否安装
 # ds_flash_b = "<another-provider>/<your-deepseek-model>"
 ```
 
-只需提供所选预设引用的精确键，缺失时安装会直接报错；后缀键是可选的额外 provider 组。切换已安装的后缀组不需要重装；新增一个 provider 时，在绑定文件加后缀键并重跑安装器。外部预设写具体 `provider/model` 时仍兼容、不需要绑定文件；写 `local:` 时同样走绑定层。角色结构本身不同（而不是同一结构换 provider）时，才复制预设目录并修改角色 `model`，详见 [`shared/roles/README.md`](shared/roles/README.md)。预设也可以放在仓库外：固定目录为 `~/.ai-vibecode-superpower/presets/`，安装时选择 External 来源或传 `--external` / `-External`，不会修改仓库。安装交互会先选内置/外置来源，再选客户端，然后只列出支持该客户端的预设并标注默认值。
+只需提供所选预设引用的精确键，缺失时安装会直接报错；后缀键声明可选的额外 provider 组。安装时若检测到后缀组，交互模式会列出各组及其绑定值让你选择；也可以直接指定：
+
+```bash
+sh install.sh zcode ds --variants default      # 只装精确键这一组，角色名不带后缀
+sh install.sh zcode ds --variants all          # 装全部组，后缀组角色名追加 _<label>
+sh install.sh zcode ds --variants b            # 只装 b 组，按普通角色名安装
+```
+
+未传 `--variants` 且非交互时等于 `all`，与旧行为一致。重装时上次安装但本次未选中的组会被备份后删除，不留残留。外部预设写具体 `provider/model` 时仍兼容、不需要绑定文件；写 `local:` 时同样走绑定层。角色结构本身不同（而不是同一结构换 provider）时，才复制预设目录并修改角色 `model`，详见 [`shared/roles/README.md`](shared/roles/README.md)。预设也可以放在仓库外：固定目录为 `~/.ai-vibecode-superpower/presets/`，安装时选择 External 来源或传 `--external` / `-External`，不会修改仓库。安装交互会先选内置/外置来源，再选客户端，然后只列出支持该客户端的预设并标注默认值。
 
 ### Codex
 
@@ -127,8 +135,8 @@ goals = true
 ### ZCode
 
 - 可在 ZCode 会话运行时安装；安装成功后重启 ZCode，使 `~/.zcode/agents` 的角色和 `~/.zcode/skills` 生效。
-- 角色由所选预设（默认 `glm`，6 个逻辑角色）翻译生成；提供后缀 provider 键时，每个 label 生成一组变体，本地绑定角色按组倍增。命名公式与各角色职责见 [`shared/roles/README.md`](shared/roles/README.md) 与预设文件。换个预设，同一套安装流程生成不同的角色集合。
-- 内置 `glm` / `ds` 的 `model` 为 `local:` 键；先按“角色预设”创建绑定文件，再运行安装器。缺失精确键会安装失败；后缀键可选，用于同一逻辑模型的多个 provider。外部预设写具体 `provider/model` 时不需要绑定文件。
+- 角色由所选预设（默认 `glm`，6 个逻辑角色）翻译生成。绑定文件里声明了后缀 provider 组时，交互安装会列出各组供选择；选一组按普通角色名安装，选两组及以上才按 label 生成带 `_<label>` 后缀与 `model:` 标注的变体。命名公式与各角色职责见 [`shared/roles/README.md`](shared/roles/README.md) 与预设文件。换个预设，同一套安装流程生成不同的角色集合。
+- 内置 `glm` / `ds` 的 `model` 为 `local:` 键；先按“角色预设”创建绑定文件，再运行安装器。缺失精确键会安装失败；后缀键可选，用于同一逻辑模型的多个 provider，由 `--variants` 或交互菜单选择本次安装哪些组。外部预设写具体 `provider/model` 时不需要绑定文件。
 - 安装器只管理 `AGENTS.md`、`docs/`、按所选预设渲染后平铺安装到 `~/.zcode/agents/` 顶层的 md agent（新版 ZCode 宿主只扫描该目录顶层，子目录不参与发现）和受管的 skills；不修改 ZCode 的 `cli/`、`v2/`、插件缓存或用户自建的其它 skills/agents。已有的 `AGENTS.md` 会先备份再替换。
 
 **Windows（PowerShell 7）**，在仓库根目录运行：
@@ -136,6 +144,7 @@ goals = true
 ```powershell
 & .\install.ps1 -Client zcode            # 交互选择来源与预设
 & .\install.ps1 -Client zcode -Preset glm
+& .\install.ps1 -Client zcode -Preset glm -Variants default   # 只装精确键组，角色名不带后缀
 & .\install.ps1 -Client zcode -Preset zcode-ds -External   # 外部预设
 & .\install.ps1 -Client zcode -Preset D:\my-presets\deepseek   # 任意自定义预设目录
 ```

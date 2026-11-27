@@ -188,10 +188,12 @@ if [ "${1:-}" = "--update-role-manifest" ]; then
     exit 0
 fi
 
-# ---- 参数解析：支持 --external；client/preset 仍为位置参数 ----
+# ---- 参数解析：支持 --external / --variants；client/preset 仍为位置参数 ----
 
 external_presets=0
 external_presets_prepared=0
+variants_spec=
+variants_spec_set=0
 positional_client=
 preset_input=
 while [ "$#" -gt 0 ]; do
@@ -200,8 +202,21 @@ while [ "$#" -gt 0 ]; do
             external_presets=1
             shift
             ;;
+        --variants)
+            [ "$#" -ge 2 ] || die "Missing value for $1 (expected all|default|<label>[,<label>...])"
+            [ "$variants_spec_set" = 0 ] || die "$1 specified more than once"
+            variants_spec=$2
+            variants_spec_set=1
+            shift 2
+            ;;
+        --variants=*)
+            [ "$variants_spec_set" = 0 ] || die "--variants specified more than once"
+            variants_spec=${1#*=}
+            variants_spec_set=1
+            shift
+            ;;
         -h|--help)
-            printf '%s\n' 'Usage: sh install.sh [--external] <codex|zcode> [preset]'
+            printf '%s\n' 'Usage: sh install.sh [--external] [--variants all|default|<label>[,<label>...]] <codex|zcode> [preset]'
             exit 0
             ;;
         --)
@@ -232,6 +247,12 @@ while [ "$#" -gt 0 ]; do
             ;;
     esac
 done
+
+# 显式空值（含仅空白）与未传等价：交互模式仍弹菜单，非交互模式装全部组。
+if [ -z "$(printf '%s' "$variants_spec" | tr -d '[:space:]')" ]; then
+    variants_spec=
+    variants_spec_set=0
+fi
 
 # ---- 预设来源选择：交互模式且未指定预设时，先选内置/外置 ----
 
@@ -320,6 +341,16 @@ case "$client" in
         skill_specs='agent-toolchain:shared project-doc-planner:shared visual-aesthetics:shared deep-dive-review:shared orchestrate-model-workflow:shared test-strategy:shared security-audit:shared'
         ;;
 esac
+
+# provider 组选择只服务 ZCode；Codex 只使用精确键，其他取值直接报错。
+if [ "$variants_spec_set" = 1 ] && [ "$host_section" != zcode ]; then
+    for variants_token in $(printf '%s' "$variants_spec" | tr ',' ' '); do
+        case "$variants_token" in
+            all|default) ;;
+            *) die "Provider variants are ZCode-only; --variants accepts all or default" ;;
+        esac
+    done
+fi
 
 skill_source_dir() {
     case "${1##*:}" in
@@ -756,6 +787,7 @@ resolve_model_bindings() {
         die "Missing model binding keys in $rmb_file [$rmb_host]: $rmb_missing"
     fi
     collect_model_variants
+    select_model_variants
     rmb_role=1
     while [ "$rmb_role" -le "$P_ROLES" ]; do
         if [ "$(pget "P_R${rmb_role}_HOST")" = "$rmb_host" ]; then
@@ -763,12 +795,21 @@ resolve_model_bindings() {
             case "$RMB_EFFECTIVE" in
                 local:*)
                     rmb_key=${RMB_EFFECTIVE#local:}
-                    if ! mb_find_binding "$rmb_key"; then
-                        die "Missing model binding key in $rmb_file [$rmb_host]: $rmb_key"
+                    rmb_bind_key=$rmb_key
+                    if [ -n "$SEL_SINGLE_LABEL" ]; then rmb_bind_key="${rmb_key}_${SEL_SINGLE_LABEL}"; fi
+                    if ! mb_find_binding "$rmb_bind_key"; then
+                        die "Missing model binding key in $rmb_file [$rmb_host]: $rmb_bind_key"
                     fi
-                    validate_model_binding_value "$rmb_host" "$MB_FOUND_VALUE" "$rmb_file:$MB_FOUND_LINE ($rmb_host/$rmb_key)"
+                    # 只校验被选中组：默认组未选中时其角色不渲染，值仅用于副本标注。
+                    if [ -z "$SEL_LABELS" ] || [ "$SEL_DEFAULT" = 1 ]; then
+                        validate_model_binding_value "$rmb_host" "$MB_FOUND_VALUE" "$rmb_file:$MB_FOUND_LINE ($rmb_host/$rmb_bind_key)"
+                    fi
                     pset "P_R${rmb_role}_model" "$MB_FOUND_VALUE"
                     pset "P_R${rmb_role}_SET_model" 1
+                    # 多组安装但未选中默认组时，变体化角色只在 label 副本中渲染。
+                    if [ -n "$SEL_LABELS" ] && [ "$SEL_DEFAULT" = 0 ]; then
+                        pset "P_R${rmb_role}_SKIP" 1
+                    fi
                     ;;
             esac
         fi
@@ -776,13 +817,11 @@ resolve_model_bindings() {
     done
 }
 
-# 枚举 ZCode 后缀 provider 变体：精确键是默认组；<key>_<label> 是额外组。
-# 只用绑定文件显式写出的键；label 必须小写；被引用的所有 key 必须有同一 label。
+# 枚举 ZCode 后缀 provider 变体组：精确键是默认组 default；<key>_<label> 是额外组。
+# 只用绑定文件显式写出的键；label 必须小写。覆盖性留到选择后只对选中组校验。
+CMV_LABELS=
 collect_model_variants() {
-    cmv_labels_file=$render_dir/variant-labels.txt
-    cmv_rows_file=$render_dir/variants.tsv
-    : > "$cmv_labels_file"
-    : > "$cmv_rows_file"
+    CMV_LABELS=
     [ "$rmb_host" = zcode ] || return 0
     [ -n "$rmb_required" ] || return 0
 
@@ -807,6 +846,12 @@ collect_model_variants() {
                                         die "Invalid model variant label in $rmb_file: $cmv_key (expected <key>_<lowercase-label>)"
                                     fi
                                     ;;
+                                default|all)
+                                    # 组名保留给精确键组和全选，避免与菜单/选项歧义。
+                                    if [ "$cmv_is_required" = 0 ]; then
+                                        die "Reserved model variant label in $rmb_file: $cmv_key (label must not be default or all)"
+                                    fi
+                                    ;;
                                 *)
                                     if [ "$cmv_is_required" = 0 ]; then
                                         case " $cmv_labels " in
@@ -825,38 +870,162 @@ collect_model_variants() {
         cmv_i=$((cmv_i+1))
     done
     [ -n "$cmv_labels" ] || return 0
+    CMV_LABELS=$(printf '%s\n' $cmv_labels | LC_ALL=C sort -u | tr '\n' ' ')
+    CMV_LABELS=${CMV_LABELS% }
+}
 
-    cmv_sorted=$(printf '%s\n' $cmv_labels | LC_ALL=C sort -u)
-    cmv_missing=
-    for cmv_label in $cmv_sorted; do
-        for cmv_key in $rmb_required; do
-            if ! mb_find_binding "${cmv_key}_${cmv_label}"; then
-                cmv_missing="${cmv_missing:+$cmv_missing, }${cmv_key}_${cmv_label}"
-            fi
-        done
+# 交互菜单用：列出该组每个被引用 key 的绑定值；缺键显示 <missing>，选中时才报错。
+group_binding_preview() {
+    gbp_group=$1
+    gbp_out=
+    for gbp_key in $rmb_required; do
+        if [ "$gbp_group" = default ]; then gbp_bind=$gbp_key; else gbp_bind="${gbp_key}_${gbp_group}"; fi
+        if mb_find_binding "$gbp_bind"; then
+            gbp_out="${gbp_out:+$gbp_out; }$gbp_bind=$MB_FOUND_VALUE"
+        else
+            gbp_out="${gbp_out:+$gbp_out; }$gbp_bind=<missing>"
+        fi
     done
-    if [ -n "$cmv_missing" ]; then
-        die "Variant labels must cover every referenced key in $rmb_file [$rmb_host]; missing: $cmv_missing"
+    printf '%s' "$gbp_out"
+}
+
+# 决定本次安装的 provider 组，只校验选中组。选择恰好一组时按单 provider 安装：
+# 角色名不加后缀，local:<key> 解析为该组的绑定（非默认组用 <key>_<label>）。
+SEL_GROUPS=
+SEL_LABELS=
+SEL_SINGLE_LABEL=
+SEL_DEFAULT=0
+select_model_variants() {
+    SEL_GROUPS=
+    SEL_LABELS=
+    SEL_SINGLE_LABEL=
+    SEL_DEFAULT=0
+    : > "$render_dir/variant-labels.txt"
+    : > "$render_dir/variants.tsv"
+    : > "$render_dir/all-bindings.tsv"
+
+    smv_groups="default${CMV_LABELS:+ $CMV_LABELS}"
+    smv_spec=
+    if [ "$variants_spec_set" = 1 ]; then
+        smv_spec=$variants_spec
+    elif [ -z "$CMV_LABELS" ]; then
+        smv_spec=all
+    elif [ -t 0 ]; then
+        printf 'Detected provider groups in %s [%s]:\n' "$rmb_file" "$rmb_host"
+        smv_i=1
+        for smv_group in $smv_groups; do
+            if [ "$smv_group" = default ]; then smv_mark=' [default]'; else smv_mark=; fi
+            printf '  %s) %s%s - %s\n' "$smv_i" "$smv_group" "$smv_mark" "$(group_binding_preview "$smv_group")"
+            smv_i=$((smv_i+1))
+        done
+        printf 'Select provider groups to install (numbers or names, comma-separated; empty = all): '
+        read -r smv_spec || smv_spec=
+    else
+        smv_spec=all
     fi
 
-    : > "$render_dir/all-bindings.tsv"
-    for cmv_key in $rmb_required; do
-        if ! mb_find_binding "$cmv_key"; then
-            die "Missing model binding key in $rmb_file [$rmb_host]: $cmv_key"
-        fi
-        validate_model_binding_value "$rmb_host" "$MB_FOUND_VALUE" "$rmb_file:$MB_FOUND_LINE ($rmb_host/$cmv_key)"
-        printf '%s\t%s\t%s\n' "$cmv_key" "" "$MB_FOUND_VALUE" >> "$render_dir/all-bindings.tsv"
-    done
-    for cmv_label in $cmv_sorted; do
-        for cmv_key in $rmb_required; do
-            if ! mb_find_binding "${cmv_key}_${cmv_label}"; then
-                die "Missing model binding key in $rmb_file [$rmb_host]: ${cmv_key}_${cmv_label}"
-            fi
-            validate_model_binding_value "$rmb_host" "$MB_FOUND_VALUE" "$rmb_file:$MB_FOUND_LINE ($rmb_host/${cmv_key}_${cmv_label})"
-            printf '%s\t%s\t%s\n' "$cmv_key" "$cmv_label" "$MB_FOUND_VALUE" >> "$cmv_rows_file"
-            printf '%s\t%s\t%s\n' "$cmv_key" "$cmv_label" "$MB_FOUND_VALUE" >> "$render_dir/all-bindings.tsv"
+    smv_tokens=$(printf '%s' "$smv_spec" | tr ',' ' ')
+    smv_token_count=0
+    for smv_token in $smv_tokens; do smv_token_count=$((smv_token_count+1)); done
+
+    smv_selected=
+    if [ "$smv_token_count" -eq 0 ]; then
+        smv_selected=$smv_groups
+    else
+        for smv_token in $smv_tokens; do
+            case "$smv_token" in
+                all)
+                    [ "$smv_token_count" -eq 1 ] || die "Provider group 'all' cannot be combined with other groups"
+                    smv_selected=$smv_groups
+                    ;;
+                *)
+                    smv_group=
+                    # 组名优先于菜单编号，避免数字 label 被当作编号。
+                    case " $smv_groups " in
+                        *" $smv_token "*) smv_group=$smv_token ;;
+                    esac
+                    if [ -z "$smv_group" ]; then
+                        case "$smv_token" in
+                            ''|*[!0-9]*) ;;
+                            *)
+                                smv_number=$smv_token
+                                while [ "${smv_number#0}" != "$smv_number" ]; do smv_number=${smv_number#0}; done
+                                if [ -n "$smv_number" ] && [ "${#smv_number}" -le 3 ]; then
+                                    smv_i=1
+                                    for smv_candidate in $smv_groups; do
+                                        if [ "$smv_i" -eq "$smv_number" ]; then smv_group=$smv_candidate; fi
+                                        smv_i=$((smv_i+1))
+                                    done
+                                fi
+                                ;;
+                        esac
+                    fi
+                    [ -n "$smv_group" ] || die "Unknown provider group '$smv_token' in $rmb_file [$rmb_host]; available: $smv_groups"
+                    smv_selected="${smv_selected:+$smv_selected }$smv_group"
+                    ;;
+            esac
         done
-        printf '%s\n' "$cmv_label" >> "$cmv_labels_file"
+    fi
+
+    # 按菜单顺序规范化并去重。
+    for smv_group in $smv_groups; do
+        case " $smv_selected " in
+            *" $smv_group "*) SEL_GROUPS="${SEL_GROUPS:+$SEL_GROUPS }$smv_group" ;;
+        esac
+    done
+    [ -n "$SEL_GROUPS" ] || die "No provider group selected"
+    case " $SEL_GROUPS " in *" default "*) SEL_DEFAULT=1 ;; esac
+    for smv_group in $SEL_GROUPS; do
+        [ "$smv_group" = default ] || SEL_LABELS="${SEL_LABELS:+$SEL_LABELS }$smv_group"
+    done
+    smv_group_count=0
+    for smv_group in $SEL_GROUPS; do smv_group_count=$((smv_group_count+1)); done
+    if [ "$smv_group_count" -eq 1 ] && [ "$SEL_DEFAULT" = 0 ]; then
+        SEL_SINGLE_LABEL=$SEL_LABELS
+        smv_missing=
+        for smv_key in $rmb_required; do
+            if ! mb_find_binding "${smv_key}_${SEL_SINGLE_LABEL}"; then
+                smv_missing="${smv_missing:+$smv_missing, }${smv_key}_${SEL_SINGLE_LABEL}"
+            fi
+        done
+        if [ -n "$smv_missing" ]; then
+            die "Selected provider group must cover every referenced key in $rmb_file [$rmb_host]; missing: $smv_missing"
+        fi
+        SEL_LABELS=
+        return 0
+    fi
+
+    smv_missing=
+    for smv_label in $SEL_LABELS; do
+        for smv_key in $rmb_required; do
+            if ! mb_find_binding "${smv_key}_${smv_label}"; then
+                smv_missing="${smv_missing:+$smv_missing, }${smv_key}_${smv_label}"
+            fi
+        done
+    done
+    if [ -n "$smv_missing" ]; then
+        die "Selected provider groups must cover every referenced key in $rmb_file [$rmb_host]; missing: $smv_missing"
+    fi
+
+    if [ "$SEL_DEFAULT" = 1 ]; then
+        for smv_key in $rmb_required; do
+            if ! mb_find_binding "$smv_key"; then
+                die "Missing model binding key in $rmb_file [$rmb_host]: $smv_key"
+            fi
+            validate_model_binding_value "$rmb_host" "$MB_FOUND_VALUE" "$rmb_file:$MB_FOUND_LINE ($rmb_host/$smv_key)"
+            printf '%s\t%s\t%s\n' "$smv_key" "" "$MB_FOUND_VALUE" >> "$render_dir/all-bindings.tsv"
+        done
+    fi
+    for smv_label in $SEL_LABELS; do
+        for smv_key in $rmb_required; do
+            if ! mb_find_binding "${smv_key}_${smv_label}"; then
+                die "Missing model binding key in $rmb_file [$rmb_host]: ${smv_key}_${smv_label}"
+            fi
+            validate_model_binding_value "$rmb_host" "$MB_FOUND_VALUE" "$rmb_file:$MB_FOUND_LINE ($rmb_host/${smv_key}_${smv_label})"
+            printf '%s\t%s\t%s\n' "$smv_key" "$smv_label" "$MB_FOUND_VALUE" >> "$render_dir/variants.tsv"
+            printf '%s\t%s\t%s\n' "$smv_key" "$smv_label" "$MB_FOUND_VALUE" >> "$render_dir/all-bindings.tsv"
+        done
+        printf '%s\n' "$smv_label" >> "$render_dir/variant-labels.txt"
     done
     if ! LC_ALL=C awk -F '\t' '
         { key = $1 "\t" $3; if (seen[key]++) { printf "Duplicate model binding for key %s: %s\n", $1, $3 > "/dev/stderr"; exit 1 } }
@@ -926,6 +1095,43 @@ expand_model_variants() {
         fi
         vx_role=$((vx_role+1))
     done
+
+    # 默认组未选中时，固定 model 的角色不得引用被变体化的角色 id：否则会解析到不渲染的默认组文件。
+    if [ "$SEL_DEFAULT" = 0 ]; then
+        vx_role=1
+        while [ "$vx_role" -le "$vx_original_roles" ]; do
+            if [ "$(pget "P_R${vx_role}_HOST")" = "$host_section" ] && [ -z "$(pget "P_R${vx_role}_LOCAL_KEY")" ]; then
+                vx_ref_id=$(pget "P_R${vx_role}_id")
+                if [ "$(pget "P_R${vx_role}_SET_body")" = 1 ]; then
+                    vx_ref_rel=$(pget "P_R${vx_role}_body")
+                else
+                    vx_ref_rel=$vx_ref_id.md
+                fi
+                vx_ref_src=$preset_dir/roles/$vx_ref_rel
+                if ! LC_ALL=C awk -v ids="$vx_variant_ids" -v sec="$host_section" -v rid="$vx_ref_id" '
+                    function has_variant(id, n, a, i) {
+                        n = split(ids, a, " ")
+                        for (i = 1; i <= n; i++) if (a[i] == id) return 1
+                        return 0
+                    }
+                    {
+                        line = $0
+                        while (match(line, /\{\{role:[A-Za-z0-9_-]+\}\}/)) {
+                            ref = substr(line, RSTART + 7, RLENGTH - 9)
+                            if (has_variant(ref)) {
+                                printf "Role [%s]/%s references variant role id %s; include the default provider group or remove the reference\n", sec, rid, ref > "/dev/stderr"
+                                exit 1
+                            }
+                            line = substr(line, RSTART + RLENGTH)
+                        }
+                    }
+                ' "$vx_ref_src"; then
+                    die "Role [$host_section]/$vx_ref_id body references could not be validated: $vx_ref_src"
+                fi
+            fi
+            vx_role=$((vx_role+1))
+        done
+    fi
 
     while IFS= read -r vx_label || [ -n "$vx_label" ]; do
         [ -n "$vx_label" ] || continue
@@ -1059,7 +1265,7 @@ render_preset() {
     fi
     ri=1
     while [ "$ri" -le "$P_ROLES" ]; do
-        if [ "$(pget "P_R${ri}_HOST")" = "$host_section" ]; then
+        if [ "$(pget "P_R${ri}_HOST")" = "$host_section" ] && [ "$(pget "P_R${ri}_SKIP")" != 1 ]; then
             printf '%s\n' "$ri" >> "$render_dir/section-roles.txt"
         fi
         ri=$((ri+1))
@@ -2043,7 +2249,11 @@ fi
 variant_labels_note=
 if [ -s "$render_dir/variant-labels.txt" ]; then
     variant_labels_note=$(LC_ALL=C awk 'BEGIN { first = 1 } { if (!first) printf ", "; printf "%s", $0; first = 0 }' "$render_dir/variant-labels.txt")
-    variant_labels_note=" (provider variants: $variant_labels_note)"
+    variant_labels_note=" (provider variants: $variant_labels_note"
+    if [ "$SEL_DEFAULT" = 0 ]; then variant_labels_note="$variant_labels_note; default group not installed"; fi
+    variant_labels_note="$variant_labels_note)"
+elif [ -n "${SEL_SINGLE_LABEL:-}" ]; then
+    variant_labels_note=" (provider group: $SEL_SINGLE_LABEL)"
 fi
 completed=1
 printf '%s\n' "$client_label configuration installed in: $client_home" "Preset '$preset_display_name' rendered $role_count roles.${variant_labels_note}" 'Standalone skills and managed agent roles installed.' "Restart $client_label to load the new configuration and skills."

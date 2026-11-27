@@ -1,5 +1,5 @@
 ﻿[CmdletBinding()]
-param([string]$Client, [string]$Preset, [switch]$External, [switch]$UpdateRoleManifest)
+param([string]$Client, [string]$Preset, [string]$Variants, [switch]$External, [switch]$UpdateRoleManifest)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -185,7 +185,7 @@ function Read-ModelBindings([string]$Path, [string]$HostSection) {
     return $bindings
 }
 
-function Resolve-ModelBindings([hashtable]$Preset, [string]$HostSection, [string]$BindingsFile) {
+function Resolve-ModelBindings([hashtable]$Preset, [string]$HostSection, [string]$BindingsFile, [string]$VariantsSpec, [bool]$Interactive) {
     $hostTable = $Preset.sections[$HostSection]
     $required = [Collections.Generic.List[string]]::new()
     foreach ($role in $hostTable.roles) {
@@ -203,7 +203,7 @@ function Resolve-ModelBindings([hashtable]$Preset, [string]$HostSection, [string
     }
     $labels = [Collections.Generic.List[string]]::new()
     $variantModels = [hashtable]::new([StringComparer]::Ordinal)
-    $resolution = @{ Labels = $labels; Models = $variantModels; File = $BindingsFile }
+    $resolution = @{ Labels = $labels; Models = $variantModels; File = $BindingsFile; Default = $true; SingleLabel = $null }
     if ($required.Count -eq 0) { return $resolution }
     $requiredDisplay = $required -join ', '
     if ([string]::IsNullOrWhiteSpace($BindingsFile)) {
@@ -216,64 +216,163 @@ function Resolve-ModelBindings([hashtable]$Preset, [string]$HostSection, [string
     $missing = @($required | Where-Object { -not $bindings.ContainsKey($_) })
     if ($missing.Count -gt 0) { throw "Missing model binding keys in ${BindingsFile} [$HostSection]: $($missing -join ', ')" }
 
+    # 枚举可用 provider 组：default 是精确键组；<key>_<label> 是额外组。
+    # 只枚举绑定文件显式写出的键；覆盖性留到选择后只对选中组校验。
+    $availableGroups = [Collections.Generic.List[string]]::new()
+    $availableGroups.Add('default')
     if ($HostSection -ceq 'zcode') {
-        # 精确键是默认组；<key>_<label> 是额外 provider 组。显式引用的 key 优先，不当作更短 key 的变体。
         $labelSet = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         $orderedKeys = @($bindings.Keys | Sort-Object { $bindings[$_].Line })
         foreach ($bindingKey in $orderedKeys) {
             $isRequired = $required.Contains($bindingKey)
             foreach ($key in $required) {
                 if (-not $bindingKey.StartsWith($key + '_', [StringComparison]::Ordinal)) { continue }
-                $label = $bindingKey.Substring($key.Length + 1)
-                if ($label -cnotmatch '^[a-z0-9][a-z0-9_-]*$') {
+                $candidateLabel = $bindingKey.Substring($key.Length + 1)
+                if ($candidateLabel -ceq 'default' -or $candidateLabel -ceq 'all') {
+                    if (-not $isRequired) { throw "Reserved model variant label in ${BindingsFile}: $bindingKey (label must not be default or all)" }
+                    continue
+                }
+                if ($candidateLabel -cnotmatch '^[a-z0-9][a-z0-9_-]*$') {
                     if (-not $isRequired) { throw "Invalid model variant label in ${BindingsFile}: $bindingKey (expected <key>_<lowercase-label>)" }
                     continue
                 }
-                if (-not $isRequired) { [void]$labelSet.Add($label) }
+                if (-not $isRequired) { [void]$labelSet.Add($candidateLabel) }
             }
         }
-        if ($labelSet.Count -gt 0) {
-            $labelArray = [string[]]@($labelSet)
+        $labelArray = [string[]]@($labelSet)
+        if ($labelArray.Count -gt 0) {
             [Array]::Sort($labelArray, [StringComparer]::Ordinal)
-            $missingVariants = [Collections.Generic.List[string]]::new()
-            foreach ($label in $labelArray) {
+            foreach ($variantLabel in $labelArray) { $availableGroups.Add($variantLabel) }
+        }
+    }
+
+    $spec = $VariantsSpec
+    if ([string]::IsNullOrWhiteSpace($spec)) {
+        if ($availableGroups.Count -eq 1) {
+            $spec = 'all'
+        } elseif ($Interactive) {
+            Write-Host "Detected provider groups in ${BindingsFile} [$HostSection]:"
+            for ($groupIndex = 0; $groupIndex -lt $availableGroups.Count; $groupIndex++) {
+                $group = $availableGroups[$groupIndex]
+                $mark = if ($group -ceq 'default') { ' [default]' } else { '' }
+                $preview = [Collections.Generic.List[string]]::new()
                 foreach ($key in $required) {
-                    $variantKey = "${key}_${label}"
-                    if (-not $bindings.ContainsKey($variantKey)) { $missingVariants.Add($variantKey) }
+                    $bindingKey = if ($group -ceq 'default') { $key } else { "${key}_${group}" }
+                    if ($bindings.ContainsKey($bindingKey)) { $preview.Add("$bindingKey=$([string]$bindings[$bindingKey].Value)") }
+                    else { $preview.Add("$bindingKey=<missing>") }
+                }
+                Write-Host ("  {0}) {1}{2} - {3}" -f ($groupIndex + 1), $group, $mark, ($preview -join '; '))
+            }
+            $spec = Read-Host 'Select provider groups to install (numbers or names, comma-separated; empty = all)'
+        } else {
+            $spec = 'all'
+        }
+    }
+
+    $tokens = @()
+    if (-not [string]::IsNullOrWhiteSpace($spec)) { $tokens = @($spec -split '[,\s]+' | Where-Object { $_ -ne '' }) }
+    $selected = [Collections.Generic.List[string]]::new()
+    if ($tokens.Count -eq 0) {
+        foreach ($group in $availableGroups) { $selected.Add($group) }
+    } else {
+        foreach ($token in $tokens) {
+            if ($token -ceq 'all') {
+                if ($tokens.Count -ne 1) { throw "Provider group 'all' cannot be combined with other groups" }
+                foreach ($group in $availableGroups) { if (-not $selected.Contains($group)) { $selected.Add($group) } }
+                continue
+            }
+            $resolvedGroup = $null
+            # 组名优先于菜单编号，避免数字 label 被当作编号。
+            if ($availableGroups.Contains($token)) { $resolvedGroup = $token }
+            elseif ($token -match '^\d+$') {
+                $number = 0
+                if ([int]::TryParse($token, [ref]$number) -and $number -ge 1 -and $number -le $availableGroups.Count) {
+                    $resolvedGroup = $availableGroups[$number - 1]
                 }
             }
-            if ($missingVariants.Count -gt 0) {
-                throw "Variant labels must cover every referenced key in ${BindingsFile} [$HostSection]; missing: $($missingVariants -join ', ')"
+            if ($null -eq $resolvedGroup) {
+                throw "Unknown provider group '$token' in ${BindingsFile} [$HostSection]; available: $($availableGroups -join ' ')"
             }
-            $seenValues = [hashtable]::new([StringComparer]::Ordinal)
-            foreach ($key in $required) {
-                $binding = $bindings[$key]
-                Assert-ModelBindingValue $HostSection ([string]$binding.Value) "${BindingsFile}:$($binding.Line) ($HostSection/$key)"
-                $seen = $key + "`t" + [string]$binding.Value
-                if ($seenValues.ContainsKey($seen)) { throw "Duplicate model binding value in ${BindingsFile} [$HostSection]" }
-                $seenValues[$seen] = $true
-            }
-            foreach ($label in $labelArray) {
-                foreach ($key in $required) {
-                    $variantKey = "${key}_${label}"
-                    $binding = $bindings[$variantKey]
-                    Assert-ModelBindingValue $HostSection ([string]$binding.Value) "${BindingsFile}:$($binding.Line) ($HostSection/$variantKey)"
-                    $seen = $key + "`t" + [string]$binding.Value
-                    if ($seenValues.ContainsKey($seen)) { throw "Duplicate model binding value in ${BindingsFile} [$HostSection]" }
-                    $seenValues[$seen] = $true
-                    $variantModels[$key + "`t" + $label] = [string]$binding.Value
-                }
-                $labels.Add($label)
+            if (-not $selected.Contains($resolvedGroup)) { $selected.Add($resolvedGroup) }
+        }
+    }
+
+    # 按菜单顺序规范化并去重。
+    $ordered = [Collections.Generic.List[string]]::new()
+    foreach ($group in $availableGroups) { if ($selected.Contains($group)) { $ordered.Add($group) } }
+    if ($ordered.Count -eq 0) { throw 'No provider group selected' }
+    $defaultSelected = $ordered.Contains('default')
+    $selectedLabels = @($ordered | Where-Object { $_ -cne 'default' })
+    $resolution.Default = $defaultSelected
+
+    # 选择恰好一组时按普通单 provider 安装：角色名不加后缀，local:<key> 解析为该组绑定。
+    if ($ordered.Count -eq 1 -and -not $defaultSelected) {
+        $singleLabel = [string]$ordered[0]
+        $missingSingle = @($required | Where-Object { -not $bindings.ContainsKey($_ + '_' + $singleLabel) })
+        if ($missingSingle.Count -gt 0) {
+            $missingSingleKeys = @($missingSingle | ForEach-Object { $_ + '_' + $singleLabel }) -join ', '
+            throw "Selected provider group must cover every referenced key in ${BindingsFile} [$HostSection]; missing: $missingSingleKeys"
+        }
+        foreach ($key in $required) {
+            $bindingKey = $key + '_' + $singleLabel
+            $binding = $bindings[$bindingKey]
+            Assert-ModelBindingValue $HostSection ([string]$binding.Value) "${BindingsFile}:$($binding.Line) ($HostSection/$bindingKey)"
+        }
+        foreach ($role in $hostTable.roles) {
+            if ($role.Contains('localKey')) {
+                $bindingKey = [string]$role.localKey + '_' + $singleLabel
+                $role['model'] = [string]$bindings[$bindingKey].Value
             }
         }
+        $resolution.SingleLabel = $singleLabel
+        return $resolution
+    }
+
+    $missingVariants = [Collections.Generic.List[string]]::new()
+    foreach ($variantLabel in $selectedLabels) {
+        foreach ($key in $required) {
+            $variantKey = "${key}_${variantLabel}"
+            if (-not $bindings.ContainsKey($variantKey)) { $missingVariants.Add($variantKey) }
+        }
+    }
+    if ($missingVariants.Count -gt 0) {
+        throw "Selected provider groups must cover every referenced key in ${BindingsFile} [$HostSection]; missing: $($missingVariants -join ', ')"
+    }
+
+    $seenValues = [hashtable]::new([StringComparer]::Ordinal)
+    if ($defaultSelected) {
+        foreach ($key in $required) {
+            $binding = $bindings[$key]
+            Assert-ModelBindingValue $HostSection ([string]$binding.Value) "${BindingsFile}:$($binding.Line) ($HostSection/$key)"
+            $seen = $key + "`t" + [string]$binding.Value
+            if ($seenValues.ContainsKey($seen)) { throw "Duplicate model binding value in ${BindingsFile} [$HostSection]" }
+            $seenValues[$seen] = $true
+        }
+    }
+    foreach ($variantLabel in $selectedLabels) {
+        foreach ($key in $required) {
+            $variantKey = "${key}_${variantLabel}"
+            $binding = $bindings[$variantKey]
+            Assert-ModelBindingValue $HostSection ([string]$binding.Value) "${BindingsFile}:$($binding.Line) ($HostSection/$variantKey)"
+            $seen = $key + "`t" + [string]$binding.Value
+            if ($seenValues.ContainsKey($seen)) { throw "Duplicate model binding value in ${BindingsFile} [$HostSection]" }
+            $seenValues[$seen] = $true
+            $variantModels[$key + "`t" + $variantLabel] = [string]$binding.Value
+        }
+        $labels.Add($variantLabel)
     }
 
     foreach ($role in $hostTable.roles) {
         if ($role.Contains('localKey')) {
             $key = [string]$role.localKey
             $binding = $bindings[$key]
-            Assert-ModelBindingValue $HostSection ([string]$binding.Value) "${BindingsFile}:$($binding.Line) ($HostSection/$key)"
+            # 只校验被选中组：默认组未选中时其角色不渲染，只保留值供副本标注使用。
+            if ($defaultSelected) {
+                Assert-ModelBindingValue $HostSection ([string]$binding.Value) "${BindingsFile}:$($binding.Line) ($HostSection/$key)"
+            }
             $role['model'] = [string]$binding.Value
+            # 多组安装但未选中默认组时，变体化角色只在 label 副本中渲染。
+            if (-not $defaultSelected) { $role['skip'] = $true }
         }
     }
     return $resolution
@@ -314,6 +413,7 @@ function Expand-ModelVariants([hashtable]$Preset, [string]$HostSection, [hashtab
             $baseName = if ($role.Contains('name')) { [string]$role.name } else { '' }
             if ($baseId.Length -eq 0 -or $baseName.Length -eq 0) { continue }
             $clone = $role.Clone()
+            if ($clone.Contains('skip')) { $clone.Remove('skip') }
             $clone['id'] = $baseId + '_' + $label
             $clone['name'] = $baseName + '_' + $label
             $clone['model'] = $model
@@ -340,6 +440,7 @@ function Convert-PresetToSkillRoute([hashtable]$Preset, [string]$Section) {
     $hostTable = $Preset.sections[$Section]
     $lines = [Collections.Generic.List[string]]::new()
     foreach ($role in $hostTable.roles) {
+        if ($role.Contains('skip')) { continue }
         $desc = if ($role.Contains('skill_desc')) { [string]$role.skill_desc } else { [string]$role.description }
         $lines.Add('- `' + [string]$role.name + '`：' + $desc)
     }
@@ -354,6 +455,8 @@ function Convert-PresetToHostFiles([hashtable]$Preset, [string]$Section, [string
     $ids = @{}
     $names = @{}
     foreach ($role in $roles) {
+        # 未选中组的角色不渲染，不参与角色名/ID 唯一性校验。
+        if ($role.Contains('skip')) { continue }
         foreach ($required in 'id', 'name', 'description') {
             if (-not $role.Contains($required)) { throw "Preset role in [$Section] missing $required" }
         }
@@ -368,11 +471,15 @@ function Convert-PresetToHostFiles([hashtable]$Preset, [string]$Section, [string
     }
     $nameById = @{}
     foreach ($role in $roles) { $nameById[[string]$role.id] = [string]$role.name }
+    # 默认组未被选中时，其角色不生成文件；固定 model 的角色不得引用这些 id。
+    $skippedIds = @{}
+    foreach ($role in $roles) { if ($role.Contains('skip')) { $skippedIds[[string]$role.id] = $true } }
     $effortMap = @{ basic = 'low'; deep = 'high'; max = 'max' }
     $defaultTools = @('Read', 'Bash', 'WebFetch', 'WebSearch', 'TodoWrite')
     $ignored = [Collections.Generic.List[string]]::new()
     $files = [ordered]@{}
     foreach ($role in $roles) {
+        if ($role.Contains('skip')) { continue }
         $id = [string]$role.id
         $name = [string]$role.name
         $description = [string]$role.description
@@ -406,7 +513,11 @@ function Convert-PresetToHostFiles([hashtable]$Preset, [string]$Section, [string
         $refVariantIds = if ($role.Contains('refVariantIds')) { $role.refVariantIds } else { $null }
         $body = [regex]::Replace($body, '\{\{role:([A-Za-z0-9_-]+)\}\}', { param($match)
             $ref = $match.Groups[1].Value
-            if ($refSuffix.Length -gt 0 -and $null -ne $refVariantIds -and $refVariantIds.ContainsKey($ref)) { $ref = $ref + $refSuffix }
+            if ($refSuffix.Length -gt 0 -and $null -ne $refVariantIds -and $refVariantIds.ContainsKey($ref)) {
+                $ref = $ref + $refSuffix
+            } elseif ($skippedIds.ContainsKey($ref)) {
+                throw "Role [$Section]/$id references role id $ref whose default provider group is not installed; include the default group or remove the reference"
+            }
             if (-not $nameById.ContainsKey($ref)) { throw "Role [$Section]/$id references unknown role id: $ref" }
             $nameById[$ref]
         })
@@ -444,7 +555,7 @@ function Convert-PresetToHostFiles([hashtable]$Preset, [string]$Section, [string
             $files[$name + '.toml'] = ($lines -join "`n") + "`n"
         }
     }
-    return @{ Files = $files; Ignored = $ignored; Count = $roles.Count }
+    return @{ Files = $files; Ignored = $ignored; Count = $files.Count }
 }
 
 function Assert-AgentFile([string]$Path) {
@@ -896,6 +1007,13 @@ if (-not $clientProfiles.Contains($Client)) { throw "Unknown client: $Client (su
 $profile = $clientProfiles[$Client]
 $label = $profile.Label
 
+# provider 组选择只服务 ZCode；Codex 只使用精确键，其他取值直接报错。
+if (-not [string]::IsNullOrWhiteSpace($Variants) -and $profile.HostSection -cne 'zcode') {
+    foreach ($variantToken in @($Variants -split '[,\s]+' | Where-Object { $_ -ne '' })) {
+        if ($variantToken -cnotin @('all', 'default')) { throw 'Provider variants are ZCode-only; -Variants accepts all or default' }
+    }
+}
+
 $presetName = $Preset
 $presetSelectedDir = $null
 $presetSearchRoot = $presetsRoot
@@ -961,11 +1079,18 @@ $isManagedPreset = $presetDir.TrimEnd('\').StartsWith($presetsRoot.TrimEnd('\') 
 if ($isManagedPreset) { Assert-PresetSources $presetsRoot ([IO.Path]::GetFileName($presetDir.TrimEnd('\'))) $presetManifest }
 $presetData = Read-Preset $presetFile
 if (-not $presetData.sections.Contains($profile.HostSection)) { throw "Preset '$presetName' has no [$($profile.HostSection)] section and cannot be installed for $label" }
-$modelResolution = Resolve-ModelBindings $presetData $profile.HostSection $modelBindingsFile
+$modelResolution = Resolve-ModelBindings $presetData $profile.HostSection $modelBindingsFile $Variants (-not [Console]::IsInputRedirected)
 Expand-ModelVariants $presetData $profile.HostSection $modelResolution
 $rendered = Convert-PresetToHostFiles $presetData $profile.HostSection $profile.RoleKind $presetDir
 $expectedRoleCount = $rendered.Count
-$variantLabelsNote = if ($modelResolution.Labels.Count -gt 0) { ' (provider variants: ' + ($modelResolution.Labels -join ', ') + ')' } else { '' }
+$variantLabelsNote = ''
+if ($modelResolution.Labels.Count -gt 0) {
+    $variantLabelsNote = ' (provider variants: ' + ($modelResolution.Labels -join ', ')
+    if (-not $modelResolution.Default) { $variantLabelsNote += '; default group not installed' }
+    $variantLabelsNote += ')'
+} elseif ($null -ne $modelResolution.SingleLabel) {
+    $variantLabelsNote = ' (provider group: ' + [string]$modelResolution.SingleLabel + ')'
+}
 
 $profilePath = if ($env:USERPROFILE) { $env:USERPROFILE } else { [Environment]::GetFolderPath('UserProfile') }
 $homeEnvValue = [Environment]::GetEnvironmentVariable($profile.HomeEnv)

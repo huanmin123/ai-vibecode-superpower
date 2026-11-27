@@ -1571,7 +1571,7 @@ test('POSIX zcode installer requires provider variants for every referenced key'
     });
     assert.notEqual(result.code, 0, result.stdout);
     const output = result.stdout + '\n' + result.stderr;
-    assert.match(output, /Variant labels must cover every referenced key/);
+    assert.match(output, /Selected provider groups must cover every referenced key/);
     assert.match(output, /glm_main_b/);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -1656,6 +1656,68 @@ test('POSIX zcode installer removes stale provider variants on reinstall', async
     assert.ok(!managed.includes('_c.md'), 'stale variant must leave the managed list');
     const backups = (await readdir(path.join(zcodeHome, 'backups'), { recursive: true })).map((entry) => entry.split(/[\\/]/).pop());
     assert.ok(backups.includes('ds_4.1_flash_low_c.md'), 'stale variant must be backed up');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('POSIX zcode installer installs only selected provider groups', async (t) => {
+  const shell = await findPosixShell();
+  if (!shell) return t.skip('POSIX shell is unavailable');
+  const root = await mkdtemp(path.join(repository, '.model-variant-selection-'));
+  const home = path.join(root, 'home');
+  const zcodeHome = path.join(root, '.zcode');
+  const agentsDir = path.join(zcodeHome, 'agents');
+  const roles = ['ds_4.1_flash_low', 'ds_4.1_flash_high', 'ds_4.1_flash_max', 'ds_4.1_flash_design_high'];
+  const agentNames = async () => (await readdir(agentsDir)).filter((name) => name.endsWith('.md')).sort();
+  try {
+    await seedModelBindings(home, {
+      ds_flash: 'provider-a/deepseek-v4.1-flash',
+      ds_flash_b: 'provider-b/deepseek-v4.1-flash',
+      ds_flash_c: 'provider-c/deepseek-v4.1-flash',
+    });
+    const env = { ...process.env, HOME: home, ZCODE_HOME: posixHome(zcodeHome) };
+
+    // 只装默认组：无后缀、无标注，未选中的组不生成。
+    const defaultOnly = await runResult(shell, ['install.sh', 'zcode', 'ds', '--variants', 'default'], { cwd: repository, env });
+    assert.equal(defaultOnly.code, 0, `${defaultOnly.stdout}\n${defaultOnly.stderr}`);
+    assert.match(defaultOnly.stdout, /rendered 4 roles\./);
+    assert.deepEqual(await agentNames(), roles.map((role) => `${role}.md`).sort());
+    for (const role of roles) {
+      const profile = await readFile(path.join(agentsDir, `${role}.md`), 'utf8');
+      assert.match(profile, /^model: "provider-a\/deepseek-v4\.1-flash"$/m, `default model missing: ${role}`);
+      assert.doesNotMatch(profile, /（model:/, `unexpected annotation: ${role}`);
+    }
+
+    // 只装 b 组：仍用普通角色名，model 指向该组绑定。
+    const singleLabel = await runResult(shell, ['install.sh', 'zcode', 'ds', '--variants', 'b'], { cwd: repository, env });
+    assert.equal(singleLabel.code, 0, `${singleLabel.stdout}\n${singleLabel.stderr}`);
+    assert.match(singleLabel.stdout, /\(provider group: b\)/);
+    assert.deepEqual(await agentNames(), roles.map((role) => `${role}.md`).sort());
+    for (const role of roles) {
+      const profile = await readFile(path.join(agentsDir, `${role}.md`), 'utf8');
+      assert.match(profile, /^model: "provider-b\/deepseek-v4\.1-flash"$/m, `selected group model missing: ${role}`);
+      assert.doesNotMatch(profile, /（model:/, `unexpected annotation: ${role}`);
+    }
+
+    // 排除默认组选两个 label：只生成带后缀的副本。
+    const labelsOnly = await runResult(shell, ['install.sh', 'zcode', 'ds', '--variants', 'b,c'], { cwd: repository, env });
+    assert.equal(labelsOnly.code, 0, `${labelsOnly.stdout}\n${labelsOnly.stderr}`);
+    assert.match(labelsOnly.stdout, /rendered 8 roles\. \(provider variants: b, c; default group not installed\)/);
+    assert.deepEqual(await agentNames(), [
+      ...roles.map((role) => `${role}_b.md`),
+      ...roles.map((role) => `${role}_c.md`),
+    ].sort());
+    const managed = await readFile(path.join(agentsDir, '.ai-vibecode-superpower.managed'), 'utf8');
+    assert.ok(!managed.includes('ds_4.1_flash_low.md'), 'default group must not stay managed');
+
+    // 回到默认组：此前的后缀副本备份后删除，不留残留。
+    const backToDefault = await runResult(shell, ['install.sh', 'zcode', 'ds', '--variants', 'default'], { cwd: repository, env });
+    assert.equal(backToDefault.code, 0, `${backToDefault.stdout}\n${backToDefault.stderr}`);
+    assert.deepEqual(await agentNames(), roles.map((role) => `${role}.md`).sort());
+    const backups = (await readdir(path.join(zcodeHome, 'backups'), { recursive: true })).map((entry) => entry.split(/[\\/]/).pop());
+    assert.ok(backups.includes('ds_4.1_flash_low_b.md'), 'removed label variant must be backed up');
+    assert.ok(backups.includes('ds_4.1_flash_low_c.md'), 'removed label variant must be backed up');
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1811,6 +1873,51 @@ test('PowerShell zcode installer expands and cleans provider variants', { skip: 
   }
 });
 
+test('PowerShell zcode installer installs only selected provider groups', { skip: process.platform !== 'win32' }, async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'model-variant-powershell-selection-'));
+  const home = path.join(root, 'profile');
+  const zcodeHome = path.join(root, '.zcode');
+  const agentsDir = path.join(zcodeHome, 'agents');
+  const roles = ['ds_4.1_flash_low', 'ds_4.1_flash_high', 'ds_4.1_flash_max', 'ds_4.1_flash_design_high'];
+  const agentNames = async () => (await readdir(agentsDir)).filter((name) => name.endsWith('.md')).sort();
+  try {
+    await seedModelBindings(home, {
+      ds_flash: 'provider-a/deepseek-v4.1-flash',
+      ds_flash_b: 'provider-b/deepseek-v4.1-flash',
+      ds_flash_c: 'provider-c/deepseek-v4.1-flash',
+    });
+    const env = { ...process.env, USERPROFILE: home, ZCODE_HOME: zcodeHome };
+    const args = ['-NoLogo', '-NoProfile', '-File', powerInstaller, '-Client', 'zcode', '-Preset', 'ds'];
+
+    const defaultOnly = await runResult('pwsh.exe', [...args, '-Variants', 'default'], { env });
+    assert.equal(defaultOnly.code, 0, `${defaultOnly.stdout}\n${defaultOnly.stderr}`);
+    assert.match(defaultOnly.stdout, /rendered 4 roles\./);
+    assert.deepEqual(await agentNames(), roles.map((role) => `${role}.md`).sort());
+
+    const singleLabel = await runResult('pwsh.exe', [...args, '-Variants', 'b'], { env });
+    assert.equal(singleLabel.code, 0, `${singleLabel.stdout}\n${singleLabel.stderr}`);
+    assert.match(singleLabel.stdout, /\(provider group: b\)/);
+    assert.match(await readFile(path.join(agentsDir, 'ds_4.1_flash_low.md'), 'utf8'), /^model: "provider-b\/deepseek-v4\.1-flash"$/m);
+
+    // 排除默认组选两个 label：只生成带后缀的副本，期望角色数按实际文件数校验。
+    const labelsOnly = await runResult('pwsh.exe', [...args, '-Variants', 'b,c'], { env });
+    assert.equal(labelsOnly.code, 0, `${labelsOnly.stdout}\n${labelsOnly.stderr}`);
+    assert.match(labelsOnly.stdout, /rendered 8 roles\. \(provider variants: b, c; default group not installed\)/);
+    assert.deepEqual(await agentNames(), [
+      ...roles.map((role) => `${role}_b.md`),
+      ...roles.map((role) => `${role}_c.md`),
+    ].sort());
+
+    const backToDefault = await runResult('pwsh.exe', [...args, '-Variants', 'default'], { env });
+    assert.equal(backToDefault.code, 0, `${backToDefault.stdout}\n${backToDefault.stderr}`);
+    assert.deepEqual(await agentNames(), roles.map((role) => `${role}.md`).sort());
+    const backups = (await readdir(path.join(zcodeHome, 'backups'), { recursive: true })).map((entry) => entry.split(/[\\/]/).pop());
+    assert.ok(backups.includes('ds_4.1_flash_low_b.md'), 'removed label variant must be backed up');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('PowerShell zcode installer requires provider variants for every referenced key', { skip: process.platform !== 'win32' }, async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'model-variant-powershell-incomplete-'));
   const home = path.join(root, 'profile');
@@ -1822,7 +1929,7 @@ test('PowerShell zcode installer requires provider variants for every referenced
     });
     assert.notEqual(result.code, 0, result.stdout);
     const output = result.stdout + '\n' + result.stderr;
-    assert.match(output, /Variant labels must cover every referenced key/);
+    assert.match(output, /Selected provider groups must cover every referenced key/);
     assert.match(output, /glm_main_b/);
   } finally {
     await rm(root, { recursive: true, force: true });
